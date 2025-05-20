@@ -1,0 +1,43 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .routes.auth import router as auth_router
+from .routes.blinkit import router as blinkit_router
+from .database import connect_db, close_db
+
+
+app = FastAPI()
+
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:8000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+async def startup_event():
+    print("FastAPI app startup event triggered.")
+    connect_db()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    print("FastAPI app shutdown event triggered.")
+    close_db()
+
+
+@app.get("/")
+def read_root():
+    return {"Hello": "World"}
+
+
+# --- Include Routers (use distinct names) ---
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
+app.include_router(blinkit_router, prefix="/blinkit", tags=["blinkit"])
