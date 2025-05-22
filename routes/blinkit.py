@@ -896,7 +896,7 @@ async def generate_report(
         def get_best_performing_month(sku_city_key):
             """
             Returns the best performing month for a given SKU/City pair based on lifetime sales data.
-            Returns dict with month_name, year, month_sales, and formatted string.
+            Returns dict with month_name, year, quantity_sold, and formatted string.
             """
             if (
                 sku_city_key not in lifetime_monthly_sales
@@ -905,7 +905,7 @@ async def generate_report(
                 return {
                     "month_name": "No Data",
                     "year": None,
-                    "month_sales": 0,
+                    "quantity_sold": 0,
                     "formatted": "No Data",
                 }
 
@@ -914,7 +914,7 @@ async def generate_report(
                 lifetime_monthly_sales[sku_city_key],
                 key=lifetime_monthly_sales[sku_city_key].get,
             )
-            best_month_sales = lifetime_monthly_sales[sku_city_key][best_month_key]
+            best_month_quantity = lifetime_monthly_sales[sku_city_key][best_month_key]
 
             # Parse the month-year key back to readable format
             year, month = best_month_key.split("-")
@@ -923,7 +923,7 @@ async def generate_report(
             return {
                 "month_name": month_name,
                 "year": int(year),
-                "month_sales": round(best_month_sales, 2),
+                "quantity_sold": round(best_month_quantity, 2),
                 "formatted": f"{month_name} {year}",
             }
 
@@ -1041,7 +1041,7 @@ async def generate_report(
                 "best_performing_month_details": {  # NEW: Detailed breakdown
                     "month_name": best_month_info["month_name"],
                     "year": best_month_info["year"],
-                    "sales_amount": best_month_info["month_sales"],
+                    "quantity_sold": best_month_info["quantity_sold"],
                 },
                 "metrics": {
                     "avg_daily_on_stock_days": round(avg_daily_on_stock_days, 2),
@@ -1190,6 +1190,9 @@ async def download_report(
                     "performance_vs_prev_30_days_pct", 0
                 ),
                 "Best Performing Month": item.get("best_performing_month", ""),
+                "Quantity Sold in Best Performing Month": item.get(
+                    "best_performing_month_details", {"quantity_sold": 0}
+                ).get("quantity_sold"),
             }
             flattened_data.append(flat_item)
 
@@ -1222,6 +1225,7 @@ async def download_report(
             "Sales Prev 30 Days",
             "Performance vs Prev 30 Days (%)",
             "Best Performing Month",
+            "Quantity Sold in Best Performing Month",
         ]
 
         df = df.reindex(columns=column_order, fill_value=None)
