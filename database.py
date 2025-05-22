@@ -1,5 +1,7 @@
 # database.py
 import os
+from datetime import datetime
+from bson import ObjectId
 from pymongo import MongoClient
 from pymongo.database import Database  # Import Database type for typing hints
 from pymongo.mongo_client import MongoClient  # Import MongoClient type for typing hints
@@ -90,3 +92,19 @@ def get_database():
         )
 
     return database
+
+
+def serialize_mongo_document(document):
+    """
+    Recursively convert MongoDB ObjectId fields to strings in a document.
+    """
+    if isinstance(document, list):
+        return [serialize_mongo_document(item) for item in document]
+    elif isinstance(document, dict):
+        return {key: serialize_mongo_document(value) for key, value in document.items()}
+    elif isinstance(document, ObjectId):
+        return str(document)
+    elif isinstance(document, datetime):
+        return document.isoformat()
+    else:
+        return document

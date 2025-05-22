@@ -1,8 +1,7 @@
 # main.py
 import pandas as pd
-from datetime import datetime, date
-import calendar
-import os, io
+from datetime import datetime, date, timedelta
+import calendar, io
 from io import BytesIO
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
@@ -11,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from pymongo import ASCENDING
 from pymongo.errors import PyMongoError
-from ..database import get_database
+from ..database import get_database, serialize_mongo_document
 
 # --- Configuration ---
 # Use environment variables for production
@@ -99,7 +98,7 @@ async def get_sku_mapping(database=Depends(get_database)):
     """
     try:
         sku_collection = database.get_collection(SKU_COLLECTION)
-        sku_documents = list(sku_collection.find({}, {"_id": 0}))
+        sku_documents = list(sku_collection.find({}, {"_id": 0}).sort("item_name", 1))
 
         return JSONResponse(content=sku_documents)
 
@@ -562,80 +561,155 @@ async def upload_inventory_data(
 # --- Report Generation Route ---
 
 
+def calculate_number_of_months(start_year, start_month, end_year, end_month):
+    """Calculates the total number of months in a given range, inclusive."""
+    return (end_year - start_year) * 12 + (end_month - start_month) + 1
+
+
 @router.get("/generate_report")
-async def generate_report(month: int, year: int, database=Depends(get_database)):
+async def generate_report(
+    start_month: int,
+    start_year: int,
+    end_month: int,
+    end_year: int,
+    database=Depends(get_database),
+):
     """
-    Generates the Sales vs Inventory report based on data stored in the database
-    for the specified month and year.
-    Calculates metrics for each SKU/City pair and saves/updates the results
-    in the database.
-    Returns a confirmation message upon successful saving.
+    Generates the Sales vs Inventory report dynamically based on the specified date range.
+    Calculates metrics for each SKU/City pair without storing in database.
+    Includes performance comparison with previous 7 and 30 days.
+    Includes best performing month for each SKU/City pair.
+    Returns the calculated report data directly.
     """
-    if not 1 <= month <= 12 or year <= 0:
+    if not (
+        1 <= start_month <= 12
+        and 1 <= end_month <= 12
+        and start_year > 0
+        and end_year > 0
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid month or year provided.",
+            detail="Invalid month or year provided in the range.",
         )
 
     try:
-        start_date = datetime(year, month, 1)
-        # Calculate end date of the month
-        last_day = calendar.monthrange(year, month)[1]
-        end_date = datetime(
-            year, month, last_day, 23, 59, 59, 999999
-        )  # Include the whole last day
+        overall_start_date = datetime(start_year, start_month, 1)
+        # Calculate end date of the end_month
+        last_day_of_end_month = calendar.monthrange(end_year, end_month)[1]
+        overall_end_date = datetime(
+            end_year, end_month, last_day_of_end_month, 23, 59, 59, 999999
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid date components for start or end of range.",
+        )
 
+    if overall_start_date > overall_end_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Start date cannot be after end date.",
+        )
+
+    period_name = f"{calendar.month_name[start_month]} {start_year} to {calendar.month_name[end_month]} {end_year}"
+
+    try:
         sales_collection = database.get_collection(SALES_COLLECTION)
         inventory_collection = database.get_collection(INVENTORY_COLLECTION)
-        report_collection = database.get_collection(REPORT_COLLECTION)
 
         print(
-            f"Querying sales and inventory data for {calendar.month_name[month]} {year} to generate report..."
+            f"Querying sales and inventory data for {period_name} to generate dynamic report..."
         )
 
-        # Query sales data for the month
+        # Query sales data for the entire period
         sales_cursor = sales_collection.find(
-            {"order_date": {"$gte": start_date, "$lte": end_date}}
+            {"order_date": {"$gte": overall_start_date, "$lte": overall_end_date}}
         )
         sales_data = list(sales_cursor)
-        print(f"Found {len(sales_data)} sales records in DB for the period.")
+        print(
+            f"Found {len(sales_data)} sales records in DB for the period {period_name}."
+        )
 
-        # Query aggregated inventory data for the month
+        # NEW: Query ALL sales data for lifetime best performing month calculation
+        print("Querying lifetime sales data for best performing month calculation...")
+        lifetime_sales_cursor = sales_collection.find({})
+        lifetime_sales_data = list(lifetime_sales_cursor)
+        print(
+            f"Found {len(lifetime_sales_data)} total sales records for lifetime analysis."
+        )
+
+        # Query aggregated inventory data for the entire period
         inventory_cursor = inventory_collection.find(
             {
                 "date": {
-                    "$gte": start_date.replace(
+                    "$gte": overall_start_date.replace(
                         hour=0, minute=0, second=0, microsecond=0
-                    ),  # Compare date parts
-                    "$lte": end_date.replace(hour=0, minute=0, second=0, microsecond=0),
+                    ),
+                    "$lte": overall_end_date.replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    ),
                 }
             }
         )
         inventory_data = list(inventory_cursor)
         print(
-            f"Found {len(inventory_data)} aggregated inventory records in DB for the period."
+            f"Found {len(inventory_data)} aggregated inventory records in DB for the period {period_name}."
         )
 
         if not sales_data and not inventory_data:
-            # Clear any existing report data for this month/year if no source data exists
-            delete_result = report_collection.delete_many(
-                {"year": year, "month": month}
-            )
-            if delete_result.deleted_count > 0:
-                print(
-                    f"Cleared {delete_result.deleted_count} existing report documents for {calendar.month_name[month]} {year} as no source data was found."
-                )
             return {
-                "message": f"No sales or inventory data found for {calendar.month_name[month]} {year}. No report generated or saved."
+                "message": f"No sales or inventory data found for {period_name}. No report generated.",
+                "data": [],
+                "period_info": {
+                    "start_month": start_month,
+                    "start_year": start_year,
+                    "end_month": end_month,
+                    "end_year": end_year,
+                    "period_name": period_name,
+                },
             }
 
-        # --- Replicate Aggregation and Calculation Logic ---
-        # This part is the same as before - it calculates the metrics into combined_data
-
-        aggregated_sales = {}
+        # --- Process Sales Data for Current Period ---
+        current_period_sales = {}
         sales_item_info = {}
-        all_sales_dates = set()  # Dates as 'YYYY-MM-DD' string
+        all_sales_dates = set()
 
+        # NEW: Lifetime monthly sales tracking for best performing month calculation
+        lifetime_monthly_sales = (
+            {}
+        )  # Structure: {(sku, city): {month_year_key: total_sales}}
+
+        # Process lifetime sales data for best performing month calculation
+        print("Processing lifetime sales data for best performing month calculation...")
+        for record in lifetime_sales_data:
+            sku = record.get("sku_code")
+            city = record.get("city")
+            order_date_dt = record.get("order_date")
+            quantity = record.get("quantity", 0)
+            item_name = record.get("item_name", "Unknown Item")
+            item_id = record.get("item_id", "Unknown ID")
+
+            if not sku or not city or not order_date_dt:
+                continue
+            quantity = float(quantity) if isinstance(quantity, (int, float)) else 0
+            if isinstance(order_date_dt, datetime):
+                # Create month-year key for monthly aggregation
+                month_year_key = order_date_dt.strftime("%Y-%m")  # Format: "2024-01"
+            else:
+                continue
+
+            if sku not in sales_item_info:
+                sales_item_info[sku] = {"item_name": item_name, "item_id": item_id}
+
+            # Aggregate lifetime monthly sales for best performing month calculation
+            sku_city_key = (sku, city)
+            if sku_city_key not in lifetime_monthly_sales:
+                lifetime_monthly_sales[sku_city_key] = {}
+            lifetime_monthly_sales[sku_city_key][month_year_key] = (
+                lifetime_monthly_sales[sku_city_key].get(month_year_key, 0) + quantity
+            )
+
+        # Process current period sales data
         for record in sales_data:
             sku = record.get("sku_code")
             city = record.get("city")
@@ -646,24 +720,23 @@ async def generate_report(month: int, year: int, database=Depends(get_database))
 
             if not sku or not city or not order_date_dt:
                 continue
-
             quantity = float(quantity) if isinstance(quantity, (int, float)) else 0
-
             if isinstance(order_date_dt, datetime):
                 date_key_str = order_date_dt.strftime("%Y-%m-%d")
             else:
                 continue
 
-            key = (sku, city, date_key_str)
-            aggregated_sales[key] = aggregated_sales.get(key, 0) + quantity
-            all_sales_dates.add(date_key_str)
-
             if sku not in sales_item_info:
                 sales_item_info[sku] = {"item_name": item_name, "item_id": item_id}
 
+            key = (sku, city, date_key_str)
+            current_period_sales[key] = current_period_sales.get(key, 0) + quantity
+            all_sales_dates.add(date_key_str)
+
+        # Process inventory data
         inventory_map = {}
         inventory_item_info = {}
-        all_inventory_dates = set()  # Dates as 'YYYY-MM-DD' string
+        all_inventory_dates = set()
 
         for record in inventory_data:
             sku = record.get("sku_code")
@@ -676,16 +749,13 @@ async def generate_report(month: int, year: int, database=Depends(get_database))
 
             if not sku or not city or not inventory_date_dt:
                 continue
-
             inventory_qty = (
                 float(inventory_qty) if isinstance(inventory_qty, (int, float)) else 0
             )
-
             if isinstance(inventory_date_dt, datetime):
                 date_key_str = inventory_date_dt.strftime("%Y-%m-%d")
             else:
                 continue
-
             key = (sku, city, date_key_str)
             inventory_map[key] = {
                 "inventory": inventory_qty,
@@ -694,41 +764,124 @@ async def generate_report(month: int, year: int, database=Depends(get_database))
                 "warehouse": warehouse,
             }
             all_inventory_dates.add(date_key_str)
-
             if sku not in inventory_item_info:
                 inventory_item_info[sku] = {"item_name": item_name, "item_id": item_id}
 
-        # Find Common Dates and Sort
         common_dates = sorted(list(all_sales_dates.intersection(all_inventory_dates)))
         n_common_days = len(common_dates)
 
         if n_common_days == 0:
-            # Check if any data existed before clearing
-            if sales_data or inventory_data:
-                # Still might have some data, but no common dates for calculation
-                # Clear any previous report data for this month/year
-                delete_result = report_collection.delete_many(
-                    {"year": year, "month": month}
-                )
-                if delete_result.deleted_count > 0:
-                    print(
-                        f"Cleared {delete_result.deleted_count} existing report documents for {calendar.month_name[month]} {year} due to no common dates."
+            return {
+                "message": f"Found data for {period_name}, but no common dates between sales and inventory data. No report generated.",
+                "data": [],
+                "period_info": {
+                    "start_month": start_month,
+                    "start_year": start_year,
+                    "end_month": end_month,
+                    "end_year": end_year,
+                    "period_name": period_name,
+                },
+            }
+
+        print(
+            f"\nFound {n_common_days} common dates for calculation within {period_name}."
+        )
+
+        last_seven_days_sales = {}
+        two_weeks_ago_seven_days_sales = {}
+        current_30_day_comparison_sales = {}
+        previous_30_day_comparison_sales = {}
+
+        if common_dates:
+            last_common_date_str = common_dates[-1]
+            last_common_date_dt = datetime.strptime(
+                last_common_date_str, "%Y-%m-%d"
+            ).replace(hour=23, minute=59, second=59, microsecond=999999)
+
+            seven_days_period_end = last_common_date_dt
+            seven_days_period_start = last_common_date_dt - timedelta(
+                days=DAYS_IN_WEEK - 1
+            )
+            prev_seven_days_period_end = seven_days_period_start - timedelta(
+                microseconds=1
+            )
+            prev_seven_days_period_start = prev_seven_days_period_end - timedelta(
+                days=DAYS_IN_WEEK - 1
+            )
+
+            current_30_day_period_end = last_common_date_dt
+            current_30_day_period_start = last_common_date_dt - timedelta(days=30 - 1)
+            previous_30_day_period_end = current_30_day_period_start - timedelta(
+                microseconds=1
+            )
+            previous_30_day_period_start = previous_30_day_period_end - timedelta(
+                days=30 - 1
+            )
+
+            print(f"Last common date in period: {last_common_date_str}")
+
+            extended_sales_fetch_start_date = previous_30_day_period_start
+            if prev_seven_days_period_start < extended_sales_fetch_start_date:
+                extended_sales_fetch_start_date = prev_seven_days_period_start
+
+            extended_sales_cursor = sales_collection.find(
+                {
+                    "order_date": {
+                        "$gte": extended_sales_fetch_start_date.replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                        "$lte": last_common_date_dt,
+                    }
+                }
+            )
+            extended_sales_data = list(extended_sales_cursor)
+            print(
+                f"Found {len(extended_sales_data)} sales records for comparison periods ending {last_common_date_str}."
+            )
+
+            for record in extended_sales_data:
+                sku = record.get("sku_code")
+                city = record.get("city")
+                order_date_dt = record.get("order_date")
+                quantity = record.get("quantity", 0)
+
+                if not sku or not city or not order_date_dt:
+                    continue
+                quantity = float(quantity) if isinstance(quantity, (int, float)) else 0
+                key_pair = (sku, city)
+
+                if seven_days_period_start <= order_date_dt <= seven_days_period_end:
+                    last_seven_days_sales[key_pair] = (
+                        last_seven_days_sales.get(key_pair, 0) + quantity
                     )
-                return {
-                    "message": f"Found data for {calendar.month_name[month]} {year}, but no common dates between sales and inventory data. No report generated or saved."
-                }
-            else:
-                # No source data at all (already handled above)
-                return {
-                    "message": f"No sales or inventory data found for {calendar.month_name[month]} {year}. No report generated or saved."
-                }
+                if (
+                    prev_seven_days_period_start
+                    <= order_date_dt
+                    <= prev_seven_days_period_end
+                ):
+                    two_weeks_ago_seven_days_sales[key_pair] = (
+                        two_weeks_ago_seven_days_sales.get(key_pair, 0) + quantity
+                    )
+                if (
+                    current_30_day_period_start
+                    <= order_date_dt
+                    <= current_30_day_period_end
+                ):
+                    current_30_day_comparison_sales[key_pair] = (
+                        current_30_day_comparison_sales.get(key_pair, 0) + quantity
+                    )
+                if (
+                    previous_30_day_period_start
+                    <= order_date_dt
+                    <= previous_30_day_period_end
+                ):
+                    previous_30_day_comparison_sales[key_pair] = (
+                        previous_30_day_comparison_sales.get(key_pair, 0) + quantity
+                    )
 
-        print(f"\nFound {n_common_days} common dates for calculation.")
-
-        # Identify all unique SKU/City pairs present on common dates
         valid_sku_city_pairs = set()
         for date_str in common_dates:
-            for sku, city, date_s in aggregated_sales.keys():
+            for sku, city, date_s in current_period_sales.keys():
                 if date_s == date_str:
                     valid_sku_city_pairs.add((sku, city))
             for sku, city, date_s in inventory_map.keys():
@@ -736,13 +889,50 @@ async def generate_report(month: int, year: int, database=Depends(get_database))
                     valid_sku_city_pairs.add((sku, city))
 
         print(
-            f"Calculating metrics for {len(valid_sku_city_pairs)} unique SKU/City pairs..."
+            f"Calculating metrics for {len(valid_sku_city_pairs)} unique SKU/City pairs for period {period_name}..."
         )
 
-        combined_data = {}  # This will store the calculated metrics per (sku, city)
+        # NEW: Helper function to find best performing month from lifetime data
+        def get_best_performing_month(sku_city_key):
+            """
+            Returns the best performing month for a given SKU/City pair based on lifetime sales data.
+            Returns dict with month_name, year, month_sales, and formatted string.
+            """
+            if (
+                sku_city_key not in lifetime_monthly_sales
+                or not lifetime_monthly_sales[sku_city_key]
+            ):
+                return {
+                    "month_name": "No Data",
+                    "year": None,
+                    "month_sales": 0,
+                    "formatted": "No Data",
+                }
+
+            # Find the month with highest sales from lifetime data
+            best_month_key = max(
+                lifetime_monthly_sales[sku_city_key],
+                key=lifetime_monthly_sales[sku_city_key].get,
+            )
+            best_month_sales = lifetime_monthly_sales[sku_city_key][best_month_key]
+
+            # Parse the month-year key back to readable format
+            year, month = best_month_key.split("-")
+            month_name = calendar.month_name[int(month)]
+
+            return {
+                "month_name": month_name,
+                "year": int(year),
+                "month_sales": round(best_month_sales, 2),
+                "formatted": f"{month_name} {year}",
+            }
+
+        report_data = []
+        num_months_in_range = calculate_number_of_months(
+            start_year, start_month, end_year, end_month
+        )
 
         for sku, city in valid_sku_city_pairs:
-            # Get item info, preferring inventory info if available
             item_info = inventory_item_info.get(
                 sku,
                 sales_item_info.get(
@@ -751,10 +941,10 @@ async def generate_report(month: int, year: int, database=Depends(get_database))
             )
             item_name = item_info["item_name"]
             item_id = item_info["item_id"]
-
-            # Find a warehouse associated with this SKU/City on a common date
             warehouse = "Unknown Warehouse"
-            for date_str in common_dates:
+
+            # Try to get warehouse from the latest inventory record
+            for date_str in reversed(common_dates):
                 inventory_key = (sku, city, date_str)
                 if (
                     inventory_key in inventory_map
@@ -763,7 +953,6 @@ async def generate_report(month: int, year: int, database=Depends(get_database))
                     warehouse = inventory_map[inventory_key]["warehouse"]
                     break
 
-            daily_details = {}
             total_sales_on_common_days = 0
             total_sales_on_days_with_inventory = 0
             days_with_inventory = 0
@@ -771,209 +960,200 @@ async def generate_report(month: int, year: int, database=Depends(get_database))
             for date_str in common_dates:
                 sales_key = (sku, city, date_str)
                 inventory_key = (sku, city, date_str)
-
-                sales_qty = aggregated_sales.get(sales_key, 0)
+                sales_qty = current_period_sales.get(sales_key, 0)
                 inventory_info_daily = inventory_map.get(inventory_key)
                 inventory_qty = (
                     inventory_info_daily["inventory"] if inventory_info_daily else 0
                 )
 
                 total_sales_on_common_days += sales_qty
-
                 if inventory_qty > 0:
                     total_sales_on_days_with_inventory += sales_qty
                     days_with_inventory += 1
 
-                daily_details[date_str] = {
-                    "sales": sales_qty,
-                    "inventory": inventory_qty,
-                }
-
-            # Calculate Averages based ONLY on days with inventory > 0
-            avg_daily = (
+            avg_daily_on_stock_days = (
                 total_sales_on_days_with_inventory / days_with_inventory
                 if days_with_inventory > 0
                 else 0
             )
-            avg_weekly = avg_daily * DAYS_IN_WEEK
-            avg_monthly = avg_daily * get_total_days_in_month(year, month)
+            avg_weekly_on_stock_days = avg_daily_on_stock_days * DAYS_IN_WEEK
 
-            last_day_inventory = (
-                daily_details.get(common_dates[-1], {}).get("inventory", 0)
-                if common_dates
-                else 0
-            )
+            avg_monthly_val_for_period = 0
+            if num_months_in_range > 0 and total_sales_on_common_days > 0:
+                avg_monthly_val_for_period = (
+                    total_sales_on_common_days / num_months_in_range
+                )
+
+            last_day_inventory = 0
+            if common_dates:
+                last_common_date_for_sku_city = common_dates[-1]
+                inventory_at_lcd_key = (sku, city, last_common_date_for_sku_city)
+                last_day_inventory_info = inventory_map.get(inventory_at_lcd_key)
+                if last_day_inventory_info:
+                    last_day_inventory = last_day_inventory_info["inventory"]
 
             doc_calc = 0
-            if avg_daily > 0:
-                doc_calc = last_day_inventory / avg_daily
-            # Handle the edge case where avg_daily is 0 but closing_stock > 0
-            # If there's stock but no sales on days with stock, DOC is effectively infinite.
-            # We'll return 0 in this case as before for simplicity, or you could represent it differently.
+            if avg_daily_on_stock_days > 0:
+                doc_calc = last_day_inventory / avg_daily_on_stock_days
 
-            # Store calculated metrics in combined_data dictionary (this dictionary is temporary)
-            combined_data[(sku, city)] = {
+            sku_city_key = (sku, city)
+            sales_target_last_7_days = last_seven_days_sales.get(sku_city_key, 0)
+            sales_baseline_prev_7_days = two_weeks_ago_seven_days_sales.get(
+                sku_city_key, 0
+            )
+            weekly_comparison_pct = 0
+            if sales_baseline_prev_7_days > 0:
+                weekly_comparison_pct = (
+                    (sales_target_last_7_days - sales_baseline_prev_7_days)
+                    / sales_baseline_prev_7_days
+                ) * 100
+            elif sales_target_last_7_days > 0:
+                weekly_comparison_pct = 0
+
+            sales_target_current_30_days = current_30_day_comparison_sales.get(
+                sku_city_key, 0
+            )
+            sales_baseline_previous_30_days = previous_30_day_comparison_sales.get(
+                sku_city_key, 0
+            )
+            monthly_comparison_pct = 0
+            if sales_baseline_previous_30_days > 0:
+                monthly_comparison_pct = (
+                    (sales_target_current_30_days - sales_baseline_previous_30_days)
+                    / sales_baseline_previous_30_days
+                ) * 100
+            elif sales_target_current_30_days > 0:
+                monthly_comparison_pct = 0
+
+            # NEW: Get best performing month data
+            best_month_info = get_best_performing_month(sku_city_key)
+
+            # Create report item
+            report_item = {
                 "item_name": item_name,
                 "item_id": item_id,
                 "city": city,
                 "sku_code": sku,
                 "warehouse": warehouse,
+                "best_performing_month": best_month_info[
+                    "formatted"
+                ],  # NEW: Main field for display
+                "best_performing_month_details": {  # NEW: Detailed breakdown
+                    "month_name": best_month_info["month_name"],
+                    "year": best_month_info["year"],
+                    "sales_amount": best_month_info["month_sales"],
+                },
                 "metrics": {
-                    "avg_daily_on_stock_days": round(avg_daily, 2),
-                    "avg_weekly_on_stock_days": round(avg_weekly, 2),
-                    "avg_monthly_on_stock_days": round(avg_monthly, 2),
+                    "avg_daily_on_stock_days": round(avg_daily_on_stock_days, 2),
+                    "avg_weekly_on_stock_days": round(avg_weekly_on_stock_days, 2),
+                    "avg_monthly_on_stock_days": round(avg_monthly_val_for_period, 2),
                     "total_sales_in_period": round(total_sales_on_common_days, 2),
                     "days_of_coverage": round(doc_calc, 2),
                     "days_with_inventory": days_with_inventory,
                     "closing_stock": round(last_day_inventory, 2),
+                    "sales_last_7_days_ending_lcd": round(sales_target_last_7_days, 2),
+                    "sales_prev_7_days_before_that": round(
+                        sales_baseline_prev_7_days, 2
+                    ),
+                    "performance_vs_prev_7_days_pct": (
+                        round(weekly_comparison_pct, 2)
+                        if weekly_comparison_pct != 0
+                        else 0
+                    ),
+                    "sales_last_30_days_ending_lcd": round(
+                        sales_target_current_30_days, 2
+                    ),
+                    "sales_prev_30_days_before_that": round(
+                        sales_baseline_previous_30_days, 2
+                    ),
+                    "performance_vs_prev_30_days_pct": (
+                        round(monthly_comparison_pct, 2)
+                        if monthly_comparison_pct != 0
+                        else 0
+                    ),
                 },
-                # Note: daily_data is *not* stored in the report document to keep it lighter
             }
+            report_data.append(report_item)
 
-        # --- Database Saving Logic ---
-        # Now, iterate through the calculated results in combined_data and save them to the report collection
         print(
-            f"Saving/Updating {len(combined_data)} report documents in the database..."
-        )
-        upserted_count = 0
-        processed_keys = (
-            set()
-        )  # To avoid redundant upserts if needed, though combined_data keys are already unique
-
-        for (sku, city), data in combined_data.items():
-            # Define the filter query for finding an existing report document
-            filter_query = {
-                "year": year,
-                "month": month,
-                "sku_code": sku,
-                "city": city,
-            }
-
-            # The document to be saved/replaced
-            # Include year, month, and generation timestamp
-            report_document = {
-                "year": year,
-                "month": month,
-                "generated_at": datetime.utcnow(),  # Timestamp for when this report was generated
-                "sku_code": sku,
-                "city": city,
-                "item_name": data.get("item_name", "Unknown Item"),  # Include item name
-                "item_id": data.get("item_id", "Unknown ID"),  # Include item ID
-                "warehouse": data.get(
-                    "warehouse", "Unknown Warehouse"
-                ),  # Include warehouse
-                "metrics": data["metrics"],  # Include the calculated metrics
-            }
-
-            # Use replace_one with upsert=True
-            # This checks if a document matching filter_query exists:
-            # - If yes, it replaces the existing document with report_document.
-            # - If no, it inserts report_document as a new document.
-            # This effectively updates the report data for this specific (month, year, sku, city)
-            # or creates it if it's the first time generating the report for this combo.
-            update_result = report_collection.replace_one(
-                filter_query, report_document, upsert=True
-            )
-
-            if update_result.matched_count > 0 or update_result.upserted_id is not None:
-                upserted_count += 1
-
-        print(f"Successfully saved/updated {upserted_count} report documents.")
-
-        # Create a compound index for efficient querying of reports
-        report_collection.create_index(
-            [
-                ("year", ASCENDING),
-                ("month", ASCENDING),
-                ("sku_code", ASCENDING),
-                ("city", ASCENDING),
-            ],
-            unique=True,
+            f"Successfully generated dynamic report with {len(report_data)} items for period {period_name}."
         )
 
-        # Return a success message indicating data was saved
         return {
-            "message": f"Successfully generated report for {calendar.month_name[month]} {year} and saved/updated {upserted_count} documents in the '{REPORT_COLLECTION}' collection."
+            "message": f"Successfully generated dynamic report for {period_name} with {len(report_data)} items.",
+            "data": sorted(report_data, key=lambda d: (d["item_name"], d["city"])),
+            "period_info": {
+                "start_month": start_month,
+                "start_year": start_year,
+                "end_month": end_month,
+                "end_year": end_year,
+                "period_name": period_name,
+                "common_dates_count": n_common_days,
+            },
         }
 
     except PyMongoError as e:
-        print(f"Database error during report generation and saving: {e}")
+        print(f"Database error during report generation for {period_name}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {e}",
+            detail=f"Database error for {period_name}: {e}",
         )
     except Exception as e:
-        print(f"Error generating and saving report: {e}")
+        print(f"Error generating report for {period_name}: {e}")
+        import traceback
+
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred generating and saving the report: {e}",
+            detail=f"An error occurred generating report for {period_name}: {str(e)}",
         )
 
 
 @router.get("/download_report")
-async def download_report(month: int, year: int, database=Depends(get_database)):
+async def download_report(
+    start_month: int,
+    start_year: int,
+    end_month: int,
+    end_year: int,
+    database=Depends(get_database),
+):
     """
-    Retrieves saved report data for the specified month/year from the database,
-    generates an Excel file, and returns it for download.
+    Generates report data dynamically for the specified date range,
+    creates an Excel file, and returns it for download.
     """
-    if not 1 <= month <= 12 or year <= 0:
+    if not (
+        1 <= start_month <= 12
+        and 1 <= end_month <= 12
+        and start_year > 0
+        and end_year > 0
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid month or year provided.",
+            detail="Invalid month or year provided in the range.",
         )
 
     try:
-        report_collection = database[REPORT_COLLECTION]
+        # Generate report data dynamically by calling the generate_report function
+        report_response = await generate_report(
+            start_month=start_month,
+            start_year=start_year,
+            end_month=end_month,
+            end_year=end_year,
+            database=database,
+        )
 
-        # Fetch the saved report data for the month/year
-        # Exclude _id and generated_at as they might not be needed or require formatting in Excel
-        report_cursor = report_collection.find(
-            {"year": year, "month": month}, {"_id": 0, "generated_at": 0}
-        ).sort([("date", ASCENDING), ("item_name", ASCENDING)])
-
-        report_data_list = list(report_cursor)
+        report_data_list = report_response.get("data", [])
+        period_info = report_response.get("period_info", {})
 
         if not report_data_list:
-            # Return a 404 if no saved data exists for this period
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No saved report data found for {calendar.month_name[month]} {year} to download.",
+                detail=f"No report data found for {period_info.get('period_name', 'the specified period')} to download.",
             )
 
         # --- Generate Excel File in Memory ---
-
-        # Prepare data for DataFrame by flattening the 'metrics' dictionary
         flattened_data = []
         for item in report_data_list:
-            # Start with the top-level fields you want in the Excel
-            flat_item = {
-                "Item Name": item.get("item_name", "Unknown Item"),
-                "Item ID": item.get("item_id", "Unknown ID"),
-                "City": item.get("city", "Unknown"),
-                "Sku Code": item.get("sku_code", "Unknown"),
-                "Warehouse": item.get("warehouse", "Unknown Warehouse"),
-                "Report Month": item.get("month"),  # Include month/year for clarity
-                "Report Year": item.get("year"),
-            }
-            # Add metrics fields from the 'metrics' dictionary
-            metrics = item.get("metrics", {})
-            flat_item["Avg Daily (Stock Days)"] = metrics.get(
-                "avg_daily_on_stock_days", 0
-            )
-            flat_item["Avg Weekly (Stock Days)"] = metrics.get(
-                "avg_weekly_on_stock_days", 0
-            )
-            flat_item["Avg Monthly (Stock Days)"] = metrics.get(
-                "avg_monthly_on_stock_days", 0
-            )
-            flat_item["Total Sales (Period)"] = metrics.get("total_sales_in_period", 0)
-            flat_item["Days of Coverage (DOC)"] = metrics.get("days_of_coverage", 0)
-            flat_item["Days with Inventory"] = metrics.get("days_with_inventory", 0)
-            flat_item["Closing Stock"] = (
-                metrics.get("closing_stock", 0),
-            )  # Note: get() returns a tuple here due to trailing comma, fix needed!
-
-            # Correcting the metrics part to not have the trailing comma
             metrics = item.get("metrics", {})
             flat_item = {
                 "Item Name": item.get("item_name", "Unknown Item"),
@@ -981,33 +1161,49 @@ async def download_report(month: int, year: int, database=Depends(get_database))
                 "City": item.get("city", "Unknown"),
                 "Sku Code": item.get("sku_code", "Unknown"),
                 "Warehouse": item.get("warehouse", "Unknown Warehouse"),
-                "Report Month": item.get("month"),
-                "Report Year": item.get("year"),
+                "Start Month": period_info.get("start_month"),
+                "Start Year": period_info.get("start_year"),
+                "End Month": period_info.get("end_month"),
+                "End Year": period_info.get("end_year"),
+                "Period Name": period_info.get("period_name"),
                 "Avg Daily (Stock Days)": metrics.get("avg_daily_on_stock_days", 0),
                 "Avg Weekly (Stock Days)": metrics.get("avg_weekly_on_stock_days", 0),
-                "Avg Monthly (Stock Days)": metrics.get("avg_monthly_on_stock_days", 0),
+                "Avg Monthly (Stock Days)": metrics.get(
+                    "avg_monthly_sales_in_period", 0
+                ),
                 "Total Sales (Period)": metrics.get("total_sales_in_period", 0),
                 "Days of Coverage (DOC)": metrics.get("days_of_coverage", 0),
                 "Days with Inventory": metrics.get("days_with_inventory", 0),
-                "Closing Stock": metrics.get(
-                    "closing_stock", 0
-                ),  # Removed trailing comma
+                "Closing Stock": metrics.get("closing_stock_at_period_end", 0),
+                "Sales Last 7 Days": metrics.get("sales_last_7_days_ending_lcd", 0),
+                "Sales Prev 7 Days": metrics.get("sales_prev_7_days_before_that", 0),
+                "Performance vs Prev 7 Days (%)": metrics.get(
+                    "performance_vs_prev_7_days_pct", 0
+                ),
+                "Sales Last 30 Days": metrics.get("sales_last_30_days_ending_lcd", 0),
+                "Sales Prev 30 Days": metrics.get("sales_prev_30_days_before_that", 0),
+                "Performance vs Prev 30 Days (%)": metrics.get(
+                    "performance_vs_prev_30_days_pct", 0
+                ),
+                "Best Performing Month": item.get("best_performing_month", ""),
             }
-
             flattened_data.append(flat_item)
 
         # Create DataFrame
         df = pd.DataFrame(flattened_data)
 
-        # Define desired column order (optional, but good for consistent output)
+        # Define desired column order
         column_order = [
             "Item Name",
             "Item ID",
             "Sku Code",
             "City",
             "Warehouse",
-            "Report Month",
-            "Report Year",
+            "Start Month",
+            "Start Year",
+            "End Month",
+            "End Year",
+            "Period Name",
             "Avg Daily (Stock Days)",
             "Avg Weekly (Stock Days)",
             "Avg Monthly (Stock Days)",
@@ -1015,48 +1211,45 @@ async def download_report(month: int, year: int, database=Depends(get_database))
             "Days of Coverage (DOC)",
             "Days with Inventory",
             "Closing Stock",
+            "Sales Last 7 Days",
+            "Sales Prev 7 Days",
+            "Performance vs Prev 7 Days (%)",
+            "Sales Last 30 Days",
+            "Sales Prev 30 Days",
+            "Performance vs Prev 30 Days (%)",
+            "Best Performing Month",
         ]
-        # Reindex the DataFrame to enforce the order, handling missing columns gracefully
-        # Use .reindex(columns=...) instead of just df[column_order]
+
         df = df.reindex(columns=column_order, fill_value=None)
 
         # Create a BytesIO buffer to write the Excel file into memory
         excel_buffer = io.BytesIO()
-        # Write the DataFrame to the buffer using openpyxl engine
-        # index=False prevents writing the DataFrame index to the Excel file
-        df.to_excel(excel_buffer, index=False, sheet_name="Report Summary")
-        # Seek to the beginning of the buffer so the StreamingResponse can read from the start
+        df.to_excel(excel_buffer, index=False, sheet_name="Sales Inventory Report")
         excel_buffer.seek(0)
 
         # --- Return as StreamingResponse ---
-        filename = f"sales_inventory_report_{year}_{month}.xlsx"
+        filename = f"sales_inventory_report_{start_year}_{start_month}_to_{end_year}_{end_month}.xlsx"
 
-        # Set headers for file download
         headers = {
-            # Tells the browser to treat this as an attachment and suggests the filename
             "Content-Disposition": f'attachment; filename="{filename}"',
-            # Essential for CORS if frontend and backend are on different origins
-            # Allows the frontend JavaScript to read the Content-Disposition header
             "Access-Control-Expose-Headers": "Content-Disposition",
         }
 
         return StreamingResponse(
             excel_buffer,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # Correct MIME type for .xlsx
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers=headers,
         )
 
+    except HTTPException as e:
+        raise e
     except PyMongoError as e:
         print(f"Database error during report download generation: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error: {e}",
         )
-    except HTTPException as e:
-        # Re-raise HTTPException, e.g., 404 from no data found
-        raise e
     except Exception as e:
-        # Catch any other unexpected errors during file generation
         print(f"Error generating report Excel file: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1064,50 +1257,56 @@ async def download_report(month: int, year: int, database=Depends(get_database))
         )
 
 
-# --- Optional: Add a route to retrieve the saved report data ---
-# You might want an endpoint to *read* the generated report data back out.
-@router.get("/get_saved_report")
-async def get_saved_report(month: int, year: int, database=Depends(get_database)):
+@router.get("/get_report_data")
+async def get_report_data(
+    start_month: int,
+    start_year: int,
+    end_month: int,
+    end_year: int,
+    database=Depends(get_database),
+):
     """
-    Retrieves the previously saved Sales vs Inventory report data
-    for the specified month and year.
+    Generates and returns report data dynamically for the specified date range.
+    This endpoint is for frontend consumption to display the report data.
     """
-    if not 1 <= month <= 12 or year <= 0:
+    if not (
+        1 <= start_month <= 12
+        and 1 <= end_month <= 12
+        and start_year > 0
+        and end_year > 0
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid month or year provided.",
+            detail="Invalid month or year provided in the range.",
         )
 
     try:
-        report_collection = database.get_collection(REPORT_COLLECTION)
-
-        report_cursor = report_collection.find(
-            {"year": year, "month": month},
-            {"_id": 0},
-        ).sort([("date", ASCENDING), ("item_name", ASCENDING)])
-
-        report_data = list(report_cursor)
-
-        if not report_data:
-            return {
-                "message": f"No saved report found for {calendar.month_name[month]} {year}."
-            }
-
-        print(
-            f"Retrieved {len(report_data)} saved report documents for {calendar.month_name[month]} {year}."
+        # Generate report data dynamically by calling the generate_report function
+        report_response = await generate_report(
+            start_month=start_month,
+            start_year=start_year,
+            end_month=end_month,
+            end_year=end_year,
+            database=database,
         )
 
-        return report_data  # Return the list of report documents as JSON
+        print(
+            f"Retrieved dynamic report data for {report_response.get('period_info', {}).get('period_name', 'specified period')}."
+        )
 
+        return report_response
+
+    except HTTPException as e:
+        raise e
     except PyMongoError as e:
-        print(f"Database error during report retrieval: {e}")
+        print(f"Database error during report data retrieval: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error: {e}",
         )
     except Exception as e:
-        print(f"Error retrieving saved report: {e}")
+        print(f"Error retrieving report data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred retrieving the saved report: {e}",
+            detail=f"An error occurred retrieving the report data: {e}",
         )
