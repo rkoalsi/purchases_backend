@@ -1166,9 +1166,13 @@ async def download_report(
                 "End Month": period_info.get("end_month"),
                 "End Year": period_info.get("end_year"),
                 "Period Name": period_info.get("period_name"),
-                "Avg Daily (Stock Days)": metrics.get("avg_daily_on_stock_days", 0),
-                "Avg Weekly (Stock Days)": metrics.get("avg_weekly_on_stock_days", 0),
-                "Avg Monthly (Stock Days)": metrics.get(
+                "Avg Daily Sales (Stock Days)": metrics.get(
+                    "avg_daily_on_stock_days", 0
+                ),
+                "Avg Weekly Sales (Stock Days)": metrics.get(
+                    "avg_weekly_on_stock_days", 0
+                ),
+                "Avg Monthly Sales (Stock Days)": metrics.get(
                     "avg_monthly_sales_in_period", 0
                 ),
                 "Total Sales (Period)": metrics.get("total_sales_in_period", 0),
@@ -1204,9 +1208,9 @@ async def download_report(
             "End Month",
             "End Year",
             "Period Name",
-            "Avg Daily (Stock Days)",
-            "Avg Weekly (Stock Days)",
-            "Avg Monthly (Stock Days)",
+            "Avg Daily Sales (Stock Days)",
+            "Avg Weekly Sales (Stock Days)",
+            "Avg Monthly Sales (Stock Days)",
             "Total Sales (Period)",
             "Days of Coverage (DOC)",
             "Days with Inventory",
