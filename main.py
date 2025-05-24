@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .routes.auth import router as auth_router
-from .routes.items import router as items_router
+from .routes.amazon import router as amazon_router
 from .routes.blinkit import router as blinkit_router
 from .database import connect_db, close_db
 
@@ -42,4 +42,4 @@ def read_root():
 # --- Include Routers (use distinct names) ---
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(blinkit_router, prefix="/blinkit", tags=["blinkit"])
-app.include_router(items_router, prefix="/items", tags=["items"])
+app.include_router(amazon_router, prefix="/amazon", tags=["amazon"])

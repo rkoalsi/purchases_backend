@@ -1,7 +1,7 @@
 # main.py
 import pandas as pd
 from datetime import datetime, date, timedelta
-import calendar, io
+import calendar, io, json
 from io import BytesIO
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
@@ -12,6 +12,37 @@ from pymongo import ASCENDING
 from pymongo.errors import PyMongoError
 from ..database import get_database, serialize_mongo_document
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import pandas as pd
+from typing import List, Dict, Any
+from pymongo import InsertOne, ReplaceOne, UpdateOne
+from datetime import datetime
+import numpy as np
+
+
+# Optimize SKU mapping with caching
+class SKUCache:
+    def __init__(self):
+        self._cache = None
+        self._last_updated = None
+
+    async def get_sku_mapping(self, sku_collection):
+        # Cache for 5 minutes to avoid repeated DB calls
+        if self._cache is None or (datetime.now() - self._last_updated).seconds > 300:
+
+            self._cache = {
+                doc["item_id"]: doc
+                for doc in sku_collection.find(
+                    {}, {"item_id": 1, "sku_code": 1, "item_name": 1}
+                )
+            }
+            self._last_updated = datetime.now()
+        return self._cache
+
+
+# Global cache instance
+sku_cache = SKUCache()
 # --- Configuration ---
 # Use environment variables for production
 
@@ -202,9 +233,7 @@ async def upload_sales_data(
     file: UploadFile = File(...), database=Depends(get_database)
 ):
     """
-    Uploads sales data from an Excel file (.xlsx).
-    Inserts records if a document with the same Item ID, City, and Order Date doesn't already exist.
-    Expected columns: 'Item ID', 'Quantity', 'Order Date', 'Customer City ', 'HSN Code', 'Item Name' (Item Name is not strictly required if SKU mapping is uploaded).
+    Optimized sales data upload with batch processing and parallel operations.
     """
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(
@@ -213,8 +242,15 @@ async def upload_sales_data(
         )
 
     try:
+        # Read file content
         file_content = await file.read()
-        df = pd.read_excel(BytesIO(file_content))
+
+        # Use thread pool for CPU-intensive pandas operations
+        with ThreadPoolExecutor() as executor:
+            df = await asyncio.get_event_loop().run_in_executor(
+                executor,
+                lambda: pd.read_excel(BytesIO(file_content), engine="openpyxl"),
+            )
 
         # Validate required columns
         required_cols = [
@@ -234,138 +270,128 @@ async def upload_sales_data(
         sales_collection = database.get_collection(SALES_COLLECTION)
         sku_collection = database.get_collection(SKU_COLLECTION)
 
-        # Load SKU mapping from DB into a dict for quick lookup
-        sku_map_dict = {
-            doc["item_id"]: doc
-            for doc in sku_collection.find(
-                {}, {"item_id": 1, "sku_code": 1, "item_name": 1}
-            )
-        }
+        # Get cached SKU mapping
+        sku_map_dict = await sku_cache.get_sku_mapping(sku_collection)
 
-        data_to_insert = []
-        inserted_count = 0
-        skipped_count = 0
-        warning_count = 0
+        # Vectorized data processing with pandas
+        df = df.dropna(
+            subset=["Item ID", "Customer City "]
+        )  # Remove rows with missing critical data
 
-        for index, row in df.iterrows():
-            item_id = (
-                int(str(row["Item ID"]).strip()) if pd.notna(row["Item ID"]) else None
-            )
-            quantity_raw = row["Quantity"]
-            raw_order_date = row["Order Date"]
-            city = (
-                str(row["Customer City "]).strip()
-                if pd.notna(row["Customer City "])
-                else None
-            )
-            hsn_raw = row.get("HSN Code")
-            hsn = (
-                str(hsn_raw).strip() if pd.notna(hsn_raw) else None
-            )  # HSN might be numeric or string
+        # Convert data types efficiently
+        df["Item ID"] = (
+            pd.to_numeric(df["Item ID"], errors="coerce").fillna(0).astype(int)
+        )
+        df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
+        df["Customer City "] = df["Customer City "].astype(str).str.strip()
+        df["HSN Code"] = df["HSN Code"].astype(str).str.strip()
 
-            if not item_id or not city:
-                # print(f"Warning: Skipping sales row {index+2} due to missing Item ID or City.") # Too noisy
-                warning_count += 1
-                continue
+        # Process dates efficiently
+        def process_dates(dates):
+            processed = []
+            for date in dates:
+                parsed_date = safe_strptime(date, "%d %b %Y")
+                if parsed_date:
+                    processed.append(parsed_date)
+                else:
+                    processed.append(None)
+            return processed
 
-            # Process quantity - handle errors
-            try:
-                quantity = pd.to_numeric(quantity_raw)
-                if pd.isna(quantity):
-                    quantity = 0
-            except (ValueError, TypeError):
-                print(
-                    f"Warning: Non-numeric sales quantity '{quantity_raw}' in row {index+2} for Item ID '{item_id}'. Using 0."
-                )
-                quantity = 0
-                warning_count += 1
-
-            # Process date - convert to datetime object
-            order_date_dt = safe_strptime(
-                raw_order_date, "%d %b %Y"
-            )  # Attempt to parse dd/mm/YYYY first if string
-
-            if order_date_dt is None:
-                print(
-                    f"Warning: Skipping sales row {index+2} for Item ID '{item_id}' due to unparseable Order Date '{raw_order_date}'."
-                )
-                warning_count += 1
-                continue
-
-            # Adjust city name if needed
-            processed_city = city if city != "Faridabad" else "Gurgaon"
-
-            # Lookup SKU and Item Name from DB mapping, fallback to file if present
-            sku_code = None
-            item_name = (
-                str(row["Item Name"]).strip()
-                if "Item Name" in df.columns and pd.notna(row["Item Name"])
-                else "Unknown Item"
+        with ThreadPoolExecutor() as executor:
+            df["processed_date"] = await asyncio.get_event_loop().run_in_executor(
+                executor, process_dates, df["Order Date"].tolist()
             )
 
-            if int(item_id) in sku_map_dict:
-                sku_code = sku_map_dict[int(item_id)].get("sku_code")
-                # Prefer item name from SKU mapping if available
-                if sku_map_dict[int(item_id)].get("item_name"):
-                    item_name = sku_map_dict[int(item_id)].get("item_name")
+        # Remove rows with invalid dates
+        df = df.dropna(subset=["processed_date"])
 
-            if sku_code is None:
-                print(
-                    f"Warning: SKU not found in mapping for Item ID: '{item_id}' in row {index+2}."
-                )
-                warning_count += 1
-                # Still include the record, but with unknown SKU
-                sku_code = "Unknown SKU"
+        # City processing
+        df["processed_city"] = df["Customer City "].replace("Faridabad", "Gurgaon")
 
-            # Define unique key for sales record: Item ID, City, Order Date
-            # Query MongoDB to check if a document with this key exists
-            existing_doc = sales_collection.find_one(
+        # SKU mapping vectorized
+        df["sku_code"] = df["Item ID"].map(
+            lambda x: sku_map_dict.get(x, {}).get("sku_code", "Unknown SKU")
+        )
+        df["item_name"] = df["Item ID"].map(
+            lambda x: sku_map_dict.get(x, {}).get("item_name", "Unknown Item")
+        )
+
+        # Handle item names from file if available
+        if "Item Name" in df.columns:
+            df["item_name"] = df["Item Name"].fillna(df["item_name"])
+
+        # Batch check for existing records
+        unique_keys = df[
+            ["Item ID", "processed_city", "processed_date"]
+        ].drop_duplicates()
+
+        # Build query for existing records
+        existing_queries = []
+        for _, row in unique_keys.iterrows():
+            existing_queries.append(
                 {
-                    "item_id": item_id,
-                    "city": processed_city,
-                    "order_date": order_date_dt,  # Compare datetime objects
+                    "item_id": int(row["Item ID"]),
+                    "city": row["processed_city"],
+                    "order_date": row["processed_date"],
                 }
             )
 
-            if existing_doc is None:
-                # Document does not exist, prepare to insert
-                data_to_insert.append(
-                    {
-                        "item_id": item_id,
-                        "sku_code": sku_code,
-                        "hsn_code": hsn,
-                        "item_name": item_name,
-                        "quantity": quantity,
-                        "city": processed_city,
-                        "order_date": order_date_dt,  # Store as BSON datetime
-                    }
-                )
-            else:
-                # Document exists, check if it's different to decide whether to "update"
-                # The requirement is "if it does it will not change them if there is no change".
-                # For raw sales, this is tricky. A simple check: are quantity, hsn, sku_code, item_name the same?
-                # This might be too complex. A simpler interpretation matching the prompt
-                # "If it does not then it will create them, if it does it will not change them"
-                # is to simply skip insertion if the unique key (item_id, city, order_date) exists.
-                # This prevents duplicate *key* entries but won't update other fields if they changed.
-                # Let's stick to the simpler "skip if key exists" for now.
-                skipped_count += 1
-                # print(f"Skipping sales row {index+2} - duplicate key (Item ID, City, Date) found: {item_id}, {processed_city}, {order_date_dt.strftime('%Y-%m-%d')}") # Too noisy
-                pass  # Skip inserting if exists based on the defined key
+        # Batch query existing records
+        existing_docs = set()
+        if existing_queries:
+            cursor = sales_collection.find(
+                {"$or": existing_queries}, {"item_id": 1, "city": 1, "order_date": 1}
+            )
+            for doc in cursor:
+                key = (doc["item_id"], doc["city"], doc["order_date"])
+                existing_docs.add(key)
 
-        if data_to_insert:
-            insert_result = sales_collection.insert_many(data_to_insert)
-            inserted_count = len(insert_result.inserted_ids)
-            print(f"Inserted {inserted_count} new sales records.")
+        # Filter out existing records
+        def is_new_record(row):
+            key = (int(row["Item ID"]), row["processed_city"], row["processed_date"])
+            return key not in existing_docs
 
-        # Create indexes for efficient querying
-        sales_collection.create_index([("order_date", ASCENDING)])
-        sales_collection.create_index(
-            [("sku_code", ASCENDING), ("city", ASCENDING), ("order_date", ASCENDING)]
-        )
+        df["is_new"] = df.apply(is_new_record, axis=1)
+        new_records_df = df[df["is_new"]]
+
+        # Prepare bulk insert operations
+        bulk_operations = []
+        for _, row in new_records_df.iterrows():
+            doc = {
+                "item_id": int(row["Item ID"]),
+                "sku_code": row["sku_code"],
+                "hsn_code": row["HSN Code"],
+                "item_name": row["item_name"],
+                "quantity": float(row["Quantity"]),
+                "city": row["processed_city"],
+                "order_date": row["processed_date"],
+            }
+            bulk_operations.append(InsertOne(doc))
+
+        # Execute bulk insert
+        inserted_count = 0
+        if bulk_operations:
+            # Process in batches of 1000 to avoid memory issues
+            batch_size = 1000
+            for i in range(0, len(bulk_operations), batch_size):
+                batch = bulk_operations[i : i + batch_size]
+                result = sales_collection.bulk_write(batch, ordered=False)
+                inserted_count += result.inserted_count
+
+        # Create indexes if not exist (do this once)
+        try:
+            sales_collection.create_index([("order_date", 1)], background=True)
+            sales_collection.create_index(
+                [("sku_code", 1), ("city", 1), ("order_date", 1)], background=True
+            )
+        except Exception:
+            pass  # Indexes might already exist
+
+        skipped_count = len(df) - len(new_records_df)
+        warning_count = len(df[df["sku_code"] == "Unknown SKU"])
 
         return {
-            "message": f"Successfully processed sales data. Inserted {inserted_count} new records, skipped {skipped_count} existing records based on (Item ID, City, Order Date). Encountered {warning_count} warnings (missing data/SKU/date issues)."
+            "message": f"Successfully processed sales data. Inserted {inserted_count} new records, skipped {skipped_count} existing records. Encountered {warning_count} warnings."
         }
 
     except HTTPException as e:
@@ -383,11 +409,7 @@ async def upload_inventory_data(
     file: UploadFile = File(...), database=Depends(get_database)
 ):
     """
-    Uploads inventory data from an Excel file (.xlsx).
-    Aggregates data by SKU, Warehouse, City, and Date.
-    For each aggregated record, it inserts or updates the record in the database
-    based on the unique key (sku_code, warehouse, city, date).
-    Expected columns: 'Item ID', 'Backend Outlet', 'Date', 'Qty', 'Item Name' (Item Name is not strictly required).
+    Optimized inventory data upload with efficient aggregation and batch upserts.
     """
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(
@@ -397,8 +419,13 @@ async def upload_inventory_data(
 
     try:
         file_content = await file.read()
-        # Use engine='openpyxl' specifically as recommended
-        df = pd.read_excel(BytesIO(file_content), engine="openpyxl")
+
+        # Use thread pool for pandas operations
+        with ThreadPoolExecutor() as executor:
+            df = await asyncio.get_event_loop().run_in_executor(
+                executor,
+                lambda: pd.read_excel(BytesIO(file_content), engine="openpyxl"),
+            )
 
         # Validate required columns
         required_cols = ["Item ID", "Backend Outlet", "Date", "Qty"]
@@ -412,140 +439,123 @@ async def upload_inventory_data(
         inventory_collection = database.get_collection(INVENTORY_COLLECTION)
         sku_collection = database.get_collection(SKU_COLLECTION)
 
-        # Load SKU mapping from DB into a dict for quick lookup
-        sku_map_dict = {
-            doc["item_id"]: doc
-            for doc in sku_collection.find(
-                {}, {"item_id": 1, "sku_code": 1, "item_name": 1}
-            )
-        }
+        # Get cached SKU mapping
+        sku_map_dict = await sku_cache.get_sku_mapping(sku_collection)
 
-        # --- Aggregation Logic (Similar to original read_inventory_data_aggregated) ---
-        aggregated_inventory = {}
-        warning_count = 0
+        # Clean and process data efficiently
+        df = df.dropna(subset=["Item ID"])
+        df["Item ID"] = (
+            pd.to_numeric(df["Item ID"], errors="coerce").fillna(0).astype(int)
+        )
+        df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0)
+        df["Backend Outlet"] = df["Backend Outlet"].astype(str).str.strip()
 
-        for index, row in df.iterrows():
-            item_id_raw = row.get("Item ID")
-            item_id = int(str(item_id_raw).strip()) if pd.notna(item_id_raw) else None
+        # Process dates
+        def process_inventory_dates(dates):
+            processed = []
+            for date in dates:
+                parsed_date = safe_strptime(date, "%Y-%m-%d")
+                if parsed_date:
+                    # Truncate to date for consistency
+                    processed.append(
+                        parsed_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                    )
+                else:
+                    processed.append(None)
+            return processed
 
-            if not item_id:
-                # print(f"Warning: Skipping inventory row {index+2} due to missing Item ID.") # Too noisy
-                warning_count += 1
-                continue
-
-            # Lookup SKU and Item Name from DB mapping, fallback to file if present
-            sku_code = None
-            item_name = (
-                str(row.get("Item Name")).strip()
-                if "Item Name" in df.columns and pd.notna(row.get("Item Name"))
-                else "Unknown Item"
-            )
-
-            if item_id in sku_map_dict:
-                sku_code = sku_map_dict[item_id].get("sku_code")
-                # Prefer item name from SKU mapping if available
-                if sku_map_dict[item_id].get("item_name"):
-                    item_name = sku_map_dict[item_id].get("item_name")
-
-            if sku_code is None:
-                print(
-                    f"Warning: SKU not found in mapping for Item ID: '{item_id}' in row {index+2}."
-                )
-                warning_count += 1
-                sku_code = (
-                    "Unknown SKU"  # Still include the record, but with unknown SKU
-                )
-
-            warehouse_raw = row.get("Backend Outlet")
-            warehouse = (
-                str(warehouse_raw).strip()
-                if pd.notna(warehouse_raw)
-                else "Unknown Warehouse"
+        with ThreadPoolExecutor() as executor:
+            df["processed_date"] = await asyncio.get_event_loop().run_in_executor(
+                executor, process_inventory_dates, df["Date"].tolist()
             )
 
-            date_raw = row.get("Date")
-            date_dt = safe_strptime(
-                date_raw, "%Y-%m-%d"
-            )  # Assuming YYYY-MM-DD format from Excel or datetime object
+        # Remove rows with invalid dates
+        df = df.dropna(subset=["processed_date"])
 
-            if date_dt is None:
-                print(
-                    f"Warning: Skipping inventory row {index+2} for Item ID '{item_id}' due to unparseable Date '{date_raw}'."
-                )
-                warning_count += 1
-                continue
+        # Add SKU and city information
+        df["sku_code"] = df["Item ID"].map(
+            lambda x: sku_map_dict.get(x, {}).get("sku_code", "Unknown SKU")
+        )
+        df["item_name"] = df["Item ID"].map(
+            lambda x: sku_map_dict.get(x, {}).get("item_name", "Unknown Item")
+        )
 
-            quantity_raw = row.get("Qty")
-            try:
-                quantity = pd.to_numeric(quantity_raw)
-                if pd.isna(quantity):
-                    quantity = 0
-            except (ValueError, TypeError):
-                print(
-                    f"Warning: Non-numeric quantity '{quantity_raw}' in row {index+2} for Item ID '{item_id}'. Using 0."
-                )
-                quantity = 0
-                warning_count += 1
+        # Handle item names from file if available
+        if "Item Name" in df.columns:
+            df["item_name"] = df["Item Name"].fillna(df["item_name"])
 
-            city = get_city_from_warehouse(warehouse, CITIES, WAREHOUSE_CITY_MAP)
-
-            # Use date object (truncated to date) for aggregation key consistency
-            group_key = (
-                sku_code,
-                warehouse,
-                city,
-                date_dt.replace(hour=0, minute=0, second=0, microsecond=0),
+        # Add city mapping
+        df["city"] = df["Backend Outlet"].apply(
+            lambda warehouse: get_city_from_warehouse(
+                warehouse, CITIES, WAREHOUSE_CITY_MAP
             )
+        )
 
-            if group_key in aggregated_inventory:
-                aggregated_inventory[group_key]["warehouse_inventory"] += quantity
-            else:
-                aggregated_inventory[group_key] = {
-                    "sku_code": sku_code,
-                    "warehouse": warehouse,
-                    "city": city,
-                    "date": date_dt.replace(hour=0, minute=0, second=0, microsecond=0),
-                    "item_id": item_id,
-                    "item_name": item_name,
-                    "warehouse_inventory": quantity,
-                }
+        # Efficient aggregation using pandas groupby
+        aggregation_columns = [
+            "sku_code",
+            "Backend Outlet",
+            "city",
+            "processed_date",
+            "Item ID",
+            "item_name",
+        ]
+        aggregated_df = (
+            df.groupby(aggregation_columns).agg({"Qty": "sum"}).reset_index()
+        )
 
-        upsert_count = 0
-        processed_keys = (
-            set()
-        )  # Track keys to avoid redundant upserts if multiple rows in Excel map to the same key
+        aggregated_df.rename(
+            columns={"Qty": "warehouse_inventory", "Backend Outlet": "warehouse"},
+            inplace=True,
+        )
 
-        for key, data in aggregated_inventory.items():
+        # Prepare bulk upsert operations
+        bulk_operations = []
+        for _, row in aggregated_df.iterrows():
             filter_query = {
-                "sku_code": data["sku_code"],
-                "warehouse": data["warehouse"],
-                "city": data["city"],
-                "date": data["date"],
+                "sku_code": row["sku_code"],
+                "warehouse": row["warehouse"],
+                "city": row["city"],
+                "date": row["processed_date"],
             }
-            update_result = inventory_collection.replace_one(
-                filter_query, data, upsert=True
+
+            document = {
+                "sku_code": row["sku_code"],
+                "warehouse": row["warehouse"],
+                "city": row["city"],
+                "date": row["processed_date"],
+                "item_id": int(row["Item ID"]),
+                "item_name": row["item_name"],
+                "warehouse_inventory": float(row["warehouse_inventory"]),
+            }
+
+            bulk_operations.append(ReplaceOne(filter_query, document, upsert=True))
+
+        # Execute bulk upsert
+        upsert_count = 0
+        if bulk_operations:
+            # Process in batches
+            batch_size = 1000
+            for i in range(0, len(bulk_operations), batch_size):
+                batch = bulk_operations[i : i + batch_size]
+                result = inventory_collection.bulk_write(batch, ordered=False)
+                upsert_count += result.upserted_count + result.modified_count
+
+        # Create indexes if not exist
+        try:
+            inventory_collection.create_index([("date", 1)], background=True)
+            inventory_collection.create_index(
+                [("sku_code", 1), ("city", 1), ("warehouse", 1), ("date", 1)],
+                unique=True,
+                background=True,
             )
-            if update_result.matched_count > 0 or update_result.upserted_id is not None:
-                upsert_count += 1
+        except Exception:
+            pass  # Indexes might already exist
 
-        print(f"Successfully processed inventory data aggregation.")
-        print(f"Upserted/Matched {upsert_count} aggregated inventory records.")
-        print(f"Encountered {warning_count} warnings (missing data/SKU/date issues).")
-
-        # Create indexes for efficient querying
-        inventory_collection.create_index([("date", ASCENDING)])
-        inventory_collection.create_index(
-            [
-                ("sku_code", ASCENDING),
-                ("city", ASCENDING),
-                ("warehouse", ASCENDING),
-                ("date", ASCENDING),
-            ],
-            unique=True,
-        )  # Unique constraint on the aggregation key
+        warning_count = len(aggregated_df[aggregated_df["sku_code"] == "Unknown SKU"])
 
         return {
-            "message": f"Successfully uploaded and processed inventory data. Upserted {upsert_count} aggregated records."
+            "message": f"Successfully uploaded and processed inventory data. Upserted {upsert_count} aggregated records. Encountered {warning_count} warnings."
         }
 
     except HTTPException as e:
@@ -1155,6 +1165,7 @@ async def download_report(
         flattened_data = []
         for item in report_data_list:
             metrics = item.get("metrics", {})
+            print(json.dumps(metrics, indent=4))
             flat_item = {
                 "Item Name": item.get("item_name", "Unknown Item"),
                 "Item ID": item.get("item_id", "Unknown ID"),
@@ -1173,12 +1184,12 @@ async def download_report(
                     "avg_weekly_on_stock_days", 0
                 ),
                 "Avg Monthly Sales (Stock Days)": metrics.get(
-                    "avg_monthly_sales_in_period", 0
+                    "avg_monthly_on_stock_days", 0
                 ),
                 "Total Sales (Period)": metrics.get("total_sales_in_period", 0),
                 "Days of Coverage (DOC)": metrics.get("days_of_coverage", 0),
                 "Days with Inventory": metrics.get("days_with_inventory", 0),
-                "Closing Stock": metrics.get("closing_stock_at_period_end", 0),
+                "Closing Stock": metrics.get("closing_stock", 0),
                 "Sales Last 7 Days": metrics.get("sales_last_7_days_ending_lcd", 0),
                 "Sales Prev 7 Days": metrics.get("sales_prev_7_days_before_that", 0),
                 "Performance vs Prev 7 Days (%)": metrics.get(
