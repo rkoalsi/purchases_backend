@@ -11,6 +11,11 @@ app = FastAPI()
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:8000",
+    "https://127.0.0.1:8000",
+    "http://purchase.pupscribe.in",
+    "https://purchase.pupscribe.in",  # Add this for when you enable SSL
+    "http://localhost",  # For nginx proxy
+    "https://localhost",  # For nginx proxy with SSL
 ]
 
 app.add_middleware(
