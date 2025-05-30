@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .routes.auth import router as auth_router
 from .routes.amazon import router as amazon_router
 from .routes.blinkit import router as blinkit_router
+from .routes.dashboard import router as dashboard_router
 from .database import connect_db, close_db
 
 
@@ -48,3 +49,4 @@ def read_root():
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(blinkit_router, prefix="/blinkit", tags=["blinkit"])
 app.include_router(amazon_router, prefix="/amazon", tags=["amazon"])
+app.include_router(dashboard_router, prefix="/dashboard", tags=["dashboard"])
