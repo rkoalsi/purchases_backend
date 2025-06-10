@@ -410,6 +410,7 @@ async def upload_inventory_data(
 ):
     """
     Optimized inventory data upload with efficient aggregation and batch upserts.
+    Fixed to preserve individual warehouse data per city.
     """
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(
@@ -448,7 +449,12 @@ async def upload_inventory_data(
             pd.to_numeric(df["Item ID"], errors="coerce").fillna(0).astype(int)
         )
         df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0)
+
+        # IMPORTANT: Clean Backend Outlet but preserve exact warehouse names
         df["Backend Outlet"] = df["Backend Outlet"].astype(str).str.strip()
+
+        # Add debugging to see unique warehouses
+        print(f"Unique warehouses in upload: {df['Backend Outlet'].unique()}")
 
         # Process dates
         def process_inventory_dates(dates):
@@ -491,18 +497,60 @@ async def upload_inventory_data(
             )
         )
 
-        # Efficient aggregation using pandas groupby
+        # CRITICAL FIX: Ensure aggregation preserves individual warehouses
+        # The aggregation should group by ALL distinguishing fields including warehouse
         aggregation_columns = [
             "sku_code",
-            "Backend Outlet",
+            "Backend Outlet",  # This should preserve individual warehouses
             "city",
             "processed_date",
             "Item ID",
             "item_name",
         ]
-        aggregated_df = (
-            df.groupby(aggregation_columns).agg({"Qty": "sum"}).reset_index()
+
+        # Debug: Check data before aggregation
+        print(f"Data before aggregation shape: {df.shape}")
+        print(f"Sample data before aggregation:")
+        print(
+            df[["sku_code", "Backend Outlet", "city", "processed_date", "Qty"]].head(10)
         )
+
+        # Perform aggregation - this should preserve individual warehouses
+        aggregated_df = (
+            df.groupby(aggregation_columns, as_index=False)
+            .agg({"Qty": "sum"})
+            .reset_index(drop=True)
+        )
+
+        # Debug: Check data after aggregation
+        print(f"Data after aggregation shape: {aggregated_df.shape}")
+        print(f"Sample data after aggregation:")
+        print(
+            aggregated_df[
+                ["sku_code", "Backend Outlet", "city", "processed_date", "Qty"]
+            ].head(10)
+        )
+
+        # Check for multiple warehouses in same city
+        city_warehouse_check = aggregated_df.groupby(
+            ["sku_code", "city", "processed_date"]
+        )["Backend Outlet"].nunique()
+        multiple_warehouses = city_warehouse_check[city_warehouse_check > 1]
+        if len(multiple_warehouses) > 0:
+            print(
+                f"Found {len(multiple_warehouses)} SKU/City/Date combinations with multiple warehouses - this is correct!"
+            )
+            print("Sample combinations with multiple warehouses:")
+            for idx in multiple_warehouses.head(5).index:
+                sku, city, date = idx
+                warehouses = aggregated_df[
+                    (aggregated_df["sku_code"] == sku)
+                    & (aggregated_df["city"] == city)
+                    & (aggregated_df["processed_date"] == date)
+                ]["Backend Outlet"].unique()
+                print(
+                    f"  SKU: {sku}, City: {city}, Date: {date}, Warehouses: {warehouses}"
+                )
 
         aggregated_df.rename(
             columns={"Qty": "warehouse_inventory", "Backend Outlet": "warehouse"},
@@ -512,16 +560,21 @@ async def upload_inventory_data(
         # Prepare bulk upsert operations
         bulk_operations = []
         for _, row in aggregated_df.iterrows():
+            # CRITICAL: The filter query must include warehouse to maintain separate records
             filter_query = {
                 "sku_code": row["sku_code"],
-                "warehouse": row["warehouse"],
+                "warehouse": row[
+                    "warehouse"
+                ],  # This ensures separate records per warehouse
                 "city": row["city"],
                 "date": row["processed_date"],
             }
 
             document = {
                 "sku_code": row["sku_code"],
-                "warehouse": row["warehouse"],
+                "warehouse": row[
+                    "warehouse"
+                ],  # This preserves individual warehouse info
                 "city": row["city"],
                 "date": row["processed_date"],
                 "item_id": int(row["Item ID"]),
@@ -544,6 +597,7 @@ async def upload_inventory_data(
         # Create indexes if not exist
         try:
             inventory_collection.create_index([("date", 1)], background=True)
+            # IMPORTANT: Index should include warehouse to support separate warehouse queries
             inventory_collection.create_index(
                 [("sku_code", 1), ("city", 1), ("warehouse", 1), ("date", 1)],
                 unique=True,
@@ -553,6 +607,19 @@ async def upload_inventory_data(
             pass  # Indexes might already exist
 
         warning_count = len(aggregated_df[aggregated_df["sku_code"] == "Unknown SKU"])
+
+        # Final verification: Check what got saved to database
+        print("Verifying data saved to database...")
+        sample_check = inventory_collection.find(
+            {"date": {"$gte": aggregated_df["processed_date"].min()}},
+            {"sku_code": 1, "warehouse": 1, "city": 1, "date": 1},
+        ).limit(10)
+
+        print("Sample records in database:")
+        for record in sample_check:
+            print(
+                f"  SKU: {record.get('sku_code')}, Warehouse: {record.get('warehouse')}, City: {record.get('city')}"
+            )
 
         return {
             "message": f"Successfully uploaded and processed inventory data. Upserted {upsert_count} aggregated records. Encountered {warning_count} warnings."
@@ -586,7 +653,7 @@ async def generate_report(
 ):
     """
     Generates the Sales vs Inventory report dynamically based on the specified date range.
-    Calculates metrics for each SKU/City pair without storing in database.
+    Calculates metrics for each SKU/City/Warehouse combination to handle multiple warehouses per city.
     Includes performance comparison with previous 7 and 30 days.
     Includes best performing month for each SKU/City pair.
     Returns the calculated report data directly.
@@ -640,7 +707,7 @@ async def generate_report(
             f"Found {len(sales_data)} sales records in DB for the period {period_name}."
         )
 
-        # NEW: Query ALL sales data for lifetime best performing month calculation
+        # Query ALL sales data for lifetime best performing month calculation
         print("Querying lifetime sales data for best performing month calculation...")
         lifetime_sales_cursor = sales_collection.find({})
         lifetime_sales_data = list(lifetime_sales_cursor)
@@ -666,6 +733,21 @@ async def generate_report(
             f"Found {len(inventory_data)} aggregated inventory records in DB for the period {period_name}."
         )
 
+        # Debug: Check for multiple warehouses per city in inventory data
+        warehouse_city_combinations = {}
+        for record in inventory_data:
+            city = record.get("city")
+            warehouse = record.get("warehouse")
+            if city and warehouse:
+                if city not in warehouse_city_combinations:
+                    warehouse_city_combinations[city] = set()
+                warehouse_city_combinations[city].add(warehouse)
+
+        print("Warehouse distribution by city:")
+        for city, warehouses in warehouse_city_combinations.items():
+            if len(warehouses) > 1:
+                print(f"  {city}: {list(warehouses)} ({len(warehouses)} warehouses)")
+
         if not sales_data and not inventory_data:
             return {
                 "message": f"No sales or inventory data found for {period_name}. No report generated.",
@@ -684,10 +766,8 @@ async def generate_report(
         sales_item_info = {}
         all_sales_dates = set()
 
-        # NEW: Lifetime monthly sales tracking for best performing month calculation
-        lifetime_monthly_sales = (
-            {}
-        )  # Structure: {(sku, city): {month_year_key: total_sales}}
+        # Lifetime monthly sales tracking for best performing month calculation
+        lifetime_monthly_sales = {}
 
         # Process lifetime sales data for best performing month calculation
         print("Processing lifetime sales data for best performing month calculation...")
@@ -703,8 +783,7 @@ async def generate_report(
                 continue
             quantity = float(quantity) if isinstance(quantity, (int, float)) else 0
             if isinstance(order_date_dt, datetime):
-                # Create month-year key for monthly aggregation
-                month_year_key = order_date_dt.strftime("%Y-%m")  # Format: "2024-01"
+                month_year_key = order_date_dt.strftime("%Y-%m")
             else:
                 continue
 
@@ -743,21 +822,22 @@ async def generate_report(
             current_period_sales[key] = current_period_sales.get(key, 0) + quantity
             all_sales_dates.add(date_key_str)
 
-        # Process inventory data
-        inventory_map = {}
+        # CRITICAL FIX: Process inventory data to maintain separate warehouse records
+        # Change the inventory_map structure to include warehouse information
+        inventory_map = {}  # Structure: {(sku, city, warehouse, date): inventory_info}
         inventory_item_info = {}
         all_inventory_dates = set()
 
         for record in inventory_data:
             sku = record.get("sku_code")
             city = record.get("city")
+            warehouse = record.get("warehouse")
             inventory_date_dt = record.get("date")
             inventory_qty = record.get("warehouse_inventory", 0)
             item_name = record.get("item_name", "Unknown Item")
             item_id = record.get("item_id", "Unknown ID")
-            warehouse = record.get("warehouse", "Unknown Warehouse")
 
-            if not sku or not city or not inventory_date_dt:
+            if not sku or not city or not warehouse or not inventory_date_dt:
                 continue
             inventory_qty = (
                 float(inventory_qty) if isinstance(inventory_qty, (int, float)) else 0
@@ -766,7 +846,9 @@ async def generate_report(
                 date_key_str = inventory_date_dt.strftime("%Y-%m-%d")
             else:
                 continue
-            key = (sku, city, date_key_str)
+
+            # Key now includes warehouse to maintain separate records
+            key = (sku, city, warehouse, date_key_str)
             inventory_map[key] = {
                 "inventory": inventory_qty,
                 "item_name": item_name,
@@ -797,6 +879,7 @@ async def generate_report(
             f"\nFound {n_common_days} common dates for calculation within {period_name}."
         )
 
+        # Performance comparison calculations remain the same for sales data
         last_seven_days_sales = {}
         two_weeks_ago_seven_days_sales = {}
         current_30_day_comparison_sales = {}
@@ -889,25 +972,33 @@ async def generate_report(
                         previous_30_day_comparison_sales.get(key_pair, 0) + quantity
                     )
 
-        valid_sku_city_pairs = set()
-        for date_str in common_dates:
-            for sku, city, date_s in current_period_sales.keys():
-                if date_s == date_str:
-                    valid_sku_city_pairs.add((sku, city))
-            for sku, city, date_s in inventory_map.keys():
-                if date_s == date_str:
-                    valid_sku_city_pairs.add((sku, city))
+        # CRITICAL FIX: Build valid combinations including warehouse information
+        valid_sku_city_warehouse_pairs = set()
+
+        # Get all unique SKU/City/Warehouse combinations from inventory data
+        for sku, city, warehouse, date_s in inventory_map.keys():
+            if date_s in common_dates:
+                valid_sku_city_warehouse_pairs.add((sku, city, warehouse))
+
+        # Also consider combinations that have sales but might not have inventory every day
+        for sku, city, date_s in current_period_sales.keys():
+            if date_s in common_dates:
+                # Find warehouses for this SKU/City combination
+                warehouses_for_sku_city = set()
+                for inv_sku, inv_city, inv_warehouse, inv_date in inventory_map.keys():
+                    if inv_sku == sku and inv_city == city:
+                        warehouses_for_sku_city.add(inv_warehouse)
+
+                # If we found warehouses, add them to valid pairs
+                for warehouse in warehouses_for_sku_city:
+                    valid_sku_city_warehouse_pairs.add((sku, city, warehouse))
 
         print(
-            f"Calculating metrics for {len(valid_sku_city_pairs)} unique SKU/City pairs for period {period_name}..."
+            f"Calculating metrics for {len(valid_sku_city_warehouse_pairs)} unique SKU/City/Warehouse combinations for period {period_name}..."
         )
 
-        # NEW: Helper function to find best performing month from lifetime data
+        # Helper function for best performing month (unchanged)
         def get_best_performing_month(sku_city_key):
-            """
-            Returns the best performing month for a given SKU/City pair based on lifetime sales data.
-            Returns dict with month_name, year, quantity_sold, and formatted string.
-            """
             if (
                 sku_city_key not in lifetime_monthly_sales
                 or not lifetime_monthly_sales[sku_city_key]
@@ -919,14 +1010,12 @@ async def generate_report(
                     "formatted": "No Data",
                 }
 
-            # Find the month with highest sales from lifetime data
             best_month_key = max(
                 lifetime_monthly_sales[sku_city_key],
                 key=lifetime_monthly_sales[sku_city_key].get,
             )
             best_month_quantity = lifetime_monthly_sales[sku_city_key][best_month_key]
 
-            # Parse the month-year key back to readable format
             year, month = best_month_key.split("-")
             month_name = calendar.month_name[int(month)]
 
@@ -942,7 +1031,8 @@ async def generate_report(
             start_year, start_month, end_year, end_month
         )
 
-        for sku, city in valid_sku_city_pairs:
+        # CRITICAL FIX: Process each SKU/City/Warehouse combination separately
+        for sku, city, warehouse in valid_sku_city_warehouse_pairs:
             item_info = inventory_item_info.get(
                 sku,
                 sales_item_info.get(
@@ -951,25 +1041,17 @@ async def generate_report(
             )
             item_name = item_info["item_name"]
             item_id = item_info["item_id"]
-            warehouse = "Unknown Warehouse"
-
-            # Try to get warehouse from the latest inventory record
-            for date_str in reversed(common_dates):
-                inventory_key = (sku, city, date_str)
-                if (
-                    inventory_key in inventory_map
-                    and "warehouse" in inventory_map[inventory_key]
-                ):
-                    warehouse = inventory_map[inventory_key]["warehouse"]
-                    break
 
             total_sales_on_common_days = 0
             total_sales_on_days_with_inventory = 0
             days_with_inventory = 0
 
             for date_str in common_dates:
+                # Sales key doesn't include warehouse (sales are at city level)
                 sales_key = (sku, city, date_str)
-                inventory_key = (sku, city, date_str)
+                # Inventory key includes warehouse (inventory is warehouse-specific)
+                inventory_key = (sku, city, warehouse, date_str)
+
                 sales_qty = current_period_sales.get(sales_key, 0)
                 inventory_info_daily = inventory_map.get(inventory_key)
                 inventory_qty = (
@@ -996,8 +1078,13 @@ async def generate_report(
 
             last_day_inventory = 0
             if common_dates:
-                last_common_date_for_sku_city = common_dates[-1]
-                inventory_at_lcd_key = (sku, city, last_common_date_for_sku_city)
+                last_common_date_for_sku_city_warehouse = common_dates[-1]
+                inventory_at_lcd_key = (
+                    sku,
+                    city,
+                    warehouse,
+                    last_common_date_for_sku_city_warehouse,
+                )
                 last_day_inventory_info = inventory_map.get(inventory_at_lcd_key)
                 if last_day_inventory_info:
                     last_day_inventory = last_day_inventory_info["inventory"]
@@ -1006,6 +1093,7 @@ async def generate_report(
             if avg_daily_on_stock_days > 0:
                 doc_calc = last_day_inventory / avg_daily_on_stock_days
 
+            # Performance comparisons use city-level sales data (as before)
             sku_city_key = (sku, city)
             sales_target_last_7_days = last_seven_days_sales.get(sku_city_key, 0)
             sales_baseline_prev_7_days = two_weeks_ago_seven_days_sales.get(
@@ -1035,20 +1123,18 @@ async def generate_report(
             elif sales_target_current_30_days > 0:
                 monthly_comparison_pct = 0
 
-            # NEW: Get best performing month data
+            # Get best performing month data
             best_month_info = get_best_performing_month(sku_city_key)
 
-            # Create report item
+            # Create report item with warehouse-specific data
             report_item = {
                 "item_name": item_name,
                 "item_id": item_id,
                 "city": city,
+                "warehouse": warehouse,  # Now includes specific warehouse
                 "sku_code": sku,
-                "warehouse": warehouse,
-                "best_performing_month": best_month_info[
-                    "formatted"
-                ],  # NEW: Main field for display
-                "best_performing_month_details": {  # NEW: Detailed breakdown
+                "best_performing_month": best_month_info["formatted"],
+                "best_performing_month_details": {
                     "month_name": best_month_info["month_name"],
                     "year": best_month_info["year"],
                     "quantity_sold": best_month_info["quantity_sold"],
@@ -1089,9 +1175,14 @@ async def generate_report(
             f"Successfully generated dynamic report with {len(report_data)} items for period {period_name}."
         )
 
+        # Sort by item name, city, then warehouse for better organization
+        sorted_report_data = sorted(
+            report_data, key=lambda d: (d["item_name"], d["city"], d["warehouse"])
+        )
+
         return {
             "message": f"Successfully generated dynamic report for {period_name} with {len(report_data)} items.",
-            "data": sorted(report_data, key=lambda d: (d["item_name"], d["city"])),
+            "data": sorted_report_data,
             "period_info": {
                 "start_month": start_month,
                 "start_year": start_year,
