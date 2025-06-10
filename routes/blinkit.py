@@ -409,8 +409,9 @@ async def upload_inventory_data(
     file: UploadFile = File(...), database=Depends(get_database)
 ):
     """
-    Optimized inventory data upload with efficient aggregation and batch upserts.
-    Fixed to preserve individual warehouse data per city.
+    Optimized inventory data upload with city-level aggregation.
+    Sums inventory quantities from multiple warehouses in the same city.
+    PROPERLY REPLACES old individual warehouse records with city-aggregated records.
     """
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(
@@ -431,7 +432,7 @@ async def upload_inventory_data(
         # Validate required columns
         required_cols = ["Item ID", "Backend Outlet", "Date", "Qty"]
         if not all(col in df.columns for col in required_cols):
-            missing = [col for col in required_cols if col not in df.columns]
+            missing = [col for col in required_cols if col not in required_cols]
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Missing required columns: {', '.join(missing)}",
@@ -450,10 +451,10 @@ async def upload_inventory_data(
         )
         df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0)
 
-        # IMPORTANT: Clean Backend Outlet but preserve exact warehouse names
+        # Clean Backend Outlet names
         df["Backend Outlet"] = df["Backend Outlet"].astype(str).str.strip()
 
-        # Add debugging to see unique warehouses
+        # Debug: Show unique warehouses before processing
         print(f"Unique warehouses in upload: {df['Backend Outlet'].unique()}")
 
         # Process dates
@@ -497,132 +498,190 @@ async def upload_inventory_data(
             )
         )
 
-        # CRITICAL FIX: Ensure aggregation preserves individual warehouses
-        # The aggregation should group by ALL distinguishing fields including warehouse
+        # Debug: Show warehouse to city mappings
+        warehouse_city_mapping = df[["Backend Outlet", "city"]].drop_duplicates()
+        print("Warehouse to City mapping:")
+        for _, row in warehouse_city_mapping.iterrows():
+            print(f"  {row['Backend Outlet']} -> {row['city']}")
+
+        # CITY-LEVEL AGGREGATION: Group by city instead of individual warehouses
+        # This will sum quantities from B3 and B4 warehouses in the same city
         aggregation_columns = [
             "sku_code",
-            "Backend Outlet",  # This should preserve individual warehouses
-            "city",
+            "city",  # Group by city, not individual warehouse
             "processed_date",
             "Item ID",
             "item_name",
         ]
 
         # Debug: Check data before aggregation
-        print(f"Data before aggregation shape: {df.shape}")
+        print(f"Data before city aggregation shape: {df.shape}")
         print(f"Sample data before aggregation:")
-        print(
-            df[["sku_code", "Backend Outlet", "city", "processed_date", "Qty"]].head(10)
-        )
+        sample_data = df[
+            ["sku_code", "Backend Outlet", "city", "processed_date", "Qty"]
+        ].head(10)
+        for _, row in sample_data.iterrows():
+            print(
+                f"  SKU: {row['sku_code']}, Warehouse: {row['Backend Outlet']}, City: {row['city']}, Qty: {row['Qty']}"
+            )
 
-        # Perform aggregation - this should preserve individual warehouses
+        # Perform city-level aggregation - this will sum B3 + B4 inventories
         aggregated_df = (
             df.groupby(aggregation_columns, as_index=False)
-            .agg({"Qty": "sum"})
+            .agg(
+                {
+                    "Qty": "sum",  # Sum quantities across all warehouses in the city
+                    "Backend Outlet": lambda x: " + ".join(
+                        sorted(set(x))
+                    ),  # Combine warehouse names for reference
+                }
+            )
             .reset_index(drop=True)
         )
 
         # Debug: Check data after aggregation
-        print(f"Data after aggregation shape: {aggregated_df.shape}")
+        print(f"Data after city aggregation shape: {aggregated_df.shape}")
         print(f"Sample data after aggregation:")
-        print(
-            aggregated_df[
-                ["sku_code", "Backend Outlet", "city", "processed_date", "Qty"]
-            ].head(10)
-        )
+        sample_agg_data = aggregated_df[
+            ["sku_code", "Backend Outlet", "city", "processed_date", "Qty"]
+        ].head(10)
+        for _, row in sample_agg_data.iterrows():
+            print(
+                f"  SKU: {row['sku_code']}, Combined Warehouses: {row['Backend Outlet']}, City: {row['city']}, Total Qty: {row['Qty']}"
+            )
 
-        # Check for multiple warehouses in same city
-        city_warehouse_check = aggregated_df.groupby(
+        # Show aggregation results
+        city_aggregation_summary = (
+            aggregated_df.groupby("city")["Qty"].agg(["count", "sum"]).reset_index()
+        )
+        print(f"\nCity-level aggregation summary:")
+        for _, row in city_aggregation_summary.iterrows():
+            print(f"  {row['city']}: {row['count']} records, Total Qty: {row['sum']}")
+
+        # Check for successful city-level aggregation
+        original_warehouses_per_city = df.groupby(
             ["sku_code", "city", "processed_date"]
         )["Backend Outlet"].nunique()
-        multiple_warehouses = city_warehouse_check[city_warehouse_check > 1]
-        if len(multiple_warehouses) > 0:
+        combined_warehouses = original_warehouses_per_city[
+            original_warehouses_per_city > 1
+        ]
+        if len(combined_warehouses) > 0:
             print(
-                f"Found {len(multiple_warehouses)} SKU/City/Date combinations with multiple warehouses - this is correct!"
+                f"\nSuccessfully combined inventory from {len(combined_warehouses)} SKU/City/Date combinations with multiple warehouses:"
             )
-            print("Sample combinations with multiple warehouses:")
-            for idx in multiple_warehouses.head(5).index:
+            for idx in combined_warehouses.head(5).index:
                 sku, city, date = idx
-                warehouses = aggregated_df[
-                    (aggregated_df["sku_code"] == sku)
-                    & (aggregated_df["city"] == city)
-                    & (aggregated_df["processed_date"] == date)
-                ]["Backend Outlet"].unique()
-                print(
-                    f"  SKU: {sku}, City: {city}, Date: {date}, Warehouses: {warehouses}"
-                )
+                original_warehouses = df[
+                    (df["sku_code"] == sku)
+                    & (df["city"] == city)
+                    & (df["processed_date"] == date)
+                ]
+                total_qty_before = original_warehouses["Qty"].sum()
+                combined_warehouses_list = original_warehouses[
+                    "Backend Outlet"
+                ].unique()
+                print(f"  SKU: {sku}, City: {city}, Date: {date}")
+                print(f"    Original warehouses: {list(combined_warehouses_list)}")
+                print(f"    Combined quantity: {total_qty_before}")
 
         aggregated_df.rename(
-            columns={"Qty": "warehouse_inventory", "Backend Outlet": "warehouse"},
+            columns={
+                "Qty": "warehouse_inventory",
+                "Backend Outlet": "combined_warehouses",
+            },
             inplace=True,
         )
 
-        # Prepare bulk upsert operations
+        # STEP 1: DELETE ALL OLD RECORDS FOR THE DATES WE'RE PROCESSING
+        # This ensures we don't have both old individual warehouse records AND new city-aggregated records
+        dates_to_process = list(aggregated_df["processed_date"].unique())
+        skus_to_process = list(aggregated_df["sku_code"].unique())
+        cities_to_process = list(aggregated_df["city"].unique())
+
+        print(
+            f"\nCleaning up old records for {len(dates_to_process)} dates, {len(skus_to_process)} SKUs, {len(cities_to_process)} cities..."
+        )
+
+        # Delete old records that match our dates/SKUs/cities
+        delete_filter = {
+            "date": {"$in": dates_to_process},
+            "sku_code": {"$in": skus_to_process},
+            "city": {"$in": cities_to_process},
+        }
+
+        delete_result = inventory_collection.delete_many(delete_filter)
+        print(f"Deleted {delete_result.deleted_count} old inventory records")
+
+        # STEP 2: INSERT NEW CITY-AGGREGATED RECORDS
         bulk_operations = []
         for _, row in aggregated_df.iterrows():
-            # CRITICAL: The filter query must include warehouse to maintain separate records
-            filter_query = {
-                "sku_code": row["sku_code"],
-                "warehouse": row[
-                    "warehouse"
-                ],  # This ensures separate records per warehouse
-                "city": row["city"],
-                "date": row["processed_date"],
-            }
-
             document = {
                 "sku_code": row["sku_code"],
-                "warehouse": row[
-                    "warehouse"
-                ],  # This preserves individual warehouse info
                 "city": row["city"],
                 "date": row["processed_date"],
                 "item_id": int(row["Item ID"]),
                 "item_name": row["item_name"],
-                "warehouse_inventory": float(row["warehouse_inventory"]),
+                "warehouse_inventory": float(
+                    row["warehouse_inventory"]
+                ),  # Sum of all warehouses in city
+                "combined_warehouses": row[
+                    "combined_warehouses"
+                ],  # Reference to source warehouses
             }
 
-            bulk_operations.append(ReplaceOne(filter_query, document, upsert=True))
+            bulk_operations.append(InsertOne(document))
 
-        # Execute bulk upsert
-        upsert_count = 0
+        # Execute bulk insert
+        insert_count = 0
         if bulk_operations:
             # Process in batches
             batch_size = 1000
             for i in range(0, len(bulk_operations), batch_size):
                 batch = bulk_operations[i : i + batch_size]
                 result = inventory_collection.bulk_write(batch, ordered=False)
-                upsert_count += result.upserted_count + result.modified_count
-
-        # Create indexes if not exist
-        try:
-            inventory_collection.create_index([("date", 1)], background=True)
-            # IMPORTANT: Index should include warehouse to support separate warehouse queries
-            inventory_collection.create_index(
-                [("sku_code", 1), ("city", 1), ("warehouse", 1), ("date", 1)],
-                unique=True,
-                background=True,
-            )
-        except Exception:
-            pass  # Indexes might already exist
+                insert_count += result.inserted_count
 
         warning_count = len(aggregated_df[aggregated_df["sku_code"] == "Unknown SKU"])
 
         # Final verification: Check what got saved to database
-        print("Verifying data saved to database...")
+        print("\nVerifying city-aggregated data saved to database...")
         sample_check = inventory_collection.find(
-            {"date": {"$gte": aggregated_df["processed_date"].min()}},
-            {"sku_code": 1, "warehouse": 1, "city": 1, "date": 1},
+            {"date": {"$in": dates_to_process}},
+            {
+                "sku_code": 1,
+                "city": 1,
+                "date": 1,
+                "warehouse_inventory": 1,
+                "combined_warehouses": 1,
+            },
         ).limit(10)
 
-        print("Sample records in database:")
+        print("Sample city-aggregated records in database after cleanup and insert:")
         for record in sample_check:
             print(
-                f"  SKU: {record.get('sku_code')}, Warehouse: {record.get('warehouse')}, City: {record.get('city')}"
+                f"  SKU: {record.get('sku_code')}, City: {record.get('city')}, "
+                f"Total Inventory: {record.get('warehouse_inventory')}, "
+                f"Source Warehouses: {record.get('combined_warehouses', 'N/A')}"
             )
 
+        old_format_check = inventory_collection.count_documents(
+            {
+                "date": {"$in": dates_to_process},
+                "warehouse": {"$exists": True},  # Old format has "warehouse" field
+            }
+        )
+
+        if old_format_check > 0:
+            print(
+                f"WARNING: Found {old_format_check} old-format records still in database!"
+            )
+        else:
+            print("✓ Confirmed: No old-format records remain in database")
+
         return {
-            "message": f"Successfully uploaded and processed inventory data. Upserted {upsert_count} aggregated records. Encountered {warning_count} warnings."
+            "message": f"Successfully uploaded and processed inventory data with city-level aggregation. "
+            f"Deleted {delete_result.deleted_count} old records, inserted {insert_count} new city-aggregated records. "
+            f"Encountered {warning_count} warnings."
         }
 
     except HTTPException as e:
@@ -653,7 +712,7 @@ async def generate_report(
 ):
     """
     Generates the Sales vs Inventory report dynamically based on the specified date range.
-    Calculates metrics for each SKU/City/Warehouse combination to handle multiple warehouses per city.
+    Calculates metrics for each SKU/City pair using city-aggregated inventory data.
     Includes performance comparison with previous 7 and 30 days.
     Includes best performing month for each SKU/City pair.
     Returns the calculated report data directly.
@@ -715,7 +774,7 @@ async def generate_report(
             f"Found {len(lifetime_sales_data)} total sales records for lifetime analysis."
         )
 
-        # Query aggregated inventory data for the entire period
+        # Query city-aggregated inventory data for the entire period
         inventory_cursor = inventory_collection.find(
             {
                 "date": {
@@ -730,23 +789,34 @@ async def generate_report(
         )
         inventory_data = list(inventory_cursor)
         print(
-            f"Found {len(inventory_data)} aggregated inventory records in DB for the period {period_name}."
+            f"Found {len(inventory_data)} city-aggregated inventory records in DB for the period {period_name}."
         )
 
-        # Debug: Check for multiple warehouses per city in inventory data
-        warehouse_city_combinations = {}
-        for record in inventory_data:
-            city = record.get("city")
-            warehouse = record.get("warehouse")
-            if city and warehouse:
-                if city not in warehouse_city_combinations:
-                    warehouse_city_combinations[city] = set()
-                warehouse_city_combinations[city].add(warehouse)
+        # Debug: Show city-aggregated inventory data structure
+        print("Sample city-aggregated inventory records:")
+        for record in inventory_data[:5]:
+            combined_warehouses = record.get("combined_warehouses", "N/A")
+            print(
+                f"  SKU: {record.get('sku_code')}, City: {record.get('city')}, "
+                f"Date: {record.get('date')}, Inventory: {record.get('warehouse_inventory')}, "
+                f"Source Warehouses: {combined_warehouses}"
+            )
 
-        print("Warehouse distribution by city:")
-        for city, warehouses in warehouse_city_combinations.items():
-            if len(warehouses) > 1:
-                print(f"  {city}: {list(warehouses)} ({len(warehouses)} warehouses)")
+        # Debug: Check if we have any city-aggregated records (multiple warehouses combined)
+        aggregated_records = [
+            r for r in inventory_data if "+" in r.get("combined_warehouses", "")
+        ]
+        print(
+            f"Found {len(aggregated_records)} city-aggregated records (with multiple warehouses)"
+        )
+        if aggregated_records:
+            print("Sample aggregated records:")
+            for record in aggregated_records[:3]:
+                print(
+                    f"  SKU: {record.get('sku_code')}, City: {record.get('city')}, "
+                    f"Total Inventory: {record.get('warehouse_inventory')}, "
+                    f"Combined from: {record.get('combined_warehouses')}"
+                )
 
         if not sales_data and not inventory_data:
             return {
@@ -822,22 +892,26 @@ async def generate_report(
             current_period_sales[key] = current_period_sales.get(key, 0) + quantity
             all_sales_dates.add(date_key_str)
 
-        # CRITICAL FIX: Process inventory data to maintain separate warehouse records
-        # Change the inventory_map structure to include warehouse information
-        inventory_map = {}  # Structure: {(sku, city, warehouse, date): inventory_info}
+        # Process city-aggregated inventory data
+        inventory_map = {}  # Structure: {(sku, city, date): inventory_info}
         inventory_item_info = {}
         all_inventory_dates = set()
+
+        # NEW: Create a mapping to store combined_warehouses info for each SKU/City combination
+        sku_city_warehouses_map = {}
 
         for record in inventory_data:
             sku = record.get("sku_code")
             city = record.get("city")
-            warehouse = record.get("warehouse")
             inventory_date_dt = record.get("date")
             inventory_qty = record.get("warehouse_inventory", 0)
             item_name = record.get("item_name", "Unknown Item")
             item_id = record.get("item_id", "Unknown ID")
+            combined_warehouses = record.get(
+                "combined_warehouses", "Unknown Warehouses"
+            )
 
-            if not sku or not city or not warehouse or not inventory_date_dt:
+            if not sku or not city or not inventory_date_dt:
                 continue
             inventory_qty = (
                 float(inventory_qty) if isinstance(inventory_qty, (int, float)) else 0
@@ -847,17 +921,30 @@ async def generate_report(
             else:
                 continue
 
-            # Key now includes warehouse to maintain separate records
-            key = (sku, city, warehouse, date_key_str)
+            # Key is now city-level (no warehouse)
+            key = (sku, city, date_key_str)
             inventory_map[key] = {
                 "inventory": inventory_qty,
                 "item_name": item_name,
                 "item_id": item_id,
-                "warehouse": warehouse,
+                "combined_warehouses": combined_warehouses,
             }
             all_inventory_dates.add(date_key_str)
             if sku not in inventory_item_info:
                 inventory_item_info[sku] = {"item_name": item_name, "item_id": item_id}
+
+            # NEW: Store the combined_warehouses info for this SKU/City combination
+            sku_city_key = (sku, city)
+            if sku_city_key not in sku_city_warehouses_map:
+                sku_city_warehouses_map[sku_city_key] = combined_warehouses
+            else:
+                # If we have multiple records for the same SKU/City, prefer the most detailed one
+                existing_warehouses = sku_city_warehouses_map[sku_city_key]
+                if (
+                    len(combined_warehouses) > len(existing_warehouses)
+                    or existing_warehouses == "Unknown Warehouses"
+                ):
+                    sku_city_warehouses_map[sku_city_key] = combined_warehouses
 
         common_dates = sorted(list(all_sales_dates.intersection(all_inventory_dates)))
         n_common_days = len(common_dates)
@@ -972,32 +1059,24 @@ async def generate_report(
                         previous_30_day_comparison_sales.get(key_pair, 0) + quantity
                     )
 
-        # CRITICAL FIX: Build valid combinations including warehouse information
-        valid_sku_city_warehouse_pairs = set()
+        # Build valid SKU/City combinations (no more warehouse separation)
+        valid_sku_city_pairs = set()
 
-        # Get all unique SKU/City/Warehouse combinations from inventory data
-        for sku, city, warehouse, date_s in inventory_map.keys():
-            if date_s in common_dates:
-                valid_sku_city_warehouse_pairs.add((sku, city, warehouse))
-
-        # Also consider combinations that have sales but might not have inventory every day
+        # Get SKU/City combinations from sales data
         for sku, city, date_s in current_period_sales.keys():
             if date_s in common_dates:
-                # Find warehouses for this SKU/City combination
-                warehouses_for_sku_city = set()
-                for inv_sku, inv_city, inv_warehouse, inv_date in inventory_map.keys():
-                    if inv_sku == sku and inv_city == city:
-                        warehouses_for_sku_city.add(inv_warehouse)
+                valid_sku_city_pairs.add((sku, city))
 
-                # If we found warehouses, add them to valid pairs
-                for warehouse in warehouses_for_sku_city:
-                    valid_sku_city_warehouse_pairs.add((sku, city, warehouse))
+        # Get SKU/City combinations from inventory data
+        for sku, city, date_s in inventory_map.keys():
+            if date_s in common_dates:
+                valid_sku_city_pairs.add((sku, city))
 
         print(
-            f"Calculating metrics for {len(valid_sku_city_warehouse_pairs)} unique SKU/City/Warehouse combinations for period {period_name}..."
+            f"Calculating metrics for {len(valid_sku_city_pairs)} unique SKU/City combinations for period {period_name}..."
         )
 
-        # Helper function for best performing month (unchanged)
+        # Helper function for best performing month
         def get_best_performing_month(sku_city_key):
             if (
                 sku_city_key not in lifetime_monthly_sales
@@ -1031,8 +1110,8 @@ async def generate_report(
             start_year, start_month, end_year, end_month
         )
 
-        # CRITICAL FIX: Process each SKU/City/Warehouse combination separately
-        for sku, city, warehouse in valid_sku_city_warehouse_pairs:
+        # Process each SKU/City combination (city-aggregated)
+        for sku, city in valid_sku_city_pairs:
             item_info = inventory_item_info.get(
                 sku,
                 sales_item_info.get(
@@ -1042,15 +1121,20 @@ async def generate_report(
             item_name = item_info["item_name"]
             item_id = item_info["item_id"]
 
+            # FIXED: Get combined warehouses info from the pre-built mapping
+            sku_city_key = (sku, city)
+            combined_warehouses = sku_city_warehouses_map.get(
+                sku_city_key, "Unknown Warehouses"
+            )
+
             total_sales_on_common_days = 0
             total_sales_on_days_with_inventory = 0
             days_with_inventory = 0
 
             for date_str in common_dates:
-                # Sales key doesn't include warehouse (sales are at city level)
+                # Both sales and inventory are now at city level
                 sales_key = (sku, city, date_str)
-                # Inventory key includes warehouse (inventory is warehouse-specific)
-                inventory_key = (sku, city, warehouse, date_str)
+                inventory_key = (sku, city, date_str)
 
                 sales_qty = current_period_sales.get(sales_key, 0)
                 inventory_info_daily = inventory_map.get(inventory_key)
@@ -1078,23 +1162,47 @@ async def generate_report(
 
             last_day_inventory = 0
             if common_dates:
-                last_common_date_for_sku_city_warehouse = common_dates[-1]
-                inventory_at_lcd_key = (
-                    sku,
-                    city,
-                    warehouse,
-                    last_common_date_for_sku_city_warehouse,
-                )
+                last_common_date = common_dates[-1]
+                inventory_at_lcd_key = (sku, city, last_common_date)
                 last_day_inventory_info = inventory_map.get(inventory_at_lcd_key)
                 if last_day_inventory_info:
                     last_day_inventory = last_day_inventory_info["inventory"]
+                    # Debug: Verify we're getting city-aggregated inventory
+                    warehouses_info = last_day_inventory_info.get(
+                        "combined_warehouses", "Unknown"
+                    )
+                    print(
+                        f"  Closing stock for SKU {sku} in {city}: {last_day_inventory} (from {warehouses_info})"
+                    )
+                else:
+                    # If no inventory found for last common date, try to find the most recent inventory
+                    print(
+                        f"  No inventory found for SKU {sku} in {city} on {last_common_date}, checking for most recent..."
+                    )
+                    most_recent_inventory = 0
+                    most_recent_date = None
+                    for date_str in reversed(
+                        common_dates
+                    ):  # Check dates in reverse order
+                        check_key = (sku, city, date_str)
+                        check_inventory_info = inventory_map.get(check_key)
+                        if check_inventory_info:
+                            most_recent_inventory = check_inventory_info["inventory"]
+                            most_recent_date = date_str
+                            warehouses_info = check_inventory_info.get(
+                                "combined_warehouses", "Unknown"
+                            )
+                            print(
+                                f"  Found most recent inventory for SKU {sku} in {city} on {most_recent_date}: {most_recent_inventory} (from {warehouses_info})"
+                            )
+                            break
+                    last_day_inventory = most_recent_inventory
 
             doc_calc = 0
             if avg_daily_on_stock_days > 0:
                 doc_calc = last_day_inventory / avg_daily_on_stock_days
 
-            # Performance comparisons use city-level sales data (as before)
-            sku_city_key = (sku, city)
+            # Performance comparisons (city level)
             sales_target_last_7_days = last_seven_days_sales.get(sku_city_key, 0)
             sales_baseline_prev_7_days = two_weeks_ago_seven_days_sales.get(
                 sku_city_key, 0
@@ -1126,12 +1234,12 @@ async def generate_report(
             # Get best performing month data
             best_month_info = get_best_performing_month(sku_city_key)
 
-            # Create report item with warehouse-specific data
+            # Create report item with city-aggregated data
             report_item = {
                 "item_name": item_name,
                 "item_id": item_id,
                 "city": city,
-                "warehouse": warehouse,  # Now includes specific warehouse
+                "warehouse": combined_warehouses,  # Now properly shows combined warehouse names
                 "sku_code": sku,
                 "best_performing_month": best_month_info["formatted"],
                 "best_performing_month_details": {
@@ -1175,9 +1283,9 @@ async def generate_report(
             f"Successfully generated dynamic report with {len(report_data)} items for period {period_name}."
         )
 
-        # Sort by item name, city, then warehouse for better organization
+        # Sort by item name, city (no warehouse sorting needed)
         sorted_report_data = sorted(
-            report_data, key=lambda d: (d["item_name"], d["city"], d["warehouse"])
+            report_data, key=lambda d: (d["item_name"], d["city"])
         )
 
         return {
