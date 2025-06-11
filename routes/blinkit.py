@@ -410,8 +410,7 @@ async def upload_inventory_data(
 ):
     """
     Optimized inventory data upload with city-level aggregation.
-    Sums inventory quantities from multiple warehouses in the same city.
-    PROPERLY REPLACES old individual warehouse records with city-aggregated records.
+    FIXED: Ensures SKU mapping is applied correctly before aggregation.
     """
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(
@@ -422,7 +421,6 @@ async def upload_inventory_data(
     try:
         file_content = await file.read()
 
-        # Use thread pool for pandas operations
         with ThreadPoolExecutor() as executor:
             df = await asyncio.get_event_loop().run_in_executor(
                 executor,
@@ -432,7 +430,7 @@ async def upload_inventory_data(
         # Validate required columns
         required_cols = ["Item ID", "Backend Outlet", "Date", "Qty"]
         if not all(col in df.columns for col in required_cols):
-            missing = [col for col in required_cols if col not in required_cols]
+            missing = [col for col in required_cols if col not in df.columns]
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Missing required columns: {', '.join(missing)}",
@@ -443,9 +441,12 @@ async def upload_inventory_data(
 
         # Get cached SKU mapping
         sku_map_dict = await sku_cache.get_sku_mapping(sku_collection)
-
+        print(f"Retrieved SKU mapping with {len(sku_map_dict)} entries")
+        print(json.dumps(serialize_mongo_document(sku_map_dict), indent=4))
         # Clean and process data efficiently
         df = df.dropna(subset=["Item ID"])
+
+        # CRITICAL FIX: Ensure Item ID conversion is consistent with sales data
         df["Item ID"] = (
             pd.to_numeric(df["Item ID"], errors="coerce").fillna(0).astype(int)
         )
@@ -454,16 +455,12 @@ async def upload_inventory_data(
         # Clean Backend Outlet names
         df["Backend Outlet"] = df["Backend Outlet"].astype(str).str.strip()
 
-        # Debug: Show unique warehouses before processing
-        print(f"Unique warehouses in upload: {df['Backend Outlet'].unique()}")
-
         # Process dates
         def process_inventory_dates(dates):
             processed = []
             for date in dates:
                 parsed_date = safe_strptime(date, "%Y-%m-%d")
                 if parsed_date:
-                    # Truncate to date for consistency
                     processed.append(
                         parsed_date.replace(hour=0, minute=0, second=0, microsecond=0)
                     )
@@ -479,13 +476,24 @@ async def upload_inventory_data(
         # Remove rows with invalid dates
         df = df.dropna(subset=["processed_date"])
 
-        # Add SKU and city information
-        df["sku_code"] = df["Item ID"].map(
-            lambda x: sku_map_dict.get(x, {}).get("sku_code", "Unknown SKU")
-        )
-        df["item_name"] = df["Item ID"].map(
-            lambda x: sku_map_dict.get(x, {}).get("item_name", "Unknown Item")
-        )
+        # Apply SKU mapping with proper type conversion
+        def get_sku_info(item_id):
+            # Ensure item_id is converted to int for mapping lookup
+            try:
+                item_id_int = int(item_id)
+                sku_info = sku_map_dict.get(item_id_int, {})
+                return {
+                    "sku_code": sku_info.get("sku_code", "Unknown SKU"),
+                    "item_name": sku_info.get("item_name", "Unknown Item"),
+                }
+            except (ValueError, TypeError):
+                print(f"Invalid Item ID for SKU mapping: {item_id}")
+                return {"sku_code": "Unknown SKU", "item_name": "Unknown Item"}
+
+        # Apply SKU mapping
+        sku_mapping_results = df["Item ID"].apply(get_sku_info)
+        df["sku_code"] = [result["sku_code"] for result in sku_mapping_results]
+        df["item_name"] = [result["item_name"] for result in sku_mapping_results]
 
         # Handle item names from file if available
         if "Item Name" in df.columns:
@@ -498,91 +506,54 @@ async def upload_inventory_data(
             )
         )
 
-        # Debug: Show warehouse to city mappings
-        warehouse_city_mapping = df[["Backend Outlet", "city"]].drop_duplicates()
-        print("Warehouse to City mapping:")
-        for _, row in warehouse_city_mapping.iterrows():
-            print(f"  {row['Backend Outlet']} -> {row['city']}")
+        # IMPORTANT: Filter out records with Unknown SKU BEFORE aggregation
+        # This prevents Unknown SKU records from being created in the first place
+        df_with_valid_sku = df[df["sku_code"] != "Unknown SKU"].copy()
+        df_with_unknown_sku = df[df["sku_code"] == "Unknown SKU"].copy()
 
-        # CITY-LEVEL AGGREGATION: Group by city instead of individual warehouses
-        # This will sum quantities from B3 and B4 warehouses in the same city
+        print(f"Proceeding with {len(df_with_valid_sku)} records with valid SKUs")
+        print(f"Excluding {len(df_with_unknown_sku)} records with Unknown SKUs")
+
+        if len(df_with_unknown_sku) > 0:
+            print("Records with Unknown SKU (will be excluded):")
+            for _, row in df_with_unknown_sku.head(5).iterrows():
+                print(
+                    f"  Item ID: {row['Item ID']}, Warehouse: {row['Backend Outlet']}, Qty: {row['Qty']}"
+                )
+
+        # Proceed with city-level aggregation using only valid SKU records
         aggregation_columns = [
             "sku_code",
-            "city",  # Group by city, not individual warehouse
+            "city",
             "processed_date",
             "Item ID",
             "item_name",
         ]
 
-        # Debug: Check data before aggregation
-        print(f"Data before city aggregation shape: {df.shape}")
-        print(f"Sample data before aggregation:")
-        sample_data = df[
-            ["sku_code", "Backend Outlet", "city", "processed_date", "Qty"]
-        ].head(10)
-        for _, row in sample_data.iterrows():
-            print(
-                f"  SKU: {row['sku_code']}, Warehouse: {row['Backend Outlet']}, City: {row['city']}, Qty: {row['Qty']}"
-            )
-
-        # Perform city-level aggregation - this will sum B3 + B4 inventories
+        # Perform city-level aggregation on valid SKU records only
         aggregated_df = (
-            df.groupby(aggregation_columns, as_index=False)
+            df_with_valid_sku.groupby(aggregation_columns, as_index=False)
             .agg(
                 {
-                    "Qty": "sum",  # Sum quantities across all warehouses in the city
-                    "Backend Outlet": lambda x: " + ".join(
-                        sorted(set(x))
-                    ),  # Combine warehouse names for reference
+                    "Qty": "sum",
+                    "Backend Outlet": lambda x: " + ".join(sorted(set(x))),
                 }
             )
             .reset_index(drop=True)
         )
 
-        # Debug: Check data after aggregation
-        print(f"Data after city aggregation shape: {aggregated_df.shape}")
-        print(f"Sample data after aggregation:")
-        sample_agg_data = aggregated_df[
-            ["sku_code", "Backend Outlet", "city", "processed_date", "Qty"]
-        ].head(10)
-        for _, row in sample_agg_data.iterrows():
-            print(
-                f"  SKU: {row['sku_code']}, Combined Warehouses: {row['Backend Outlet']}, City: {row['city']}, Total Qty: {row['Qty']}"
-            )
+        print(f"After city aggregation: {len(aggregated_df)} records")
 
-        # Show aggregation results
-        city_aggregation_summary = (
-            aggregated_df.groupby("city")["Qty"].agg(["count", "sum"]).reset_index()
+        # Verify no Unknown SKUs in final data
+        final_unknown_count = len(
+            aggregated_df[aggregated_df["sku_code"] == "Unknown SKU"]
         )
-        print(f"\nCity-level aggregation summary:")
-        for _, row in city_aggregation_summary.iterrows():
-            print(f"  {row['city']}: {row['count']} records, Total Qty: {row['sum']}")
-
-        # Check for successful city-level aggregation
-        original_warehouses_per_city = df.groupby(
-            ["sku_code", "city", "processed_date"]
-        )["Backend Outlet"].nunique()
-        combined_warehouses = original_warehouses_per_city[
-            original_warehouses_per_city > 1
-        ]
-        if len(combined_warehouses) > 0:
+        if final_unknown_count > 0:
             print(
-                f"\nSuccessfully combined inventory from {len(combined_warehouses)} SKU/City/Date combinations with multiple warehouses:"
+                f"WARNING: {final_unknown_count} Unknown SKU records still present after filtering!"
             )
-            for idx in combined_warehouses.head(5).index:
-                sku, city, date = idx
-                original_warehouses = df[
-                    (df["sku_code"] == sku)
-                    & (df["city"] == city)
-                    & (df["processed_date"] == date)
-                ]
-                total_qty_before = original_warehouses["Qty"].sum()
-                combined_warehouses_list = original_warehouses[
-                    "Backend Outlet"
-                ].unique()
-                print(f"  SKU: {sku}, City: {city}, Date: {date}")
-                print(f"    Original warehouses: {list(combined_warehouses_list)}")
-                print(f"    Combined quantity: {total_qty_before}")
+        else:
+            print("✓ No Unknown SKU records in final aggregated data")
 
         aggregated_df.rename(
             columns={
@@ -592,17 +563,17 @@ async def upload_inventory_data(
             inplace=True,
         )
 
-        # STEP 1: DELETE ALL OLD RECORDS FOR THE DATES WE'RE PROCESSING
-        # This ensures we don't have both old individual warehouse records AND new city-aggregated records
+        # Rest of the function remains the same...
+        # (Delete old records and insert new ones)
+
         dates_to_process = list(aggregated_df["processed_date"].unique())
         skus_to_process = list(aggregated_df["sku_code"].unique())
         cities_to_process = list(aggregated_df["city"].unique())
 
         print(
-            f"\nCleaning up old records for {len(dates_to_process)} dates, {len(skus_to_process)} SKUs, {len(cities_to_process)} cities..."
+            f"Cleaning up old records for {len(dates_to_process)} dates, {len(skus_to_process)} SKUs, {len(cities_to_process)} cities..."
         )
 
-        # Delete old records that match our dates/SKUs/cities
         delete_filter = {
             "date": {"$in": dates_to_process},
             "sku_code": {"$in": skus_to_process},
@@ -612,7 +583,7 @@ async def upload_inventory_data(
         delete_result = inventory_collection.delete_many(delete_filter)
         print(f"Deleted {delete_result.deleted_count} old inventory records")
 
-        # STEP 2: INSERT NEW CITY-AGGREGATED RECORDS
+        # Insert new city-aggregated records
         bulk_operations = []
         for _, row in aggregated_df.iterrows():
             document = {
@@ -621,67 +592,25 @@ async def upload_inventory_data(
                 "date": row["processed_date"],
                 "item_id": int(row["Item ID"]),
                 "item_name": row["item_name"],
-                "warehouse_inventory": float(
-                    row["warehouse_inventory"]
-                ),  # Sum of all warehouses in city
-                "combined_warehouses": row[
-                    "combined_warehouses"
-                ],  # Reference to source warehouses
+                "warehouse_inventory": float(row["warehouse_inventory"]),
+                "combined_warehouses": row["combined_warehouses"],
             }
-
             bulk_operations.append(InsertOne(document))
 
-        # Execute bulk insert
         insert_count = 0
         if bulk_operations:
-            # Process in batches
             batch_size = 1000
             for i in range(0, len(bulk_operations), batch_size):
                 batch = bulk_operations[i : i + batch_size]
                 result = inventory_collection.bulk_write(batch, ordered=False)
                 insert_count += result.inserted_count
 
-        warning_count = len(aggregated_df[aggregated_df["sku_code"] == "Unknown SKU"])
-
-        # Final verification: Check what got saved to database
-        print("\nVerifying city-aggregated data saved to database...")
-        sample_check = inventory_collection.find(
-            {"date": {"$in": dates_to_process}},
-            {
-                "sku_code": 1,
-                "city": 1,
-                "date": 1,
-                "warehouse_inventory": 1,
-                "combined_warehouses": 1,
-            },
-        ).limit(10)
-
-        print("Sample city-aggregated records in database after cleanup and insert:")
-        for record in sample_check:
-            print(
-                f"  SKU: {record.get('sku_code')}, City: {record.get('city')}, "
-                f"Total Inventory: {record.get('warehouse_inventory')}, "
-                f"Source Warehouses: {record.get('combined_warehouses', 'N/A')}"
-            )
-
-        old_format_check = inventory_collection.count_documents(
-            {
-                "date": {"$in": dates_to_process},
-                "warehouse": {"$exists": True},  # Old format has "warehouse" field
-            }
-        )
-
-        if old_format_check > 0:
-            print(
-                f"WARNING: Found {old_format_check} old-format records still in database!"
-            )
-        else:
-            print("✓ Confirmed: No old-format records remain in database")
+        excluded_unknown_count = len(df_with_unknown_sku)
 
         return {
             "message": f"Successfully uploaded and processed inventory data with city-level aggregation. "
             f"Deleted {delete_result.deleted_count} old records, inserted {insert_count} new city-aggregated records. "
-            f"Encountered {warning_count} warnings."
+            f"Excluded {excluded_unknown_count} records with Unknown SKU."
         }
 
     except HTTPException as e:
