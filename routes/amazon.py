@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 import calendar, io
 from io import BytesIO
-
+from bson import ObjectId
 from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,7 +30,9 @@ async def get_sku_mapping(database=Depends(get_database)):
     """
     try:
         sku_collection = database.get_collection(SKU_COLLECTION)
-        sku_documents = list(sku_collection.find({}, {"_id": 0}).sort("item_name", 1))
+        sku_documents = serialize_mongo_document(
+            list(sku_collection.find({}).sort("item_name", -1))
+        )
 
         return JSONResponse(content=sku_documents)
 
@@ -123,6 +125,53 @@ async def upload_sku_mapping(
         raise e  # Re-raise intended HTTP exceptions
     except Exception as e:
         print(f"Error uploading SKU mapping: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred processing the file: {e}",
+        )
+
+
+@router.post("/create_single_item")
+async def create_single_item(body: dict):
+    try:
+        item_name = body.get("item_name")
+        item_id = body.get("item_id")
+        sku_code = body.get("sku_code")
+        db = get_database()
+        result = db[SKU_COLLECTION].find_one(
+            {"item_name": item_name, "item_id": item_id}
+        )
+        if result:
+            raise HTTPException(
+                status_code=400, detail="Item Name and Item Id already Exists"
+            )
+        else:
+            db[SKU_COLLECTION].insert_one(
+                {"item_name": item_name, "item_id": int(item_id), "sku_code": sku_code}
+            )
+            return "Item Created"
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error uploading sales data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred creating the item: {e}",
+        )
+
+
+@router.delete("/delete_item/{item_id}")
+async def delete_item(item_id: str):
+    try:
+        db = get_database()
+        result = db[SKU_COLLECTION].delete_one({"_id": ObjectId(item_id)})
+        if result.deleted_count == 1:
+            return JSONResponse(status_code=200, content="Item Deleted Successfully")
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error uploading sales data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",
