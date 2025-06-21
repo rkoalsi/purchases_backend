@@ -5,6 +5,7 @@ from .routes.amazon import router as amazon_router
 from .routes.blinkit import router as blinkit_router
 from .routes.dashboard import router as dashboard_router
 from .routes.zoho import router as zoho_router
+from .routes.util import router as util_router
 from .database import connect_db, close_db
 
 
@@ -51,4 +52,5 @@ app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(blinkit_router, prefix="/blinkit", tags=["blinkit"])
 app.include_router(amazon_router, prefix="/amazon", tags=["amazon"])
 app.include_router(zoho_router, prefix="/zoho", tags=["zoho"])
+app.include_router(util_router, prefix="/util", tags=["util"])
 app.include_router(dashboard_router, prefix="/dashboard", tags=["dashboard"])
