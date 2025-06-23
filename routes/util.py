@@ -335,6 +335,7 @@ def process_upload_data(file_content: bytes) -> bytes:
         name = str(item.get("name")).strip()
         code = item.get("hsn")
         price = item.get("price")
+        rounded_price = round(price, 6)
 
         items_from_db = get_items_from_db(name)
         if len(items_from_db) > 0:
@@ -353,7 +354,7 @@ def process_upload_data(file_content: bytes) -> bytes:
             if (
                 compare_strings(name, product_name)
                 and compare_strings(code, product_code)
-                and compare_strings(price, product_price)
+                and compare_strings(rounded_price, product_price)
             ):
                 matched_ci.append(
                     {
@@ -368,8 +369,10 @@ def process_upload_data(file_content: bytes) -> bytes:
                     reasons.append(f"Name {name} not matched with {product_name}")
                 if not compare_strings(code, product_code):
                     reasons.append(f"HSN {code} not matched with {product_code}")
-                if not compare_strings(price, product_price):
-                    reasons.append(f"Price {price} not matched with {product_price}")
+                if not compare_strings(rounded_price, product_price):
+                    reasons.append(
+                        f"Price {rounded_price} not matched with {product_price}"
+                    )
 
                 reason = "; ".join(reasons)
                 unmatched_ci.append(
@@ -381,7 +384,7 @@ def process_upload_data(file_content: bytes) -> bytes:
                     }
                 )
         else:
-            reason = f"{name} Not found in database"
+            reason = f"{name} Not found in Zoho"
             unmatched_ci.append(
                 {
                     "name": name,
