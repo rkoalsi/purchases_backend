@@ -340,10 +340,10 @@ async def upload_sales_data(
         df["processed_city"] = df["Customer City"].replace("Faridabad", "Gurgaon")
 
         # SKU mapping vectorized
-        df["sku_code"] = df["Item ID"].map(
+        df["sku_code"] = df["Item Id"].map(
             lambda x: sku_map_dict.get(x, {}).get("sku_code", "Unknown SKU")
         )
-        df["item_name"] = df["Item ID"].map(
+        df["item_name"] = df["Item Id"].map(
             lambda x: sku_map_dict.get(x, {}).get("item_name", "Unknown Item")
         )
 
@@ -353,7 +353,7 @@ async def upload_sales_data(
 
         # Batch check for existing records
         unique_keys = df[
-            ["Item ID", "processed_city", "processed_date"]
+            ["Item Id", "processed_city", "processed_date"]
         ].drop_duplicates()
 
         # Build query for existing records
@@ -361,7 +361,7 @@ async def upload_sales_data(
         for _, row in unique_keys.iterrows():
             existing_queries.append(
                 {
-                    "item_id": int(row["Item ID"]),
+                    "item_id": int(row["Item Id"]),
                     "city": row["processed_city"],
                     "order_date": row["processed_date"],
                 }
