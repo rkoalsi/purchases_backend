@@ -306,15 +306,15 @@ async def upload_sales_data(
 
         # Vectorized data processing with pandas
         df = df.dropna(
-            subset=["Item ID", "Customer City "]
+            subset=["Item Id", "Customer City"]
         )  # Remove rows with missing critical data
 
         # Convert data types efficiently
-        df["Item ID"] = (
-            pd.to_numeric(df["Item ID"], errors="coerce").fillna(0).astype(int)
+        df["Item Id"] = (
+            pd.to_numeric(df["Item Id"], errors="coerce").fillna(0).astype(int)
         )
         df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
-        df["Customer City "] = df["Customer City "].astype(str).str.strip()
+        df["Customer City"] = df["Customer City"].astype(str).str.strip()
         df["HSN Code"] = df["HSN Code"].astype(str).str.strip()
 
         # Process dates efficiently
@@ -379,7 +379,7 @@ async def upload_sales_data(
 
         # Filter out existing records
         def is_new_record(row):
-            key = (int(row["Item ID"]), row["processed_city"], row["processed_date"])
+            key = (int(row["Item Id"]), row["processed_city"], row["processed_date"])
             return key not in existing_docs
 
         df["is_new"] = df.apply(is_new_record, axis=1)
@@ -389,7 +389,7 @@ async def upload_sales_data(
         bulk_operations = []
         for _, row in new_records_df.iterrows():
             doc = {
-                "item_id": int(row["Item ID"]),
+                "item_id": int(row["Item Id"]),
                 "sku_code": row["sku_code"],
                 "hsn_code": row["HSN Code"],
                 "item_name": row["item_name"],
