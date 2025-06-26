@@ -285,10 +285,10 @@ async def upload_sales_data(
 
         # Validate required columns
         required_cols = [
-            "Item ID",
+            "Item Id",
             "Quantity",
             "Order Date",
-            "Customer City ",
+            "Customer City",
             "HSN Code",
         ]
         if not all(col in df.columns for col in required_cols):
