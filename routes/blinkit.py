@@ -337,7 +337,7 @@ async def upload_sales_data(
         df = df.dropna(subset=["processed_date"])
 
         # City processing
-        df["processed_city"] = df["Customer City "].replace("Faridabad", "Gurgaon")
+        df["processed_city"] = df["Customer City"].replace("Faridabad", "Gurgaon")
 
         # SKU mapping vectorized
         df["sku_code"] = df["Item ID"].map(
