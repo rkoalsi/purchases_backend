@@ -1,15 +1,12 @@
 from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, status, Depends
-from pymongo import MongoClient
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
 from jose import jwt
 import os
 from datetime import datetime, timedelta, timezone
 from passlib.context import CryptContext
-from ..database import (
-    get_database,
-)
+from ..database import get_database, serialize_mongo_document
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM")
@@ -105,7 +102,7 @@ async def login(data: User, database=Depends(get_database)):
     return JSONResponse(
         content={
             "access_token": access_token,
-            "user": user,
+            "user": serialize_mongo_document(user),
             "token_type": "bearer",
         }
     )
