@@ -5,7 +5,7 @@ from ..database import get_database, serialize_mongo_document
 router = APIRouter()
 
 
-@router.get("/")
+@router.get("")
 async def get_users():
     try:
         db = get_database()
