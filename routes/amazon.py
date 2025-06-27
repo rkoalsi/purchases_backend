@@ -1,12 +1,9 @@
 # main.py
 import pandas as pd
-from datetime import datetime, date, timedelta
-import calendar, io
 from io import BytesIO
 from bson import ObjectId
 from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from pymongo import ASCENDING
 from pymongo.errors import PyMongoError

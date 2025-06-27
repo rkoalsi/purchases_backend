@@ -6,7 +6,6 @@ from io import BytesIO
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
 from bson import ObjectId
 from pymongo import ASCENDING
 from pymongo.errors import PyMongoError
@@ -15,10 +14,8 @@ from ..database import get_database, serialize_mongo_document
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
-from typing import List, Dict, Any
-from pymongo import InsertOne, ReplaceOne, UpdateOne
+from pymongo import InsertOne
 from datetime import datetime
-import numpy as np
 
 
 # Optimize SKU mapping with caching

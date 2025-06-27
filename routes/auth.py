@@ -54,7 +54,7 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
 @router.post("/login")
 async def login(data: User, database=Depends(get_database)):
     """Handles user login and returns a JWT on success."""
-    email = data.email
+    email = str(data.email).strip()
     password = data.password
 
     # 1. Find the user by email
