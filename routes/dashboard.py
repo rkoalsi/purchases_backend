@@ -43,7 +43,6 @@ class TopProduct(BaseModel):
     item_id: int
     item_name: str
     sku_code: str
-    city: str
     metrics: ProductMetrics
     year: int
     month: int
@@ -83,7 +82,7 @@ async def get_top_performing_products(
         le=12,
         description="Month to filter by (legacy, use start_date/end_date instead)",
     ),
-    city: Optional[str] = Query(None, description="City to filter by"),
+    # city: Optional[str] = Query(None, description="City to filter by"),
 ):
     """
     Get top performing products based on total sales in period.
@@ -125,11 +124,6 @@ async def get_top_performing_products(
             "date": {"$gte": parsed_start_date, "$lte": parsed_end_date}
         }
 
-        # Add optional city filter
-        if city:
-            sales_filter["city"] = city
-            inventory_filter["city"] = city
-
         # Step 1: Aggregate sales data
         sales_pipeline = [
             {"$match": sales_filter},
@@ -138,7 +132,7 @@ async def get_top_performing_products(
                     "_id": {
                         "item_id": "$item_id",
                         "sku_code": "$sku_code",
-                        "city": "$city",
+                        # "city": "$city",
                         "item_name": "$item_name",
                     },
                     "total_sales_in_period": {"$sum": "$quantity"},
@@ -156,7 +150,7 @@ async def get_top_performing_products(
                     "_id": {
                         "item_id": "$item_id",
                         "sku_code": "$sku_code",
-                        "city": "$city",
+                        # "city": "$city",
                         "item_name": "$item_name",
                     },
                     "avg_inventory": {"$avg": "$warehouse_inventory"},
@@ -177,12 +171,12 @@ async def get_top_performing_products(
         # Create lookup dict for inventory data
         inventory_lookup = {}
         for inv in inventory_results:
-            key = (inv["_id"]["item_id"], inv["_id"]["sku_code"], inv["_id"]["city"])
+            key = (inv["_id"]["item_id"], inv["_id"]["sku_code"])
             inventory_lookup[key] = inv
 
         # Combine with sales data
         for sale in sales_results:
-            key = (sale["_id"]["item_id"], sale["_id"]["sku_code"], sale["_id"]["city"])
+            key = (sale["_id"]["item_id"], sale["_id"]["sku_code"])
 
             inventory_data = inventory_lookup.get(key, {})
 
@@ -210,7 +204,6 @@ async def get_top_performing_products(
                 "item_id": sale["_id"]["item_id"],
                 "item_name": sale["_id"]["item_name"],
                 "sku_code": sale["_id"]["sku_code"],
-                "city": sale["_id"]["city"],
                 "metrics": {
                     "avg_daily_on_stock_days": round(avg_daily_on_stock_days, 2),
                     "avg_weekly_on_stock_days": round(avg_weekly_on_stock_days, 2),
