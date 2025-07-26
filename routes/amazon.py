@@ -1,23 +1,925 @@
-# main.py
 import pandas as pd
 from io import BytesIO
 from bson import ObjectId
 from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
-from fastapi.responses import JSONResponse
-
+from fastapi.responses import JSONResponse, StreamingResponse
+from datetime import datetime, timedelta
 from pymongo import ASCENDING
 from pymongo.errors import PyMongoError
 from ..database import get_database, serialize_mongo_document
+import os
+import requests
+import json
+import time, io
+import gzip
+from typing import Optional, Dict, Any, List
+from dotenv import load_dotenv
+import logging
 
 # --- Configuration ---
-# Use environment variables for production
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ENV
+load_dotenv()
 
 SKU_COLLECTION = "amazon_sku_mapping"
 SALES_COLLECTION = "amazon_sales"
 INVENTORY_COLLECTION = "amazon_inventory"
 REPORT_COLLECTION = "amazon_sales_inventory_reports"
+SALES_TRAFFIC_COLLECTION = "amazon_sales_traffic"
+LEDGER_COLLECTION = "amazon_ledger"
 
 router = APIRouter()
+
+# SP API Configuration
+REFRESH_TOKEN = os.getenv("SP_REFRESH_TOKEN")
+GRANT_TYPE = os.getenv("SP_GRANT_TYPE", "refresh_token")
+CLIENT_ID = os.getenv("SP_CLIENT_ID")
+CLIENT_SECRET = os.getenv("SP_CLIENT_SECRET")
+LOGIN_URL = os.getenv("SP_LOGIN_URL", "https://api.amazon.com/auth/o2/token")
+MARKETPLACE_ID = os.getenv("SP_MARKETPLACE_ID", "A21TJRUUN4KGV")  # IN marketplace
+SP_API_BASE_URL = os.getenv(
+    "SP_API_BASE_URL", "https://sellingpartnerapi-na.amazon.com"
+)
+
+# Global variable to store access token and expiry
+_access_token = None
+_token_expires_at = None
+
+
+def get_amazon_token() -> str:
+    """
+    Get a new access token from Amazon SP API using refresh token
+    """
+    global _access_token, _token_expires_at
+
+    # Check if current token is still valid (with 5 minute buffer)
+    if (
+        _access_token
+        and _token_expires_at
+        and datetime.now() < (_token_expires_at - timedelta(minutes=5))
+    ):
+        return _access_token
+
+    try:
+        payload = {
+            "grant_type": GRANT_TYPE,
+            "refresh_token": REFRESH_TOKEN,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        }
+
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+        response = requests.post(LOGIN_URL, data=payload, headers=headers)
+        response.raise_for_status()
+
+        token_data = response.json()
+        _access_token = token_data.get("access_token")
+        expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
+        _token_expires_at = datetime.now() + timedelta(seconds=expires_in)
+
+        logger.info("Successfully obtained new Amazon SP API token")
+        return _access_token
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error getting Amazon token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to authenticate with Amazon SP API: {str(e)}",
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error getting Amazon token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred during authentication: {str(e)}",
+        )
+
+
+def make_sp_api_request(
+    endpoint: str, method: str = "GET", params: Dict = None, data: Dict = None
+) -> Dict:
+    """
+    Make a request to Amazon SP API with proper authentication
+    """
+    access_token = get_amazon_token()
+
+    headers = {"x-amz-access-token": access_token, "Content-Type": "application/json"}
+
+    url = f"{SP_API_BASE_URL}{endpoint}"
+
+    try:
+        if method.upper() == "GET":
+            response = requests.get(url, headers=headers, params=params)
+        elif method.upper() == "POST":
+            response = requests.post(url, headers=headers, json=data, params=params)
+        else:
+            raise ValueError(f"Unsupported HTTP method: {method}")
+
+        response.raise_for_status()
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"SP API request failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Amazon SP API request failed: {str(e)}",
+        )
+
+
+def create_report(
+    report_type: str,
+    start_date: str,
+    end_date: str,
+    marketplace_ids: List[str] = None,
+    report_options: Dict = None,
+) -> str:
+    """
+    Create a report request and return the report document ID
+    """
+    if marketplace_ids is None:
+        marketplace_ids = [MARKETPLACE_ID]
+
+    endpoint = "/reports/2021-06-30/reports"
+
+    report_data = {
+        "reportType": report_type,
+        "dataStartTime": start_date,
+        "dataEndTime": end_date,
+        "marketplaceIds": marketplace_ids,
+    }
+
+    # Add report options if provided (for ledger reports)
+    if report_options:
+        report_data["reportOptions"] = report_options
+
+    response = make_sp_api_request(endpoint, method="POST", data=report_data)
+    return response.get("reportId")
+
+
+def get_report_status(report_document_id: str) -> Dict:
+    """
+    Check the status of a report
+    """
+    endpoint = f"/reports/2021-06-30/reports/{report_document_id}"
+    return make_sp_api_request(endpoint)
+
+
+def download_report_data(report_document_id: str, is_gzipped: bool = False) -> str:
+    """
+    Download report data using the document ID
+    """
+    endpoint = f"/reports/2021-06-30/documents/{report_document_id}"
+    document_info = make_sp_api_request(endpoint)
+
+    # Get the download URL
+    download_url = document_info.get("url")
+    if not download_url:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No download URL found in report document",
+        )
+
+    # Download the actual report data
+    response = requests.get(download_url)
+    response.raise_for_status()
+
+    # Handle gzipped content (for ledger reports)
+    if is_gzipped:
+        try:
+            return gzip.decompress(response.content).decode("utf-8")
+        except Exception as e:
+            logger.error(f"Error decompressing gzipped content: {e}")
+            # Fallback to regular content if not actually gzipped
+            return response.text
+
+    return response.text
+
+
+def get_amazon_sales_traffic_data(
+    start_date: str, end_date: str, db: Any, marketplace_ids: List[str] = None
+) -> List[Dict]:
+    """
+    Fetch sales and traffic data from Amazon SP API (ASIN-wise daily data)
+    """
+    if marketplace_ids is None:
+        marketplace_ids = [MARKETPLACE_ID]
+
+    try:
+        # Create sales and traffic report
+        report_id = create_report(
+            report_type="GET_SALES_AND_TRAFFIC_REPORT",
+            start_date=start_date,
+            end_date=end_date,
+            marketplace_ids=marketplace_ids,
+        )
+
+        # Add validation for report_id
+        if not report_id:
+            raise ValueError("Failed to create report - no report ID returned")
+
+        # Wait for report to be ready (with timeout)
+        max_wait_time = 300  # 5 minutes
+        wait_time = 0
+
+        while wait_time < max_wait_time:
+            report_status = get_report_status(report_id)
+
+            # Add validation for report_status
+            if not report_status:
+                raise ValueError("Failed to get report status - empty response")
+
+            processing_status = report_status.get("processingStatus")
+            report_document_id = report_status.get("reportDocumentId")
+
+            if processing_status == "DONE":
+                break
+            elif processing_status == "FATAL":
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Sales and traffic report processing failed",
+                )
+
+            time.sleep(10)
+            wait_time += 10
+
+        if wait_time >= max_wait_time:
+            raise HTTPException(
+                status_code=status.HTTP_408_REQUEST_TIMEOUT,
+                detail="Sales and traffic report processing timed out",
+            )
+
+        # Validate report_document_id before downloading
+        if not report_document_id:
+            raise ValueError("No report document ID available")
+
+        # Download and parse report data (JSON format)
+        report_data = download_report_data(report_document_id, is_gzipped=True)
+
+        # Add validation for report_data
+        if not report_data:
+            raise ValueError("Downloaded report data is empty")
+
+        # Parse JSON data with better error handling
+        try:
+            json_data = json.loads(report_data)
+        except json.JSONDecodeError as json_error:
+            raise ValueError(f"Failed to parse JSON report data: {json_error}")
+
+        # Validate json_data structure
+        if not isinstance(json_data, dict):
+            raise ValueError("Invalid JSON structure - expected dictionary")
+
+        # Extract ASIN-wise daily data
+        sales_traffic_data = []
+
+        # Process salesAndTrafficByAsin data
+        if "salesAndTrafficByAsin" in json_data:
+            asin_data_list = json_data["salesAndTrafficByAsin"]
+
+            if not isinstance(asin_data_list, list):
+                raise ValueError("salesAndTrafficByAsin is not a list")
+
+            for asin_data in asin_data_list:
+                asin = asin_data["parentAsin"]
+                asin_data["date"] = datetime.fromisoformat(start_date)
+                asin_data["created_at"] = datetime.now()
+                result = db[SALES_TRAFFIC_COLLECTION].find_one(
+                    {"parentAsin": asin, "date": asin_data["date"]}
+                )
+                if not result:
+                    sales_traffic_data.append(asin_data)
+        else:
+            logger.warning("No 'salesAndTrafficByAsin' data found in report")
+
+        return sales_traffic_data
+
+    except HTTPException:
+        # Re-raise HTTPExceptions as-is
+        raise
+    except ValueError as ve:
+        logger.error(f"Validation error in sales and traffic data: {ve}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Data validation error: {str(ve)}",
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error fetching sales and traffic data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch sales and traffic data: {str(e)}",
+        )
+
+
+def get_amazon_ledger_data(
+    start_date: str,
+    end_date: str,
+    db: Any,
+    marketplace_ids: List[str] = None,
+    aggregate_by_location: str = "COUNTRY",
+    aggregated_by_time_period: str = "DAILY",
+) -> List[Dict]:
+    print(start_date, end_date)
+    """
+    Fetch ledger summary data from Amazon SP API
+    """
+    if marketplace_ids is None:
+        marketplace_ids = [MARKETPLACE_ID]
+
+    try:
+        # Report options for ledger data
+        report_options = {
+            "aggregateByLocation": aggregate_by_location,
+            "aggregatedByTimePeriod": aggregated_by_time_period,
+        }
+
+        # Create ledger report
+        report_id = create_report(
+            report_type="GET_LEDGER_SUMMARY_VIEW_DATA",
+            start_date=start_date,
+            end_date=end_date,
+            marketplace_ids=marketplace_ids,
+            report_options=report_options,
+        )
+
+        # Wait for report to be ready (with timeout)
+        max_wait_time = 300  # 5 minutes
+        wait_time = 0
+        report_document_id = ""
+        while wait_time < max_wait_time:
+            report_status = get_report_status(report_id)
+            processing_status = report_status.get("processingStatus")
+            report_document_id = report_status.get("reportDocumentId")
+
+            if processing_status == "DONE":
+                break
+            elif processing_status == "FATAL":
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Ledger report processing failed",
+                )
+
+            time.sleep(10)
+            wait_time += 10
+
+        if wait_time >= max_wait_time:
+            raise HTTPException(
+                status_code=status.HTTP_408_REQUEST_TIMEOUT,
+                detail="Ledger report processing timed out",
+            )
+
+        # Download and parse report data (TSV format, gzipped)
+        report_data = download_report_data(report_document_id, is_gzipped=True)
+
+        # Convert TSV data to list of dictionaries
+        df = pd.read_csv(BytesIO(report_data.encode("utf-8")), sep="\t")
+        ledger_data = df.to_dict("records")
+        # Add metadata
+        normalized_data = []
+        for record in ledger_data:
+            normalized_record = {
+                key.lower().replace(" ", "_"): value for key, value in record.items()
+            }
+            normalized_record["date"] = datetime.fromisoformat(start_date)
+            normalized_record["created_at"] = datetime.now()
+            normalized_record["report_type"] = "ledger"
+            result = db.amazon_ledger.find_one(
+                {
+                    "date": normalized_record["date"],
+                    "asin": normalized_record["asin"],
+                    "location": normalized_record["location"],
+                    "ending_warehouse_balance": normalized_record[
+                        "ending_warehouse_balance"
+                    ],
+                }
+            )
+            if not result:
+                normalized_data.append(normalized_record)
+
+        return normalized_data
+
+    except Exception as e:
+        logger.error(f"Error fetching ledger data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch ledger data: {str(e)}",
+        )
+
+
+def get_amazon_inventory_data() -> List[Dict]:
+    """
+    Fetch inventory data from Amazon SP API
+    """
+    try:
+        endpoint = "/fba/inventory/v1/summaries"
+        params = {
+            "granularityType": "Marketplace",
+            "granularityId": MARKETPLACE_ID,
+            "marketplaceIds": MARKETPLACE_ID,
+        }
+
+        response = make_sp_api_request(endpoint, params=params)
+        inventory_summaries = response.get("inventorySummaries", [])
+
+        # Add metadata
+        for record in inventory_summaries:
+            record["created_at"] = datetime.now()
+            record["_report_type"] = "inventory"
+
+        return inventory_summaries
+
+    except Exception as e:
+        logger.error(f"Error fetching inventory data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch inventory data: {str(e)}",
+        )
+
+
+async def insert_data_to_db(
+    collection_name: str, data: List[Dict], db=Depends(get_database)
+) -> int:
+    """
+    Insert data into MongoDB collection
+    """
+    try:
+        if not data:
+            return 0
+
+        collection = db[collection_name]
+
+        # # Create indexes for better performance
+        # if collection_name == SALES_COLLECTION:
+        #     collection.create_index([("amazon-order-id", ASCENDING)])
+        #     collection.create_index([("purchase-date", ASCENDING)])
+        # elif collection_name == INVENTORY_COLLECTION:
+        #     collection.create_index([("sellerSku", ASCENDING)])
+        #     collection.create_index([("asin", ASCENDING)])
+        # elif collection_name == SALES_TRAFFIC_COLLECTION:
+        #     collection.create_index([("parentAsin", ASCENDING)])
+        #     collection.create_index([("childAsin", ASCENDING)])
+        #     collection.create_index([("date", ASCENDING)])
+        # elif collection_name == LEDGER_COLLECTION:
+        #     collection.create_index([("Date", ASCENDING)])
+        #     collection.create_index([("Transaction Type", ASCENDING)])
+
+        # Insert data
+        result = collection.insert_many(data)
+        logger.info(
+            f"Inserted {len(result.inserted_ids)} records into {collection_name}"
+        )
+
+        return len(result.inserted_ids)
+
+    except PyMongoError as e:
+        logger.error(f"Database error inserting data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}",
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error inserting data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}",
+        )
+
+
+# API Endpoints
+
+
+@router.post("/auth/token")
+async def refresh_amazon_token():
+    """
+    Refresh Amazon SP API token
+    """
+    try:
+        token = get_amazon_token()
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Token refreshed successfully",
+                "token_expires_at": (
+                    _token_expires_at.isoformat() if _token_expires_at else None
+                ),
+            },
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+@router.post("/sync/sales-traffic")
+async def sync_sales_traffic_data(
+    start_date: str,
+    end_date: str,
+    marketplace_ids: Optional[List[str]] = None,
+    db=Depends(get_database),
+):
+    """
+    Fetch ASIN-wise daily sales and traffic data from Amazon and insert into database
+    Format: YYYY-MM-DD
+    """
+    try:
+        # Validate date format
+        datetime.strptime(start_date, "%Y-%m-%d")
+        datetime.strptime(end_date, "%Y-%m-%d")
+
+        # Convert to ISO format for API
+        start_datetime = f"{start_date}T00:00:00Z"
+        end_datetime = f"{end_date}T23:59:59Z"
+
+        # Fetch sales and traffic data
+        sales_traffic_data = get_amazon_sales_traffic_data(
+            start_datetime, end_datetime, db, marketplace_ids
+        )
+        # Insert into database
+        inserted_count = await insert_data_to_db(
+            SALES_TRAFFIC_COLLECTION, sales_traffic_data, db
+        )
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Sales and traffic data synced successfully",
+                "records_inserted": inserted_count,
+                "date_range": f"{start_date} to {end_date}",
+                "marketplace_ids": marketplace_ids or [MARKETPLACE_ID],
+            },
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid date format. Use YYYY-MM-DD",
+        )
+    except Exception as e:
+        logger.error(f"Error syncing sales and traffic data: {e}")
+        raise
+
+
+@router.post("/sync/ledger")
+async def sync_ledger_data(
+    start_date: str,
+    end_date: str,
+    marketplace_ids: Optional[List[str]] = None,
+    aggregate_by_location: str = "FC",
+    aggregated_by_time_period: str = "DAILY",
+    db=Depends(get_database),
+):
+    """
+    Fetch ledger summary data from Amazon and insert into database
+    Format: YYYY-MM-DD
+    """
+    try:
+        # Validate date format
+        datetime.strptime(start_date, "%Y-%m-%d")
+        datetime.strptime(end_date, "%Y-%m-%d")
+
+        # Convert to ISO format for API
+        start_datetime = f"{start_date}T00:00:00Z"
+        end_datetime = f"{end_date}T00:00:00Z"
+
+        # Fetch ledger data
+        ledger_data = get_amazon_ledger_data(
+            start_datetime,
+            end_datetime,
+            db,
+            marketplace_ids,
+            aggregate_by_location,
+            aggregated_by_time_period,
+        )
+
+        # Insert into database
+        inserted_count = await insert_data_to_db(LEDGER_COLLECTION, ledger_data, db)
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Ledger data synced successfully",
+                "records_inserted": inserted_count,
+                "date_range": f"{start_date} to {end_date}",
+                "marketplace_ids": marketplace_ids or [MARKETPLACE_ID],
+                "aggregate_by_location": aggregate_by_location,
+                "aggregated_by_time_period": aggregated_by_time_period,
+            },
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid date format. Use YYYY-MM-DD",
+        )
+    except Exception as e:
+        logger.error(f"Error syncing ledger data: {e}")
+        raise
+
+
+@router.post("/sync/inventory")
+async def sync_inventory_data(db=Depends(get_database)):
+    """
+    Fetch inventory data from Amazon and insert into database
+    """
+    try:
+        # Fetch inventory data
+        inventory_data = get_amazon_inventory_data()
+
+        # Insert into database
+        inserted_count = await insert_data_to_db(
+            INVENTORY_COLLECTION, inventory_data, db
+        )
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Inventory data synced successfully",
+                "records_inserted": inserted_count,
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Error syncing inventory data: {e}")
+        raise
+
+
+@router.post("/sync/all")
+async def sync_all_data(
+    start_date: str,
+    end_date: str,
+    marketplace_ids: Optional[List[str]] = None,
+    include_sales_traffic: bool = True,
+    include_ledger: bool = True,
+    include_inventory: bool = True,
+    db=Depends(get_database),
+):
+    """
+    Sync sales traffic, ledger, and inventory data
+    """
+    results = {}
+
+    try:
+        # Sync sales and traffic data
+        if include_sales_traffic:
+            try:
+                sales_traffic_data = get_amazon_sales_traffic_data(
+                    f"{start_date}T00:00:00Z",
+                    f"{end_date}T23:59:59Z",
+                    db,
+                    marketplace_ids,
+                )
+                sales_traffic_count = await insert_data_to_db(
+                    SALES_TRAFFIC_COLLECTION, sales_traffic_data, db
+                )
+                results["sales_traffic_records"] = sales_traffic_count
+            except Exception as e:
+                logger.error(f"Error syncing sales traffic data: {e}")
+                results["sales_traffic_error"] = str(e)
+
+        # Sync ledger data
+        if include_ledger:
+            try:
+                ledger_data = get_amazon_ledger_data(
+                    f"{start_date}T00:00:00Z",
+                    f"{end_date}T23:59:59Z",
+                    db,
+                    marketplace_ids,
+                )
+                ledger_count = await insert_data_to_db(
+                    LEDGER_COLLECTION, ledger_data, db
+                )
+                results["ledger_records"] = ledger_count
+            except Exception as e:
+                logger.error(f"Error syncing ledger data: {e}")
+                results["ledger_error"] = str(e)
+
+        # Sync inventory data
+        if include_inventory:
+            try:
+                inventory_data = get_amazon_inventory_data()
+                inventory_count = await insert_data_to_db(
+                    INVENTORY_COLLECTION, inventory_data, db
+                )
+                results["inventory_records"] = inventory_count
+            except Exception as e:
+                logger.error(f"Error syncing inventory data: {e}")
+                results["inventory_error"] = str(e)
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Data synchronization completed",
+                "date_range": f"{start_date} to {end_date}",
+                "marketplace_ids": marketplace_ids or [MARKETPLACE_ID],
+                **results,
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Error syncing all data: {e}")
+        raise
+
+
+@router.get("/status")
+async def get_sync_status(db=Depends(get_database)):
+    """
+    Get synchronization status and data counts
+    """
+    try:
+        sales_count = db[SALES_COLLECTION].count_documents({})
+        inventory_count = db[INVENTORY_COLLECTION].count_documents({})
+
+        # Get latest sync timestamps
+        latest_sales = db[SALES_COLLECTION].find_one({}, sort=[("_extracted_at", -1)])
+        latest_inventory = db[INVENTORY_COLLECTION].find_one(
+            {}, sort=[("_extracted_at", -1)]
+        )
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "sales_records": sales_count,
+                "inventory_records": inventory_count,
+                "last_sales_sync": (
+                    latest_sales.get("_extracted_at").isoformat()
+                    if latest_sales
+                    else None
+                ),
+                "last_inventory_sync": (
+                    latest_inventory.get("_extracted_at").isoformat()
+                    if latest_inventory
+                    else None
+                ),
+                "token_expires_at": (
+                    _token_expires_at.isoformat() if _token_expires_at else None
+                ),
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Error getting sync status: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+@router.get("/sales-traffic/{asin}")
+async def get_asin_sales_data(
+    asin: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db=Depends(get_database),
+):
+    """
+    Get sales and traffic data for a specific ASIN
+    """
+    try:
+        query = {"$or": [{"parentAsin": asin}, {"childAsin": asin}]}
+
+        # Add date range filter if provided
+        if start_date and end_date:
+            query["date"] = {"$gte": start_date, "$lte": end_date}
+
+        collection = db[SALES_TRAFFIC_COLLECTION]
+        results = list(collection.find(query).sort("date", 1))
+
+        # Serialize MongoDB documents
+        serialized_results = [serialize_mongo_document(doc) for doc in results]
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "asin": asin,
+                "records_found": len(serialized_results),
+                "data": serialized_results,
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Error fetching ASIN data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+@router.get("/ledger/summary")
+async def get_ledger_summary(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+    db=Depends(get_database),
+):
+    """
+    Get ledger summary data with optional filters
+    """
+    try:
+        query = {}
+
+        # Add date range filter if provided
+        if start_date and end_date:
+            query["Date"] = {"$gte": start_date, "$lte": end_date}
+
+        # Add transaction type filter if provided
+        if transaction_type:
+            query["Transaction Type"] = transaction_type
+
+        collection = db[LEDGER_COLLECTION]
+        results = list(collection.find(query).sort("Date", 1))
+
+        # Serialize MongoDB documents
+        serialized_results = [serialize_mongo_document(doc) for doc in results]
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "records_found": len(serialized_results),
+                "filters": {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "transaction_type": transaction_type,
+                },
+                "data": serialized_results,
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Error fetching ledger summary: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+@router.post("/sync/daily-batch")
+async def sync_daily_batch(
+    date: str, marketplace_ids: Optional[List[str]] = None, db=Depends(get_database)
+):
+    """
+    Sync all data for a specific date (useful for daily batch processing)
+    """
+    try:
+        # Validate date format
+        datetime.strptime(date, "%Y-%m-%d")
+
+        results = {}
+
+        # Sync sales and traffic data for the specific date
+        try:
+            sales_traffic_data = get_amazon_sales_traffic_data(
+                f"{date}T00:00:00Z", f"{date}T23:59:59Z", db, marketplace_ids
+            )
+            sales_traffic_count = await insert_data_to_db(
+                SALES_TRAFFIC_COLLECTION, sales_traffic_data, db
+            )
+            results["sales_traffic_records"] = sales_traffic_count
+        except Exception as e:
+            logger.error(f"Error syncing daily sales traffic data: {e}")
+            results["sales_traffic_error"] = str(e)
+
+        # Sync ledger data for the specific date
+        try:
+            ledger_data = get_amazon_ledger_data(
+                f"{date}T00:00:00Z", f"{date}T23:59:59Z", db, marketplace_ids
+            )
+            ledger_count = await insert_data_to_db(LEDGER_COLLECTION, ledger_data, db)
+            results["ledger_records"] = ledger_count
+        except Exception as e:
+            logger.error(f"Error syncing daily ledger data: {e}")
+            results["ledger_error"] = str(e)
+
+        # Sync inventory data (current snapshot)
+        try:
+            inventory_data = get_amazon_inventory_data()
+            inventory_count = await insert_data_to_db(
+                INVENTORY_COLLECTION, inventory_data, db
+            )
+            results["inventory_records"] = inventory_count
+        except Exception as e:
+            logger.error(f"Error syncing daily inventory data: {e}")
+            results["inventory_error"] = str(e)
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Daily batch synchronization completed",
+                "date": date,
+                "marketplace_ids": marketplace_ids or [MARKETPLACE_ID],
+                **results,
+            },
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid date format. Use YYYY-MM-DD",
+        )
+    except Exception as e:
+        logger.error(f"Error in daily batch sync: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid date format. Use YYYY-MM-DD",
+        )
 
 
 @router.get("/get_amazon_sku_mapping")
@@ -172,4 +1074,333 @@ async def delete_item(item_id: str):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",
+        )
+
+
+async def generate_report_by_date_range(
+    start_date: str, end_date: str, database: Any, warehouse_type: str = "all"
+):
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+
+        is_single_day = start == end
+
+        # Build warehouse filter based on warehouse_type parameter
+        warehouse_filter = {}
+        if warehouse_type == "fba":
+            warehouse_filter = {"location": {"$ne": "VKSX"}}
+        elif warehouse_type == "seller_flex":
+            warehouse_filter = {"location": "VKSX"}
+        # If warehouse_type is "all" or any other value, no additional filter is applied
+
+        # Common initial stages
+        base_pipeline = [
+            {
+                "$match": {
+                    "disposition": "SELLABLE",
+                    "date": {"$gte": start, "$lte": end},
+                    **warehouse_filter,  # Add warehouse filter here
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "amazon_sku_mapping",
+                    "localField": "asin",
+                    "foreignField": "item_id",
+                    "as": "item_info",
+                }
+            },
+            {"$unwind": {"path": "$item_info", "preserveNullAndEmptyArrays": True}},
+            {
+                "$lookup": {
+                    "from": "amazon_sales_traffic",
+                    "let": {"ledger_asin": "$asin", "ledger_date": "$date"},
+                    "pipeline": [
+                        {
+                            "$match": {
+                                "$expr": {
+                                    "$and": [
+                                        {"$eq": ["$parentAsin", "$$ledger_asin"]},
+                                        {"$eq": ["$date", "$$ledger_date"]},
+                                    ]
+                                }
+                            }
+                        }
+                    ],
+                    "as": "sales_data",
+                }
+            },
+            {"$unwind": {"path": "$sales_data", "preserveNullAndEmptyArrays": True}},
+            {
+                "$project": {
+                    "_id": 0,
+                    "asin": "$asin",
+                    "item_name": "$title",
+                    "warehouse": "$location",
+                    "units_sold": {
+                        "$ifNull": ["$sales_data.salesByAsin.unitsOrdered", 0]
+                    },
+                    "total_amount": {
+                        "$ifNull": [
+                            "$sales_data.salesByAsin.orderedProductSales.amount",
+                            0,
+                        ]
+                    },
+                    "revenue": {"$ifNull": ["$sales_data.revenue", 0]},
+                    "date": "$date",
+                    "closing_stock": {"$ifNull": ["$ending_warehouse_balance", 0]},
+                    "sessions": {"$ifNull": ["$sales_data.trafficByAsin.sessions", 0]},
+                    "sku_code": "$item_info.sku_code",
+                }
+            },
+            # Group by product (without warehouse) to get sum totals across all warehouses
+            {
+                "$group": {
+                    "_id": {
+                        "asin": "$asin",
+                        "sku_code": "$sku_code",
+                        "item_name": "$item_name",
+                    },
+                    "total_units_sold": {"$sum": "$units_sold"},
+                    "total_amount": {"$sum": "$total_amount"},
+                    "total_sessions": {"$sum": "$sessions"},
+                    "total_closing_stock": {"$sum": "$closing_stock"},
+                    "warehouses": {
+                        "$addToSet": "$warehouse"
+                    },  # Keep track of which warehouses are included
+                }
+            },
+            {
+                "$project": {
+                    "_id": 0,
+                    "asin": "$_id.asin",
+                    "sku_code": "$_id.sku_code",
+                    "item_name": "$_id.item_name",
+                    "warehouses": "$warehouses",  # Show which warehouses contributed to the totals
+                    "units_sold": "$total_units_sold",
+                    "total_amount": "$total_amount",
+                    "sessions": "$total_sessions",
+                    "closing_stock": "$total_closing_stock",
+                }
+            },
+            {
+                "$sort": {
+                    "sku_code": -1,
+                    "warehouse": -1,
+                    "asin": -1,
+                }
+            },
+        ]
+
+        collection = database.get_collection(LEDGER_COLLECTION)
+        cursor = list(collection.aggregate(base_pipeline))
+        result = serialize_mongo_document(cursor)
+
+        return result
+
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred generating Amazon report: {str(e)}",
+        )
+
+
+@router.get("/get_report_data_by_date_range")
+async def get_report_data_by_date_range(
+    start_date: str,
+    end_date: str,
+    warehouse_type: str = "all",  # New parameter: "all", "fba", or "seller_flex"
+    database=Depends(get_database),
+):
+    """
+    Returns report data for a specific date range with sum totals for frontend consumption.
+
+    Parameters:
+    - start_date: Start date in YYYY-MM-DD format
+    - end_date: End date in YYYY-MM-DD format
+    - warehouse_type: Filter type - "all" (default), "fba" (excludes VKSX), or "seller_flex" (only VKSX)
+    """
+    try:
+        # Validate warehouse_type parameter
+        valid_types = ["all", "fba", "seller_flex"]
+        if warehouse_type not in valid_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid warehouse_type. Must be one of: {', '.join(valid_types)}",
+            )
+
+        report_response = await generate_report_by_date_range(
+            start_date=start_date,
+            end_date=end_date,
+            database=database,
+            warehouse_type=warehouse_type,
+        )
+
+        print(f"Retrieved dynamic report data for warehouse_type: {warehouse_type}")
+        return report_response
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error retrieving report data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred retrieving the report data: {e}",
+        )
+
+def format_column_name(column_name):
+    """Convert snake_case column names to proper formatted names"""
+    # Replace underscores with spaces and title case
+    formatted = column_name.replace('_', ' ').title()
+    
+    # Handle specific cases for better formatting
+    replacements = {
+        'Asin': 'ASIN',
+        'Sku Code': 'SKU Code',
+        'Item Name': 'Item Name',
+        'Units Sold': 'Units Sold',
+        'Total Amount': 'Total Amount',
+        'Closing Stock': 'Closing Stock',
+        'Sessions': 'Sessions',
+        'Warehouses': 'Warehouses'
+    }
+    
+    return replacements.get(formatted, formatted)
+
+@router.get('/download_report_by_date_range')
+async def download_report_by_date_range(
+    start_date: str,
+    end_date: str,
+    warehouse_type: str = "all",  # "all", "fba", or "seller_flex"
+    database=Depends(get_database),
+):
+    """
+    Downloads report data for a specific date range as an Excel file.
+
+    Parameters:
+    - start_date: Start date in YYYY-MM-DD format
+    - end_date: End date in YYYY-MM-DD format
+    - warehouse_type: Filter type - "all" (default), "fba" (excludes VKSX), or "seller_flex" (only VKSX)
+    
+    Returns:
+    - Excel file download with formatted column names
+    """
+    try:
+        # Validate warehouse_type parameter
+        valid_types = ["all", "fba", "seller_flex"]
+        if warehouse_type not in valid_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid warehouse_type. Must be one of: {', '.join(valid_types)}",
+            )
+
+        # Generate the report data using existing function
+        report_data = await generate_report_by_date_range(
+            start_date=start_date,
+            end_date=end_date,
+            database=database,
+            warehouse_type=warehouse_type,
+        )
+
+        if not report_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No data found for the specified date range and warehouse type",
+            )
+
+        # Convert to DataFrame
+        df = pd.DataFrame(report_data)
+        
+        # Format column names
+        column_mapping = {}
+        for col in df.columns:
+            column_mapping[col] = format_column_name(col)
+        
+        df = df.rename(columns=column_mapping)
+        
+        # Handle the warehouses column (convert list to string)
+        if 'Warehouses' in df.columns:
+            df['Warehouses'] = df['Warehouses'].apply(
+                lambda x: ', '.join(x) if isinstance(x, list) else str(x)
+            )
+        
+        # Reorder columns for better presentation
+        preferred_order = [
+            'ASIN', 'SKU Code', 'Item Name', 'Warehouses', 
+            'Units Sold', 'Total Amount', 'Sessions', 'Closing Stock'
+        ]
+        
+        # Only include columns that exist in the DataFrame
+        column_order = [col for col in preferred_order if col in df.columns]
+        # Add any remaining columns not in preferred order
+        remaining_cols = [col for col in df.columns if col not in column_order]
+        final_column_order = column_order + remaining_cols
+        
+        df = df[final_column_order]
+        
+        # Create Excel file in memory
+        excel_buffer = io.BytesIO()
+        
+        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Report Data', index=False)
+            
+            # Get the workbook and worksheet for formatting
+            workbook = writer.book
+            worksheet = writer.sheets['Report Data']
+            
+            # Auto-adjust column widths
+            for column in worksheet.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                
+                adjusted_width = min(max_length + 2, 50)  # Cap at 50 characters
+                worksheet.column_dimensions[column_letter].width = adjusted_width
+            
+            # Style the header row
+            from openpyxl.styles import Font, PatternFill
+            
+            header_font = Font(bold=True, color="FFFFFF")
+            header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+            
+            for cell in worksheet[1]:
+                cell.font = header_font
+                cell.fill = header_fill
+        
+        excel_buffer.seek(0)
+        
+        # Generate filename with timestamp and warehouse type
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        warehouse_suffix = f"_{warehouse_type}" if warehouse_type != "all" else ""
+        filename = f"inventory_report_{start_date}_to_{end_date}{warehouse_suffix}_{timestamp}.xlsx"
+        
+        # Create streaming response
+        response = StreamingResponse(
+            io.BytesIO(excel_buffer.read()),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+        print(f"Generated Excel report for warehouse_type: {warehouse_type}, rows: {len(df)}")
+        return response
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error generating Excel report: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred generating the Excel report: {e}",
         )
