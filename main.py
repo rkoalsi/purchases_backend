@@ -9,18 +9,50 @@ from .routes.zoho import router as zoho_router
 from .routes.util import router as util_router
 from .routes.workflow import router as workflow_router
 from .database import connect_db, close_db
+from contextlib import asynccontextmanager
+from .helpers.scheduler import scheduler, api_scheduler, setup_scheduler
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle"""
+    # Startup
+    print("Starting up application...")
+    
+    # Initialize database
+    connect_db()
+    
+    # Initialize HTTP client for scheduler
+    await api_scheduler.initialize_client()
+    
+    # Setup and start scheduler
+    setup_scheduler()
+    scheduler.start()
+    print("Scheduler started")
+    
+    yield
+    
+    # Shutdown
+    print("Shutting down application...")
+    
+    # Shutdown scheduler
+    scheduler.shutdown()
+    await api_scheduler.close_client()
+    
+    # Close database
+    close_db()
+    
+    print("Application shutdown complete")
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:8000",
     "https://127.0.0.1:8000",
     "http://purchase.pupscribe.in",
-    "https://purchase.pupscribe.in",  # Add this for when you enable SSL
-    "http://localhost",  # For nginx proxy
-    "https://localhost",  # For nginx proxy with SSL
+    "https://purchase.pupscribe.in",  
+    "http://localhost",  
+    "https://localhost", 
 ]
 
 app.add_middleware(
@@ -31,25 +63,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.on_event("startup")
-async def startup_event():
-    print("FastAPI app startup event triggered.")
-    connect_db()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    print("FastAPI app shutdown event triggered.")
-    close_db()
-
-
 @app.get("/")
 def read_root():
     return {"Hello": "World"}
 
 
-# --- Include Routers (use distinct names) ---
+# --- Include Routers ---
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(user_router, prefix="/users", tags=["user"])
 app.include_router(blinkit_router, prefix="/blinkit", tags=["blinkit"])
