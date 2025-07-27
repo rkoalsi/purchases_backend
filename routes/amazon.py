@@ -1160,12 +1160,12 @@ async def generate_report_by_date_range(
                     "_id": {
                         "asin": "$asin",
                         "sku_code": "$sku_code",
-                        "item_name": "$item_name",
                     },
                     "total_units_sold": {"$sum": "$units_sold"},
                     "total_amount": {"$sum": "$total_amount"},
                     "total_sessions": {"$sum": "$sessions"},
                     "total_closing_stock": {"$sum": "$closing_stock"},
+                    "item_name": {"$last":"$item_name"},
                     "warehouses": {
                         "$addToSet": "$warehouse"
                     },  # Keep track of which warehouses are included
@@ -1176,7 +1176,7 @@ async def generate_report_by_date_range(
                     "_id": 0,
                     "asin": "$_id.asin",
                     "sku_code": "$_id.sku_code",
-                    "item_name": "$_id.item_name",
+                    "item_name": "$item_name",
                     "warehouses": "$warehouses",  # Show which warehouses contributed to the totals
                     "units_sold": "$total_units_sold",
                     "total_amount": "$total_amount",
