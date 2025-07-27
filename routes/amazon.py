@@ -1076,7 +1076,6 @@ async def delete_item(item_id: str):
             detail=f"An error occurred processing the file: {e}",
         )
 
-
 async def generate_report_by_date_range(
     start_date: str, end_date: str, database: Any, warehouse_type: str = "all"
 ):
@@ -1154,21 +1153,99 @@ async def generate_report_by_date_range(
                     "sku_code": "$item_info.sku_code",
                 }
             },
-            # Group by product (without warehouse) to get sum totals across all warehouses
+            # Group by product and date to get daily totals across all warehouses
             {
                 "$group": {
                     "_id": {
                         "asin": "$asin",
                         "sku_code": "$sku_code",
+                        "date": "$date"
                     },
-                    "total_units_sold": {"$sum": "$units_sold"},
-                    "total_amount": {"$sum": "$total_amount"},
-                    "total_sessions": {"$sum": "$sessions"},
-                    "total_closing_stock": {"$sum": "$closing_stock"},
-                    "item_name": {"$last":"$item_name"},
+                    "daily_units_sold": {"$sum": "$units_sold"},
+                    "daily_amount": {"$sum": "$total_amount"},
+                    "daily_sessions": {"$sum": "$sessions"},
+                    "daily_closing_stock": {"$sum": "$closing_stock"},
+                    "item_name": {"$last": "$item_name"},
+                    "warehouses_for_day": {"$addToSet": "$warehouse"}
+                }
+            },
+            # Now group by product to collect all daily data and calculate totals
+            {
+                "$group": {
+                    "_id": {
+                        "asin": "$_id.asin",
+                        "sku_code": "$_id.sku_code",
+                    },
+                    "total_units_sold": {"$sum": "$daily_units_sold"},
+                    "total_amount": {"$sum": "$daily_amount"},
+                    "total_sessions": {"$sum": "$daily_sessions"},
+                    "total_closing_stock": {"$sum": "$daily_closing_stock"},
+                    "item_name": {"$last": "$item_name"},
+                    "all_warehouses": {"$addToSet": "$warehouses_for_day"},
+                    "daily_data": {
+                        "$push": {
+                            "date": "$_id.date",
+                            "closing_stock": "$daily_closing_stock",
+                            "units_sold": "$daily_units_sold"
+                        }
+                    }
+                }
+            },
+            # Calculate days in stock at the product level - FIXED VERSION
+            {
+                "$addFields": {
+                    "total_days_in_stock": {
+                        "$cond": {
+                            "if": {
+                                "$and": [
+                                    {"$ne": ["$daily_data", None]},
+                                    {"$gt": [{"$size": "$daily_data"}, 0]}
+                                ]
+                            },
+                            "then": {
+                                "$let": {
+                                    "vars": {
+                                        "sorted_data": {
+                                            "$sortArray": {
+                                                "input": "$daily_data",
+                                                "sortBy": {"date": 1}
+                                            }
+                                        }
+                                    },
+                                    "in": {
+                                        "$size": {
+                                            "$filter": {
+                                                "input": "$$sorted_data",
+                                                "cond": {"$gt": ["$$this.closing_stock", 0]}
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            "else": 0
+                        }
+                    },
                     "warehouses": {
-                        "$addToSet": "$warehouse"
-                    },  # Keep track of which warehouses are included
+                        "$reduce": {
+                            "input": "$all_warehouses",
+                            "initialValue": [],
+                            "in": {"$setUnion": ["$$value", "$$this"]}
+                        }
+                    }
+                }
+            },
+            # Calculate DRR (Daily Run Rate)
+            {
+                "$addFields": {
+                    "drr": {
+                        "$cond": {
+                            "if": {"$gt": ["$total_days_in_stock", 0]},
+                            "then": {
+                                "$divide": ["$total_units_sold", "$total_days_in_stock"]
+                            },
+                            "else": 0
+                        }
+                    }
                 }
             },
             {
@@ -1182,6 +1259,8 @@ async def generate_report_by_date_range(
                     "total_amount": "$total_amount",
                     "sessions": "$total_sessions",
                     "closing_stock": "$total_closing_stock",
+                    "total_days_in_stock": "$total_days_in_stock",  # New column
+                    "drr": {"$round": ["$drr", 2]}  # New column - rounded to 2 decimal places
                 }
             },
             {
@@ -1208,7 +1287,6 @@ async def generate_report_by_date_range(
             detail=f"An error occurred generating Amazon report: {str(e)}",
         )
 
-
 @router.get("/get_report_data_by_date_range")
 async def get_report_data_by_date_range(
     start_date: str,
@@ -1223,6 +1301,10 @@ async def get_report_data_by_date_range(
     - start_date: Start date in YYYY-MM-DD format
     - end_date: End date in YYYY-MM-DD format
     - warehouse_type: Filter type - "all" (default), "fba" (excludes VKSX), or "seller_flex" (only VKSX)
+    
+    New Columns:
+    - total_days_in_stock: Number of days the item had stock > 0 (resets when stock = 0)
+    - drr: Daily Run Rate (total units sold / total days in stock)
     """
     try:
         # Validate warehouse_type parameter
@@ -1251,7 +1333,7 @@ async def get_report_data_by_date_range(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred retrieving the report data: {e}",
         )
-
+        
 def format_column_name(column_name):
     """Convert snake_case column names to proper formatted names"""
     # Replace underscores with spaces and title case
