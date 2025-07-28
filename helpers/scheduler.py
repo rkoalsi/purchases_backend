@@ -31,7 +31,7 @@ class APIScheduler:
         try:
             logger.info("Executing Sales Traffic API call...")
             start_date = (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
-            response = await self.client.get(f"/amazon/sync/sales_traffic?start_date={start_date}&end_date={start_date}")
+            response = await self.client.get(f"/amazon/sync/sales-traffic?start_date={start_date}&end_date={start_date}")
             response.raise_for_status()
             logger.info(f"Sales Traffic API call successful: {response.status_code}")
             return response.json()
