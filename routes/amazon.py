@@ -1075,7 +1075,7 @@ async def delete_item(item_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",
         )
-
+        
 async def generate_report_by_date_range(
     start_date: str, end_date: str, database: Any, warehouse_type: str = "all"
 ):
@@ -1085,106 +1085,111 @@ async def generate_report_by_date_range(
 
         is_single_day = start == end
 
-        # Build warehouse filter based on warehouse_type parameter
-        warehouse_filter = {}
+        # Build ledger match conditions based on warehouse_type parameter
+        ledger_match_conditions = [
+            {"$eq": ["$asin", "$$sales_asin"]},
+            {"$eq": ["$date", "$$sales_date"]},
+            {"$eq": ["$disposition", "SELLABLE"]}
+        ]
+        
         if warehouse_type == "fba":
-            warehouse_filter = {"location": {"$ne": "VKSX"}}
+            ledger_match_conditions.append({"$ne": ["$location", "VKSX"]})
         elif warehouse_type == "seller_flex":
-            warehouse_filter = {"location": "VKSX"}
-        # If warehouse_type is "all" or any other value, no additional filter is applied
+            ledger_match_conditions.append({"$eq": ["$location", "VKSX"]})
+        # If warehouse_type is "all", no additional filter is applied
 
-        # Fixed pipeline that aggregates ledger data first to prevent sales data multiplication
+        # Pipeline that starts from sales_traffic to ensure no sales data is missed
         base_pipeline = [
+            # Start with sales data to ensure we don't miss any sales
             {
                 "$match": {
-                    "disposition": "SELLABLE",
                     "date": {"$gte": start, "$lte": end},
-                    **warehouse_filter,  # Add warehouse filter here
                 }
             },
-            # FIRST: Aggregate ledger data by ASIN and date across all warehouses
             {
                 "$group": {
                     "_id": {
-                        "asin": "$asin",
+                        "asin": "$parentAsin",
                         "date": "$date"
                     },
-                    "total_closing_stock": {"$sum": "$ending_warehouse_balance"},
-                    "total_customer_shipments": {"$sum": {"$abs": "$customer_shipments"}},
-                    "item_name": {"$last": "$title"},
-                    "warehouses": {"$addToSet": "$location"}
+                    "units_sold": {"$sum": "$salesByAsin.unitsOrdered"},
+                    "amount": {"$sum": "$salesByAsin.orderedProductSales.amount"},
+                    "sessions": {
+                        "$sum": {
+                            "$add": [
+                                {"$ifNull": ["$trafficByAsin.sessions", 0]},
+                                {"$ifNull": ["$trafficByAsin.sessionsB2B", 0]}
+                            ]
+                        }
+                    }
                 }
             },
-            # THEN: Lookup SKU mapping (once per ASIN)
+            # Lookup corresponding ledger data
             {
                 "$lookup": {
-                    "from": "amazon_sku_mapping",
-                    "localField": "_id.asin",
-                    "foreignField": "item_id",
-                    "as": "item_info",
-                }
-            },
-            {"$addFields": {"item_info": {"$first": "$item_info"}}},
-            # THEN: Lookup sales data (once per ASIN per date)
-            {
-                "$lookup": {
-                    "from": "amazon_sales_traffic",
-                    "let": {"ledger_asin": "$_id.asin", "ledger_date": "$_id.date"},
+                    "from": "amazon_ledger",
+                    "let": {
+                        "sales_asin": "$_id.asin",
+                        "sales_date": "$_id.date"
+                    },
                     "pipeline": [
                         {
                             "$match": {
                                 "$expr": {
-                                    "$and": [
-                                        {"$eq": ["$parentAsin", "$$ledger_asin"]},
-                                        {"$eq": ["$date", "$$ledger_date"]},
-                                    ]
+                                    "$and": ledger_match_conditions
                                 }
                             }
                         },
                         {
                             "$group": {
-                                "_id": {"parentAsin": "$parentAsin", "date": "$date"},
-                                "unitsOrdered": {"$sum": "$salesByAsin.unitsOrdered"},
-                                "orderedProductSales": {
-                                    "$sum": "$salesByAsin.orderedProductSales.amount"
-                                },
-                                "sessions": {"$sum": "$trafficByAsin.sessions"},
-                                "revenue": {"$sum": "$revenue"},
+                                "_id": {"asin": "$asin", "date": "$date"},
+                                "closing_stock": {"$sum": "$ending_warehouse_balance"},
+                                "item_name": {"$last": "$title"},
+                                "warehouses": {"$addToSet": "$location"}
                             }
-                        },
+                        }
                     ],
-                    "as": "sales_data",
+                    "as": "ledger_data"
                 }
             },
-            {"$addFields": {"sales_data": {"$first": "$sales_data"}}},
-            # Now group by ASIN to collect all daily data and calculate totals
+            {
+                "$addFields": {
+                    "ledger_data": {"$first": "$ledger_data"}
+                }
+            },
+            # Lookup SKU mapping
+            {
+                "$lookup": {
+                    "from": "amazon_sku_mapping",
+                    "localField": "_id.asin",
+                    "foreignField": "item_id",
+                    "as": "item_info"
+                }
+            },
+            {
+                "$addFields": {
+                    "item_info": {"$first": "$item_info"}
+                }
+            },
+            # Group by ASIN to get totals
             {
                 "$group": {
-                    "_id": {
-                        "asin": "$_id.asin"
-                    },
-                    "total_units_sold": {
-                        "$sum": {"$ifNull": ["$sales_data.unitsOrdered", 0]}
-                    },
-                    "total_amount": {
-                        "$sum": {"$ifNull": ["$sales_data.orderedProductSales", 0]}
-                    },
-                    "total_sessions": {
-                        "$sum": {"$ifNull": ["$sales_data.sessions", 0]}
-                    },
+                    "_id": {"asin": "$_id.asin"},
+                    "total_units_sold": {"$sum": "$units_sold"},
+                    "total_amount": {"$sum": "$amount"},
+                    "total_sessions": {"$sum": "$sessions"},
                     "total_closing_stock": {
-                        "$sum": "$total_closing_stock"
+                        "$sum": {"$ifNull": ["$ledger_data.closing_stock", 0]}
                     },
-                    "item_name": {"$last": "$item_name"},
+                    "item_name": {"$last": "$ledger_data.item_name"},
                     "sku_code": {"$last": "$item_info.sku_code"},
-                    "all_warehouses": {
-                        "$addToSet": "$warehouses"
-                    },
+                    "all_warehouses": {"$addToSet": "$ledger_data.warehouses"},
                     "daily_data": {
                         "$push": {
                             "date": "$_id.date",
-                            "closing_stock": "$total_closing_stock",
-                            "units_sold": {"$ifNull": ["$sales_data.unitsOrdered", 0]}
+                            "closing_stock": {"$ifNull": ["$ledger_data.closing_stock", 0]},
+                            "units_sold": "$units_sold",
+                            "sessions": "$sessions"
                         }
                     }
                 }
@@ -1271,7 +1276,8 @@ async def generate_report_by_date_range(
             },
         ]
         
-        collection = database.get_collection(LEDGER_COLLECTION)
+        # Changed to start from sales_traffic collection
+        collection = database.get_collection(SALES_TRAFFIC_COLLECTION)
         cursor = list(collection.aggregate(base_pipeline))
         result = serialize_mongo_document(cursor)
 
@@ -1285,7 +1291,6 @@ async def generate_report_by_date_range(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred generating Amazon report: {str(e)}",
         )
-
 @router.get("/get_report_data_by_date_range")
 async def get_report_data_by_date_range(
     start_date: str,
