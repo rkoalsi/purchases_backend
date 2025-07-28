@@ -1093,7 +1093,7 @@ async def generate_report_by_date_range(
             warehouse_filter = {"location": "VKSX"}
         # If warehouse_type is "all" or any other value, no additional filter is applied
 
-        # Common initial stages
+        # Fixed pipeline that aggregates ledger data first to prevent sales data multiplication
         base_pipeline = [
             {
                 "$match": {
@@ -1102,19 +1102,34 @@ async def generate_report_by_date_range(
                     **warehouse_filter,  # Add warehouse filter here
                 }
             },
+            # FIRST: Aggregate ledger data by ASIN and date across all warehouses
+            {
+                "$group": {
+                    "_id": {
+                        "asin": "$asin",
+                        "date": "$date"
+                    },
+                    "total_closing_stock": {"$sum": "$ending_warehouse_balance"},
+                    "total_customer_shipments": {"$sum": {"$abs": "$customer_shipments"}},
+                    "item_name": {"$last": "$title"},
+                    "warehouses": {"$addToSet": "$location"}
+                }
+            },
+            # THEN: Lookup SKU mapping (once per ASIN)
             {
                 "$lookup": {
                     "from": "amazon_sku_mapping",
-                    "localField": "asin",
+                    "localField": "_id.asin",
                     "foreignField": "item_id",
                     "as": "item_info",
                 }
             },
-            {"$unwind": {"path": "$item_info", "preserveNullAndEmptyArrays": True}},
+            {"$addFields": {"item_info": {"$first": "$item_info"}}},
+            # THEN: Lookup sales data (once per ASIN per date)
             {
                 "$lookup": {
                     "from": "amazon_sales_traffic",
-                    "let": {"ledger_asin": "$asin", "ledger_date": "$date"},
+                    "let": {"ledger_asin": "$_id.asin", "ledger_date": "$_id.date"},
                     "pipeline": [
                         {
                             "$match": {
@@ -1125,73 +1140,56 @@ async def generate_report_by_date_range(
                                     ]
                                 }
                             }
-                        }
+                        },
+                        {
+                            "$group": {
+                                "_id": {"parentAsin": "$parentAsin", "date": "$date"},
+                                "unitsOrdered": {"$sum": "$salesByAsin.unitsOrdered"},
+                                "orderedProductSales": {
+                                    "$sum": "$salesByAsin.orderedProductSales.amount"
+                                },
+                                "sessions": {"$sum": "$trafficByAsin.sessions"},
+                                "revenue": {"$sum": "$revenue"},
+                            }
+                        },
                     ],
                     "as": "sales_data",
                 }
             },
-            {"$unwind": {"path": "$sales_data", "preserveNullAndEmptyArrays": True}},
+            {"$addFields": {"sales_data": {"$first": "$sales_data"}}},
+            # Now group by ASIN to collect all daily data and calculate totals
             {
-                "$project": {
-                    "_id": 0,
-                    "asin": "$asin",
-                    "item_name": "$title",
-                    "warehouse": "$location",
-                    "units_sold": {
-                        "$ifNull": ["$sales_data.salesByAsin.unitsOrdered", 0]
+                "$group": {
+                    "_id": {
+                        "asin": "$_id.asin"
+                    },
+                    "total_units_sold": {
+                        "$sum": {"$ifNull": ["$sales_data.unitsOrdered", 0]}
                     },
                     "total_amount": {
-                        "$ifNull": [
-                            "$sales_data.salesByAsin.orderedProductSales.amount",
-                            0,
-                        ]
+                        "$sum": {"$ifNull": ["$sales_data.orderedProductSales", 0]}
                     },
-                    "revenue": {"$ifNull": ["$sales_data.revenue", 0]},
-                    "date": "$date",
-                    "closing_stock": {"$ifNull": ["$ending_warehouse_balance", 0]},
-                    "sessions": {"$ifNull": ["$sales_data.trafficByAsin.sessions", 0]},
-                    "sku_code": "$item_info.sku_code",
-                }
-            },
-            # Group by product and date to get daily totals across all warehouses
-            {
-                "$group": {
-                    "_id": {
-                        "asin": "$asin",
-                        "sku_code": "$sku_code",
-                        "date": "$date"
+                    "total_sessions": {
+                        "$sum": {"$ifNull": ["$sales_data.sessions", 0]}
                     },
-                    "daily_units_sold": {"$sum": "$units_sold"},
-                    "daily_amount": {"$sum": "$total_amount"},
-                    "daily_sessions": {"$sum": "$sessions"},
-                    "daily_closing_stock": {"$sum": "$closing_stock"},
+                    "total_closing_stock": {
+                        "$sum": "$total_closing_stock"
+                    },
                     "item_name": {"$last": "$item_name"},
-                    "warehouses_for_day": {"$addToSet": "$warehouse"}
-                }
-            },
-            # Now group by product to collect all daily data and calculate totals
-            {
-                "$group": {
-                    "_id": {
-                        "asin": "$_id.asin",
-                        "sku_code": "$_id.sku_code",
+                    "sku_code": {"$last": "$item_info.sku_code"},
+                    "all_warehouses": {
+                        "$addToSet": "$warehouses"
                     },
-                    "total_units_sold": {"$sum": "$daily_units_sold"},
-                    "total_amount": {"$sum": "$daily_amount"},
-                    "total_sessions": {"$sum": "$daily_sessions"},
-                    "total_closing_stock": {"$sum": "$daily_closing_stock"},
-                    "item_name": {"$last": "$item_name"},
-                    "all_warehouses": {"$addToSet": "$warehouses_for_day"},
                     "daily_data": {
                         "$push": {
                             "date": "$_id.date",
-                            "closing_stock": "$daily_closing_stock",
-                            "units_sold": "$daily_units_sold"
+                            "closing_stock": "$total_closing_stock",
+                            "units_sold": {"$ifNull": ["$sales_data.unitsOrdered", 0]}
                         }
                     }
                 }
             },
-            # Calculate days in stock at the product level - FIXED VERSION
+            # Calculate days in stock at the product level
             {
                 "$addFields": {
                     "total_days_in_stock": {
@@ -1199,7 +1197,7 @@ async def generate_report_by_date_range(
                             "if": {
                                 "$and": [
                                     {"$ne": ["$daily_data", None]},
-                                    {"$gt": [{"$size": "$daily_data"}, 0]}
+                                    {"$gt": [{"$size": "$daily_data"}, 0]},
                                 ]
                             },
                             "then": {
@@ -1208,7 +1206,7 @@ async def generate_report_by_date_range(
                                         "sorted_data": {
                                             "$sortArray": {
                                                 "input": "$daily_data",
-                                                "sortBy": {"date": 1}
+                                                "sortBy": {"date": 1},
                                             }
                                         }
                                     },
@@ -1216,22 +1214,24 @@ async def generate_report_by_date_range(
                                         "$size": {
                                             "$filter": {
                                                 "input": "$$sorted_data",
-                                                "cond": {"$gt": ["$$this.closing_stock", 0]}
+                                                "cond": {
+                                                    "$gt": ["$$this.closing_stock", 0]
+                                                },
                                             }
                                         }
-                                    }
+                                    },
                                 }
                             },
-                            "else": 0
+                            "else": 0,
                         }
                     },
                     "warehouses": {
                         "$reduce": {
                             "input": "$all_warehouses",
                             "initialValue": [],
-                            "in": {"$setUnion": ["$$value", "$$this"]}
+                            "in": {"$setUnion": ["$$value", "$$this"]},
                         }
-                    }
+                    },
                 }
             },
             # Calculate DRR (Daily Run Rate)
@@ -1243,7 +1243,7 @@ async def generate_report_by_date_range(
                             "then": {
                                 "$divide": ["$total_units_sold", "$total_days_in_stock"]
                             },
-                            "else": 0
+                            "else": 0,
                         }
                     }
                 }
@@ -1252,26 +1252,25 @@ async def generate_report_by_date_range(
                 "$project": {
                     "_id": 0,
                     "asin": "$_id.asin",
-                    "sku_code": "$_id.sku_code",
+                    "sku_code": "$sku_code",
                     "item_name": "$item_name",
-                    "warehouses": "$warehouses",  # Show which warehouses contributed to the totals
+                    "warehouses": "$warehouses",
                     "units_sold": "$total_units_sold",
                     "total_amount": "$total_amount",
                     "sessions": "$total_sessions",
                     "closing_stock": "$total_closing_stock",
-                    "total_days_in_stock": "$total_days_in_stock",  # New column
-                    "drr": {"$round": ["$drr", 2]}  # New column - rounded to 2 decimal places
+                    "total_days_in_stock": "$total_days_in_stock",
+                    "drr": {"$round": ["$drr", 2]},
                 }
             },
             {
                 "$sort": {
                     "sku_code": -1,
-                    "warehouse": -1,
                     "asin": -1,
                 }
             },
         ]
-
+        
         collection = database.get_collection(LEDGER_COLLECTION)
         cursor = list(collection.aggregate(base_pipeline))
         result = serialize_mongo_document(cursor)
@@ -1301,7 +1300,7 @@ async def get_report_data_by_date_range(
     - start_date: Start date in YYYY-MM-DD format
     - end_date: End date in YYYY-MM-DD format
     - warehouse_type: Filter type - "all" (default), "fba" (excludes VKSX), or "seller_flex" (only VKSX)
-    
+
     New Columns:
     - total_days_in_stock: Number of days the item had stock > 0 (resets when stock = 0)
     - drr: Daily Run Rate (total units sold / total days in stock)
@@ -1333,27 +1332,29 @@ async def get_report_data_by_date_range(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred retrieving the report data: {e}",
         )
-        
+
+
 def format_column_name(column_name):
     """Convert snake_case column names to proper formatted names"""
     # Replace underscores with spaces and title case
-    formatted = column_name.replace('_', ' ').title()
-    
+    formatted = column_name.replace("_", " ").title()
+
     # Handle specific cases for better formatting
     replacements = {
-        'Asin': 'ASIN',
-        'Sku Code': 'SKU Code',
-        'Item Name': 'Item Name',
-        'Units Sold': 'Units Sold',
-        'Total Amount': 'Total Amount',
-        'Closing Stock': 'Closing Stock',
-        'Sessions': 'Sessions',
-        'Warehouses': 'Warehouses'
+        "Asin": "ASIN",
+        "Sku Code": "SKU Code",
+        "Item Name": "Item Name",
+        "Units Sold": "Units Sold",
+        "Total Amount": "Total Amount",
+        "Closing Stock": "Closing Stock",
+        "Sessions": "Sessions",
+        "Warehouses": "Warehouses",
     }
-    
+
     return replacements.get(formatted, formatted)
 
-@router.get('/download_report_by_date_range')
+
+@router.get("/download_report_by_date_range")
 async def download_report_by_date_range(
     start_date: str,
     end_date: str,
@@ -1367,7 +1368,7 @@ async def download_report_by_date_range(
     - start_date: Start date in YYYY-MM-DD format
     - end_date: End date in YYYY-MM-DD format
     - warehouse_type: Filter type - "all" (default), "fba" (excludes VKSX), or "seller_flex" (only VKSX)
-    
+
     Returns:
     - Excel file download with formatted column names
     """
@@ -1396,84 +1397,94 @@ async def download_report_by_date_range(
 
         # Convert to DataFrame
         df = pd.DataFrame(report_data)
-        
+
         # Format column names
         column_mapping = {}
         for col in df.columns:
             column_mapping[col] = format_column_name(col)
-        
+
         df = df.rename(columns=column_mapping)
-        
+
         # Handle the warehouses column (convert list to string)
-        if 'Warehouses' in df.columns:
-            df['Warehouses'] = df['Warehouses'].apply(
-                lambda x: ', '.join(x) if isinstance(x, list) else str(x)
+        if "Warehouses" in df.columns:
+            df["Warehouses"] = df["Warehouses"].apply(
+                lambda x: ", ".join(x) if isinstance(x, list) else str(x)
             )
-        
+
         # Reorder columns for better presentation
         preferred_order = [
-            'ASIN', 'SKU Code', 'Item Name', 'Warehouses', 
-            'Units Sold', 'Total Amount', 'Sessions', 'Closing Stock'
+            "ASIN",
+            "SKU Code",
+            "Item Name",
+            "Warehouses",
+            "Units Sold",
+            "Total Amount",
+            "Sessions",
+            "Closing Stock",
         ]
-        
+
         # Only include columns that exist in the DataFrame
         column_order = [col for col in preferred_order if col in df.columns]
         # Add any remaining columns not in preferred order
         remaining_cols = [col for col in df.columns if col not in column_order]
         final_column_order = column_order + remaining_cols
-        
+
         df = df[final_column_order]
-        
+
         # Create Excel file in memory
         excel_buffer = io.BytesIO()
-        
-        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Report Data', index=False)
-            
+
+        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Report Data", index=False)
+
             # Get the workbook and worksheet for formatting
             workbook = writer.book
-            worksheet = writer.sheets['Report Data']
-            
+            worksheet = writer.sheets["Report Data"]
+
             # Auto-adjust column widths
             for column in worksheet.columns:
                 max_length = 0
                 column_letter = column[0].column_letter
-                
+
                 for cell in column:
                     try:
                         if len(str(cell.value)) > max_length:
                             max_length = len(str(cell.value))
                     except:
                         pass
-                
+
                 adjusted_width = min(max_length + 2, 50)  # Cap at 50 characters
                 worksheet.column_dimensions[column_letter].width = adjusted_width
-            
+
             # Style the header row
             from openpyxl.styles import Font, PatternFill
-            
+
             header_font = Font(bold=True, color="FFFFFF")
-            header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-            
+            header_fill = PatternFill(
+                start_color="366092", end_color="366092", fill_type="solid"
+            )
+
             for cell in worksheet[1]:
                 cell.font = header_font
                 cell.fill = header_fill
-        
+
         excel_buffer.seek(0)
-        
+
         # Generate filename with timestamp and warehouse type
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         warehouse_suffix = f"_{warehouse_type}" if warehouse_type != "all" else ""
         filename = f"inventory_report_{start_date}_to_{end_date}{warehouse_suffix}_{timestamp}.xlsx"
-        
+
         # Create streaming response
         response = StreamingResponse(
             io.BytesIO(excel_buffer.read()),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
-        
-        print(f"Generated Excel report for warehouse_type: {warehouse_type}, rows: {len(df)}")
+
+        print(
+            f"Generated Excel report for warehouse_type: {warehouse_type}, rows: {len(df)}"
+        )
         return response
 
     except HTTPException as e:
@@ -1481,6 +1492,7 @@ async def download_report_by_date_range(
     except Exception as e:
         print(f"Error generating Excel report: {e}")
         import traceback
+
         traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
