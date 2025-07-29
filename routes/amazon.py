@@ -1168,7 +1168,7 @@ async def generate_report_by_date_range(
             },
             {
                 "$addFields": {
-                    "item_info": {"$first": "$item_info"}
+                    "item_info": {"$last": "$item_info"}
                 }
             },
             # Group by ASIN to get totals
@@ -1181,7 +1181,7 @@ async def generate_report_by_date_range(
                     "total_closing_stock": {
                         "$sum": {"$ifNull": ["$ledger_data.closing_stock", 0]}
                     },
-                    "item_name": {"$last": "$ledger_data.item_name"},
+                    "item_name": {"$last": "$item_info.item_name"},
                     "sku_code": {"$last": "$item_info.sku_code"},
                     "all_warehouses": {"$addToSet": "$ledger_data.warehouses"},
                     "daily_data": {
