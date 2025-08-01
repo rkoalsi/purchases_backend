@@ -3,7 +3,7 @@ from io import BytesIO
 from bson import ObjectId
 from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pymongo import ASCENDING
 from pymongo.errors import PyMongoError
 from ..database import get_database, serialize_mongo_document
@@ -1075,32 +1075,191 @@ async def delete_item(item_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",
         )
-        
+
+
 async def generate_report_by_date_range(
-    start_date: str, end_date: str, database: Any, warehouse_type: str = "all"
+    start_date: str, end_date: str, database: Any, report_type: str = "all"
 ):
     try:
-        start = datetime.strptime(start_date, "%Y-%m-%d")
-        end = datetime.strptime(end_date, "%Y-%m-%d")
+        start = datetime.strptime(start_date, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
+        )
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+        )
+        print(start, end)
 
-        is_single_day = start == end
+        # Handle vendor report_type with different pipeline
+        if report_type == "vendor_central":
+            vendor_pipeline = [
+                {
+                    "$match": {
+                        "date": {"$gte": start, "$lte": end},
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": {"asin": "$asin", "date": "$date"},
+                        "units_sold": {"$sum": "$orderedUnits"},
+                        "amount": {"$sum": "$orderedRevenue.amount"},
+                    }
+                },
+                {
+                    "$lookup": {
+                        "from": "amazon_vendor_inventory",
+                        "let": {"sales_asin": "$_id.asin", "sales_date": "$_id.date"},
+                        "pipeline": [
+                            {
+                                "$match": {
+                                    "$expr": {
+                                        "$and": [
+                                            {"$eq": ["$asin", "$$sales_asin"]},
+                                            {"$eq": ["$date", "$$sales_date"]},
+                                        ]
+                                    }
+                                }
+                            },
+                            {
+                                "$group": {
+                                    "_id": {"asin": "$asin", "date": "$date"},
+                                    "closing_stock": {
+                                        "$sum": "$sellableOnHandInventoryUnits"
+                                    },
+                                }
+                            },
+                        ],
+                        "as": "inventory_data",
+                    }
+                },
+                {"$addFields": {"inventory_data": {"$last": "$inventory_data"}}},
+                {
+                    "$lookup": {
+                        "from": "amazon_sku_mapping",
+                        "localField": "_id.asin",
+                        "foreignField": "item_id",
+                        "as": "item_info",
+                    }
+                },
+                {"$addFields": {"item_info": {"$last": "$item_info"}}},
+                # SORT BY DATE DESCENDING BEFORE GROUPING - This is key!
+                {"$sort": {"_id.date": -1}},
+                {
+                    "$group": {
+                        "_id": {"asin": "$_id.asin"},
+                        "total_units_sold": {"$sum": "$units_sold"},
+                        "total_amount": {"$sum": "$amount"},
+                        # Get closing stock from FIRST record (which is the latest date due to sorting)
+                        "last_day_closing_stock": {
+                            "$first": {"$ifNull": ["$inventory_data.closing_stock", 0]}
+                        },
+                        "item_name": {"$last": "$item_info.item_name"},
+                        "sku_code": {"$last": "$item_info.sku_code"},
+                        "daily_data": {
+                            "$push": {
+                                "date": "$_id.date",
+                                "closing_stock": {
+                                    "$ifNull": ["$inventory_data.closing_stock", 0]
+                                },
+                                "units_sold": "$units_sold",
+                            }
+                        },
+                    }
+                },
+                {
+                    "$addFields": {
+                        "total_days_in_stock": {
+                            "$cond": {
+                                "if": {
+                                    "$and": [
+                                        {"$ne": ["$daily_data", None]},
+                                        {"$gt": [{"$size": "$daily_data"}, 0]},
+                                    ]
+                                },
+                                "then": {
+                                    "$let": {
+                                        "vars": {
+                                            "sorted_data": {
+                                                "$sortArray": {
+                                                    "input": "$daily_data",
+                                                    "sortBy": {"date": 1},
+                                                }
+                                            }
+                                        },
+                                        "in": {
+                                            "$size": {
+                                                "$filter": {
+                                                    "input": "$$sorted_data",
+                                                    "cond": {
+                                                        "$gt": [
+                                                            "$$this.closing_stock",
+                                                            0,
+                                                        ]
+                                                    },
+                                                }
+                                            }
+                                        },
+                                    }
+                                },
+                                "else": 0,
+                            }
+                        }
+                    }
+                },
+                {
+                    "$addFields": {
+                        "drr": {
+                            "$cond": {
+                                "if": {"$gt": ["$total_days_in_stock", 0]},
+                                "then": {
+                                    "$divide": [
+                                        "$total_units_sold",
+                                        "$total_days_in_stock",
+                                    ]
+                                },
+                                "else": 0,
+                            }
+                        }
+                    }
+                },
+                {
+                    "$project": {
+                        "_id": 0,
+                        "asin": "$_id.asin",
+                        "item_name": "$item_name",
+                        "sku_code": "$sku_code",
+                        "units_sold": "$total_units_sold",
+                        "closing_stock": "$last_day_closing_stock",  # Only last day's closing stock
+                        "total_amount": {"$round": ["$total_amount", 2]},
+                        "stock": "$last_day_closing_stock",  # Same as closing_stock
+                        "total_days_in_stock": "$total_days_in_stock",
+                        "drr": {"$round": ["$drr", 2]},
+                    }
+                },
+                {
+                    "$sort": {
+                        "sku_code": -1,
+                        "asin": -1,
+                    }
+                },
+            ]
+            collection = database.get_collection("amazon_vendor_sales")
+            cursor = list(collection.aggregate(vendor_pipeline))
+            result = serialize_mongo_document(cursor)
+            return result
 
-        # Build ledger match conditions based on warehouse_type parameter
+        # Original logic for other report_types
         ledger_match_conditions = [
             {"$eq": ["$asin", "$$sales_asin"]},
             {"$eq": ["$date", "$$sales_date"]},
-            {"$eq": ["$disposition", "SELLABLE"]}
+            {"$eq": ["$disposition", "SELLABLE"]},
         ]
-        
-        if warehouse_type == "fba":
-            ledger_match_conditions.append({"$ne": ["$location", "VKSX"]})
-        elif warehouse_type == "seller_flex":
-            ledger_match_conditions.append({"$eq": ["$location", "VKSX"]})
-        # If warehouse_type is "all", no additional filter is applied
 
-        # Pipeline that starts from sales_traffic to ensure no sales data is missed
+        if report_type == "fba":
+            ledger_match_conditions.append({"$ne": ["$location", "VKSX"]})
+        elif report_type == "seller_flex":
+            ledger_match_conditions.append({"$eq": ["$location", "VKSX"]})
+
         base_pipeline = [
-            # Start with sales data to ensure we don't miss any sales
             {
                 "$match": {
                     "date": {"$gte": start, "$lte": end},
@@ -1108,70 +1267,47 @@ async def generate_report_by_date_range(
             },
             {
                 "$group": {
-                    "_id": {
-                        "asin": "$parentAsin",
-                        "date": "$date"
-                    },
+                    "_id": {"asin": "$parentAsin", "date": "$date"},
                     "units_sold": {"$sum": "$salesByAsin.unitsOrdered"},
                     "amount": {"$sum": "$salesByAsin.orderedProductSales.amount"},
                     "sessions": {
                         "$sum": {
                             "$add": [
                                 {"$ifNull": ["$trafficByAsin.sessions", 0]},
-                                {"$ifNull": ["$trafficByAsin.sessionsB2B", 0]}
+                                {"$ifNull": ["$trafficByAsin.sessionsB2B", 0]},
                             ]
                         }
-                    }
+                    },
                 }
             },
-            # Lookup corresponding ledger data
             {
                 "$lookup": {
                     "from": "amazon_ledger",
-                    "let": {
-                        "sales_asin": "$_id.asin",
-                        "sales_date": "$_id.date"
-                    },
+                    "let": {"sales_asin": "$_id.asin", "sales_date": "$_id.date"},
                     "pipeline": [
-                        {
-                            "$match": {
-                                "$expr": {
-                                    "$and": ledger_match_conditions
-                                }
-                            }
-                        },
+                        {"$match": {"$expr": {"$and": ledger_match_conditions}}},
                         {
                             "$group": {
                                 "_id": {"asin": "$asin", "date": "$date"},
                                 "closing_stock": {"$sum": "$ending_warehouse_balance"},
                                 "item_name": {"$last": "$title"},
-                                "warehouses": {"$addToSet": "$location"}
+                                "warehouses": {"$addToSet": "$location"},
                             }
-                        }
+                        },
                     ],
-                    "as": "ledger_data"
+                    "as": "ledger_data",
                 }
             },
-            {
-                "$addFields": {
-                    "ledger_data": {"$first": "$ledger_data"}
-                }
-            },
-            # Lookup SKU mapping
+            {"$addFields": {"ledger_data": {"$first": "$ledger_data"}}},
             {
                 "$lookup": {
                     "from": "amazon_sku_mapping",
                     "localField": "_id.asin",
                     "foreignField": "item_id",
-                    "as": "item_info"
+                    "as": "item_info",
                 }
             },
-            {
-                "$addFields": {
-                    "item_info": {"$last": "$item_info"}
-                }
-            },
-            # Group by ASIN to get totals
+            {"$addFields": {"item_info": {"$last": "$item_info"}}},
             {
                 "$group": {
                     "_id": {"asin": "$_id.asin"},
@@ -1187,14 +1323,15 @@ async def generate_report_by_date_range(
                     "daily_data": {
                         "$push": {
                             "date": "$_id.date",
-                            "closing_stock": {"$ifNull": ["$ledger_data.closing_stock", 0]},
+                            "closing_stock": {
+                                "$ifNull": ["$ledger_data.closing_stock", 0]
+                            },
                             "units_sold": "$units_sold",
-                            "sessions": "$sessions"
+                            "sessions": "$sessions",
                         }
-                    }
+                    },
                 }
             },
-            # Calculate days in stock at the product level
             {
                 "$addFields": {
                     "total_days_in_stock": {
@@ -1239,7 +1376,6 @@ async def generate_report_by_date_range(
                     },
                 }
             },
-            # Calculate DRR (Daily Run Rate)
             {
                 "$addFields": {
                     "drr": {
@@ -1275,7 +1411,7 @@ async def generate_report_by_date_range(
                 }
             },
         ]
-        
+
         # Changed to start from sales_traffic collection
         collection = database.get_collection(SALES_TRAFFIC_COLLECTION)
         cursor = list(collection.aggregate(base_pipeline))
@@ -1291,42 +1427,31 @@ async def generate_report_by_date_range(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred generating Amazon report: {str(e)}",
         )
+
+
 @router.get("/get_report_data_by_date_range")
 async def get_report_data_by_date_range(
     start_date: str,
     end_date: str,
-    warehouse_type: str = "all",  # New parameter: "all", "fba", or "seller_flex"
+    report_type: str = "all",  # New parameter: "all", "fba", "seller_flex" or "vendor_central"
     database=Depends(get_database),
 ):
-    """
-    Returns report data for a specific date range with sum totals for frontend consumption.
-
-    Parameters:
-    - start_date: Start date in YYYY-MM-DD format
-    - end_date: End date in YYYY-MM-DD format
-    - warehouse_type: Filter type - "all" (default), "fba" (excludes VKSX), or "seller_flex" (only VKSX)
-
-    New Columns:
-    - total_days_in_stock: Number of days the item had stock > 0 (resets when stock = 0)
-    - drr: Daily Run Rate (total units sold / total days in stock)
-    """
     try:
-        # Validate warehouse_type parameter
-        valid_types = ["all", "fba", "seller_flex"]
-        if warehouse_type not in valid_types:
+        # Validate type parameter
+        valid_types = ["all", "fba", "seller_flex", "vendor_central"]
+        if report_type not in valid_types:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid warehouse_type. Must be one of: {', '.join(valid_types)}",
+                detail=f"Invalid type. Must be one of: {', '.join(valid_types)}",
             )
 
         report_response = await generate_report_by_date_range(
             start_date=start_date,
             end_date=end_date,
             database=database,
-            warehouse_type=warehouse_type,
+            report_type=report_type,
         )
-
-        print(f"Retrieved dynamic report data for warehouse_type: {warehouse_type}")
+        print(f"Retrieved dynamic report data of type: {report_type}")
         return report_response
 
     except HTTPException as e:
@@ -1363,7 +1488,7 @@ def format_column_name(column_name):
 async def download_report_by_date_range(
     start_date: str,
     end_date: str,
-    warehouse_type: str = "all",  # "all", "fba", or "seller_flex"
+    report_type: str = "all",  # "all", "fba", or "seller_flex"
     database=Depends(get_database),
 ):
     """
@@ -1380,7 +1505,7 @@ async def download_report_by_date_range(
     try:
         # Validate warehouse_type parameter
         valid_types = ["all", "fba", "seller_flex"]
-        if warehouse_type not in valid_types:
+        if report_type not in valid_types:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid warehouse_type. Must be one of: {', '.join(valid_types)}",
@@ -1391,7 +1516,7 @@ async def download_report_by_date_range(
             start_date=start_date,
             end_date=end_date,
             database=database,
-            warehouse_type=warehouse_type,
+            report_type=report_type,
         )
 
         if not report_data:
@@ -1477,7 +1602,7 @@ async def download_report_by_date_range(
 
         # Generate filename with timestamp and warehouse type
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        warehouse_suffix = f"_{warehouse_type}" if warehouse_type != "all" else ""
+        warehouse_suffix = f"_{report_type}" if report_type != "all" else ""
         filename = f"inventory_report_{start_date}_to_{end_date}{warehouse_suffix}_{timestamp}.xlsx"
 
         # Create streaming response
@@ -1487,9 +1612,7 @@ async def download_report_by_date_range(
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
-        print(
-            f"Generated Excel report for warehouse_type: {warehouse_type}, rows: {len(df)}"
-        )
+        print(f"Generated Excel report for report_type: {report_type}, rows: {len(df)}")
         return response
 
     except HTTPException as e:

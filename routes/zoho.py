@@ -28,6 +28,7 @@ class ReportRequest(BaseModel):
     start_date: str
     end_date: str
     brand: str
+    exclude_customers: bool
 
     @validator("start_date", "end_date")
     def validate_date_format(cls, v):
@@ -566,19 +567,48 @@ def get_skus_by_brand(db, brand: str) -> List[str]:
 
 
 def query_invoices_for_skus(
-    db, skus: List[str], start_date: datetime, end_date: datetime
+    db,
+    skus: List[str],
+    start_date: datetime,
+    end_date: datetime,
+    exclude_customers: bool,
 ) -> List[dict]:
     """
     Optimized query that processes all SKUs in a single aggregation pipeline.
     This is the biggest performance improvement.
     """
+    customer_list = [
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd",
+        "Pupscribe Enterprises Private Limited",
+        "(OSAMP) Office samples",
+        "(PUPEV) PUPSCRIBE EVENTS",
+        "(SSAM) Sales samples",
+    ]
     try:
         invoices_collection = db.get_collection(INVOICES_COLLECTION)
-
-        # Single aggregation pipeline that handles ALL SKUs at once
-        pipeline = [
-            # Stage 1: Match documents by date range and status
+        match_statement = (
             {
+                "$match": {
+                    "$expr": {
+                        "$and": [
+                            {"$gte": [{"$toDate": "$created_date"}, start_date]},
+                            {"$lte": [{"$toDate": "$created_date"}, end_date]},
+                        ]
+                    },
+                    "status": {"$nin": ["draft", "void"]},
+                    "customer_name": {"$nin": customer_list},
+                    # Match any line item that has any of our target SKUs
+                    "line_items": {
+                        "$elemMatch": {
+                            "item_custom_fields": {
+                                "$elemMatch": {"value": {"$in": skus}}
+                            }
+                        }
+                    },
+                }
+            }
+            if exclude_customers
+            else {
                 "$match": {
                     "$expr": {
                         "$and": [
@@ -596,7 +626,12 @@ def query_invoices_for_skus(
                         }
                     },
                 }
-            },
+            }
+        )
+        # Single aggregation pipeline that handles ALL SKUs at once
+        pipeline = [
+            # Stage 1: Match documents by date range and status
+            match_statement,
             # Stage 2: Add field with all matching items for ANY of our SKUs
             {
                 "$addFields": {
@@ -777,7 +812,9 @@ async def generate_invoice_report(
 
         # STEP 2: Query invoices (optimized single aggregation)
         query_start = datetime.now()
-        invoice_data = query_invoices_for_skus(db, skus, start_date, end_date)
+        invoice_data = query_invoices_for_skus(
+            db, skus, start_date, end_date, request.exclude_customers
+        )
         query_duration = (datetime.now() - query_start).total_seconds()
         logger.info(f"Invoice query took {query_duration:.2f} seconds")
 
