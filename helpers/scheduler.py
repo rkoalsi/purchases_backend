@@ -30,7 +30,7 @@ class APIScheduler:
     async def get_sales_traffic(self):
         try:
             logger.info("Executing Sales Traffic API call...")
-            start_date = (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+            start_date = (datetime.now().date() - timedelta(days=2)).strftime("%Y-%m-%d")
             response = await self.client.post(f"/amazon/sync/sales-traffic?start_date={start_date}&end_date={start_date}")
             print(response.json())
             response.raise_for_status()
@@ -43,7 +43,7 @@ class APIScheduler:
     async def get_inventory_ledger(self):
         try:
             logger.info("Executing Inventory Ledger API call...")
-            start_date = (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+            start_date = (datetime.now().date() - timedelta(days=2)).strftime("%Y-%m-%d")
             response = await self.client.post(f"/amazon/sync/ledger?start_date={start_date}&end_date={start_date}")
             print(response.json())
             response.raise_for_status()
