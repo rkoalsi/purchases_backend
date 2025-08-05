@@ -15,7 +15,7 @@ import gzip
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 import logging
-
+from .amazon_vc import router as amazon_vendor_router
 # --- Configuration ---
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -25,13 +25,12 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 SKU_COLLECTION = "amazon_sku_mapping"
-SALES_COLLECTION = "amazon_sales"
-INVENTORY_COLLECTION = "amazon_inventory"
-REPORT_COLLECTION = "amazon_sales_inventory_reports"
-SALES_TRAFFIC_COLLECTION = "amazon_sales_traffic"
-LEDGER_COLLECTION = "amazon_ledger"
+SALES_COLLECTION = "amazon_sales_traffic"
+INVENTORY_COLLECTION = "amazon_ledger"
 
 router = APIRouter()
+
+router.include_router(amazon_vendor_router,prefix='/vendor')
 
 # SP API Configuration
 REFRESH_TOKEN = os.getenv("SP_REFRESH_TOKEN")
@@ -45,23 +44,23 @@ SP_API_BASE_URL = os.getenv(
 )
 
 # Global variable to store access token and expiry
-_access_token = None
-_token_expires_at = None
+_sc_access_token = None
+_sc_token_expires_at = None
 
 
 def get_amazon_token() -> str:
     """
     Get a new access token from Amazon SP API using refresh token
     """
-    global _access_token, _token_expires_at
+    global _sc_access_token, _sc_token_expires_at
 
     # Check if current token is still valid (with 5 minute buffer)
     if (
-        _access_token
-        and _token_expires_at
-        and datetime.now() < (_token_expires_at - timedelta(minutes=5))
+        _sc_access_token
+        and _sc_token_expires_at
+        and datetime.now() < (_sc_token_expires_at - timedelta(minutes=5))
     ):
-        return _access_token
+        return _sc_access_token
 
     try:
         payload = {
@@ -77,12 +76,12 @@ def get_amazon_token() -> str:
         response.raise_for_status()
 
         token_data = response.json()
-        _access_token = token_data.get("access_token")
+        _sc_access_token = token_data.get("access_token")
         expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
-        _token_expires_at = datetime.now() + timedelta(seconds=expires_in)
+        _sc_token_expires_at = datetime.now() + timedelta(seconds=expires_in)
 
         logger.info("Successfully obtained new Amazon SP API token")
-        return _access_token
+        return _sc_access_token
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Error getting Amazon token: {e}")
@@ -286,7 +285,7 @@ def get_amazon_sales_traffic_data(
                 asin = asin_data["parentAsin"]
                 asin_data["date"] = datetime.fromisoformat(start_date)
                 asin_data["created_at"] = datetime.now()
-                result = db[SALES_TRAFFIC_COLLECTION].find_one(
+                result = db[SALES_COLLECTION].find_one(
                     {"parentAsin": asin, "date": asin_data["date"]}
                 )
                 if not result:
@@ -450,21 +449,6 @@ async def insert_data_to_db(
 
         collection = db[collection_name]
 
-        # # Create indexes for better performance
-        # if collection_name == SALES_COLLECTION:
-        #     collection.create_index([("amazon-order-id", ASCENDING)])
-        #     collection.create_index([("purchase-date", ASCENDING)])
-        # elif collection_name == INVENTORY_COLLECTION:
-        #     collection.create_index([("sellerSku", ASCENDING)])
-        #     collection.create_index([("asin", ASCENDING)])
-        # elif collection_name == SALES_TRAFFIC_COLLECTION:
-        #     collection.create_index([("parentAsin", ASCENDING)])
-        #     collection.create_index([("childAsin", ASCENDING)])
-        #     collection.create_index([("date", ASCENDING)])
-        # elif collection_name == LEDGER_COLLECTION:
-        #     collection.create_index([("Date", ASCENDING)])
-        #     collection.create_index([("Transaction Type", ASCENDING)])
-
         # Insert data
         result = collection.insert_many(data)
         logger.info(
@@ -502,7 +486,7 @@ async def refresh_amazon_token():
             content={
                 "message": "Token refreshed successfully",
                 "token_expires_at": (
-                    _token_expires_at.isoformat() if _token_expires_at else None
+                    _sc_token_expires_at.isoformat() if _sc_token_expires_at else None
                 ),
             },
         )
@@ -538,7 +522,7 @@ async def sync_sales_traffic_data(
         )
         # Insert into database
         inserted_count = await insert_data_to_db(
-            SALES_TRAFFIC_COLLECTION, sales_traffic_data, db
+            SALES_COLLECTION, sales_traffic_data, db
         )
 
         return JSONResponse(
@@ -594,7 +578,7 @@ async def sync_ledger_data(
         )
 
         # Insert into database
-        inserted_count = await insert_data_to_db(LEDGER_COLLECTION, ledger_data, db)
+        inserted_count = await insert_data_to_db(INVENTORY_COLLECTION, ledger_data, db)
 
         return JSONResponse(
             status_code=status.HTTP_200_OK,
@@ -618,143 +602,101 @@ async def sync_ledger_data(
         raise
 
 
-@router.post("/sync/inventory")
-async def sync_inventory_data(db=Depends(get_database)):
-    """
-    Fetch inventory data from Amazon and insert into database
-    """
-    try:
-        # Fetch inventory data
-        inventory_data = get_amazon_inventory_data()
-
-        # Insert into database
-        inserted_count = await insert_data_to_db(
-            INVENTORY_COLLECTION, inventory_data, db
-        )
-
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={
-                "message": "Inventory data synced successfully",
-                "records_inserted": inserted_count,
-            },
-        )
-
-    except Exception as e:
-        logger.error(f"Error syncing inventory data: {e}")
-        raise
-
-
-@router.post("/sync/all")
-async def sync_all_data(
-    start_date: str,
-    end_date: str,
-    marketplace_ids: Optional[List[str]] = None,
-    include_sales_traffic: bool = True,
-    include_ledger: bool = True,
-    include_inventory: bool = True,
-    db=Depends(get_database),
-):
-    """
-    Sync sales traffic, ledger, and inventory data
-    """
-    results = {}
-
-    try:
-        # Sync sales and traffic data
-        if include_sales_traffic:
-            try:
-                sales_traffic_data = get_amazon_sales_traffic_data(
-                    f"{start_date}T00:00:00Z",
-                    f"{end_date}T23:59:59Z",
-                    db,
-                    marketplace_ids,
-                )
-                sales_traffic_count = await insert_data_to_db(
-                    SALES_TRAFFIC_COLLECTION, sales_traffic_data, db
-                )
-                results["sales_traffic_records"] = sales_traffic_count
-            except Exception as e:
-                logger.error(f"Error syncing sales traffic data: {e}")
-                results["sales_traffic_error"] = str(e)
-
-        # Sync ledger data
-        if include_ledger:
-            try:
-                ledger_data = get_amazon_ledger_data(
-                    f"{start_date}T00:00:00Z",
-                    f"{end_date}T23:59:59Z",
-                    db,
-                    marketplace_ids,
-                )
-                ledger_count = await insert_data_to_db(
-                    LEDGER_COLLECTION, ledger_data, db
-                )
-                results["ledger_records"] = ledger_count
-            except Exception as e:
-                logger.error(f"Error syncing ledger data: {e}")
-                results["ledger_error"] = str(e)
-
-        # Sync inventory data
-        if include_inventory:
-            try:
-                inventory_data = get_amazon_inventory_data()
-                inventory_count = await insert_data_to_db(
-                    INVENTORY_COLLECTION, inventory_data, db
-                )
-                results["inventory_records"] = inventory_count
-            except Exception as e:
-                logger.error(f"Error syncing inventory data: {e}")
-                results["inventory_error"] = str(e)
-
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={
-                "message": "Data synchronization completed",
-                "date_range": f"{start_date} to {end_date}",
-                "marketplace_ids": marketplace_ids or [MARKETPLACE_ID],
-                **results,
-            },
-        )
-
-    except Exception as e:
-        logger.error(f"Error syncing all data: {e}")
-        raise
-
-
 @router.get("/status")
-async def get_sync_status(db=Depends(get_database)):
-    """
-    Get synchronization status and data counts
-    """
+async def sync_status(
+    start_date: str, end_date: str, report_type: str, db=Depends(get_database)
+):
     try:
-        sales_count = db[SALES_COLLECTION].count_documents({})
-        inventory_count = db[INVENTORY_COLLECTION].count_documents({})
-
-        # Get latest sync timestamps
-        latest_sales = db[SALES_COLLECTION].find_one({}, sort=[("_extracted_at", -1)])
-        latest_inventory = db[INVENTORY_COLLECTION].find_one(
-            {}, sort=[("_extracted_at", -1)]
+        # Parse date range
+        start = datetime.strptime(start_date, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
         )
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+        )
+
+        # Initialize date range variables
+        first_sales_date = None
+        last_sales_date = None
+        first_inventory_date = None
+        last_inventory_date = None
+
+        # Determine collections based on report type
+        if report_type == "vendor_central":
+            sales_collection = "amazon_vendor_sales"
+            inventory_collection = "amazon_vendor_inventory"
+        else:
+            sales_collection = SALES_COLLECTION  # or your sales collection name
+            inventory_collection = INVENTORY_COLLECTION
+        # Get first and last sales dates in the date range
+        sales_date_pipeline = [
+            {
+                "$match": {
+                    "date": {"$gte": start, "$lte": end}
+                }
+            },
+            {
+                "$group": {
+                    "_id": None,
+                    "first_date": {"$min": "$date"},
+                    "last_date": {"$max": "$date"}
+                }
+            }
+        ]
+        
+        sales_dates = list(db[sales_collection].aggregate(sales_date_pipeline))
+        if sales_dates:
+            first_sales_date = sales_dates[0]["first_date"].isoformat() if sales_dates[0]["first_date"] else None
+            last_sales_date = sales_dates[0]["last_date"].isoformat() if sales_dates[0]["last_date"] else None
+
+        # Get first and last inventory dates in the date range
+        inventory_date_pipeline = [
+            {
+                "$match": {
+                    "date": {"$gte": start, "$lte": end}
+                }
+            },
+            {
+                "$group": {
+                    "_id": None,
+                    "first_date": {"$min": "$date"},
+                    "last_date": {"$max": "$date"}
+                }
+            }
+        ]
+        
+        inventory_dates = list(db[inventory_collection].aggregate(inventory_date_pipeline))
+        if inventory_dates:
+            first_inventory_date = inventory_dates[0]["first_date"].isoformat() if inventory_dates[0]["first_date"] else None
+            last_inventory_date = inventory_dates[0]["last_date"].isoformat() if inventory_dates[0]["last_date"] else None
+
+        # Get total counts (you might want to filter these by date range too)
+        sales_count = db[sales_collection].count_documents({
+            "date": {"$gte": start, "$lte": end}
+        })
+        inventory_count = db[inventory_collection].count_documents({
+            "date": {"$gte": start, "$lte": end}
+        })
 
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
-                "sales_records": sales_count,
-                "inventory_records": inventory_count,
-                "last_sales_sync": (
-                    latest_sales.get("_extracted_at").isoformat()
-                    if latest_sales
-                    else None
-                ),
-                "last_inventory_sync": (
-                    latest_inventory.get("_extracted_at").isoformat()
-                    if latest_inventory
-                    else None
-                ),
-                "token_expires_at": (
-                    _token_expires_at.isoformat() if _token_expires_at else None
-                ),
+                "date_range": {
+                    "start_date": start_date,
+                    "end_date": end_date
+                },
+                "sales_data": {
+                    "records_count": sales_count,
+                    "first_sales_date": first_sales_date,
+                    "last_sales_date": last_sales_date,
+                 
+                },
+                "inventory_data": {
+                    "records_count": inventory_count,
+                    "first_inventory_date": first_inventory_date,
+                    "last_inventory_date": last_inventory_date,
+                },
+                "report_type": report_type,
             },
         )
 
@@ -763,7 +705,6 @@ async def get_sync_status(db=Depends(get_database)):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
-
 
 @router.get("/sales-traffic/{asin}")
 async def get_asin_sales_data(
@@ -782,7 +723,7 @@ async def get_asin_sales_data(
         if start_date and end_date:
             query["date"] = {"$gte": start_date, "$lte": end_date}
 
-        collection = db[SALES_TRAFFIC_COLLECTION]
+        collection = db[SALES_COLLECTION]
         results = list(collection.find(query).sort("date", 1))
 
         # Serialize MongoDB documents
@@ -825,7 +766,7 @@ async def get_ledger_summary(
         if transaction_type:
             query["Transaction Type"] = transaction_type
 
-        collection = db[LEDGER_COLLECTION]
+        collection = db[INVENTORY_COLLECTION]
         results = list(collection.find(query).sort("Date", 1))
 
         # Serialize MongoDB documents
@@ -848,77 +789,6 @@ async def get_ledger_summary(
         logger.error(f"Error fetching ledger summary: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
-        )
-
-
-@router.post("/sync/daily-batch")
-async def sync_daily_batch(
-    date: str, marketplace_ids: Optional[List[str]] = None, db=Depends(get_database)
-):
-    """
-    Sync all data for a specific date (useful for daily batch processing)
-    """
-    try:
-        # Validate date format
-        datetime.strptime(date, "%Y-%m-%d")
-
-        results = {}
-
-        # Sync sales and traffic data for the specific date
-        try:
-            sales_traffic_data = get_amazon_sales_traffic_data(
-                f"{date}T00:00:00Z", f"{date}T23:59:59Z", db, marketplace_ids
-            )
-            sales_traffic_count = await insert_data_to_db(
-                SALES_TRAFFIC_COLLECTION, sales_traffic_data, db
-            )
-            results["sales_traffic_records"] = sales_traffic_count
-        except Exception as e:
-            logger.error(f"Error syncing daily sales traffic data: {e}")
-            results["sales_traffic_error"] = str(e)
-
-        # Sync ledger data for the specific date
-        try:
-            ledger_data = get_amazon_ledger_data(
-                f"{date}T00:00:00Z", f"{date}T23:59:59Z", db, marketplace_ids
-            )
-            ledger_count = await insert_data_to_db(LEDGER_COLLECTION, ledger_data, db)
-            results["ledger_records"] = ledger_count
-        except Exception as e:
-            logger.error(f"Error syncing daily ledger data: {e}")
-            results["ledger_error"] = str(e)
-
-        # Sync inventory data (current snapshot)
-        try:
-            inventory_data = get_amazon_inventory_data()
-            inventory_count = await insert_data_to_db(
-                INVENTORY_COLLECTION, inventory_data, db
-            )
-            results["inventory_records"] = inventory_count
-        except Exception as e:
-            logger.error(f"Error syncing daily inventory data: {e}")
-            results["inventory_error"] = str(e)
-
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={
-                "message": "Daily batch synchronization completed",
-                "date": date,
-                "marketplace_ids": marketplace_ids or [MARKETPLACE_ID],
-                **results,
-            },
-        )
-
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid date format. Use YYYY-MM-DD",
-        )
-    except Exception as e:
-        logger.error(f"Error in daily batch sync: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid date format. Use YYYY-MM-DD",
         )
 
 
@@ -1078,7 +948,7 @@ async def delete_item(item_id: str):
 
 
 async def generate_report_by_date_range(
-    start_date: str, end_date: str, database: Any, report_type: str = "all"
+    start_date: str, end_date: str, database: Any, report_type: str = "fba+seller_flex"
 ):
     try:
         start = datetime.strptime(start_date, "%Y-%m-%d").replace(
@@ -1087,9 +957,7 @@ async def generate_report_by_date_range(
         end = datetime.strptime(end_date, "%Y-%m-%d").replace(
             hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
         )
-        print(start, end)
 
-        # Handle vendor report_type with different pipeline
         if report_type == "vendor_central":
             vendor_pipeline = [
                 {
@@ -1141,14 +1009,12 @@ async def generate_report_by_date_range(
                     }
                 },
                 {"$addFields": {"item_info": {"$last": "$item_info"}}},
-                # SORT BY DATE DESCENDING BEFORE GROUPING - This is key!
                 {"$sort": {"_id.date": -1}},
                 {
                     "$group": {
                         "_id": {"asin": "$_id.asin"},
                         "total_units_sold": {"$sum": "$units_sold"},
                         "total_amount": {"$sum": "$amount"},
-                        # Get closing stock from FIRST record (which is the latest date due to sorting)
                         "last_day_closing_stock": {
                             "$first": {"$ifNull": ["$inventory_data.closing_stock", 0]}
                         },
@@ -1315,7 +1181,7 @@ async def generate_report_by_date_range(
                     "total_amount": {"$sum": "$amount"},
                     "total_sessions": {"$sum": "$sessions"},
                     "total_closing_stock": {
-                        "$sum": {"$ifNull": ["$ledger_data.closing_stock", 0]}
+                        "$last": {"$ifNull": ["$ledger_data.closing_stock", 0]}
                     },
                     "item_name": {"$last": "$item_info.item_name"},
                     "sku_code": {"$last": "$item_info.sku_code"},
@@ -1413,7 +1279,7 @@ async def generate_report_by_date_range(
         ]
 
         # Changed to start from sales_traffic collection
-        collection = database.get_collection(SALES_TRAFFIC_COLLECTION)
+        collection = database.get_collection(SALES_COLLECTION)
         cursor = list(collection.aggregate(base_pipeline))
         result = serialize_mongo_document(cursor)
 
@@ -1422,6 +1288,7 @@ async def generate_report_by_date_range(
     except Exception as e:
         import traceback
 
+        print(str(e))
         traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1433,12 +1300,12 @@ async def generate_report_by_date_range(
 async def get_report_data_by_date_range(
     start_date: str,
     end_date: str,
-    report_type: str = "all",  # New parameter: "all", "fba", "seller_flex" or "vendor_central"
+    report_type: str = "fba+seller_flex",
     database=Depends(get_database),
 ):
     try:
         # Validate type parameter
-        valid_types = ["all", "fba", "seller_flex", "vendor_central"]
+        valid_types = ["fba+seller_flex", "fba", "seller_flex", "vendor_central"]
         if report_type not in valid_types:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1488,27 +1355,17 @@ def format_column_name(column_name):
 async def download_report_by_date_range(
     start_date: str,
     end_date: str,
-    report_type: str = "all",  # "all", "fba", or "seller_flex"
+    report_type: str = "fba+seller_flex",  # "fba+seller_flex", "fba", "seller_flex", or "vendor_central"
     database=Depends(get_database),
 ):
-    """
-    Downloads report data for a specific date range as an Excel file.
 
-    Parameters:
-    - start_date: Start date in YYYY-MM-DD format
-    - end_date: End date in YYYY-MM-DD format
-    - warehouse_type: Filter type - "all" (default), "fba" (excludes VKSX), or "seller_flex" (only VKSX)
-
-    Returns:
-    - Excel file download with formatted column names
-    """
     try:
-        # Validate warehouse_type parameter
-        valid_types = ["all", "fba", "seller_flex"]
+        # Validate report_type parameter - Updated to include vendor_central
+        valid_types = ["fba+seller_flex", "fba", "seller_flex", "vendor_central"]
         if report_type not in valid_types:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid warehouse_type. Must be one of: {', '.join(valid_types)}",
+                detail=f"Invalid report_type. Must be one of: {', '.join(valid_types)}",
             )
 
         # Generate the report data using existing function
@@ -1522,7 +1379,7 @@ async def download_report_by_date_range(
         if not report_data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="No data found for the specified date range and warehouse type",
+                detail="No data found for the specified date range and report type",
             )
 
         # Convert to DataFrame
@@ -1535,23 +1392,39 @@ async def download_report_by_date_range(
 
         df = df.rename(columns=column_mapping)
 
-        # Handle the warehouses column (convert list to string)
+        # Handle the warehouses column (convert list to string) - only for non-vendor reports
         if "Warehouses" in df.columns:
             df["Warehouses"] = df["Warehouses"].apply(
                 lambda x: ", ".join(x) if isinstance(x, list) else str(x)
             )
 
         # Reorder columns for better presentation
-        preferred_order = [
-            "ASIN",
-            "SKU Code",
-            "Item Name",
-            "Warehouses",
-            "Units Sold",
-            "Total Amount",
-            "Sessions",
-            "Closing Stock",
-        ]
+        # Different column orders for vendor_central vs other report types
+        if report_type == "vendor_central":
+            preferred_order = [
+                "ASIN",
+                "SKU Code",
+                "Item Name",
+                "Units Sold",
+                "Total Amount",
+                "Closing Stock",
+                "Stock",  # vendor_central includes both closing_stock and stock
+                "Total Days In Stock",
+                "Drr",
+            ]
+        else:
+            preferred_order = [
+                "ASIN",
+                "SKU Code",
+                "Item Name",
+                "Warehouses",
+                "Units Sold",
+                "Total Amount",
+                "Sessions",
+                "Closing Stock",
+                "Total Days In Stock",
+                "Drr",
+            ]
 
         # Only include columns that exist in the DataFrame
         column_order = [col for col in preferred_order if col in df.columns]
@@ -1600,10 +1473,12 @@ async def download_report_by_date_range(
 
         excel_buffer.seek(0)
 
-        # Generate filename with timestamp and warehouse type
+        # Generate filename with timestamp and report type
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        warehouse_suffix = f"_{report_type}" if report_type != "all" else ""
-        filename = f"inventory_report_{start_date}_to_{end_date}{warehouse_suffix}_{timestamp}.xlsx"
+        type_suffix = f"_{report_type}" if report_type != "fba+seller_flex" else ""
+        filename = (
+            f"inventory_report_{start_date}_to_{end_date}{type_suffix}_{timestamp}.xlsx"
+        )
 
         # Create streaming response
         response = StreamingResponse(

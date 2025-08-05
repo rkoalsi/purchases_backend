@@ -27,7 +27,7 @@ class APIScheduler:
         if self.client:
             await self.client.aclose()
     
-    async def get_sales_traffic(self):
+    async def get_sc_sales_traffic(self):
         try:
             logger.info("Executing Sales Traffic API call...")
             start_date = (datetime.now().date() - timedelta(days=2)).strftime("%Y-%m-%d")
@@ -40,7 +40,7 @@ class APIScheduler:
             logger.error(f"Sales Traffic API call failed: {str(e)}")
             raise
     
-    async def get_inventory_ledger(self):
+    async def get_sc_inventory(self):
         try:
             logger.info("Executing Inventory Ledger API call...")
             start_date = (datetime.now().date() - timedelta(days=2)).strftime("%Y-%m-%d")
@@ -53,13 +53,41 @@ class APIScheduler:
             logger.error(f"Inventory Ledger API call failed: {str(e)}")
             raise
     
+    async def get_vc_sales_traffic(self):
+        try:
+            logger.info("Executing Sales Traffic API call...")
+            start_date = (datetime.now().date() - timedelta(days=2)).strftime("%Y-%m-%d")
+            response = await self.client.post(f"/amazon/vendor/sync/sales?start_date={start_date}&end_date={start_date}")
+            print(response.json())
+            response.raise_for_status()
+            logger.info(f"Sales Traffic API call successful: {response.status_code}")
+            return response.json()
+        except Exception as e:
+            logger.error(f"Sales Traffic API call failed: {str(e)}")
+            raise
+    
+    async def get_vc_inventory(self):
+        try:
+            logger.info("Executing Inventory Ledger API call...")
+            start_date = (datetime.now().date() - timedelta(days=2)).strftime("%Y-%m-%d")
+            response = await self.client.post(f"/amazon/vendor/sync/inventory?start_date={start_date}&end_date={start_date}")
+            print(response.json())
+            response.raise_for_status()
+            logger.info(f"Inventory Ledger API call successful: {response.status_code}")
+            return response.json()
+        except Exception as e:
+            logger.error(f"Inventory Ledger API call failed: {str(e)}")
+            raise
+    
     async def daily_task_execution(self):
         try:
             logger.info(f"Starting daily task execution at {datetime.now()}")
             
-            await self.get_sales_traffic()
+            await self.get_sc_sales_traffic()
+            await self.get_sc_inventory()
             
-            await self.get_inventory_ledger()
+            await self.get_vc_inventory()
+            await self.get_vc_sales_traffic()
             
             logger.info("Daily task execution completed successfully")
             
