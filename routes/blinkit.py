@@ -15,7 +15,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 from pymongo import InsertOne
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 # Optimize SKU mapping with caching
@@ -46,7 +46,6 @@ sku_cache = SKUCache()
 SKU_COLLECTION = "blinkit_sku_mapping"
 SALES_COLLECTION = "blinkit_sales"
 INVENTORY_COLLECTION = "blinkit_inventory"
-REPORT_COLLECTION = "blinkit_sales_inventory_reports"
 
 CITIES = [
     "Hyderabad",
@@ -255,6 +254,104 @@ async def create_single_item(body: dict):
             detail=f"An error occurred creating the item: {e}",
         )
 
+
+@router.get("/status")
+async def sync_status(
+    start_date: str, end_date: str, db=Depends(get_database)
+):
+    try:
+        # Parse date range
+        start = datetime.strptime(start_date, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
+        )
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+        )
+
+        # Initialize date range variables
+        first_sales_date = None
+        last_sales_date = None
+        first_inventory_date = None
+        last_inventory_date = None
+
+        sales_collection = SALES_COLLECTION  
+        inventory_collection = INVENTORY_COLLECTION
+        # Get first and last sales dates in the date range
+        sales_date_pipeline = [
+            {
+                "$match": {
+                    "order_date": {"$gte": start, "$lte": end}
+                }
+            },
+            {
+                "$group": {
+                    "_id": None,
+                    "first_date": {"$min": "$order_date"},
+                    "last_date": {"$max": "$order_date"}
+                }
+            }
+        ]
+        
+        sales_dates = list(db[sales_collection].aggregate(sales_date_pipeline))
+        if sales_dates:
+            first_sales_date = sales_dates[0]["first_date"].isoformat() if sales_dates[0]["first_date"] else None
+            last_sales_date = sales_dates[0]["last_date"].isoformat() if sales_dates[0]["last_date"] else None
+
+        # Get first and last inventory dates in the date range
+        inventory_date_pipeline = [
+            {
+                "$match": {
+                    "date": {"$gte": start, "$lte": end}
+                }
+            },
+            {
+                "$group": {
+                    "_id": None,
+                    "first_date": {"$min": "$date"},
+                    "last_date": {"$max": "$date"}
+                }
+            }
+        ]
+        
+        inventory_dates = list(db[inventory_collection].aggregate(inventory_date_pipeline))
+        if inventory_dates:
+            first_inventory_date = inventory_dates[0]["first_date"].isoformat() if inventory_dates[0]["first_date"] else None
+            last_inventory_date = inventory_dates[0]["last_date"].isoformat() if inventory_dates[0]["last_date"] else None
+
+        # Get total counts (you might want to filter these by date range too)
+        sales_count = db[sales_collection].count_documents({
+            "date": {"$gte": start, "$lte": end}
+        })
+        inventory_count = db[inventory_collection].count_documents({
+            "date": {"$gte": start, "$lte": end}
+        })
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "date_range": {
+                    "start_date": start_date,
+                    "end_date": end_date
+                },
+                "sales_data": {
+                    "records_count": sales_count,
+                    "first_sales_date": first_sales_date,
+                    "last_sales_date": last_sales_date,
+                 
+                },
+                "inventory_data": {
+                    "records_count": inventory_count,
+                    "first_inventory_date": first_inventory_date,
+                    "last_inventory_date": last_inventory_date,
+                },
+            },
+        )
+
+    except Exception as e:
+        print(f"Error getting sync status: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
 
 @router.post("/upload_sales_data")
 async def upload_sales_data(
