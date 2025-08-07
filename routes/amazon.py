@@ -1474,18 +1474,17 @@ def format_column_name(column_name):
 
     return replacements.get(formatted, formatted)
 
-
 @router.get("/download_report_by_date_range")
 async def download_report_by_date_range(
     start_date: str,
     end_date: str,
-    report_type: str = "fba+seller_flex",  # "fba+seller_flex", "fba", "seller_flex", or "vendor_central"
+    report_type: str = "fba+seller_flex",  # "fba+seller_flex", "fba", "seller_flex", "vendor_central", or "all"
     database=Depends(get_database),
 ):
 
     try:
-        # Validate report_type parameter - Updated to include vendor_central
-        valid_types = ["fba+seller_flex", "fba", "seller_flex", "vendor_central"]
+        # Validate report_type parameter - Updated to include "all"
+        valid_types = ["fba+seller_flex", "fba", "seller_flex", "vendor_central", "all"]
         if report_type not in valid_types:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1523,7 +1522,7 @@ async def download_report_by_date_range(
             )
 
         # Reorder columns for better presentation
-        # Different column orders for vendor_central vs other report types
+        # Different column orders for different report types
         if report_type == "vendor_central":
             preferred_order = [
                 "ASIN",
@@ -1536,7 +1535,24 @@ async def download_report_by_date_range(
                 "Total Days In Stock",
                 "Drr",
             ]
+        elif report_type == "all":
+            # Combined report includes all fields from both vendor and FBA data
+            preferred_order = [
+                "ASIN",
+                "SKU Code",
+                "Item Name",
+                "Warehouses",
+                "Units Sold",
+                "Total Amount",
+                "Sessions",
+                "Closing Stock",
+                "Stock",  # Combined reports include both closing_stock and stock
+                "Total Days In Stock",
+                "Drr",
+                "Data Source",  # Show which source the data came from
+            ]
         else:
+            # FBA, Seller Flex, and FBA+Seller Flex reports
             preferred_order = [
                 "ASIN",
                 "SKU Code",
@@ -1595,6 +1611,28 @@ async def download_report_by_date_range(
                 cell.font = header_font
                 cell.fill = header_fill
 
+            # Special formatting for "all" report type - color code rows by data source
+            if report_type == "all" and "Data Source" in df.columns:
+                from openpyxl.styles import PatternFill
+                
+                # Define colors for different data sources
+                color_mapping = {
+                    "combined": PatternFill(start_color="E8F5E8", end_color="E8F5E8", fill_type="solid"),     # Light green
+                    "vendor_only": PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"),  # Light yellow
+                    "fba_only": PatternFill(start_color="E1F5FE", end_color="E1F5FE", fill_type="solid"),     # Light blue
+                }
+                
+                # Apply color coding to rows based on data source
+                data_source_col_index = df.columns.get_loc("Data Source") + 1  # +1 because Excel is 1-indexed
+                
+                for row_num in range(2, len(df) + 2):  # Start from row 2 (after header)
+                    data_source_value = worksheet.cell(row=row_num, column=data_source_col_index).value
+                    row_fill = color_mapping.get(data_source_value)
+                    
+                    if row_fill:
+                        for col_num in range(1, len(df.columns) + 1):
+                            worksheet.cell(row=row_num, column=col_num).fill = row_fill
+
         excel_buffer.seek(0)
 
         # Generate filename with timestamp and report type
@@ -1625,3 +1663,28 @@ async def download_report_by_date_range(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred generating the Excel report: {e}",
         )
+
+
+# Updated format_column_name function to handle the new "Data Source" column
+def format_column_name(column_name):
+    """Convert snake_case column names to proper formatted names"""
+    # Replace underscores with spaces and title case
+    formatted = column_name.replace("_", " ").title()
+
+    # Handle specific cases for better formatting
+    replacements = {
+        "Asin": "ASIN",
+        "Sku Code": "SKU Code",
+        "Item Name": "Item Name",
+        "Units Sold": "Units Sold",
+        "Total Amount": "Total Amount",
+        "Closing Stock": "Closing Stock",
+        "Sessions": "Sessions",
+        "Warehouses": "Warehouses",
+        "Data Source": "Data Source",
+        "Total Days In Stock": "Total Days In Stock",
+        "Drr": "DRR",
+        "Stock": "Stock",
+    }
+
+    return replacements.get(formatted, formatted)
