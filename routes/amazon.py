@@ -1653,9 +1653,11 @@ async def download_report_by_date_range(
         return response
 
     except HTTPException as e:
+        print(str(e))
         raise e
     except Exception as e:
         print(f"Error generating Excel report: {e}")
+        print(str(e))
         import traceback
 
         traceback.print_exc()
