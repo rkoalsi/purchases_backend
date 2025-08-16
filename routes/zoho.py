@@ -1,6 +1,6 @@
 import pandas as pd
 from datetime import datetime, timedelta
-import io, logging, math, json
+import io, logging, math, json, re
 from fastapi import (
     APIRouter,
     File,
@@ -583,7 +583,9 @@ def query_invoices_for_skus(
         "(OSAMP) Office samples",
         "(PUPEV) PUPSCRIBE EVENTS",
         "(SSAM) Sales samples",
-        "(RS) Retail samples"
+        "(RS) Retail samples",
+        "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
+        "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
     ]
     try:
         invoices_collection = db.get_collection(INVOICES_COLLECTION)
@@ -927,7 +929,6 @@ executor = ThreadPoolExecutor(max_workers=4)
 async def get_sales_report_fast(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
-    use_cache: bool = Query(False, description="Use cached results if available"),
     db=Depends(get_database),
 ):
     """
@@ -946,13 +947,13 @@ async def get_sales_report_fast(
             )
 
         # Check cache first
-        if use_cache:
-            cache_key = f"sales_report_{start_date}_{end_date}"
-            cached_result = await get_cached_report(cache_key, db)
-            if cached_result:
-                logger.info(f"Returning cached report for {start_date} to {end_date}")
-                cached_result["meta"]["from_cache"] = True
-                return JSONResponse(content=cached_result)
+        # if use_cache:
+        #     cache_key = f"sales_report_{start_date}_{end_date}"
+        #     cached_result = await get_cached_report(cache_key, db)
+        #     if cached_result:
+        #         logger.info(f"Returning cached report for {start_date} to {end_date}")
+        #         cached_result["meta"]["from_cache"] = True
+        #         return JSONResponse(content=cached_result)
 
         logger.info(
             f"Generating ultra-fast sales report for {start_date} to {end_date}"
@@ -967,7 +968,7 @@ async def get_sales_report_fast(
 
         # OPTIMIZATION 2: Use more efficient customer filtering
         excluded_customers = get_excluded_customer_list()
-
+        print(excluded_customers)
         # OPTIMIZATION 3: Optimized main pipeline
         invoices_collection = db[INVOICES_COLLECTION]
 
@@ -1065,9 +1066,9 @@ async def get_sales_report_fast(
             },
         }
 
-        # Cache the result for future use
-        if use_cache:
-            await cache_report(cache_key, response_data, db)
+        # # Cache the result for future use
+        # if use_cache:
+        #     await cache_report(cache_key, response_data, db)
 
         return JSONResponse(content=response_data)
 
@@ -1079,7 +1080,7 @@ async def get_sales_report_fast(
 
 
 def build_optimized_pipeline(
-    start_date: str, end_date: str, excluded_customers: List[str]
+    start_date: str, end_date: str, excluded_customers: str
 ) -> List[Dict]:
     """
     Build an optimized aggregation pipeline with better filtering and projection.
@@ -1092,7 +1093,15 @@ def build_optimized_pipeline(
                     {"date": {"$gte": start_date, "$lte": end_date}},
                     {"status": {"$nin": ["draft", "void"]}},
                     # More efficient customer filtering
-                    {"customer_name": {"$nin": excluded_customers}},
+                  {
+                        "customer_name": {
+                            "$not": {
+                                "$regex": excluded_customers,
+                                "$options": "i"  # case insensitive
+                            }
+                        }
+                    },
+
                 ]
             }
         },
@@ -1265,13 +1274,7 @@ def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Di
 
 
 @lru_cache(maxsize=100)
-def get_excluded_customer_list() -> List[str]:
-    """
-    Get cached list of excluded customer patterns.
-    Consider storing this in database for easier management.
-    """
-    # Instead of complex regex, use exact matches where possible
-    # This would be even better if stored in a database collection
+def get_excluded_customer_list() -> str:
     patterns = [
         "EC",
         "NA",
@@ -1284,17 +1287,13 @@ def get_excluded_customer_list() -> List[str]:
         "SSAM",
         "OSAM",
         "Blinkit",
+        "ETRADE"
     ]
-
-    # Generate variations (upper, lower, mixed case)
-    excluded = []
-    for pattern in patterns:
-        excluded.extend(
-            [pattern, pattern.lower(), pattern.upper(), pattern.capitalize()]
-        )
-
-    return excluded
-
+    
+    escaped_patterns = [re.escape(pattern) for pattern in patterns]
+    regex_pattern = "|".join(escaped_patterns)
+    
+    return regex_pattern
 
 async def get_cached_report(cache_key: str, db) -> Optional[Dict]:
     """
@@ -1382,7 +1381,7 @@ async def download_sales_report(
 
         # OPTIMIZATION 2: Use more efficient customer filtering (same as fast API)
         excluded_customers = get_excluded_customer_list()
-
+        print(excluded_customers)
         # OPTIMIZATION 3: Use the same optimized pipeline as fast API
         invoices_collection = db[INVOICES_COLLECTION]
         pipeline = build_optimized_pipeline(start_date, end_date, excluded_customers)
