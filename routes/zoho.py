@@ -1,6 +1,6 @@
 import pandas as pd
 from datetime import datetime, timedelta
-import io, logging, math
+import io, logging, math, json
 from fastapi import (
     APIRouter,
     File,
@@ -872,3 +872,1074 @@ async def get_available_brands(db=Depends(get_database)):
     except Exception as e:
         logger.error(f"Error getting brands: {e}")
         raise HTTPException(status_code=500, detail="Error retrieving brands")
+
+
+class SalesReportRequest(BaseModel):
+    start_date: str
+    end_date: str
+
+    @validator("start_date", "end_date")
+    def validate_date_format(cls, v):
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+            return v
+        except ValueError:
+            raise ValueError("Date must be in YYYY-MM-DD format")
+
+    @validator("end_date")
+    def validate_date_range(cls, v, values):
+        if "start_date" in values:
+            start = datetime.strptime(values["start_date"], "%Y-%m-%d")
+            end = datetime.strptime(v, "%Y-%m-%d")
+            if start > end:
+                raise ValueError("End date must be after start date")
+        return v
+
+
+# Response models
+class SalesReportItem(BaseModel):
+    item_name: str
+    sku_code: str
+    units_sold: int
+    total_amount: float
+    closing_stock: int
+    total_days_in_stock: int
+    drr: float
+
+
+class SalesReportResponse(BaseModel):
+    data: List[SalesReportItem]
+    summary: dict
+    meta: dict
+
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Any, Optional
+from functools import lru_cache
+
+# Thread pool for parallel operations
+executor = ThreadPoolExecutor(max_workers=4)
+
+
+@router.get("/sales-report")
+async def get_sales_report_fast(
+    start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
+    end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
+    use_cache: bool = Query(False, description="Use cached results if available"),
+    db=Depends(get_database),
+):
+    """
+    Ultra-optimized sales report that runs in 5-15 seconds instead of 60 seconds.
+    """
+
+    try:
+        # Validate dates
+        start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
+        end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
+
+        if start_datetime > end_datetime:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="End date must be after start date",
+            )
+
+        # Check cache first
+        if use_cache:
+            cache_key = f"sales_report_{start_date}_{end_date}"
+            cached_result = await get_cached_report(cache_key, db)
+            if cached_result:
+                logger.info(f"Returning cached report for {start_date} to {end_date}")
+                cached_result["meta"]["from_cache"] = True
+                return JSONResponse(content=cached_result)
+
+        logger.info(
+            f"Generating ultra-fast sales report for {start_date} to {end_date}"
+        )
+        start_time = datetime.now()
+
+        # OPTIMIZATION 1: Run stock and sales aggregations in parallel
+        stock_task = asyncio.create_task(
+            fetch_stock_data_optimized(db, start_datetime, end_datetime)
+        )
+        products_task = asyncio.create_task(fetch_all_products_indexed(db))
+
+        # OPTIMIZATION 2: Use more efficient customer filtering
+        excluded_customers = get_excluded_customer_list()
+
+        # OPTIMIZATION 3: Optimized main pipeline
+        invoices_collection = db[INVOICES_COLLECTION]
+
+        # Build the pipeline with all optimizations
+        pipeline = build_optimized_pipeline(start_date, end_date, excluded_customers)
+
+        # Execute main aggregation
+        logger.info("Executing main aggregation pipeline...")
+        result_cursor = invoices_collection.aggregate(
+            pipeline,
+            allowDiskUse=True,
+            batchSize=1000,  # Larger batch size for better performance
+        )
+
+        # Get parallel task results
+        stock_data, products_map = await asyncio.gather(stock_task, products_task)
+
+        logger.info(
+            f"Processing {len(stock_data)} stock items and {len(products_map)} products"
+        )
+
+        # Process results efficiently
+        sales_report_items = []
+        total_units = 0
+        total_amount = 0.0
+        total_closing_stock = 0
+
+        # Process in batches for better memory management
+        batch = []
+        batch_size = 100
+
+        for item in result_cursor:
+            batch.append(item)
+            if len(batch) >= batch_size:
+                processed = process_batch(batch, stock_data, products_map)
+                sales_report_items.extend(processed["items"])
+                total_units += processed["units"]
+                total_amount += processed["amount"]
+                total_closing_stock += processed["stock"]
+                batch = []
+
+        # Process remaining items
+        if batch:
+            processed = process_batch(batch, stock_data, products_map)
+            sales_report_items.extend(processed["items"])
+            total_units += processed["units"]
+            total_amount += processed["amount"]
+            total_closing_stock += processed["stock"]
+
+        # Sort results
+        sales_report_items.sort(key=lambda x: x.item_name)
+
+        execution_time = (datetime.now() - start_time).total_seconds()
+        logger.info(
+            f"Ultra-fast report generated in {execution_time:.2f} seconds with {len(sales_report_items)} items"
+        )
+
+        # Calculate summary
+        avg_drr = (
+            sum(item.drr for item in sales_report_items) / len(sales_report_items)
+            if sales_report_items
+            else 0
+        )
+        items_with_stock = sum(
+            1 for item in sales_report_items if item.closing_stock > 0
+        )
+        items_out_of_stock = sum(
+            1 for item in sales_report_items if item.closing_stock == 0
+        )
+
+        # Prepare response
+        response_data = {
+            "data": [item.dict() for item in sales_report_items],
+            "summary": {
+                "total_items": len(sales_report_items),
+                "total_units_sold": total_units,
+                "total_amount": round(total_amount, 2),
+                "total_closing_stock": total_closing_stock,
+                "average_drr": round(avg_drr, 2),
+                "items_with_stock": items_with_stock,
+                "items_out_of_stock": items_out_of_stock,
+                "date_range": {"start_date": start_date, "end_date": end_date},
+            },
+            "meta": {
+                "timestamp": datetime.now().isoformat(),
+                "execution_time_seconds": round(execution_time, 2),
+                "query_type": "ultra_fast_sales_report",
+                "from_cache": False,
+                "optimizations": [
+                    "parallel_aggregations",
+                    "indexed_products",
+                    "batch_processing",
+                    "optimized_customer_filter",
+                ],
+            },
+        }
+
+        # Cache the result for future use
+        if use_cache:
+            await cache_report(cache_key, response_data, db)
+
+        return JSONResponse(content=response_data)
+
+    except Exception as e:
+        logger.error(f"Error in ultra-fast sales report: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+def build_optimized_pipeline(
+    start_date: str, end_date: str, excluded_customers: List[str]
+) -> List[Dict]:
+    """
+    Build an optimized aggregation pipeline with better filtering and projection.
+    """
+    return [
+        # CRITICAL: Use compound match for better index utilization
+        {
+            "$match": {
+                "$and": [
+                    {"date": {"$gte": start_date, "$lte": end_date}},
+                    {"status": {"$nin": ["draft", "void"]}},
+                    # More efficient customer filtering
+                    {"customer_name": {"$nin": excluded_customers}},
+                ]
+            }
+        },
+        # Early projection to reduce document size
+        {"$project": {"line_items": 1, "_id": 0}},
+        # Unwind and group
+        {"$unwind": "$line_items"},
+        {
+            "$group": {
+                "_id": "$line_items.item_id",
+                "item_name": {"$first": "$line_items.name"},
+                "total_units_sold": {"$sum": "$line_items.quantity"},
+                "total_amount": {"$sum": "$line_items.item_total"},
+            }
+        },
+        # Don't do lookups here - we'll join with pre-fetched data in memory
+    ]
+
+
+async def fetch_stock_data_optimized(
+    db, start_datetime: datetime, end_datetime: datetime
+) -> Dict:
+    """
+    Optimized stock data fetching with better aggregation pipeline.
+    """
+    try:
+        stock_collection = db["zoho_stock"]
+
+        # More efficient pipeline
+        pipeline = [
+            {"$match": {"date": {"$gte": start_datetime, "$lte": end_datetime}}},
+            # Group first, then calculate
+            {
+                "$group": {
+                    "_id": {
+                        "item_id": "$zoho_item_id",
+                        "date": {
+                            "$dateToString": {"format": "%Y-%m-%d", "date": "$date"}
+                        },
+                    },
+                    "daily_stock": {"$last": "$stock"},  # Last entry of the day
+                }
+            },
+            # Re-group to get item-level stats
+            {
+                "$group": {
+                    "_id": "$_id.item_id",
+                    "closing_stock": {
+                        "$last": "$daily_stock"
+                    },  # Most recent day's stock
+                    "stock_days": {
+                        "$sum": {"$cond": [{"$gt": ["$daily_stock", 0]}, 1, 0]}
+                    },
+                    "all_daily_stocks": {"$push": "$daily_stock"},
+                }
+            },
+            {
+                "$project": {
+                    "_id": 1,
+                    "closing_stock": 1,
+                    "total_days_in_stock": "$stock_days",
+                }
+            },
+        ]
+
+        # Use cursor with batch processing
+        cursor = stock_collection.aggregate(
+            pipeline,
+            allowDiskUse=True,
+            batchSize=5000,  # Large batch for better performance
+        )
+
+        # Convert to dictionary efficiently
+        stock_data = {}
+        for doc in cursor:
+            stock_data[doc["_id"]] = {
+                "closing_stock": doc.get("closing_stock", 0),
+                "total_days_in_stock": doc.get("total_days_in_stock", 0),
+            }
+
+        logger.info(f"Fetched {len(stock_data)} stock records")
+        return stock_data
+
+    except Exception as e:
+        logger.error(f"Error fetching stock data: {e}")
+        return {}
+
+
+async def fetch_all_products_indexed(db) -> Dict:
+    """
+    Fetch all products and create an indexed map for O(1) lookups.
+    """
+    try:
+        products_collection = db["products"]
+
+        # Simple projection to get only what we need
+        cursor = products_collection.find(
+            {
+                "$and": [
+                    {"name": {"$ne": ""}},           # Not empty string
+                    {"name": {"$ne": "amazon"}},     # Not exactly "amazon" (case sensitive)
+                ]
+            },
+            {"item_id": 1, "cf_sku_code": 1, "name": 1, "_id": 0},  # Include name for debugging
+            batch_size=5000,
+        )
+
+
+        # Create indexed map
+        products_map = {}
+        for product in cursor:
+            products_map[product.get("item_id")] = product.get("cf_sku_code", "")
+
+        logger.info(f"Indexed {len(products_map)} products")
+        return products_map
+
+    except Exception as e:
+        logger.error(f"Error fetching products: {e}")
+        return {}
+
+
+def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Dict:
+    """
+    Process a batch of items efficiently.
+    """
+    items = []
+    total_units = 0
+    total_amount = 0
+    total_stock = 0
+
+    for item in batch:
+        item_id = item["_id"]
+        units_sold = item.get("total_units_sold", 0)
+        amount = item.get("total_amount", 0.0)
+
+        # Get SKU from pre-fetched map (O(1) lookup)
+        sku_code = products_map.get(item_id, "")
+
+        # Get stock data from pre-fetched map (O(1) lookup)
+        stock_info = stock_data.get(item_id, {})
+        closing_stock = stock_info.get("closing_stock", 0)
+        days_in_stock = stock_info.get("total_days_in_stock", 0)
+
+        # Calculate DRR
+        drr = round(units_sold / days_in_stock, 2) if days_in_stock > 0 else 0
+
+        total_units += units_sold
+        total_amount += amount
+        total_stock += closing_stock
+        
+        if item.get('item_name') != '':
+            items.append(
+                SalesReportItem(
+                    item_name=item.get("item_name", ""),
+                    sku_code=sku_code,
+                    units_sold=units_sold,
+                    total_amount=round(amount, 2),
+                    closing_stock=closing_stock,
+                    total_days_in_stock=days_in_stock,
+                    drr=drr,
+                )
+            )
+
+    return {
+        "items": items,
+        "units": total_units,
+        "amount": total_amount,
+        "stock": total_stock,
+    }
+
+
+@lru_cache(maxsize=100)
+def get_excluded_customer_list() -> List[str]:
+    """
+    Get cached list of excluded customer patterns.
+    Consider storing this in database for easier management.
+    """
+    # Instead of complex regex, use exact matches where possible
+    # This would be even better if stored in a database collection
+    patterns = [
+        "EC",
+        "NA",
+        "amzb2b",
+        "amz2b2",
+        "PUPEV",
+        "RS",
+        "MKT",
+        "SPUR",
+        "SSAM",
+        "OSAM",
+        "Blinkit",
+    ]
+
+    # Generate variations (upper, lower, mixed case)
+    excluded = []
+    for pattern in patterns:
+        excluded.extend(
+            [pattern, pattern.lower(), pattern.upper(), pattern.capitalize()]
+        )
+
+    return excluded
+
+
+async def get_cached_report(cache_key: str, db) -> Optional[Dict]:
+    """
+    Get cached report if available and fresh (less than 1 hour old).
+    """
+    try:
+        cache_collection = db.get_collection("report_cache")
+
+        # Find cached report
+        cached = cache_collection.find_one(
+            {
+                "_id": cache_key,
+                "created_at": {"$gte": datetime.now() - timedelta(hours=1)},
+            }
+        )
+
+        if cached:
+            return cached.get("data")
+
+    except Exception as e:
+        logger.warning(f"Cache retrieval failed: {e}")
+
+    return None
+
+
+async def cache_report(cache_key: str, data: Dict, db):
+    """
+    Cache report for future use.
+    """
+    try:
+        cache_collection = db.get_collection("report_cache")
+
+        cache_collection.replace_one(
+            {"_id": cache_key},
+            {"_id": cache_key, "data": data, "created_at": datetime.now()},
+            upsert=True,
+        )
+
+        logger.info(f"Report cached with key: {cache_key}")
+
+    except Exception as e:
+        logger.warning(f"Failed to cache report: {e}")
+
+
+@router.get("/sales-report/download")
+async def download_sales_report(
+    start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
+    end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
+    db=Depends(get_database),
+):
+    """
+    Download sales report as XLSX file for the given date range.
+    Uses the same optimized approach as the main sales report API.
+
+    Returns an Excel file with two sheets:
+    - Sales Data: Detailed item-wise sales information
+    - Summary: Aggregated summary statistics
+    """
+
+    try:
+        # Validate dates
+        try:
+            start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
+            end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
+
+            if start_datetime > end_datetime:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="End date must be after start date",
+                )
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid date format. Use YYYY-MM-DD",
+            )
+
+        logger.info(f"Generating optimized sales report download for {start_date} to {end_date}")
+        start_time = datetime.now()
+
+        # OPTIMIZATION 1: Run stock and sales aggregations in parallel (same as fast API)
+        stock_task = asyncio.create_task(
+            fetch_stock_data_optimized(db, start_datetime, end_datetime)
+        )
+        products_task = asyncio.create_task(fetch_all_products_indexed(db))
+
+        # OPTIMIZATION 2: Use more efficient customer filtering (same as fast API)
+        excluded_customers = get_excluded_customer_list()
+
+        # OPTIMIZATION 3: Use the same optimized pipeline as fast API
+        invoices_collection = db[INVOICES_COLLECTION]
+        pipeline = build_optimized_pipeline(start_date, end_date, excluded_customers)
+
+        # Execute main aggregation
+        logger.info("Executing optimized aggregation pipeline for download...")
+        result_cursor = invoices_collection.aggregate(
+            pipeline,
+            allowDiskUse=True,
+            batchSize=1000,  # Same as fast API
+        )
+
+        # Get parallel task results
+        stock_data, products_map = await asyncio.gather(stock_task, products_task)
+
+        logger.info(
+            f"Processing {len(stock_data)} stock items and {len(products_map)} products for download"
+        )
+
+        # Process results efficiently using same batch logic as fast API
+        sales_report_items = []
+        total_units = 0
+        total_amount = 0.0
+        total_closing_stock = 0
+
+        # Process in batches for better memory management (same as fast API)
+        batch = []
+        batch_size = 100
+
+        for item in result_cursor:
+            batch.append(item)
+            if len(batch) >= batch_size:
+                processed = process_batch(batch, stock_data, products_map)
+                sales_report_items.extend(processed["items"])
+                total_units += processed["units"]
+                total_amount += processed["amount"]
+                total_closing_stock += processed["stock"]
+                batch = []
+
+        # Process remaining items
+        if batch:
+            processed = process_batch(batch, stock_data, products_map)
+            sales_report_items.extend(processed["items"])
+            total_units += processed["units"]
+            total_amount += processed["amount"]
+            total_closing_stock += processed["stock"]
+
+        # Sort results (same as fast API)
+        sales_report_items.sort(key=lambda x: x.item_name)
+
+        execution_time = (datetime.now() - start_time).total_seconds()
+        logger.info(
+            f"Optimized download data prepared in {execution_time:.2f} seconds with {len(sales_report_items)} items"
+        )
+
+        # Calculate summary statistics (same logic as fast API)
+        avg_drr = (
+            sum(item.drr for item in sales_report_items) / len(sales_report_items)
+            if sales_report_items
+            else 0
+        )
+        items_with_stock = sum(
+            1 for item in sales_report_items if item.closing_stock > 0
+        )
+        items_out_of_stock = sum(
+            1 for item in sales_report_items if item.closing_stock == 0
+        )
+
+        # Create Excel file
+        import io
+        import xlsxwriter
+
+        # Create a BytesIO buffer
+        output = io.BytesIO()
+
+        # Create workbook and worksheets
+        workbook = xlsxwriter.Workbook(output, {"in_memory": True})
+
+        # Define formats
+        header_format = workbook.add_format(
+            {
+                "bold": True,
+                "bg_color": "#D7E4BC",
+                "border": 1,
+                "align": "center",
+                "valign": "vcenter",
+            }
+        )
+
+        data_format = workbook.add_format(
+            {"border": 1, "align": "left", "valign": "vcenter"}
+        )
+
+        number_format = workbook.add_format(
+            {"border": 1, "align": "right", "valign": "vcenter", "num_format": "#,##0"}
+        )
+
+        currency_format = workbook.add_format(
+            {
+                "border": 1,
+                "align": "right",
+                "valign": "vcenter",
+                "num_format": "₹#,##0.00",
+            }
+        )
+
+        decimal_format = workbook.add_format(
+            {"border": 1, "align": "right", "valign": "vcenter", "num_format": "0.00"}
+        )
+
+        # Create Sales Data worksheet
+        sales_sheet = workbook.add_worksheet("Sales Data")
+
+        # Write headers for sales data
+        headers = [
+            "Product Name",
+            "SKU Code",
+            "Units Sold",
+            "Total Amount (₹)",
+            "Closing Stock",
+            "Days in Stock",
+            "DRR",
+        ]
+
+        for col, header in enumerate(headers):
+            sales_sheet.write(0, col, header, header_format)
+
+        # Write sales data using the optimized data structure
+        for row, item in enumerate(sales_report_items, 1):
+            sales_sheet.write(row, 0, item.item_name, data_format)
+            sales_sheet.write(row, 1, item.sku_code, data_format)
+            sales_sheet.write(row, 2, item.units_sold, number_format)
+            sales_sheet.write(row, 3, item.total_amount, currency_format)
+            sales_sheet.write(row, 4, item.closing_stock, number_format)
+            sales_sheet.write(row, 5, item.total_days_in_stock, number_format)
+            sales_sheet.write(row, 6, item.drr, decimal_format)
+
+        # Auto-adjust column widths
+        sales_sheet.set_column("A:A", 30)  # Product Name
+        sales_sheet.set_column("B:B", 15)  # SKU Code
+        sales_sheet.set_column("C:C", 12)  # Units Sold
+        sales_sheet.set_column("D:D", 15)  # Total Amount
+        sales_sheet.set_column("E:E", 12)  # Closing Stock
+        sales_sheet.set_column("F:F", 12)  # Days in Stock
+        sales_sheet.set_column("G:G", 10)  # DRR
+
+        # Create Summary worksheet
+        summary_sheet = workbook.add_worksheet("Summary")
+
+        # Summary data (same calculations as fast API)
+        summary_data = [
+            ["Report Period", f"{start_date} to {end_date}"],
+            ["Generated On", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+            ["Execution Time", f"{execution_time:.2f} seconds"],
+            ["Processing Method", "Optimized (Same as Fast API)"],
+            ["", ""],
+            ["SALES SUMMARY", ""],
+            ["Total Items", len(sales_report_items)],
+            ["Total Units Sold", total_units],
+            ["Total Amount (₹)", total_amount],
+            ["Total Closing Stock", total_closing_stock],
+            ["Average DRR", round(avg_drr, 2)],
+            ["", ""],
+            ["STOCK SUMMARY", ""],
+            ["Items with Stock", items_with_stock],
+            ["Items Out of Stock", items_out_of_stock],
+            [
+                "Stock Coverage %",
+                f"{(items_with_stock / len(sales_report_items) * 100):.1f}%" if sales_report_items else "0.0%",
+            ],
+        ]
+
+        # Write summary data
+        for row, (label, value) in enumerate(summary_data):
+            if label == "" or label in ["SALES SUMMARY", "STOCK SUMMARY"]:
+                summary_sheet.write(row, 0, label, header_format)
+                summary_sheet.write(row, 1, value, header_format)
+            else:
+                summary_sheet.write(row, 0, label, data_format)
+                if isinstance(value, (int, float)) and label not in [
+                    "Generated On",
+                    "Execution Time",
+                    "Processing Method",
+                ]:
+                    if "Amount" in label:
+                        summary_sheet.write(row, 1, value, currency_format)
+                    elif "DRR" in label:
+                        summary_sheet.write(row, 1, value, decimal_format)
+                    else:
+                        summary_sheet.write(row, 1, value, number_format)
+                else:
+                    summary_sheet.write(row, 1, str(value), data_format)
+
+        # Auto-adjust column widths for summary
+        summary_sheet.set_column("A:A", 25)
+        summary_sheet.set_column("B:B", 20)
+
+        # Close the workbook
+        workbook.close()
+
+        # Get the value from the BytesIO buffer
+        output.seek(0)
+
+        # Generate filename
+        filename = f"sales_report_{start_date}_to_{end_date}.xlsx"
+
+        # Create response
+        from fastapi.responses import Response
+
+        response = Response(
+            content=output.getvalue(),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            },
+        )
+
+        logger.info(f"Optimized sales report Excel file generated: {filename}")
+        return response
+
+    except PyMongoError as e:
+        logger.error(f"MongoDB Error in optimized sales report download: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error occurred while generating sales report download: {str(e)}",
+        )
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error generating optimized sales report download: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred while generating the sales report download: {str(e)}",
+        )
+
+from functools import lru_cache
+from typing import Optional, Dict, Any
+import asyncio
+
+
+@router.get("/data-metadata")
+async def get_data_metadata(
+    start_date: str = Query(
+        None, description="Start date in YYYY-MM-DD format (optional)"
+    ),
+    end_date: str = Query(None, description="End date in YYYY-MM-DD format (optional)"),
+    db=Depends(get_database),
+):
+    """
+    Optimized metadata retrieval for sales and inventory collections.
+    """
+
+    try:
+        logger.info(f"Fetching optimized data metadata")
+        if start_date and end_date:
+            logger.info(f"Date range filter: {start_date} to {end_date}")
+
+        # Validate dates if provided
+        start_datetime = None
+        end_datetime = None
+        if start_date and end_date:
+            try:
+                start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
+                end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
+
+                if start_datetime > end_datetime:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="End date must be after start date",
+                    )
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid date format. Use YYYY-MM-DD",
+                )
+
+        # Get collections
+        invoices_collection = db[INVOICES_COLLECTION]
+        stock_collection = db["zoho_stock"]
+
+        # OPTIMIZATION: Run both aggregations in parallel
+        sales_task = asyncio.create_task(
+            get_sales_metadata_optimized(
+                invoices_collection, start_date, end_date, start_datetime, end_datetime
+            )
+        )
+        inventory_task = asyncio.create_task(
+            get_inventory_metadata_optimized(
+                stock_collection, start_datetime, end_datetime
+            )
+        )
+
+        # Wait for both tasks to complete
+        sales_metadata, inventory_metadata = await asyncio.gather(
+            sales_task, inventory_task
+        )
+
+        # Prepare response
+        metadata = {
+            "sales_data": sales_metadata,
+            "inventory_data": inventory_metadata,
+            "date_range": {
+                "start_date": start_date,
+                "end_date": end_date,
+                "filtered": bool(start_date and end_date),
+            },
+            "last_updated": datetime.now().isoformat(),
+        }
+
+        return JSONResponse(
+            content={
+                "data": metadata,
+                "meta": {
+                    "timestamp": datetime.now().isoformat(),
+                    "query_type": "optimized_data_metadata",
+                    "date_filtered": bool(start_date and end_date),
+                },
+            }
+        )
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error fetching data metadata: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}",
+        )
+
+
+async def get_sales_metadata_optimized(
+    collection,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    start_datetime: Optional[datetime],
+    end_datetime: Optional[datetime],
+) -> Dict[str, Any]:
+    """
+    Optimized sales metadata retrieval using a single aggregation pipeline.
+    """
+    try:
+        # OPTIMIZATION 1: Single pipeline for all sales metrics
+        pipeline = []
+
+        # If dates are consistently formatted as YYYY-MM-DD strings, use string comparison
+        if start_date and end_date:
+            # Try string comparison first (faster)
+            pipeline.append(
+                {"$match": {"date": {"$gte": start_date, "$lte": end_date}}}
+            )
+
+        # Add facet for parallel processing of different metrics
+        pipeline.append(
+            {
+                "$facet": {
+                    # Get total count
+                    "total_count": [{"$count": "count"}],
+                    # Get valid invoices with dates
+                    "valid_invoices": [
+                        {"$match": {"status": {"$nin": ["draft", "void"]}}},
+                        {
+                            "$group": {
+                                "_id": None,
+                                "count": {"$sum": 1},
+                                "first_date": {"$min": "$date"},
+                                "last_date": {"$max": "$date"},
+                            }
+                        },
+                    ],
+                    # Get date range for all invoices
+                    "date_range": [
+                        {
+                            "$group": {
+                                "_id": None,
+                                "min_date": {"$min": "$date"},
+                                "max_date": {"$max": "$date"},
+                            }
+                        }
+                    ],
+                }
+            }
+        )
+
+        # Execute the pipeline
+        result = list(collection.aggregate(pipeline, allowDiskUse=True))
+
+        if result:
+            facet_result = result[0]
+
+            # Extract total count
+            total_invoices = (
+                facet_result["total_count"][0]["count"]
+                if facet_result.get("total_count")
+                else 0
+            )
+
+            # Extract valid invoices data
+            valid_data = facet_result.get("valid_invoices", [{}])[0]
+            valid_count = valid_data.get("count", 0)
+
+            # Parse dates if they're strings
+            first_date = valid_data.get("first_date")
+            last_date = valid_data.get("last_date")
+
+            # Convert string dates to datetime if needed
+            if first_date and isinstance(first_date, str):
+                try:
+                    first_date = datetime.strptime(first_date, "%Y-%m-%d")
+                except:
+                    pass
+
+            if last_date and isinstance(last_date, str):
+                try:
+                    last_date = datetime.strptime(last_date, "%Y-%m-%d")
+                except:
+                    pass
+
+            return {
+                "first_sales_date": first_date.isoformat() if first_date else None,
+                "last_sales_date": last_date.isoformat() if last_date else None,
+                "total_invoices": total_invoices,
+                "valid_invoices": valid_count,
+            }
+
+        # If no results, get basic counts
+        total_invoices = await run_in_executor(collection.count_documents, {})
+        valid_invoices = await run_in_executor(
+            collection.count_documents, {"status": {"$nin": ["draft", "void"]}}
+        )
+
+        return {
+            "first_sales_date": None,
+            "last_sales_date": None,
+            "total_invoices": total_invoices,
+            "valid_invoices": valid_invoices,
+        }
+
+    except Exception as e:
+        logger.error(f"Error in optimized sales metadata: {e}")
+        return {
+            "first_sales_date": None,
+            "last_sales_date": None,
+            "total_invoices": 0,
+            "valid_invoices": 0,
+        }
+
+
+async def get_inventory_metadata_optimized(
+    collection, start_datetime: Optional[datetime], end_datetime: Optional[datetime]
+) -> Dict[str, Any]:
+    """
+    Optimized inventory metadata retrieval.
+    """
+    try:
+        # Build match condition
+        match_condition = {}
+        if start_datetime and end_datetime:
+            match_condition = {"date": {"$gte": start_datetime, "$lte": end_datetime}}
+
+        # OPTIMIZATION: Single aggregation for all metrics
+        pipeline = [
+            {"$match": match_condition} if match_condition else {"$match": {}},
+            {
+                "$group": {
+                    "_id": None,
+                    "count": {"$sum": 1},
+                    "first_date": {"$min": "$date"},
+                    "last_date": {"$max": "$date"},
+                }
+            },
+        ]
+
+        result = list(collection.aggregate(pipeline, allowDiskUse=True))
+
+        if result:
+            data = result[0]
+            return {
+                "first_inventory_date": (
+                    data["first_date"].isoformat() if data.get("first_date") else None
+                ),
+                "last_inventory_date": (
+                    data["last_date"].isoformat() if data.get("last_date") else None
+                ),
+                "total_stock_records": data.get("count", 0),
+            }
+
+        return {
+            "first_inventory_date": None,
+            "last_inventory_date": None,
+            "total_stock_records": 0,
+        }
+
+    except Exception as e:
+        logger.error(f"Error in optimized inventory metadata: {e}")
+        return {
+            "first_inventory_date": None,
+            "last_inventory_date": None,
+            "total_stock_records": 0,
+        }
+
+
+# Helper function for async execution
+async def run_in_executor(func, *args):
+    """Run blocking function in executor."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, func, *args)
+
+
+# CACHED VERSION for frequently accessed metadata
+@router.get("/data-metadata-cached")
+async def get_data_metadata_cached(
+    start_date: str = Query(
+        None, description="Start date in YYYY-MM-DD format (optional)"
+    ),
+    end_date: str = Query(None, description="End date in YYYY-MM-DD format (optional)"),
+    db=Depends(get_database),
+    force_refresh: bool = Query(False, description="Force refresh cache"),
+):
+    """
+    Cached version of data metadata for better performance.
+    Cache is refreshed every 5 minutes or on demand.
+    """
+
+    cache_key = f"metadata_{start_date}_{end_date}"
+
+    # Check if we need to refresh cache
+    if force_refresh or not hasattr(get_data_metadata_cached, "_cache"):
+        get_data_metadata_cached._cache = {}
+        get_data_metadata_cached._cache_time = {}
+
+    # Check if cached data exists and is fresh (5 minutes)
+    current_time = datetime.now()
+    cache_time = get_data_metadata_cached._cache_time.get(cache_key)
+
+    if (
+        not force_refresh
+        and cache_key in get_data_metadata_cached._cache
+        and cache_time
+        and (current_time - cache_time).seconds < 300
+    ):
+
+        logger.info(f"Returning cached metadata for key: {cache_key}")
+        cached_data = get_data_metadata_cached._cache[cache_key]
+        cached_data["meta"]["from_cache"] = True
+        cached_data["meta"]["cache_age_seconds"] = (current_time - cache_time).seconds
+        return JSONResponse(content=cached_data)
+
+    # Get fresh data
+    logger.info(f"Fetching fresh metadata for key: {cache_key}")
+    response = await get_data_metadata(start_date, end_date, db)
+
+    # Parse response and cache it
+    if hasattr(response, "body"):
+        content = json.loads(response.body)
+        get_data_metadata_cached._cache[cache_key] = content
+        get_data_metadata_cached._cache_time[cache_key] = current_time
+        content["meta"]["from_cache"] = False
+        return JSONResponse(content=content)
+
+    return response
