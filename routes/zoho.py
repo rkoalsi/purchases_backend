@@ -583,6 +583,7 @@ def query_invoices_for_skus(
         "(OSAMP) Office samples",
         "(PUPEV) PUPSCRIBE EVENTS",
         "(SSAM) Sales samples",
+        "(RS) Retail samples"
     ]
     try:
         invoices_collection = db.get_collection(INVOICES_COLLECTION)
