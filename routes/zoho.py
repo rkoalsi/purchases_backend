@@ -982,7 +982,6 @@ async def get_sales_report_fast(
             allowDiskUse=True,
             batchSize=1000,  # Larger batch size for better performance
         )
-
         # Get parallel task results
         stock_data, products_map = await asyncio.gather(stock_task, products_task)
 
@@ -1093,15 +1092,14 @@ def build_optimized_pipeline(
                     {"date": {"$gte": start_date, "$lte": end_date}},
                     {"status": {"$nin": ["draft", "void"]}},
                     # More efficient customer filtering
-                  {
+                    {
                         "customer_name": {
                             "$not": {
                                 "$regex": excluded_customers,
-                                "$options": "i"  # case insensitive
+                                "$options": "i",  # case insensitive
                             }
                         }
                     },
-
                 ]
             }
         },
@@ -1201,14 +1199,20 @@ async def fetch_all_products_indexed(db) -> Dict:
         cursor = products_collection.find(
             {
                 "$and": [
-                    {"name": {"$ne": ""}},           # Not empty string
-                    {"name": {"$ne": "amazon"}},     # Not exactly "amazon" (case sensitive)
+                    {"name": {"$ne": ""}},  # Not empty string
+                    {
+                        "name": {"$ne": "amazon"}
+                    },  # Not exactly "amazon" (case sensitive)
                 ]
             },
-            {"item_id": 1, "cf_sku_code": 1, "name": 1, "_id": 0},  # Include name for debugging
+            {
+                "item_id": 1,
+                "cf_sku_code": 1,
+                "name": 1,
+                "_id": 0,
+            },  # Include name for debugging
             batch_size=5000,
         )
-
 
         # Create indexed map
         products_map = {}
@@ -1251,8 +1255,8 @@ def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Di
         total_units += units_sold
         total_amount += amount
         total_stock += closing_stock
-        
-        if item.get('item_name') != '':
+
+        if item.get("item_name") != "":
             items.append(
                 SalesReportItem(
                     item_name=item.get("item_name", ""),
@@ -1276,24 +1280,26 @@ def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Di
 @lru_cache(maxsize=100)
 def get_excluded_customer_list() -> str:
     patterns = [
-        "EC",
-        "NA",
-        "amzb2b",
-        "amz2b2",
-        "PUPEV",
-        "RS",
-        "MKT",
-        "SPUR",
-        "SSAM",
-        "OSAM",
+        "(EC)",
+        "(NA)",
+        "(amzb2b)",
+        "(amz2b2)",
+        "(PUPEV)",
+        "(RS)",
+        "(MKT)",
+        "(SPUR)",
+        "(SSAM)",
+        "(OSAM)",
         "Blinkit",
-        "ETRADE"
+        "ETRADE",
+        "Pupscribe",
     ]
-    
+
     escaped_patterns = [re.escape(pattern) for pattern in patterns]
     regex_pattern = "|".join(escaped_patterns)
-    
+
     return regex_pattern
+
 
 async def get_cached_report(cache_key: str, db) -> Optional[Dict]:
     """
@@ -1370,7 +1376,9 @@ async def download_sales_report(
                 detail="Invalid date format. Use YYYY-MM-DD",
             )
 
-        logger.info(f"Generating optimized sales report download for {start_date} to {end_date}")
+        logger.info(
+            f"Generating optimized sales report download for {start_date} to {end_date}"
+        )
         start_time = datetime.now()
 
         # OPTIMIZATION 1: Run stock and sales aggregations in parallel (same as fast API)
@@ -1385,7 +1393,6 @@ async def download_sales_report(
         # OPTIMIZATION 3: Use the same optimized pipeline as fast API
         invoices_collection = db[INVOICES_COLLECTION]
         pipeline = build_optimized_pipeline(start_date, end_date, excluded_customers)
-
         # Execute main aggregation
         logger.info("Executing optimized aggregation pipeline for download...")
         result_cursor = invoices_collection.aggregate(
@@ -1550,7 +1557,11 @@ async def download_sales_report(
             ["Items Out of Stock", items_out_of_stock],
             [
                 "Stock Coverage %",
-                f"{(items_with_stock / len(sales_report_items) * 100):.1f}%" if sales_report_items else "0.0%",
+                (
+                    f"{(items_with_stock / len(sales_report_items) * 100):.1f}%"
+                    if sales_report_items
+                    else "0.0%"
+                ),
             ],
         ]
 
@@ -1617,6 +1628,7 @@ async def download_sales_report(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred while generating the sales report download: {str(e)}",
         )
+
 
 from functools import lru_cache
 from typing import Optional, Dict, Any
