@@ -1290,9 +1290,11 @@ def get_excluded_customer_list() -> str:
         "(SPUR)",
         "(SSAM)",
         "(OSAM)",
+        "(OSAMP)",
         "Blinkit",
         "ETRADE",
         "Pupscribe",
+        "Flipkart"
     ]
 
     escaped_patterns = [re.escape(pattern) for pattern in patterns]
