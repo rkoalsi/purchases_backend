@@ -10,12 +10,14 @@ from bson import ObjectId
 from pymongo import ASCENDING
 from pymongo.errors import PyMongoError
 from ..database import get_database, serialize_mongo_document
-
+import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 from pymongo import InsertOne
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 
 
 # Optimize SKU mapping with caching
@@ -132,13 +134,13 @@ async def get_sku_mapping(database=Depends(get_database)):
         return JSONResponse(content=sku_documents)
 
     except PyMongoError as e:  # Catch database-specific errors
-        print(f"Database error retrieving SKU mapping: {e}", exc_info=True)
+        logger.info(f"Database error retrieving SKU mapping: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error retrieving SKU mapping: {e}",
         )
     except Exception as e:  # Catch any other unexpected errors
-        print(f"Unexpected error retrieving SKU mapping: {e}", exc_info=True)
+        logger.info(f"Unexpected error retrieving SKU mapping: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}",
@@ -178,7 +180,7 @@ async def upload_sku_mapping(
         # Optional: Clear existing mapping or implement upsert logic
         # Clearing is simpler if the Excel is the source of truth for the full mapping
         delete_result = sku_collection.delete_many({})
-        print(f"Deleted {delete_result.deleted_count} existing SKU mappings.")
+        logger.info(f"Deleted {delete_result.deleted_count} existing SKU mappings.")
 
         data_to_insert = []
         for _, row in df.iterrows():
@@ -201,13 +203,13 @@ async def upload_sku_mapping(
                     }
                 )
             else:
-                print(f"Skipping SKU row due to missing data: {row.to_dict()}")
+                logger.info(f"Skipping SKU row due to missing data: {row.to_dict()}")
 
         if not data_to_insert:
             return {"message": "No valid SKU mapping data found to insert."}
 
         insert_result = sku_collection.insert_many(data_to_insert)
-        print(f"Inserted {len(insert_result.inserted_ids)} new SKU mappings.")
+        logger.info(f"Inserted {len(insert_result.inserted_ids)} new SKU mappings.")
 
         # Create index for efficient lookup
         sku_collection.create_index([("item_id", ASCENDING)], unique=True)
@@ -219,7 +221,7 @@ async def upload_sku_mapping(
     except HTTPException as e:
         raise e  # Re-raise intended HTTP exceptions
     except Exception as e:
-        print(f"Error uploading SKU mapping: {e}")
+        logger.info(f"Error uploading SKU mapping: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",
@@ -248,7 +250,7 @@ async def create_single_item(body: dict):
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error uploading sales data: {e}")
+        logger.info(f"Error uploading sales data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred creating the item: {e}",
@@ -348,7 +350,7 @@ async def sync_status(
         )
 
     except Exception as e:
-        print(f"Error getting sync status: {e}")
+        logger.info(f"Error getting sync status: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
@@ -522,7 +524,7 @@ async def upload_sales_data(
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error uploading sales data: {e}")
+        logger.info(f"Error uploading sales data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",
@@ -566,8 +568,8 @@ async def upload_inventory_data(
 
         # Get cached SKU mapping
         sku_map_dict = await sku_cache.get_sku_mapping(sku_collection)
-        print(f"Retrieved SKU mapping with {len(sku_map_dict)} entries")
-        print(json.dumps(serialize_mongo_document(sku_map_dict), indent=4))
+        logger.info(f"Retrieved SKU mapping with {len(sku_map_dict)} entries")
+        logger.info(json.dumps(serialize_mongo_document(sku_map_dict), indent=4))
         # Clean and process data efficiently
         df = df.dropna(subset=["Item ID"])
 
@@ -612,7 +614,7 @@ async def upload_inventory_data(
                     "item_name": sku_info.get("item_name", "Unknown Item"),
                 }
             except (ValueError, TypeError):
-                print(f"Invalid Item ID for SKU mapping: {item_id}")
+                logger.info(f"Invalid Item ID for SKU mapping: {item_id}")
                 return {"sku_code": "Unknown SKU", "item_name": "Unknown Item"}
 
         # Apply SKU mapping
@@ -636,13 +638,13 @@ async def upload_inventory_data(
         df_with_valid_sku = df[df["sku_code"] != "Unknown SKU"].copy()
         df_with_unknown_sku = df[df["sku_code"] == "Unknown SKU"].copy()
 
-        print(f"Proceeding with {len(df_with_valid_sku)} records with valid SKUs")
-        print(f"Excluding {len(df_with_unknown_sku)} records with Unknown SKUs")
+        logger.info(f"Proceeding with {len(df_with_valid_sku)} records with valid SKUs")
+        logger.info(f"Excluding {len(df_with_unknown_sku)} records with Unknown SKUs")
 
         if len(df_with_unknown_sku) > 0:
-            print("Records with Unknown SKU (will be excluded):")
+            logger.info("Records with Unknown SKU (will be excluded):")
             for _, row in df_with_unknown_sku.head(5).iterrows():
-                print(
+                logger.info(
                     f"  Item ID: {row['Item ID']}, Warehouse: {row['Backend Outlet']}, Qty: {row['Qty']}"
                 )
 
@@ -667,18 +669,18 @@ async def upload_inventory_data(
             .reset_index(drop=True)
         )
 
-        print(f"After city aggregation: {len(aggregated_df)} records")
+        logger.info(f"After city aggregation: {len(aggregated_df)} records")
 
         # Verify no Unknown SKUs in final data
         final_unknown_count = len(
             aggregated_df[aggregated_df["sku_code"] == "Unknown SKU"]
         )
         if final_unknown_count > 0:
-            print(
+            logger.info(
                 f"WARNING: {final_unknown_count} Unknown SKU records still present after filtering!"
             )
         else:
-            print("✓ No Unknown SKU records in final aggregated data")
+            logger.info("✓ No Unknown SKU records in final aggregated data")
 
         aggregated_df.rename(
             columns={
@@ -695,7 +697,7 @@ async def upload_inventory_data(
         skus_to_process = list(aggregated_df["sku_code"].unique())
         cities_to_process = list(aggregated_df["city"].unique())
 
-        print(
+        logger.info(
             f"Cleaning up old records for {len(dates_to_process)} dates, {len(skus_to_process)} SKUs, {len(cities_to_process)} cities..."
         )
 
@@ -706,7 +708,7 @@ async def upload_inventory_data(
         }
 
         delete_result = inventory_collection.delete_many(delete_filter)
-        print(f"Deleted {delete_result.deleted_count} old inventory records")
+        logger.info(f"Deleted {delete_result.deleted_count} old inventory records")
 
         # Insert new city-aggregated records
         bulk_operations = []
@@ -741,7 +743,7 @@ async def upload_inventory_data(
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error uploading inventory data: {e}")
+        logger.info(f"Error uploading inventory data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",
@@ -807,7 +809,7 @@ async def generate_report(
         sales_collection = database.get_collection(SALES_COLLECTION)
         inventory_collection = database.get_collection(INVENTORY_COLLECTION)
 
-        print(
+        logger.info(
             f"Querying sales and inventory data for {period_name} to generate dynamic report..."
         )
 
@@ -816,15 +818,15 @@ async def generate_report(
             {"order_date": {"$gte": overall_start_date, "$lte": overall_end_date}}
         )
         sales_data = list(sales_cursor)
-        print(
+        logger.info(
             f"Found {len(sales_data)} sales records in DB for the period {period_name}."
         )
 
         # Query ALL sales data for lifetime best performing month calculation
-        print("Querying lifetime sales data for best performing month calculation...")
+        logger.info("Querying lifetime sales data for best performing month calculation...")
         lifetime_sales_cursor = sales_collection.find({})
         lifetime_sales_data = list(lifetime_sales_cursor)
-        print(
+        logger.info(
             f"Found {len(lifetime_sales_data)} total sales records for lifetime analysis."
         )
 
@@ -842,15 +844,15 @@ async def generate_report(
             }
         )
         inventory_data = list(inventory_cursor)
-        print(
+        logger.info(
             f"Found {len(inventory_data)} city-aggregated inventory records in DB for the period {period_name}."
         )
 
         # Debug: Show city-aggregated inventory data structure
-        print("Sample city-aggregated inventory records:")
+        logger.info("Sample city-aggregated inventory records:")
         for record in inventory_data[:5]:
             combined_warehouses = record.get("combined_warehouses", "N/A")
-            print(
+            logger.info(
                 f"  SKU: {record.get('sku_code')}, City: {record.get('city')}, "
                 f"Date: {record.get('date')}, Inventory: {record.get('warehouse_inventory')}, "
                 f"Source Warehouses: {combined_warehouses}"
@@ -860,13 +862,13 @@ async def generate_report(
         aggregated_records = [
             r for r in inventory_data if "+" in r.get("combined_warehouses", "")
         ]
-        print(
+        logger.info(
             f"Found {len(aggregated_records)} city-aggregated records (with multiple warehouses)"
         )
         if aggregated_records:
-            print("Sample aggregated records:")
+            logger.info("Sample aggregated records:")
             for record in aggregated_records[:3]:
-                print(
+                logger.info(
                     f"  SKU: {record.get('sku_code')}, City: {record.get('city')}, "
                     f"Total Inventory: {record.get('warehouse_inventory')}, "
                     f"Combined from: {record.get('combined_warehouses')}"
@@ -894,7 +896,7 @@ async def generate_report(
         lifetime_monthly_sales = {}
 
         # Process lifetime sales data for best performing month calculation
-        print("Processing lifetime sales data for best performing month calculation...")
+        logger.info("Processing lifetime sales data for best performing month calculation...")
         for record in lifetime_sales_data:
             sku = record.get("sku_code")
             city = record.get("city")
@@ -1016,7 +1018,7 @@ async def generate_report(
                 },
             }
 
-        print(
+        logger.info(
             f"\nFound {n_common_days} common dates for calculation within {period_name}."
         )
 
@@ -1052,7 +1054,7 @@ async def generate_report(
                 days=30 - 1
             )
 
-            print(f"Last common date in period: {last_common_date_str}")
+            logger.info(f"Last common date in period: {last_common_date_str}")
 
             extended_sales_fetch_start_date = previous_30_day_period_start
             if prev_seven_days_period_start < extended_sales_fetch_start_date:
@@ -1069,7 +1071,7 @@ async def generate_report(
                 }
             )
             extended_sales_data = list(extended_sales_cursor)
-            print(
+            logger.info(
                 f"Found {len(extended_sales_data)} sales records for comparison periods ending {last_common_date_str}."
             )
 
@@ -1126,7 +1128,7 @@ async def generate_report(
             if date_s in common_dates:
                 valid_sku_city_pairs.add((sku, city))
 
-        print(
+        logger.info(
             f"Calculating metrics for {len(valid_sku_city_pairs)} unique SKU/City combinations for period {period_name}..."
         )
 
@@ -1225,12 +1227,12 @@ async def generate_report(
                     warehouses_info = last_day_inventory_info.get(
                         "combined_warehouses", "Unknown"
                     )
-                    print(
+                    logger.info(
                         f"  Closing stock for SKU {sku} in {city}: {last_day_inventory} (from {warehouses_info})"
                     )
                 else:
                     # If no inventory found for last common date, try to find the most recent inventory
-                    print(
+                    logger.info(
                         f"  No inventory found for SKU {sku} in {city} on {last_common_date}, checking for most recent..."
                     )
                     most_recent_inventory = 0
@@ -1246,7 +1248,7 @@ async def generate_report(
                             warehouses_info = check_inventory_info.get(
                                 "combined_warehouses", "Unknown"
                             )
-                            print(
+                            logger.info(
                                 f"  Found most recent inventory for SKU {sku} in {city} on {most_recent_date}: {most_recent_inventory} (from {warehouses_info})"
                             )
                             break
@@ -1333,7 +1335,7 @@ async def generate_report(
             }
             report_data.append(report_item)
 
-        print(
+        logger.info(
             f"Successfully generated dynamic report with {len(report_data)} items for period {period_name}."
         )
 
@@ -1356,13 +1358,13 @@ async def generate_report(
         }
 
     except PyMongoError as e:
-        print(f"Database error during report generation for {period_name}: {e}")
+        logger.info(f"Database error during report generation for {period_name}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error for {period_name}: {e}",
         )
     except Exception as e:
-        print(f"Error generating report for {period_name}: {e}")
+        logger.info(f"Error generating report for {period_name}: {e}")
         import traceback
 
         traceback.print_exc()
@@ -1418,7 +1420,7 @@ async def download_report(
         flattened_data = []
         for item in report_data_list:
             metrics = item.get("metrics", {})
-            print(json.dumps(metrics, indent=4))
+            logger.info(json.dumps(metrics, indent=4))
             flat_item = {
                 "Item Name": item.get("item_name", "Unknown Item"),
                 "Item ID": item.get("item_id", "Unknown ID"),
@@ -1516,13 +1518,13 @@ async def download_report(
     except HTTPException as e:
         raise e
     except PyMongoError as e:
-        print(f"Database error during report download generation: {e}", exc_info=True)
+        logger.info(f"Database error during report download generation: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error: {e}",
         )
     except Exception as e:
-        print(f"Error generating report Excel file: {e}", exc_info=True)
+        logger.info(f"Error generating report Excel file: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An internal error occurred while generating the Excel file: {e}",
@@ -1562,7 +1564,7 @@ async def get_report_data(
             database=database,
         )
 
-        print(
+        logger.info(
             f"Retrieved dynamic report data for {report_response.get('period_info', {}).get('period_name', 'specified period')}."
         )
 
@@ -1571,13 +1573,13 @@ async def get_report_data(
     except HTTPException as e:
         raise e
     except PyMongoError as e:
-        print(f"Database error during report data retrieval: {e}")
+        logger.info(f"Database error during report data retrieval: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error: {e}",
         )
     except Exception as e:
-        print(f"Error retrieving report data: {e}")
+        logger.info(f"Error retrieving report data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred retrieving the report data: {e}",
@@ -1599,7 +1601,6 @@ async def generate_report_by_date_range(
         try:
             start_date_dt = datetime.strptime(start_date, "%Y-%m-%d")
             end_date_dt = datetime.strptime(end_date, "%Y-%m-%d")
-            print(start_date_dt, end_date_dt)
         except ValueError:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1628,7 +1629,7 @@ async def generate_report_by_date_range(
         sales_collection = database.get_collection(SALES_COLLECTION)
         inventory_collection = database.get_collection(INVENTORY_COLLECTION)
 
-        print(
+        logger.info(
             f"Querying sales and inventory data for {period_name} to generate dynamic report..."
         )
 
@@ -1637,15 +1638,15 @@ async def generate_report_by_date_range(
             {"order_date": {"$gte": overall_start_date, "$lte": overall_end_date}}
         )
         sales_data = list(sales_cursor)
-        print(
+        logger.info(
             f"Found {len(sales_data)} sales records in DB for the period {period_name}."
         )
 
         # Query ALL sales data for lifetime best performing month calculation
-        print("Querying lifetime sales data for best performing month calculation...")
+        logger.info("Querying lifetime sales data for best performing month calculation...")
         lifetime_sales_cursor = sales_collection.find({})
         lifetime_sales_data = list(lifetime_sales_cursor)
-        print(
+        logger.info(
             f"Found {len(lifetime_sales_data)} total sales records for lifetime analysis."
         )
 
@@ -1663,7 +1664,7 @@ async def generate_report_by_date_range(
             }
         )
         inventory_data = list(inventory_cursor)
-        print(
+        logger.info(
             f"Found {len(inventory_data)} city-aggregated inventory records in DB for the period {period_name}."
         )
 
@@ -1688,7 +1689,7 @@ async def generate_report_by_date_range(
         lifetime_monthly_sales = {}
 
         # Process lifetime sales data for best performing month calculation
-        print("Processing lifetime sales data for best performing month calculation...")
+        logger.info("Processing lifetime sales data for best performing month calculation...")
         for record in lifetime_sales_data:
             sku = record.get("sku_code")
             city = record.get("city")
@@ -1804,7 +1805,7 @@ async def generate_report_by_date_range(
                 },
             }
 
-        print(
+        logger.info(
             f"\nFound {n_common_days} common dates for calculation within {period_name}."
         )
 
@@ -1840,7 +1841,7 @@ async def generate_report_by_date_range(
                 days=30 - 1
             )
 
-            print(f"Last common date in period: {last_common_date_str}")
+            logger.info(f"Last common date in period: {last_common_date_str}")
 
             extended_sales_fetch_start_date = previous_30_day_period_start
             if prev_seven_days_period_start < extended_sales_fetch_start_date:
@@ -1857,7 +1858,7 @@ async def generate_report_by_date_range(
                 }
             )
             extended_sales_data = list(extended_sales_cursor)
-            print(
+            logger.info(
                 f"Found {len(extended_sales_data)} sales records for comparison periods ending {last_common_date_str}."
             )
 
@@ -1912,7 +1913,7 @@ async def generate_report_by_date_range(
             if date_s in common_dates:
                 valid_sku_city_pairs.add((sku, city))
 
-        print(
+        logger.info(
             f"Calculating metrics for {len(valid_sku_city_pairs)} unique SKU/City combinations for period {period_name}..."
         )
 
@@ -2096,7 +2097,7 @@ async def generate_report_by_date_range(
             }
             report_data.append(report_item)
 
-        print(
+        logger.info(
             f"Successfully generated dynamic report with {len(report_data)} items for period {period_name}."
         )
 
@@ -2118,13 +2119,13 @@ async def generate_report_by_date_range(
         }
 
     except PyMongoError as e:
-        print(f"Database error during report generation for {period_name}: {e}")
+        logger.info(f"Database error during report generation for {period_name}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error for {period_name}: {e}",
         )
     except Exception as e:
-        # print(f"Error generating report for {period_name}: {e}")
+        # logger.info(f"Error generating report for {period_name}: {e}")
         import traceback
 
         traceback.print_exc()
@@ -2255,7 +2256,7 @@ async def download_report_by_date_range(
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error generating report Excel file: {e}", exc_info=True)
+        logger.info(f"Error generating report Excel file: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An internal error occurred while generating the Excel file: {e}",
@@ -2278,7 +2279,7 @@ async def get_report_data_by_date_range(
             database=database,
         )
 
-        print(
+        logger.info(
             f"Retrieved dynamic report data for {report_response.get('period_info', {}).get('period_name', 'specified period')}."
         )
         return report_response
@@ -2286,7 +2287,7 @@ async def get_report_data_by_date_range(
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error retrieving report data: {e}")
+        logger.info(f"Error retrieving report data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred retrieving the report data: {e}",
@@ -2304,7 +2305,7 @@ async def delete_item(item_id: str):
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error uploading sales data: {e}")
+        logger.info(f"Error uploading sales data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",

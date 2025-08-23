@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 import io
 import re
+import logging
 import pandas as pd
 from functools import lru_cache
 from openpyxl import Workbook, load_workbook
@@ -11,6 +12,7 @@ from typing import List, Dict
 from ..database import get_database
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/download_template")
@@ -166,7 +168,7 @@ def save_combined_sheet(matched_ci, unmatched_ci, matched_pl, unmatched_pl):
         return output_buffer.getvalue()
 
     except Exception as e:
-        print(f"Error saving combined sheet: {e}")
+        logger.info(f"Error saving combined sheet: {e}")
         return None
 
 
@@ -212,7 +214,7 @@ def get_purchase_orders_from_db(items: List[Dict]) -> List[Dict]:
         found_items = []
         found_names = set()
 
-        print("Processing POs from MongoDB")
+        logger.info("Processing POs from MongoDB")
 
         # Process each purchase order
         for purchase_order in purchase_orders:
@@ -236,11 +238,11 @@ def get_purchase_orders_from_db(items: List[Dict]) -> List[Dict]:
         for item in items:
             if item["name"] not in found_names:
                 found_items.append({"rate": 0, "name": item["name"]})
-        print("Done Processing POs from MongoDB")
+        logger.info("Done Processing POs from MongoDB")
         return found_items
 
     except Exception as e:
-        print(f"Error querying MongoDB: {e}")
+        logger.info(f"Error querying MongoDB: {e}")
         return [{"rate": 0, "name": item["name"]} for item in items]
 
 
@@ -265,7 +267,7 @@ def get_items_from_db(search_text: str) -> List[Dict]:
         )
         return items
     except Exception as e:
-        print(f"Error querying items from MongoDB: {e}")
+        logger.info(f"Error querying items from MongoDB: {e}")
         return []
 
 
@@ -294,7 +296,7 @@ def process_upload_data(file_content: bytes) -> bytes:
     pl_sheet["Name"] = pl_sheet["Name"].apply(clean_name)
     ci_sheet["Name"] = ci_sheet["Name"].apply(clean_name)
 
-    print(f"PL Data count: {len(pl_sheet['Name'])}")
+    logger.info(f"PL Data count: {len(pl_sheet['Name'])}")
     pl_data = [x for x in pl_sheet["Name"] if pd.notna(x)]
 
     ci_data = [
@@ -313,7 +315,7 @@ def process_upload_data(file_content: bytes) -> bytes:
     # Get purchase orders data from MongoDB
     purchase_data = get_purchase_orders_from_db(ci_data)
 
-    print(f"Processing PL Data: {len(pl_data)}")
+    logger.info(f"Processing PL Data: {len(pl_data)}")
     # Process PL data
     for item in pl_data:
         items_from_db = get_items_from_db(item)
@@ -327,8 +329,8 @@ def process_upload_data(file_content: bytes) -> bytes:
         else:
             unmatched_pl.append({"name": item})
 
-    print("Done Processing PL Data")
-    print(f"Processing CI Data: {len(ci_data)}")
+    logger.info("Done Processing PL Data")
+    logger.info(f"Processing CI Data: {len(ci_data)}")
 
     # Process CI data
     for item in ci_data:
@@ -394,7 +396,7 @@ def process_upload_data(file_content: bytes) -> bytes:
                 }
             )
 
-    print("Done Processing CI Data")
+    logger.info("Done Processing CI Data")
 
     # Create DataFrames and sort them
     matched_pl_df = pd.DataFrame(sorted(matched_pl, key=lambda x: str(x["name"])))

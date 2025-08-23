@@ -47,7 +47,7 @@ def get_amazon_token() -> str:
     """
     global _vc_access_token, _vc_token_expires_at
 
-    print("🔑 Checking Amazon token validity...")
+    logger.info("🔑 Checking Amazon token validity...")
     
     # Check if current token is still valid (with 5 minute buffer)
     if (
@@ -55,10 +55,10 @@ def get_amazon_token() -> str:
         and _vc_token_expires_at
         and datetime.now() < (_vc_token_expires_at - timedelta(minutes=5))
     ):
-        print("✅ Using existing valid token")
+        logger.info("✅ Using existing valid token")
         return _vc_access_token
 
-    print("🔄 Requesting new Amazon SP API token...")
+    logger.info("🔄 Requesting new Amazon SP API token...")
     
     try:
         payload = {
@@ -78,19 +78,19 @@ def get_amazon_token() -> str:
         expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
         _vc_token_expires_at = datetime.now() + timedelta(seconds=expires_in)
 
-        print("✅ Successfully obtained new Amazon SP API token")
+        logger.info("✅ Successfully obtained new Amazon SP API token")
         logger.info("Successfully obtained new Amazon SP API token")
         return _vc_access_token
 
     except requests.exceptions.RequestException as e:
-        print(f"❌ Error getting Amazon token: {e}")
+        logger.info(f"❌ Error getting Amazon token: {e}")
         logger.error(f"Error getting Amazon token: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to authenticate with Amazon SP API: {str(e)}",
         )
     except Exception as e:
-        print(f"❌ Unexpected error getting Amazon token: {e}")
+        logger.info(f"❌ Unexpected error getting Amazon token: {e}")
         logger.error(f"Unexpected error getting Amazon token: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -104,7 +104,7 @@ def make_sp_api_request(
     """
     Make a request to Amazon SP API with proper authentication
     """
-    print(f"📡 Making {method} request to: {endpoint}")
+    logger.info(f"📡 Making {method} request to: {endpoint}")
     access_token = get_amazon_token()
 
     headers = {"x-amz-access-token": access_token, "Content-Type": "application/json"}
@@ -120,11 +120,11 @@ def make_sp_api_request(
             raise ValueError(f"Unsupported HTTP method: {method}")
 
         response.raise_for_status()
-        print(f"✅ API request successful: {response.status_code}")
+        logger.info(f"✅ API request successful: {response.status_code}")
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        print(f"❌ API request failed: {e}")
+        logger.info(f"❌ API request failed: {e}")
         logger.error(f"VC API request failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -142,7 +142,7 @@ def create_report(
     """
     Create a report request and return the report document ID
     """
-    print(f"📊 Creating {report_type} report for {start_date} to {end_date}")
+    logger.info(f"📊 Creating {report_type} report for {start_date} to {end_date}")
     
     if marketplace_ids is None:
         marketplace_ids = [MARKETPLACE_ID]
@@ -161,7 +161,7 @@ def create_report(
 
     response = make_sp_api_request(endpoint, method="POST", data=report_data)
     report_id = response.get("reportId")
-    print(f"✅ Report created with ID: {report_id}")
+    logger.info(f"✅ Report created with ID: {report_id}")
     return report_id
 
 
@@ -171,7 +171,7 @@ def get_report_status(report_document_id: str) -> Dict:
 
 
 def download_report_data(report_document_id: str, is_gzipped: bool = False) -> str:
-    print(f"📥 Downloading report data for document: {report_document_id}")
+    logger.info(f"📥 Downloading report data for document: {report_document_id}")
     
     endpoint = f"/reports/2021-06-30/documents/{report_document_id}"
     document_info = make_sp_api_request(endpoint)
@@ -184,7 +184,7 @@ def download_report_data(report_document_id: str, is_gzipped: bool = False) -> s
             detail="No download URL found in report document",
         )
 
-    print("📥 Downloading report from Amazon...")
+    logger.info("📥 Downloading report from Amazon...")
     # Download the actual report data
     response = requests.get(download_url)
     response.raise_for_status()
@@ -192,15 +192,15 @@ def download_report_data(report_document_id: str, is_gzipped: bool = False) -> s
     # Handle gzipped content (for inventory reports)
     if is_gzipped:
         try:
-            print("🗜️ Decompressing gzipped report data...")
+            logger.info("🗜️ Decompressing gzipped report data...")
             return gzip.decompress(response.content).decode("utf-8")
         except Exception as e:
-            print(f"⚠️ Error decompressing gzipped content: {e}")
+            logger.info(f"⚠️ Error decompressing gzipped content: {e}")
             logger.error(f"Error decompressing gzipped content: {e}")
             # Fallback to regular content if not actually gzipped
             return response.text
 
-    print("✅ Report data downloaded successfully")
+    logger.info("✅ Report data downloaded successfully")
     return response.text
 
 
@@ -210,7 +210,7 @@ def get_vendor_sales(
     """
     Fetch sales and traffic data from Amazon SP API (ASIN-wise daily data)
     """
-    print(f"🛒 Starting sales data fetch for {start_date} to {end_date}")
+    logger.info(f"🛒 Starting sales data fetch for {start_date} to {end_date}")
     
     if marketplace_ids is None:
         marketplace_ids = [MARKETPLACE_ID]
@@ -233,13 +233,13 @@ def get_vendor_sales(
         if not report_id:
             raise ValueError("Failed to create report - no report ID returned")
 
-        print(f"⏳ Waiting for report {report_id} to be ready...")
+        logger.info(f"⏳ Waiting for report {report_id} to be ready...")
         # Wait for report to be ready (with timeout)
         max_wait_time = 300  # 5 minutes
         wait_time = 0
 
         while wait_time < max_wait_time:
-            print(f"⏱️ Checking report status... (waited {wait_time}s / {max_wait_time}s)")
+            logger.info(f"⏱️ Checking report status... (waited {wait_time}s / {max_wait_time}s)")
             report_status = get_report_status(report_id)
 
             # Add validation for report_status
@@ -249,24 +249,24 @@ def get_vendor_sales(
             processing_status = report_status.get("processingStatus")
             report_document_id = report_status.get("reportDocumentId")
 
-            print(f"📊 Report status: {processing_status}")
+            logger.info(f"📊 Report status: {processing_status}")
 
             if processing_status == "DONE":
-                print("✅ Report processing completed!")
+                logger.info("✅ Report processing completed!")
                 break
             elif processing_status == "FATAL":
-                print("❌ Report processing failed with FATAL status")
+                logger.info("❌ Report processing failed with FATAL status")
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Sales and traffic report processing failed",
                 )
 
-            print("⏳ Report still processing, waiting 10 seconds...")
+            logger.info("⏳ Report still processing, waiting 10 seconds...")
             time.sleep(10)
             wait_time += 10
 
         if wait_time >= max_wait_time:
-            print("⏰ Report processing timed out!")
+            logger.info("⏰ Report processing timed out!")
             raise HTTPException(
                 status_code=status.HTTP_408_REQUEST_TIMEOUT,
                 detail="Sales and traffic report processing timed out",
@@ -280,7 +280,7 @@ def get_vendor_sales(
         if not report_data:
             raise ValueError("Downloaded report data is empty")
 
-        print("📊 Parsing JSON report data...")
+        logger.info("📊 Parsing JSON report data...")
         try:
             json_data = json.loads(report_data)
         except json.JSONDecodeError as json_error:
@@ -293,12 +293,12 @@ def get_vendor_sales(
         sales_data = []
         
         if sales_by_asin:
-            print(f"📊 Found {len(sales_by_asin)} items in salesByAsin")
+            logger.info(f"📊 Found {len(sales_by_asin)} items in salesByAsin")
             logger.info(f"Found {len(sales_by_asin)} items in salesByAsin")
             
             for i, asin_data in enumerate(sales_by_asin):
                 if i % 10 == 0:  # Print progress every 10 items
-                    print(f"📝 Processing item {i+1}/{len(sales_by_asin)}")
+                    logger.info(f"📝 Processing item {i+1}/{len(sales_by_asin)}")
                     
                 asin = asin_data["asin"]
                 asin_data["date"] = datetime.fromisoformat(start_date)
@@ -309,10 +309,10 @@ def get_vendor_sales(
                 if not result:
                     sales_data.append(asin_data)
                     
-            print(f"✅ Sales data processing completed! {len(sales_data)} new records to insert")
+            logger.info(f"✅ Sales data processing completed! {len(sales_data)} new records to insert")
             return sales_by_asin
         else:
-            print("⚠️ No salesByAsin data found in report")
+            logger.info("⚠️ No salesByAsin data found in report")
             logger.warning(f"No salesByAsin data found in report")
             return None
 
@@ -320,14 +320,14 @@ def get_vendor_sales(
         # Re-raise HTTPExceptions as-is
         raise
     except ValueError as ve:
-        print(f"❌ Validation error: {ve}")
+        logger.info(f"❌ Validation error: {ve}")
         logger.error(f"Validation error in sales and traffic data: {ve}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Data validation error: {str(ve)}",
         )
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
+        logger.info(f"❌ Unexpected error: {e}")
         logger.error(f"Unexpected error fetching sales and traffic data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -341,7 +341,7 @@ def get_vendor_inventory(
     db: Any,
     marketplace_ids: List[str] = None,
 ) -> List[Dict]:
-    print(f"📦 Starting inventory data fetch for {start_date} to {end_date}")
+    logger.info(f"📦 Starting inventory data fetch for {start_date} to {end_date}")
     
     if marketplace_ids is None:
         marketplace_ids = [MARKETPLACE_ID]
@@ -363,36 +363,36 @@ def get_vendor_inventory(
             report_options=report_options,
         )
 
-        print(f"⏳ Waiting for inventory report {report_id} to be ready...")
+        logger.info(f"⏳ Waiting for inventory report {report_id} to be ready...")
         # Wait for report to be ready (with timeout)
         max_wait_time = 300  # 5 minutes
         wait_time = 0
         report_document_id = ""
         
         while wait_time < max_wait_time:
-            print(f"⏱️ Checking inventory report status... (waited {wait_time}s / {max_wait_time}s)")
+            logger.info(f"⏱️ Checking inventory report status... (waited {wait_time}s / {max_wait_time}s)")
             report_status = get_report_status(report_id)
             processing_status = report_status.get("processingStatus")
             report_document_id = report_status.get("reportDocumentId")
 
-            print(f"📦 Inventory report status: {processing_status}")
+            logger.info(f"📦 Inventory report status: {processing_status}")
 
             if processing_status == "DONE":
-                print("✅ Inventory report processing completed!")
+                logger.info("✅ Inventory report processing completed!")
                 break
             elif processing_status == "FATAL":
-                print("❌ Inventory report processing failed with FATAL status")
+                logger.info("❌ Inventory report processing failed with FATAL status")
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Ledger report processing failed",
                 )
 
-            print("⏳ Inventory report still processing, waiting 10 seconds...")
+            logger.info("⏳ Inventory report still processing, waiting 10 seconds...")
             time.sleep(10)
             wait_time += 10
 
         if wait_time >= max_wait_time:
-            print("⏰ Inventory report processing timed out!")
+            logger.info("⏰ Inventory report processing timed out!")
             raise HTTPException(
                 status_code=status.HTTP_408_REQUEST_TIMEOUT,
                 detail="Ledger report processing timed out",
@@ -404,7 +404,7 @@ def get_vendor_inventory(
         if not report_data:
             raise ValueError("Downloaded report data is empty")
 
-        print("📦 Parsing JSON inventory data...")
+        logger.info("📦 Parsing JSON inventory data...")
         try:
             json_data = json.loads(report_data)
         except json.JSONDecodeError as json_error:
@@ -417,12 +417,12 @@ def get_vendor_inventory(
         inventory_data = []
         
         if inventory_by_asin:
-            print(f"📦 Found {len(inventory_by_asin)} items in inventoryByAsin")
+            logger.info(f"📦 Found {len(inventory_by_asin)} items in inventoryByAsin")
             logger.info(f"Found {len(inventory_by_asin)} items in inventoryByAsin")
             
             for i, asin_data in enumerate(inventory_by_asin):
                 if i % 10 == 0:  # Print progress every 10 items
-                    print(f"📝 Processing inventory item {i+1}/{len(inventory_by_asin)}")
+                    logger.info(f"📝 Processing inventory item {i+1}/{len(inventory_by_asin)}")
                     
                 asin = asin_data["asin"]
                 asin_data["date"] = datetime.fromisoformat(start_date)
@@ -433,15 +433,15 @@ def get_vendor_inventory(
                 if not result:
                     inventory_data.append(asin_data)
                     
-            print(f"✅ Inventory data processing completed! {len(inventory_data)} new records to insert")
+            logger.info(f"✅ Inventory data processing completed! {len(inventory_data)} new records to insert")
             return inventory_by_asin
         else:
-            print("⚠️ No inventoryByAsin data found in report")
+            logger.info("⚠️ No inventoryByAsin data found in report")
             logger.warning(f"No inventoryByAsin data found in report")
             return None
             
     except Exception as e:
-        print(f"❌ Error fetching inventory data: {e}")
+        logger.info(f"❌ Error fetching inventory data: {e}")
         logger.error(f"Error fetching inventory data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -455,18 +455,18 @@ async def insert_data_to_db(
     """
     Insert data into MongoDB collection
     """
-    print(f"💾 Inserting {len(data) if data else 0} records into {collection_name}")
+    logger.info(f"💾 Inserting {len(data) if data else 0} records into {collection_name}")
     
     try:
         if not data:
-            print("⚠️ No data to insert")
+            logger.info("⚠️ No data to insert")
             return 0
 
         collection = db[collection_name]
 
         # Insert data
         result = collection.insert_many(data)
-        print(f"✅ Successfully inserted {len(result.inserted_ids)} records into {collection_name}")
+        logger.info(f"✅ Successfully inserted {len(result.inserted_ids)} records into {collection_name}")
         logger.info(
             f"Inserted {len(result.inserted_ids)} records into {collection_name}"
         )
@@ -474,14 +474,14 @@ async def insert_data_to_db(
         return len(result.inserted_ids)
 
     except PyMongoError as e:
-        print(f"❌ Database error inserting data: {e}")
+        logger.info(f"❌ Database error inserting data: {e}")
         logger.error(f"Database error inserting data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error: {str(e)}",
         )
     except Exception as e:
-        print(f"❌ Unexpected error inserting data: {e}")
+        logger.info(f"❌ Unexpected error inserting data: {e}")
         logger.error(f"Unexpected error inserting data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -492,12 +492,12 @@ async def insert_data_to_db(
 # Background task functions
 def background_sync_sales(start_datetime: str, end_datetime: str, marketplace_ids: List[str], db, task_id: str):
     """Background task for sales data sync"""
-    print(f"🚀 [TASK-{task_id}] Starting background sales sync task")
+    logger.info(f"🚀 [TASK-{task_id}] Starting background sales sync task")
     try:
         sales_traffic_data = get_vendor_sales(start_datetime, end_datetime, db, marketplace_ids)
         
         if sales_traffic_data:
-            print(f"💾 [TASK-{task_id}] Starting database insertion...")
+            logger.info(f"💾 [TASK-{task_id}] Starting database insertion...")
             # Note: We can't use await here since this is a sync function
             # You might want to convert this to async or use a different approach
             collection = db[SALES_COLLECTION]
@@ -514,25 +514,25 @@ def background_sync_sales(start_datetime: str, end_datetime: str, marketplace_id
             
             if new_records:
                 result = collection.insert_many(new_records)
-                print(f"✅ [TASK-{task_id}] Background sales sync completed! Inserted {len(result.inserted_ids)} records")
+                logger.info(f"✅ [TASK-{task_id}] Background sales sync completed! Inserted {len(result.inserted_ids)} records")
             else:
-                print(f"ℹ️ [TASK-{task_id}] No new sales records to insert")
+                logger.info(f"ℹ️ [TASK-{task_id}] No new sales records to insert")
         else:
-            print(f"⚠️ [TASK-{task_id}] No sales data received")
+            logger.info(f"⚠️ [TASK-{task_id}] No sales data received")
             
     except Exception as e:
-        print(f"❌ [TASK-{task_id}] Background sales sync failed: {e}")
+        logger.info(f"❌ [TASK-{task_id}] Background sales sync failed: {e}")
         logger.error(f"Background sales sync failed: {e}")
 
 
 def background_sync_inventory(start_datetime: str, end_datetime: str, marketplace_ids: List[str], db, task_id: str):
     """Background task for inventory data sync"""
-    print(f"🚀 [TASK-{task_id}] Starting background inventory sync task")
+    logger.info(f"🚀 [TASK-{task_id}] Starting background inventory sync task")
     try:
         inventory_data = get_vendor_inventory(start_datetime, end_datetime, db, marketplace_ids)
         
         if inventory_data:
-            print(f"💾 [TASK-{task_id}] Starting database insertion...")
+            logger.info(f"💾 [TASK-{task_id}] Starting database insertion...")
             collection = db[INVENTORY_COLLECTION]
             
             # Filter out existing records
@@ -547,14 +547,14 @@ def background_sync_inventory(start_datetime: str, end_datetime: str, marketplac
             
             if new_records:
                 result = collection.insert_many(new_records)
-                print(f"✅ [TASK-{task_id}] Background inventory sync completed! Inserted {len(result.inserted_ids)} records")
+                logger.info(f"✅ [TASK-{task_id}] Background inventory sync completed! Inserted {len(result.inserted_ids)} records")
             else:
-                print(f"ℹ️ [TASK-{task_id}] No new inventory records to insert")
+                logger.info(f"ℹ️ [TASK-{task_id}] No new inventory records to insert")
         else:
-            print(f"⚠️ [TASK-{task_id}] No inventory data received")
+            logger.info(f"⚠️ [TASK-{task_id}] No inventory data received")
             
     except Exception as e:
-        print(f"❌ [TASK-{task_id}] Background inventory sync failed: {e}")
+        logger.info(f"❌ [TASK-{task_id}] Background inventory sync failed: {e}")
         logger.error(f"Background inventory sync failed: {e}")
 
 
@@ -565,7 +565,7 @@ async def refresh_amazon_token():
     """
     Refresh Amazon SP API token
     """
-    print("🔑 Token refresh endpoint called")
+    logger.info("🔑 Token refresh endpoint called")
     try:
         token = get_amazon_token()
         return JSONResponse(
@@ -578,7 +578,7 @@ async def refresh_amazon_token():
             },
         )
     except Exception as e:
-        print(f"❌ Token refresh failed: {e}")
+        logger.info(f"❌ Token refresh failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
@@ -596,7 +596,7 @@ async def sync_sales_data(
     Fetch ASIN-wise daily sales and traffic data from Amazon and insert into database (Background Task)
     Format: YYYY-MM-DD
     """
-    print(f"🛒 Sales sync endpoint called for {start_date} to {end_date}")
+    logger.info(f"🛒 Sales sync endpoint called for {start_date} to {end_date}")
     
     try:
         # Validate date format
@@ -620,7 +620,7 @@ async def sync_sales_data(
             task_id
         )
 
-        print(f"✅ Sales sync background task {task_id} started")
+        logger.info(f"✅ Sales sync background task {task_id} started")
 
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
@@ -635,13 +635,13 @@ async def sync_sales_data(
         )
 
     except ValueError as e:
-        print(f"❌ Invalid date format: {e}")
+        logger.info(f"❌ Invalid date format: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid date format. Use YYYY-MM-DD",
         )
     except Exception as e:
-        print(f"❌ Error starting sales sync: {e}")
+        logger.info(f"❌ Error starting sales sync: {e}")
         logger.error(f"Error syncing sales and traffic data: {e}")
         raise
 
@@ -658,7 +658,7 @@ async def sync_inventory_data(
     Fetch inventory summary data from Amazon and insert into database (Background Task)
     Format: YYYY-MM-DD
     """
-    print(f"📦 Inventory sync endpoint called for {start_date} to {end_date}")
+    logger.info(f"📦 Inventory sync endpoint called for {start_date} to {end_date}")
     
     try:
         # Validate date format
@@ -682,7 +682,7 @@ async def sync_inventory_data(
             task_id
         )
 
-        print(f"✅ Inventory sync background task {task_id} started")
+        logger.info(f"✅ Inventory sync background task {task_id} started")
 
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
@@ -697,12 +697,12 @@ async def sync_inventory_data(
         )
 
     except ValueError as e:
-        print(f"❌ Invalid date format: {e}")
+        logger.info(f"❌ Invalid date format: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid date format. Use YYYY-MM-DD",
         )
     except Exception as e:
-        print(f"❌ Error starting inventory sync: {e}")
+        logger.info(f"❌ Error starting inventory sync: {e}")
         logger.error(f"Error syncing inventory data: {e}")
         raise

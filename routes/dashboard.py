@@ -12,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pymongo import ASCENDING
 from pymongo.errors import PyMongoError
 from ..database import get_database, serialize_mongo_document
+import logging 
+logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 # Use environment variables for production
@@ -237,7 +239,7 @@ async def get_top_performing_products(
             detail=f"Database error: {str(e)}",
         )
     except Exception as e:
-        print(e)
+        logger.info(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal server error: {str(e)}",

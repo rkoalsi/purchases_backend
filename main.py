@@ -6,17 +6,20 @@ from .routes.amazon import router as amazon_router
 from .routes.blinkit import router as blinkit_router
 from .routes.dashboard import router as dashboard_router
 from .routes.zoho import router as zoho_router
+from .routes.master import router as master_router
 from .routes.util import router as util_router
 from .routes.workflow import router as workflow_router
 from .database import connect_db, close_db
 from contextlib import asynccontextmanager
 from .helpers.scheduler import scheduler, api_scheduler, setup_scheduler
+import logging
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle"""
     # Startup
-    print("Starting up application...")
+    logger.info("Starting up application...")
     
     # Initialize database
     connect_db()
@@ -27,12 +30,12 @@ async def lifespan(app: FastAPI):
     # Setup and start scheduler
     setup_scheduler()
     scheduler.start()
-    print("Scheduler started")
+    logger.info("Scheduler started")
     
     yield
     
     # Shutdown
-    print("Shutting down application...")
+    logger.info("Shutting down application...")
     
     # Shutdown scheduler
     scheduler.shutdown()
@@ -41,7 +44,7 @@ async def lifespan(app: FastAPI):
     # Close database
     close_db()
     
-    print("Application shutdown complete")
+    logger.info("Application shutdown complete")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -74,6 +77,7 @@ app.include_router(user_router, prefix="/users", tags=["user"])
 app.include_router(blinkit_router, prefix="/blinkit", tags=["blinkit"])
 app.include_router(amazon_router, prefix="/amazon", tags=["amazon"])
 app.include_router(zoho_router, prefix="/zoho", tags=["zoho"])
+app.include_router(master_router, prefix="/master", tags=["master"])
 app.include_router(util_router, prefix="/util", tags=["util"])
 app.include_router(dashboard_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(workflow_router, prefix="/workflows", tags=["workflow"])

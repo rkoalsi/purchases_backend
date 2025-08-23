@@ -1,8 +1,9 @@
 from fastapi import APIRouter, HTTPException, status, Depends
 from fastapi.responses import JSONResponse
 from ..database import get_database, serialize_mongo_document
-
+import logging
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("")
@@ -17,7 +18,7 @@ async def get_users():
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error uploading sales data: {e}")
+        logger.info(f"Error uploading sales data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",
@@ -36,7 +37,7 @@ async def get_permissions():
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error uploading sales data: {e}")
+        logger.info(f"Error uploading sales data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",

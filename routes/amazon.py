@@ -320,7 +320,7 @@ def get_amazon_ledger_data(
     aggregate_by_location: str = "COUNTRY",
     aggregated_by_time_period: str = "DAILY",
 ) -> List[Dict]:
-    print(start_date, end_date)
+    logger.info(start_date, end_date)
     """
     Fetch ledger summary data from Amazon SP API
     """
@@ -828,13 +828,13 @@ async def get_sku_mapping(database=Depends(get_database)):
         return JSONResponse(content=sku_documents)
 
     except PyMongoError as e:  # Catch database-specific errors
-        print(f"Database error retrieving SKU mapping: {e}", exc_info=True)
+        logger.info(f"Database error retrieving SKU mapping: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error retrieving SKU mapping: {e}",
         )
     except Exception as e:  # Catch any other unexpected errors
-        print(f"Unexpected error retrieving SKU mapping: {e}", exc_info=True)
+        logger.info(f"Unexpected error retrieving SKU mapping: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}",
@@ -876,7 +876,7 @@ async def upload_sku_mapping(
         # Optional: Clear existing mapping or implement upsert logic
         # Clearing is simpler if the Excel is the source of truth for the full mapping
         delete_result = sku_collection.delete_many({})
-        print(f"Deleted {delete_result.deleted_count} existing SKU mappings.")
+        logger.info(f"Deleted {delete_result.deleted_count} existing SKU mappings.")
 
         data_to_insert = []
         for _, row in df.iterrows():
@@ -897,13 +897,13 @@ async def upload_sku_mapping(
                     }
                 )
             else:
-                print(f"Skipping SKU row due to missing data: {row.to_dict()}")
+                logger.info(f"Skipping SKU row due to missing data: {row.to_dict()}")
 
         if not data_to_insert:
             return {"message": "No valid SKU mapping data found to insert."}
 
         insert_result = sku_collection.insert_many(data_to_insert)
-        print(f"Inserted {len(insert_result.inserted_ids)} new SKU mappings.")
+        logger.info(f"Inserted {len(insert_result.inserted_ids)} new SKU mappings.")
 
         # Create index for efficient lookup
         sku_collection.create_index([("item_id", ASCENDING)], unique=True)
@@ -915,7 +915,7 @@ async def upload_sku_mapping(
     except HTTPException as e:
         raise e  # Re-raise intended HTTP exceptions
     except Exception as e:
-        print(f"Error uploading SKU mapping: {e}")
+        logger.info(f"Error uploading SKU mapping: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",
@@ -944,7 +944,7 @@ async def create_single_item(body: dict):
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error uploading sales data: {e}")
+        logger.info(f"Error uploading sales data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred creating the item: {e}",
@@ -962,7 +962,7 @@ async def delete_item(item_id: str):
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error uploading sales data: {e}")
+        logger.info(f"Error uploading sales data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",
@@ -1002,7 +1002,7 @@ async def generate_report_by_date_range(
 
     except Exception as e:
         import traceback
-        print(str(e))
+        logger.info(str(e))
         traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1443,13 +1443,13 @@ async def get_report_data_by_date_range(
             database=database,
             report_type=report_type,
         )
-        print(f"Retrieved dynamic report data of type: {report_type}")
+        logger.info(f"Retrieved dynamic report data of type: {report_type}")
         return report_response
 
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error retrieving report data: {e}")
+        logger.info(f"Error retrieving report data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred retrieving the report data: {e}",
@@ -1649,15 +1649,15 @@ async def download_report_by_date_range(
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
-        print(f"Generated Excel report for report_type: {report_type}, rows: {len(df)}")
+        logger.info(f"Generated Excel report for report_type: {report_type}, rows: {len(df)}")
         return response
 
     except HTTPException as e:
-        print(str(e))
+        logger.info(str(e))
         raise e
     except Exception as e:
-        print(f"Error generating Excel report: {e}")
-        print(str(e))
+        logger.info(f"Error generating Excel report: {e}")
+        logger.info(str(e))
         import traceback
 
         traceback.print_exc()
