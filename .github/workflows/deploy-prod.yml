@@ -1,0 +1,45 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  deploy-backend:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Backend Code
+      uses: actions/checkout@v4
+      
+    - name: Setup SSH Connection
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+        
+    - name: Deploy Backend
+      run: |
+        echo "🚀 Starting backend deployment..."
+        echo "Repository: ${{ github.repository }}"
+        echo "Commit: ${{ github.sha }}"
+        echo "Branch: ${{ github.ref_name }}"
+        
+        # Execute deployment with real-time logging
+        ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "
+          cd app/deployment/ && ./deploy.sh --backend && docker system prune -af
+        " 2>&1 | while IFS= read -r line; do
+          echo "$(date '+%Y-%m-%d %H:%M:%S') | $line"
+        done
+        
+    - name: Deployment Result
+      if: always()
+      run: |
+        if [ $? -eq 0 ]; then
+          echo "🎉 Backend deployment completed successfully!"
+        else
+          echo "💥 Backend deployment failed!"
+          exit 1
+        fi
