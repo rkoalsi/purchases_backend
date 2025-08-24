@@ -1527,7 +1527,6 @@ async def get_sales_report_fast(
         )
 
 
-# Also update the download function to use the same logic
 @router.get("/sales-report/download")
 async def download_sales_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
@@ -1540,7 +1539,7 @@ async def download_sales_report(
     """
 
     try:
-        # Same validation logic as before...
+        # Validate dates
         start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
         end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
 
@@ -1608,48 +1607,105 @@ async def download_sales_report(
 
         execution_time = (datetime.now() - start_time).total_seconds()
         logger.info(
-            f"Download data with credit notes prepared in {execution_time:.2f} seconds"
+            f"Download data with credit notes prepared in {execution_time:.2f} seconds with {len(sales_report_items)} items"
         )
 
-        # Rest of the Excel generation code remains the same...
-        # The data structure is identical, just with net values instead of gross values
-
-        # Create Excel file (same code as before)
-        import io
-        import xlsxwriter
-
+        # Create Excel file
         output = io.BytesIO()
-        workbook = xlsxwriter.Workbook(output, {"in_memory": True})
-
-        # Same formatting and worksheet creation code...
-        # (keeping the same for brevity, but all the Excel generation code remains identical)
         
-        # The key difference is that the summary will now show:
-        summary_data = [
-            ["Report Period", f"{start_date} to {end_date}"],
-            ["Generated On", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-            ["Processing Method", "Optimized with Credit Notes Integration"],  # Updated
-            ["Credit Notes Integrated", "Yes"],  # NEW
-            ["", ""],
-            ["NET SALES SUMMARY", ""],  # Updated label
-            ["Total Items", len(sales_report_items)],
-            ["Net Units Sold", total_units],  # Updated label
-            ["Net Amount (₹)", total_amount],  # Updated label
-            # ... rest remains the same
-        ]
+        # Convert SalesReportItem objects to dictionaries for DataFrame
+        sales_data = []
+        for item in sales_report_items:
+            sales_data.append({
+                "Item Name": item.item_name,
+                "SKU Code": item.sku_code,
+                "Units Sold": item.units_sold,
+                "Total Amount (₹)": item.total_amount,
+                "Closing Stock": item.closing_stock,
+                "Days In Stock": item.total_days_in_stock,
+                "DRR (Daily Run Rate)": item.drr
+            })
+
+        # Create DataFrame
+        df = pd.DataFrame(sales_data)
+
+        # Create Excel file with multiple sheets
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            # Main data sheet
+            df.to_excel(writer, sheet_name="Sales Report", index=False)
+            
+            # Summary sheet
+            summary_data = {
+                "Metric": [
+                    "Report Period",
+                    "Generated On", 
+                    "Processing Method",
+                    "Credit Notes Integrated",
+                    "",
+                    "NET SALES SUMMARY",
+                    "Total Items",
+                    "Net Units Sold", 
+                    "Net Amount (₹)",
+                    "Total Closing Stock",
+                    "Items With Stock",
+                    "Items Out of Stock",
+                    "Average DRR"
+                ],
+                "Value": [
+                    f"{start_date} to {end_date}",
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "Optimized with Credit Notes Integration",
+                    "Yes",
+                    "",
+                    "",
+                    len(sales_report_items),
+                    total_units,
+                    f"₹{total_amount:,.2f}",
+                    total_closing_stock,
+                    sum(1 for item in sales_report_items if item.closing_stock > 0),
+                    sum(1 for item in sales_report_items if item.closing_stock == 0),
+                    f"{sum(item.drr for item in sales_report_items) / len(sales_report_items):.2f}" if sales_report_items else "0.00"
+                ]
+            }
+            
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_excel(writer, sheet_name="Summary", index=False)
+            
+            # Format the main sheet
+            workbook = writer.book
+            worksheet = writer.sheets["Sales Report"]
+            
+            # Auto-adjust column widths
+            for column in df:
+                column_length = max(df[column].astype(str).map(len).max(), len(column))
+                col_idx = df.columns.get_loc(column)
+                # Convert column index to Excel column letter
+                col_letter = chr(65 + col_idx) if col_idx < 26 else chr(65 + col_idx // 26 - 1) + chr(65 + col_idx % 26)
+                worksheet.column_dimensions[col_letter].width = min(column_length + 2, 50)
+
+        output.seek(0)
 
         # Generate filename with credit notes indicator
-        filename = f"net_sales_report_{start_date}_to_{end_date}.xlsx"  # Updated filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"net_sales_report_{start_date}_to_{end_date}_{timestamp}.xlsx"
 
-        # Same Excel generation and response code...
+        logger.info(f"Excel file generated successfully: {filename}")
+
+        # Return the Excel file as streaming response
+        return StreamingResponse(
+            io.BytesIO(output.read()),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
         
+    except HTTPException as e:
+        raise e
     except Exception as e:
         logger.error(f"Error generating sales report download with credit notes: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {str(e)}",
         )
-
 from functools import lru_cache
 from typing import Optional, Dict, Any
 import asyncio
