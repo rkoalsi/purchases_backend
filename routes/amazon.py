@@ -320,7 +320,7 @@ def get_amazon_ledger_data(
     aggregate_by_location: str = "COUNTRY",
     aggregated_by_time_period: str = "DAILY",
 ) -> List[Dict]:
-    logger.info(start_date, end_date)
+    logger.info(f"Processing dates - start: {start_date}, end: {end_date}")
     """
     Fetch ledger summary data from Amazon SP API
     """
@@ -566,7 +566,6 @@ async def sync_ledger_data(
         # Convert to ISO format for API
         start_datetime = f"{start_date}T00:00:00Z"
         end_datetime = f"{end_date}T00:00:00Z"
-
         # Fetch ledger data
         ledger_data = get_amazon_ledger_data(
             start_datetime,
