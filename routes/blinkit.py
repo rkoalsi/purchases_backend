@@ -47,6 +47,8 @@ sku_cache = SKUCache()
 
 SKU_COLLECTION = "blinkit_sku_mapping"
 SALES_COLLECTION = "blinkit_sales"
+RETURN_COLLECTION = "blinkit_returns"
+TEMP_SALES_COLLECTION = "blinkit_sales_temp"
 INVENTORY_COLLECTION = "blinkit_inventory"
 
 CITIES = [
@@ -178,7 +180,6 @@ async def upload_sku_mapping(
         sku_collection = database.get_collection(SKU_COLLECTION)
 
         # Optional: Clear existing mapping or implement upsert logic
-        # Clearing is simpler if the Excel is the source of truth for the full mapping
         delete_result = sku_collection.delete_many({})
         logger.info(f"Deleted {delete_result.deleted_count} existing SKU mappings.")
 
@@ -258,9 +259,7 @@ async def create_single_item(body: dict):
 
 
 @router.get("/status")
-async def sync_status(
-    start_date: str, end_date: str, db=Depends(get_database)
-):
+async def sync_status(start_date: str, end_date: str, db=Depends(get_database)):
     try:
         # Parse date range
         start = datetime.strptime(start_date, "%Y-%m-%d").replace(
@@ -276,70 +275,76 @@ async def sync_status(
         first_inventory_date = None
         last_inventory_date = None
 
-        sales_collection = SALES_COLLECTION  
+        sales_collection = SALES_COLLECTION
         inventory_collection = INVENTORY_COLLECTION
         # Get first and last sales dates in the date range
         sales_date_pipeline = [
-            {
-                "$match": {
-                    "order_date": {"$gte": start, "$lte": end}
-                }
-            },
+            {"$match": {"order_date": {"$gte": start, "$lte": end}}},
             {
                 "$group": {
                     "_id": None,
                     "first_date": {"$min": "$order_date"},
-                    "last_date": {"$max": "$order_date"}
+                    "last_date": {"$max": "$order_date"},
                 }
-            }
+            },
         ]
-        
+
         sales_dates = list(db[sales_collection].aggregate(sales_date_pipeline))
         if sales_dates:
-            first_sales_date = sales_dates[0]["first_date"].isoformat() if sales_dates[0]["first_date"] else None
-            last_sales_date = sales_dates[0]["last_date"].isoformat() if sales_dates[0]["last_date"] else None
+            first_sales_date = (
+                sales_dates[0]["first_date"].isoformat()
+                if sales_dates[0]["first_date"]
+                else None
+            )
+            last_sales_date = (
+                sales_dates[0]["last_date"].isoformat()
+                if sales_dates[0]["last_date"]
+                else None
+            )
 
         # Get first and last inventory dates in the date range
         inventory_date_pipeline = [
-            {
-                "$match": {
-                    "date": {"$gte": start, "$lte": end}
-                }
-            },
+            {"$match": {"date": {"$gte": start, "$lte": end}}},
             {
                 "$group": {
                     "_id": None,
                     "first_date": {"$min": "$date"},
-                    "last_date": {"$max": "$date"}
+                    "last_date": {"$max": "$date"},
                 }
-            }
+            },
         ]
-        
-        inventory_dates = list(db[inventory_collection].aggregate(inventory_date_pipeline))
+
+        inventory_dates = list(
+            db[inventory_collection].aggregate(inventory_date_pipeline)
+        )
         if inventory_dates:
-            first_inventory_date = inventory_dates[0]["first_date"].isoformat() if inventory_dates[0]["first_date"] else None
-            last_inventory_date = inventory_dates[0]["last_date"].isoformat() if inventory_dates[0]["last_date"] else None
+            first_inventory_date = (
+                inventory_dates[0]["first_date"].isoformat()
+                if inventory_dates[0]["first_date"]
+                else None
+            )
+            last_inventory_date = (
+                inventory_dates[0]["last_date"].isoformat()
+                if inventory_dates[0]["last_date"]
+                else None
+            )
 
         # Get total counts (you might want to filter these by date range too)
-        sales_count = db[sales_collection].count_documents({
-            "date": {"$gte": start, "$lte": end}
-        })
-        inventory_count = db[inventory_collection].count_documents({
-            "date": {"$gte": start, "$lte": end}
-        })
+        sales_count = db[sales_collection].count_documents(
+            {"date": {"$gte": start, "$lte": end}}
+        )
+        inventory_count = db[inventory_collection].count_documents(
+            {"date": {"$gte": start, "$lte": end}}
+        )
 
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
-                "date_range": {
-                    "start_date": start_date,
-                    "end_date": end_date
-                },
+                "date_range": {"start_date": start_date, "end_date": end_date},
                 "sales_data": {
                     "records_count": sales_count,
                     "first_sales_date": first_sales_date,
                     "last_sales_date": last_sales_date,
-                 
                 },
                 "inventory_data": {
                     "records_count": inventory_count,
@@ -355,55 +360,94 @@ async def sync_status(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
 
-@router.post("/upload_sales_data")
-async def upload_sales_data(
-    file: UploadFile = File(...), database=Depends(get_database)
-):
-    """
-    Optimized sales data upload with batch processing and parallel operations.
-    """
-    if not file.filename.endswith((".xlsx", ".xls")):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid file type. Please upload an Excel file (.xlsx or .xls).",
-        )
 
+async def process_orders_file(file_content: bytes, database, config: dict) -> dict:
+    """
+    Common function to process order files (both sales and return orders).
+    """
     try:
-        # Read file content
-        file_content = await file.read()
+        # Get collections
+        collection = database.get_collection(config["collection_name"])
+        sku_collection = database.get_collection(SKU_COLLECTION)
 
         # Use thread pool for CPU-intensive pandas operations
         with ThreadPoolExecutor() as executor:
             df = await asyncio.get_event_loop().run_in_executor(
                 executor,
-                lambda: pd.read_excel(BytesIO(file_content), engine="openpyxl"),
+                lambda: pd.read_excel(
+                    BytesIO(file_content),
+                    sheet_name=config["sheet_name"],
+                    skiprows=4,
+                    engine="openpyxl",
+                ),
             )
 
-        # Validate required columns
+        # Check if dataframe is empty
+        if df.empty:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"The {config['order_type']} sheet appears to be empty or contains no data rows.",
+            )
+
+        # Rename columns to match expected format
+        df = df.rename(columns=config["column_mapping"])
+
+        # Handle dynamic date column detection for return orders
+        actual_date_column = config["date_column"]
+        if config["order_type"] == "Return Orders":
+            # Check which date column exists in the dataframe
+            possible_date_columns = ["Return Order Date", "Return Invoice Date"]
+            available_date_columns = [
+                col for col in possible_date_columns if col in df.columns
+            ]
+
+            if not available_date_columns:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Neither 'Return Order Date' nor 'Return Invoice Date' found in the return orders data. Available columns: {list(df.columns)}",
+                )
+
+            # Use the first available date column
+            actual_date_column = available_date_columns[0]
+            logger.info(
+                f"Using date column: {actual_date_column} for return orders processing"
+            )
+
+        # Validate required columns (use actual_date_column instead of config date_column)
         required_cols = [
             "Item Id",
             "Quantity",
-            "Order Date",
+            actual_date_column,
             "Customer City",
             "HSN Code",
         ]
-        if not all(col in df.columns for col in required_cols):
-            missing = [col for col in required_cols if col not in df.columns]
+        missing_cols = [col for col in required_cols if col not in df.columns]
+
+        if missing_cols:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Missing required columns: {', '.join(missing)}",
+                detail=f"Missing required columns: {', '.join(missing_cols)}. Available columns: {list(df.columns)}",
             )
 
-        sales_collection = database.get_collection(SALES_COLLECTION)
-        sku_collection = database.get_collection(SKU_COLLECTION)
+        original_count = len(df)
 
-        # Get cached SKU mapping
-        sku_map_dict = await sku_cache.get_sku_mapping(sku_collection)
+        # Check if data is empty after initial validation
+        if original_count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No valid data rows found in {config['order_type']} sheet.",
+            )
 
-        # Vectorized data processing with pandas
-        df = df.dropna(
-            subset=["Item Id", "Customer City"]
-        )  # Remove rows with missing critical data
+        # Clean and process the data
+        df = df.dropna(subset=["Item Id", "Customer City"])
+        after_cleanup_count = len(df)
+
+        # Check if data is empty after cleanup
+        if after_cleanup_count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No valid data rows remaining after cleanup in {config['order_type']} sheet. All rows had missing Item Id or Customer City.",
+            )
 
         # Convert data types efficiently
         df["Item Id"] = (
@@ -411,43 +455,95 @@ async def upload_sales_data(
         )
         df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
         df["Customer City"] = df["Customer City"].astype(str).str.strip()
+        df["Customer Name"] = (
+            df["Customer Name"].astype(str).str.strip()
+            if "Customer Name" in df.columns
+            else "Unknown Customer"
+        )
+        df["Customer State"] = (
+            df["Customer State"].astype(str).str.strip()
+            if "Customer State" in df.columns
+            else "Unknown State"
+        )
         df["HSN Code"] = df["HSN Code"].astype(str).str.strip()
 
-        # Process dates efficiently
-        def process_dates(dates):
-            processed = []
-            for date in dates:
-                parsed_date = safe_strptime(date, "%d %b %Y")
-                if parsed_date:
-                    processed.append(parsed_date)
-                else:
-                    processed.append(None)
-            return processed
+        # Handle supply state/city for return orders
+        if "Supply City" in df.columns:
+            df["Supply City"] = df["Supply City"].astype(str).str.strip()
+        if "Supply State" in df.columns:
+            df["Supply State"] = df["Supply State"].astype(str).str.strip()
 
-        with ThreadPoolExecutor() as executor:
-            df["processed_date"] = await asyncio.get_event_loop().run_in_executor(
-                executor, process_dates, df["Order Date"].tolist()
-            )
-
-        # Remove rows with invalid dates
-        df = df.dropna(subset=["processed_date"])
-
-        # City processing
-        df["processed_city"] = df["Customer City"].replace("Faridabad", "Gurgaon")
+        # Get cached SKU mapping
+        sku_map_dict = await sku_cache.get_sku_mapping(sku_collection)
 
         # SKU mapping vectorized
         df["sku_code"] = df["Item Id"].map(
             lambda x: sku_map_dict.get(x, {}).get("sku_code", "Unknown SKU")
         )
-        df["item_name"] = df["Item Id"].map(
+        df["item_name_from_sku"] = df["Item Id"].map(
             lambda x: sku_map_dict.get(x, {}).get("item_name", "Unknown Item")
         )
 
-        # Handle item names from file if available
-        if "Item Name" in df.columns:
-            df["item_name"] = df["Item Name"].fillna(df["item_name"])
+        # Process dates efficiently (use actual_date_column)
+        def safe_strptime(date_string):
+            try:
+                if pd.isna(date_string) or date_string == "":
+                    return None
 
-        # Batch check for existing records
+                date_string = str(date_string).strip()
+
+                # Try multiple date formats
+                formats = [
+                    "%d %B %Y",  # "30 June 2025"
+                    "%d %b %Y",  # "30 Jun 2025"
+                    "%Y-%m-%d",  # "2025-06-30"
+                    "%d/%m/%Y",  # "30/06/2025"
+                    "%m/%d/%Y",  # "06/30/2025"
+                    "%d-%m-%Y",  # "30-06-2025"
+                ]
+
+                for fmt in formats:
+                    try:
+                        return datetime.strptime(date_string, fmt)
+                    except ValueError:
+                        continue
+
+                # If none work, try pandas
+                parsed = pd.to_datetime(date_string, errors="coerce")
+                return parsed.to_pydatetime() if pd.notna(parsed) else None
+
+            except Exception:
+                return None
+
+        def process_dates(dates):
+            return [safe_strptime(date) for date in dates]
+
+        with ThreadPoolExecutor() as executor:
+            df["processed_date"] = await asyncio.get_event_loop().run_in_executor(
+                executor, process_dates, df[actual_date_column].tolist()
+            )
+
+        # Remove rows with invalid dates
+        df = df.dropna(subset=["processed_date"])
+        after_date_cleanup_count = len(df)
+
+        # Check if data is empty after date processing
+        if after_date_cleanup_count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No valid data rows remaining after date processing in {config['order_type']} sheet. All rows had invalid or missing dates in column '{actual_date_column}'.",
+            )
+
+        # City processing
+        df["processed_city"] = df["Customer City"].replace("Faridabad", "Gurgaon")
+
+        # Use Product Name if available, fallback to SKU mapping
+        if "Item Name" in df.columns:
+            df["final_item_name"] = df["Item Name"].fillna(df["item_name_from_sku"])
+        else:
+            df["final_item_name"] = df["item_name_from_sku"]
+
+        # Batch check for existing records to prevent duplicates
         unique_keys = df[
             ["Item Id", "processed_city", "processed_date"]
         ].drop_duplicates()
@@ -459,18 +555,19 @@ async def upload_sales_data(
                 {
                     "item_id": int(row["Item Id"]),
                     "city": row["processed_city"],
-                    "order_date": row["processed_date"],
+                    config["date_field_name"]: row["processed_date"],
                 }
             )
 
         # Batch query existing records
         existing_docs = set()
         if existing_queries:
-            cursor = sales_collection.find(
-                {"$or": existing_queries}, {"item_id": 1, "city": 1, "order_date": 1}
+            cursor = collection.find(
+                {"$or": existing_queries},
+                {"item_id": 1, "city": 1, config["date_field_name"]: 1},
             )
             for doc in cursor:
-                key = (doc["item_id"], doc["city"], doc["order_date"])
+                key = (doc["item_id"], doc["city"], doc[config["date_field_name"]])
                 existing_docs.add(key)
 
         # Filter out existing records
@@ -483,17 +580,66 @@ async def upload_sales_data(
 
         # Prepare bulk insert operations
         bulk_operations = []
+        processed_records = []
+
         for _, row in new_records_df.iterrows():
+            # Document for database insertion
             doc = {
                 "item_id": int(row["Item Id"]),
                 "sku_code": row["sku_code"],
-                "hsn_code": row["HSN Code"],
-                "item_name": row["item_name"],
+                "hsn_code": str(row["HSN Code"]),
+                "item_name": row["final_item_name"],
                 "quantity": float(row["Quantity"]),
+                "customer_name": (
+                    str(row["Customer Name"])
+                    if pd.notna(row.get("Customer Name"))
+                    else "Unknown Customer"
+                ),
+                "customer_state": (
+                    str(row["Customer State"])
+                    if pd.notna(row.get("Customer State"))
+                    else "Unknown State"
+                ),
                 "city": row["processed_city"],
-                "order_date": row["processed_date"],
+                config["date_field_name"]: row[
+                    "processed_date"
+                ],  # This will be stored as datetime
+                "created_at": config["created_at_func"](),
             }
+
+            # Add the actual date column used for processing (for return orders tracking)
+            if config["order_type"] == "Return Orders":
+                doc["date_column_used"] = actual_date_column
+
+            # Add optional fields if they exist and are not null
+            optional_fields = {
+                "Invoice ID": "invoice_id",
+                "Order ID": "order_id",
+                "Order Status": "order_status",
+                "Selling Price": "selling_price",
+                "MRP": "mrp",
+            }
+
+            for excel_col, doc_field in optional_fields.items():
+                if excel_col in row and pd.notna(row[excel_col]):
+                    doc[doc_field] = row[excel_col]
+
             bulk_operations.append(InsertOne(doc))
+
+            # Record for response (with ISO format date for JSON serialization)
+            response_record = doc.copy()
+            response_record[config["date_field_name"]] = (
+                row["processed_date"].isoformat() if row["processed_date"] else None
+            )
+            response_record[f"original_{config['date_field_name']}"] = str(
+                row[actual_date_column]
+            )
+            if "created_at" in response_record:
+                response_record["created_at"] = response_record[
+                    "created_at"
+                ].isoformat()
+
+            processed_records.append(response_record)
 
         # Execute bulk insert
         inserted_count = 0
@@ -502,33 +648,174 @@ async def upload_sales_data(
             batch_size = 1000
             for i in range(0, len(bulk_operations), batch_size):
                 batch = bulk_operations[i : i + batch_size]
-                result = sales_collection.bulk_write(batch, ordered=False)
+                result = collection.bulk_write(batch, ordered=False)
                 inserted_count += result.inserted_count
 
-        # Create indexes if not exist (do this once)
+        # Create indexes if not exist
         try:
-            sales_collection.create_index([("order_date", 1)], background=True)
-            sales_collection.create_index(
-                [("sku_code", 1), ("city", 1), ("order_date", 1)], background=True
+            collection.create_index([(config["date_field_name"], 1)], background=True)
+            collection.create_index(
+                [("sku_code", 1), ("city", 1), (config["date_field_name"], 1)],
+                background=True,
             )
+            collection.create_index(
+                [("item_id", 1), ("city", 1), (config["date_field_name"], 1)],
+                background=True,
+            )
+            collection.create_index([("customer_state", 1)], background=True)
         except Exception:
             pass  # Indexes might already exist
+
+        # Generate statistics from all processed data
+        city_stats = df["processed_city"].value_counts().head(10).to_dict()
+        customer_stats = df["Customer Name"].value_counts().head(10).to_dict()
+        state_stats = df["Customer State"].value_counts().head(10).to_dict()
+        sku_stats = df["sku_code"].value_counts().head(10).to_dict()
+        date_range = {
+            "earliest": (
+                df["processed_date"].min().isoformat() if not df.empty else None
+            ),
+            "latest": df["processed_date"].max().isoformat() if not df.empty else None,
+        }
 
         skipped_count = len(df) - len(new_records_df)
         warning_count = len(df[df["sku_code"] == "Unknown SKU"])
 
         return {
-            "message": f"Successfully processed sales data. Inserted {inserted_count} new records, skipped {skipped_count} existing records. Encountered {warning_count} warnings."
+            "processing_stats": {
+                "original_rows": original_count,
+                "after_cleanup": after_cleanup_count,
+                "after_date_processing": after_date_cleanup_count,
+                "final_processed": len(df),
+                "new_records": len(new_records_df),
+                "inserted_count": inserted_count,
+                "skipped_duplicates": skipped_count,
+                "warning_count": warning_count,
+                "dropped_rows": original_count - len(df),
+                "date_column_used": (
+                    actual_date_column
+                    if config["order_type"] == "Return Orders"
+                    else config["date_column"]
+                ),
+            },
+            "data_overview": {
+                "date_range": date_range,
+                "cities": city_stats,
+                "customers": customer_stats,
+                "states": state_stats,
+                "sku_codes": sku_stats,
+                "total_quantity": float(df["Quantity"].sum()),
+                "unique_items": int(df["Item Id"].nunique()),
+                "unique_customers": int(df["Customer Name"].nunique()),
+                "unique_cities": int(df["processed_city"].nunique()),
+                "unique_states": int(df["Customer State"].nunique()),
+            },
+            "sample_inserted_records": processed_records[:5],
+            "message": f"Successfully processed {config['order_type']} data using date column '{actual_date_column}'. Inserted {inserted_count} new records, skipped {skipped_count} duplicates. Encountered {warning_count} unknown SKU warnings.",
         }
 
     except HTTPException as e:
         raise e
     except Exception as e:
-        logger.info(f"Error uploading sales data: {e}")
+        logger.error(f"Error processing {config['order_type']} data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred processing the file: {e}",
+            detail=f"An error occurred processing the {config['order_type']} file: {e}",
         )
+
+
+def get_return_orders_config():
+    """Configuration for return orders processing."""
+    return {
+        "collection_name": RETURN_COLLECTION,
+        "sheet_name": "Cancelled or Returned Orders",
+        "date_column": None,  # Will be dynamically determined
+        "date_field_name": "return_date",
+        "order_type": "Return Orders",
+        "created_at_func": datetime.now,
+        "column_mapping": {
+            "Forward Invoice ID": "Forward Invoice Id",
+            "Forward Invoice Date": "Forward Invoice Date",
+            "Return Invoice ID": "Return Invoice Id",
+            "Return Order ID": "Return Order Id",
+            "Return Order Date": "Return Order Date",
+            "Return Invoice Date": "Return Invoice Date",
+            "Customer Name": "Customer Name",
+            "Supply City": "Supply City",
+            "Customer City": "Customer City",
+            "Supply State": "Supply State",
+            "Customer State": "Customer State",
+            "Quantity": "Quantity",
+            "HSN Code": "HSN Code",
+            "Product Name": "Item Name",
+            "Item ID": "Item Id",
+            "Order ID": "Order ID",
+            "Order Status": "Order Status",
+            "Selling Price (Rs)": "Selling Price",
+            "MRP (Rs)": "MRP",
+        },
+    }
+
+
+def get_sales_orders_config():
+    """Configuration for sales orders processing."""
+    return {
+        "collection_name": TEMP_SALES_COLLECTION,
+        "sheet_name": "Forward Orders",
+        "date_column": "Order Date",
+        "date_field_name": "order_date",
+        "order_type": "Forward Orders",
+        "created_at_func": datetime.now,
+        "column_mapping": {
+            "Item ID": "Item Id",
+            "Quantity": "Quantity",
+            "Order Date": "Order Date",
+            "Customer City": "Customer City",
+            "Customer Name": "Customer Name",
+            "Customer State": "Customer State",
+            "HSN Code": "HSN Code",
+            "Product Name": "Item Name",
+            "Invoice ID": "Invoice ID",
+            "Order ID": "Order ID",
+            "Order Status": "Order Status",
+            "Selling Price (Rs)": "Selling Price",
+            "MRP (Rs)": "MRP",
+        },
+    }
+
+
+@router.post("/upload_return_data")
+async def upload_return_orders(
+    file: UploadFile = File(...), database=Depends(get_database)
+):
+    """Upload Return Orders Excel data and save to database."""
+    if not file.filename.endswith((".xlsx", ".xls")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid file type. Please upload an Excel file (.xlsx or .xls).",
+        )
+
+    file_content = await file.read()
+    config = get_return_orders_config()
+
+    return await process_orders_file(file_content, database, config)
+
+
+@router.post("/upload_sales_data")
+async def upload_sales_orders(
+    file: UploadFile = File(...), database=Depends(get_database)
+):
+    """Upload Forward Orders Excel data and save to database."""
+    if not file.filename.endswith((".xlsx", ".xls")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid file type. Please upload an Excel file (.xlsx or .xls).",
+        )
+
+    file_content = await file.read()
+    config = get_sales_orders_config()
+
+    return await process_orders_file(file_content, database, config)
 
 
 @router.post("/upload_inventory_data")
@@ -758,834 +1045,6 @@ def calculate_number_of_months(start_year, start_month, end_year, end_month):
     return (end_year - start_year) * 12 + (end_month - start_month) + 1
 
 
-@router.get("/generate_report")
-async def generate_report(
-    start_month: int,
-    start_year: int,
-    end_month: int,
-    end_year: int,
-    database=Depends(get_database),
-):
-    """
-    Generates the Sales vs Inventory report dynamically based on the specified date range.
-    Calculates metrics for each SKU/City pair using city-aggregated inventory data.
-    Includes performance comparison with previous 7 and 30 days.
-    Includes best performing month for each SKU/City pair.
-    Returns the calculated report data directly.
-    """
-    if not (
-        1 <= start_month <= 12
-        and 1 <= end_month <= 12
-        and start_year > 0
-        and end_year > 0
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid month or year provided in the range.",
-        )
-
-    try:
-        overall_start_date = datetime(start_year, start_month, 1)
-        # Calculate end date of the end_month
-        last_day_of_end_month = calendar.monthrange(end_year, end_month)[1]
-        overall_end_date = datetime(
-            end_year, end_month, last_day_of_end_month, 23, 59, 59, 999999
-        )
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid date components for start or end of range.",
-        )
-
-    if overall_start_date > overall_end_date:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Start date cannot be after end date.",
-        )
-
-    period_name = f"{calendar.month_name[start_month]} {start_year} to {calendar.month_name[end_month]} {end_year}"
-
-    try:
-        sales_collection = database.get_collection(SALES_COLLECTION)
-        inventory_collection = database.get_collection(INVENTORY_COLLECTION)
-
-        logger.info(
-            f"Querying sales and inventory data for {period_name} to generate dynamic report..."
-        )
-
-        # Query sales data for the entire period
-        sales_cursor = sales_collection.find(
-            {"order_date": {"$gte": overall_start_date, "$lte": overall_end_date}}
-        )
-        sales_data = list(sales_cursor)
-        logger.info(
-            f"Found {len(sales_data)} sales records in DB for the period {period_name}."
-        )
-
-        # Query ALL sales data for lifetime best performing month calculation
-        logger.info("Querying lifetime sales data for best performing month calculation...")
-        lifetime_sales_cursor = sales_collection.find({})
-        lifetime_sales_data = list(lifetime_sales_cursor)
-        logger.info(
-            f"Found {len(lifetime_sales_data)} total sales records for lifetime analysis."
-        )
-
-        # Query city-aggregated inventory data for the entire period
-        inventory_cursor = inventory_collection.find(
-            {
-                "date": {
-                    "$gte": overall_start_date.replace(
-                        hour=0, minute=0, second=0, microsecond=0
-                    ),
-                    "$lte": overall_end_date.replace(
-                        hour=0, minute=0, second=0, microsecond=0
-                    ),
-                }
-            }
-        )
-        inventory_data = list(inventory_cursor)
-        logger.info(
-            f"Found {len(inventory_data)} city-aggregated inventory records in DB for the period {period_name}."
-        )
-
-        # Debug: Show city-aggregated inventory data structure
-        logger.info("Sample city-aggregated inventory records:")
-        for record in inventory_data[:5]:
-            combined_warehouses = record.get("combined_warehouses", "N/A")
-            logger.info(
-                f"  SKU: {record.get('sku_code')}, City: {record.get('city')}, "
-                f"Date: {record.get('date')}, Inventory: {record.get('warehouse_inventory')}, "
-                f"Source Warehouses: {combined_warehouses}"
-            )
-
-        # Debug: Check if we have any city-aggregated records (multiple warehouses combined)
-        aggregated_records = [
-            r for r in inventory_data if "+" in r.get("combined_warehouses", "")
-        ]
-        logger.info(
-            f"Found {len(aggregated_records)} city-aggregated records (with multiple warehouses)"
-        )
-        if aggregated_records:
-            logger.info("Sample aggregated records:")
-            for record in aggregated_records[:3]:
-                logger.info(
-                    f"  SKU: {record.get('sku_code')}, City: {record.get('city')}, "
-                    f"Total Inventory: {record.get('warehouse_inventory')}, "
-                    f"Combined from: {record.get('combined_warehouses')}"
-                )
-
-        if not sales_data and not inventory_data:
-            return {
-                "message": f"No sales or inventory data found for {period_name}. No report generated.",
-                "data": [],
-                "period_info": {
-                    "start_month": start_month,
-                    "start_year": start_year,
-                    "end_month": end_month,
-                    "end_year": end_year,
-                    "period_name": period_name,
-                },
-            }
-
-        # --- Process Sales Data for Current Period ---
-        current_period_sales = {}
-        sales_item_info = {}
-        all_sales_dates = set()
-
-        # Lifetime monthly sales tracking for best performing month calculation
-        lifetime_monthly_sales = {}
-
-        # Process lifetime sales data for best performing month calculation
-        logger.info("Processing lifetime sales data for best performing month calculation...")
-        for record in lifetime_sales_data:
-            sku = record.get("sku_code")
-            city = record.get("city")
-            order_date_dt = record.get("order_date")
-            quantity = record.get("quantity", 0)
-            item_name = record.get("item_name", "Unknown Item")
-            item_id = record.get("item_id", "Unknown ID")
-
-            if not sku or not city or not order_date_dt:
-                continue
-            quantity = float(quantity) if isinstance(quantity, (int, float)) else 0
-            if isinstance(order_date_dt, datetime):
-                month_year_key = order_date_dt.strftime("%Y-%m")
-            else:
-                continue
-
-            if sku not in sales_item_info:
-                sales_item_info[sku] = {"item_name": item_name, "item_id": item_id}
-
-            # Aggregate lifetime monthly sales for best performing month calculation
-            sku_city_key = (sku, city)
-            if sku_city_key not in lifetime_monthly_sales:
-                lifetime_monthly_sales[sku_city_key] = {}
-            lifetime_monthly_sales[sku_city_key][month_year_key] = (
-                lifetime_monthly_sales[sku_city_key].get(month_year_key, 0) + quantity
-            )
-
-        # Process current period sales data
-        for record in sales_data:
-            sku = record.get("sku_code")
-            city = record.get("city")
-            order_date_dt = record.get("order_date")
-            quantity = record.get("quantity", 0)
-            item_name = record.get("item_name", "Unknown Item")
-            item_id = record.get("item_id", "Unknown ID")
-
-            if not sku or not city or not order_date_dt:
-                continue
-            quantity = float(quantity) if isinstance(quantity, (int, float)) else 0
-            if isinstance(order_date_dt, datetime):
-                date_key_str = order_date_dt.strftime("%Y-%m-%d")
-            else:
-                continue
-
-            if sku not in sales_item_info:
-                sales_item_info[sku] = {"item_name": item_name, "item_id": item_id}
-
-            key = (sku, city, date_key_str)
-            current_period_sales[key] = current_period_sales.get(key, 0) + quantity
-            all_sales_dates.add(date_key_str)
-
-        # Process city-aggregated inventory data
-        inventory_map = {}  # Structure: {(sku, city, date): inventory_info}
-        inventory_item_info = {}
-        all_inventory_dates = set()
-
-        # NEW: Create a mapping to store combined_warehouses info for each SKU/City combination
-        sku_city_warehouses_map = {}
-
-        for record in inventory_data:
-            sku = record.get("sku_code")
-            city = record.get("city")
-            inventory_date_dt = record.get("date")
-            inventory_qty = record.get("warehouse_inventory", 0)
-            item_name = record.get("item_name", "Unknown Item")
-            item_id = record.get("item_id", "Unknown ID")
-            combined_warehouses = record.get(
-                "combined_warehouses", "Unknown Warehouses"
-            )
-
-            if not sku or not city or not inventory_date_dt:
-                continue
-            inventory_qty = (
-                float(inventory_qty) if isinstance(inventory_qty, (int, float)) else 0
-            )
-            if isinstance(inventory_date_dt, datetime):
-                date_key_str = inventory_date_dt.strftime("%Y-%m-%d")
-            else:
-                continue
-
-            # Key is now city-level (no warehouse)
-            key = (sku, city, date_key_str)
-            inventory_map[key] = {
-                "inventory": inventory_qty,
-                "item_name": item_name,
-                "item_id": item_id,
-                "combined_warehouses": combined_warehouses,
-            }
-            all_inventory_dates.add(date_key_str)
-            if sku not in inventory_item_info:
-                inventory_item_info[sku] = {"item_name": item_name, "item_id": item_id}
-
-            # NEW: Store the combined_warehouses info for this SKU/City combination
-            sku_city_key = (sku, city)
-            if sku_city_key not in sku_city_warehouses_map:
-                sku_city_warehouses_map[sku_city_key] = combined_warehouses
-            else:
-                # If we have multiple records for the same SKU/City, prefer the most detailed one
-                existing_warehouses = sku_city_warehouses_map[sku_city_key]
-                if (
-                    len(combined_warehouses) > len(existing_warehouses)
-                    or existing_warehouses == "Unknown Warehouses"
-                ):
-                    sku_city_warehouses_map[sku_city_key] = combined_warehouses
-
-        common_dates = sorted(list(all_sales_dates.intersection(all_inventory_dates)))
-        n_common_days = len(common_dates)
-
-        if n_common_days == 0:
-            return {
-                "message": f"Found data for {period_name}, but no common dates between sales and inventory data. No report generated.",
-                "data": [],
-                "period_info": {
-                    "start_month": start_month,
-                    "start_year": start_year,
-                    "end_month": end_month,
-                    "end_year": end_year,
-                    "period_name": period_name,
-                },
-            }
-
-        logger.info(
-            f"\nFound {n_common_days} common dates for calculation within {period_name}."
-        )
-
-        # Performance comparison calculations remain the same for sales data
-        last_seven_days_sales = {}
-        two_weeks_ago_seven_days_sales = {}
-        current_30_day_comparison_sales = {}
-        previous_30_day_comparison_sales = {}
-
-        if common_dates:
-            last_common_date_str = common_dates[-1]
-            last_common_date_dt = datetime.strptime(
-                last_common_date_str, "%Y-%m-%d"
-            ).replace(hour=23, minute=59, second=59, microsecond=999999)
-
-            seven_days_period_end = last_common_date_dt
-            seven_days_period_start = last_common_date_dt - timedelta(
-                days=DAYS_IN_WEEK - 1
-            )
-            prev_seven_days_period_end = seven_days_period_start - timedelta(
-                microseconds=1
-            )
-            prev_seven_days_period_start = prev_seven_days_period_end - timedelta(
-                days=DAYS_IN_WEEK - 1
-            )
-
-            current_30_day_period_end = last_common_date_dt
-            current_30_day_period_start = last_common_date_dt - timedelta(days=30 - 1)
-            previous_30_day_period_end = current_30_day_period_start - timedelta(
-                microseconds=1
-            )
-            previous_30_day_period_start = previous_30_day_period_end - timedelta(
-                days=30 - 1
-            )
-
-            logger.info(f"Last common date in period: {last_common_date_str}")
-
-            extended_sales_fetch_start_date = previous_30_day_period_start
-            if prev_seven_days_period_start < extended_sales_fetch_start_date:
-                extended_sales_fetch_start_date = prev_seven_days_period_start
-
-            extended_sales_cursor = sales_collection.find(
-                {
-                    "order_date": {
-                        "$gte": extended_sales_fetch_start_date.replace(
-                            hour=0, minute=0, second=0, microsecond=0
-                        ),
-                        "$lte": last_common_date_dt,
-                    }
-                }
-            )
-            extended_sales_data = list(extended_sales_cursor)
-            logger.info(
-                f"Found {len(extended_sales_data)} sales records for comparison periods ending {last_common_date_str}."
-            )
-
-            for record in extended_sales_data:
-                sku = record.get("sku_code")
-                city = record.get("city")
-                order_date_dt = record.get("order_date")
-                quantity = record.get("quantity", 0)
-
-                if not sku or not city or not order_date_dt:
-                    continue
-                quantity = float(quantity) if isinstance(quantity, (int, float)) else 0
-                key_pair = (sku, city)
-
-                if seven_days_period_start <= order_date_dt <= seven_days_period_end:
-                    last_seven_days_sales[key_pair] = (
-                        last_seven_days_sales.get(key_pair, 0) + quantity
-                    )
-                if (
-                    prev_seven_days_period_start
-                    <= order_date_dt
-                    <= prev_seven_days_period_end
-                ):
-                    two_weeks_ago_seven_days_sales[key_pair] = (
-                        two_weeks_ago_seven_days_sales.get(key_pair, 0) + quantity
-                    )
-                if (
-                    current_30_day_period_start
-                    <= order_date_dt
-                    <= current_30_day_period_end
-                ):
-                    current_30_day_comparison_sales[key_pair] = (
-                        current_30_day_comparison_sales.get(key_pair, 0) + quantity
-                    )
-                if (
-                    previous_30_day_period_start
-                    <= order_date_dt
-                    <= previous_30_day_period_end
-                ):
-                    previous_30_day_comparison_sales[key_pair] = (
-                        previous_30_day_comparison_sales.get(key_pair, 0) + quantity
-                    )
-
-        # Build valid SKU/City combinations (no more warehouse separation)
-        valid_sku_city_pairs = set()
-
-        # Get SKU/City combinations from sales data
-        for sku, city, date_s in current_period_sales.keys():
-            if date_s in common_dates:
-                valid_sku_city_pairs.add((sku, city))
-
-        # Get SKU/City combinations from inventory data
-        for sku, city, date_s in inventory_map.keys():
-            if date_s in common_dates:
-                valid_sku_city_pairs.add((sku, city))
-
-        logger.info(
-            f"Calculating metrics for {len(valid_sku_city_pairs)} unique SKU/City combinations for period {period_name}..."
-        )
-
-        # Helper function for best performing month
-        def get_best_performing_month(sku_city_key):
-            if (
-                sku_city_key not in lifetime_monthly_sales
-                or not lifetime_monthly_sales[sku_city_key]
-            ):
-                return {
-                    "month_name": "No Data",
-                    "year": None,
-                    "quantity_sold": 0,
-                    "formatted": "No Data",
-                }
-
-            best_month_key = max(
-                lifetime_monthly_sales[sku_city_key],
-                key=lifetime_monthly_sales[sku_city_key].get,
-            )
-            best_month_quantity = lifetime_monthly_sales[sku_city_key][best_month_key]
-
-            year, month = best_month_key.split("-")
-            month_name = calendar.month_name[int(month)]
-
-            return {
-                "month_name": month_name,
-                "year": int(year),
-                "quantity_sold": round(best_month_quantity, 2),
-                "formatted": f"{month_name} {year}",
-            }
-
-        report_data = []
-        num_months_in_range = calculate_number_of_months(
-            start_year, start_month, end_year, end_month
-        )
-
-        # Process each SKU/City combination (city-aggregated)
-        for sku, city in valid_sku_city_pairs:
-            item_info = inventory_item_info.get(
-                sku,
-                sales_item_info.get(
-                    sku, {"item_name": "Unknown Item", "item_id": "Unknown ID"}
-                ),
-            )
-            item_name = item_info["item_name"]
-            item_id = item_info["item_id"]
-
-            # FIXED: Get combined warehouses info from the pre-built mapping
-            sku_city_key = (sku, city)
-            combined_warehouses = sku_city_warehouses_map.get(
-                sku_city_key, "Unknown Warehouses"
-            )
-
-            total_sales_on_common_days = 0
-            total_sales_on_days_with_inventory = 0
-            days_with_inventory = 0
-
-            for date_str in common_dates:
-                # Both sales and inventory are now at city level
-                sales_key = (sku, city, date_str)
-                inventory_key = (sku, city, date_str)
-
-                sales_qty = current_period_sales.get(sales_key, 0)
-                inventory_info_daily = inventory_map.get(inventory_key)
-                inventory_qty = (
-                    inventory_info_daily["inventory"] if inventory_info_daily else 0
-                )
-
-                total_sales_on_common_days += sales_qty
-                if inventory_qty > 0:
-                    total_sales_on_days_with_inventory += sales_qty
-                    days_with_inventory += 1
-
-            avg_daily_on_stock_days = (
-                total_sales_on_days_with_inventory / days_with_inventory
-                if days_with_inventory > 0
-                else 0
-            )
-            avg_weekly_on_stock_days = avg_daily_on_stock_days * DAYS_IN_WEEK
-
-            avg_monthly_val_for_period = 0
-            if num_months_in_range > 0 and total_sales_on_common_days > 0:
-                avg_monthly_val_for_period = (
-                    total_sales_on_common_days / num_months_in_range
-                )
-
-            last_day_inventory = 0
-            if common_dates:
-                last_common_date = common_dates[-1]
-                inventory_at_lcd_key = (sku, city, last_common_date)
-                last_day_inventory_info = inventory_map.get(inventory_at_lcd_key)
-                if last_day_inventory_info:
-                    last_day_inventory = last_day_inventory_info["inventory"]
-                    # Debug: Verify we're getting city-aggregated inventory
-                    warehouses_info = last_day_inventory_info.get(
-                        "combined_warehouses", "Unknown"
-                    )
-                    logger.info(
-                        f"  Closing stock for SKU {sku} in {city}: {last_day_inventory} (from {warehouses_info})"
-                    )
-                else:
-                    # If no inventory found for last common date, try to find the most recent inventory
-                    logger.info(
-                        f"  No inventory found for SKU {sku} in {city} on {last_common_date}, checking for most recent..."
-                    )
-                    most_recent_inventory = 0
-                    most_recent_date = None
-                    for date_str in reversed(
-                        common_dates
-                    ):  # Check dates in reverse order
-                        check_key = (sku, city, date_str)
-                        check_inventory_info = inventory_map.get(check_key)
-                        if check_inventory_info:
-                            most_recent_inventory = check_inventory_info["inventory"]
-                            most_recent_date = date_str
-                            warehouses_info = check_inventory_info.get(
-                                "combined_warehouses", "Unknown"
-                            )
-                            logger.info(
-                                f"  Found most recent inventory for SKU {sku} in {city} on {most_recent_date}: {most_recent_inventory} (from {warehouses_info})"
-                            )
-                            break
-                    last_day_inventory = most_recent_inventory
-
-            doc_calc = 0
-            if avg_daily_on_stock_days > 0:
-                doc_calc = last_day_inventory / avg_daily_on_stock_days
-
-            # Performance comparisons (city level)
-            sales_target_last_7_days = last_seven_days_sales.get(sku_city_key, 0)
-            sales_baseline_prev_7_days = two_weeks_ago_seven_days_sales.get(
-                sku_city_key, 0
-            )
-            weekly_comparison_pct = 0
-            if sales_baseline_prev_7_days > 0:
-                weekly_comparison_pct = (
-                    (sales_target_last_7_days - sales_baseline_prev_7_days)
-                    / sales_baseline_prev_7_days
-                ) * 100
-            elif sales_target_last_7_days > 0:
-                weekly_comparison_pct = 0
-
-            sales_target_current_30_days = current_30_day_comparison_sales.get(
-                sku_city_key, 0
-            )
-            sales_baseline_previous_30_days = previous_30_day_comparison_sales.get(
-                sku_city_key, 0
-            )
-            monthly_comparison_pct = 0
-            if sales_baseline_previous_30_days > 0:
-                monthly_comparison_pct = (
-                    (sales_target_current_30_days - sales_baseline_previous_30_days)
-                    / sales_baseline_previous_30_days
-                ) * 100
-            elif sales_target_current_30_days > 0:
-                monthly_comparison_pct = 0
-
-            # Get best performing month data
-            best_month_info = get_best_performing_month(sku_city_key)
-
-            # Create report item with city-aggregated data
-            report_item = {
-                "item_name": item_name,
-                "item_id": item_id,
-                "city": city,
-                "warehouse": combined_warehouses,  # Now properly shows combined warehouse names
-                "sku_code": sku,
-                "best_performing_month": best_month_info["formatted"],
-                "best_performing_month_details": {
-                    "month_name": best_month_info["month_name"],
-                    "year": best_month_info["year"],
-                    "quantity_sold": best_month_info["quantity_sold"],
-                },
-                "metrics": {
-                    "avg_daily_on_stock_days": round(avg_daily_on_stock_days, 2),
-                    "avg_weekly_on_stock_days": round(avg_weekly_on_stock_days, 2),
-                    "avg_monthly_on_stock_days": round(avg_monthly_val_for_period, 2),
-                    "total_sales_in_period": round(total_sales_on_common_days, 2),
-                    "days_of_coverage": round(doc_calc, 2),
-                    "days_with_inventory": days_with_inventory,
-                    "closing_stock": round(last_day_inventory, 2),
-                    "sales_last_7_days_ending_lcd": round(sales_target_last_7_days, 2),
-                    "sales_prev_7_days_before_that": round(
-                        sales_baseline_prev_7_days, 2
-                    ),
-                    "performance_vs_prev_7_days_pct": (
-                        round(weekly_comparison_pct, 2)
-                        if weekly_comparison_pct != 0
-                        else 0
-                    ),
-                    "sales_last_30_days_ending_lcd": round(
-                        sales_target_current_30_days, 2
-                    ),
-                    "sales_prev_30_days_before_that": round(
-                        sales_baseline_previous_30_days, 2
-                    ),
-                    "performance_vs_prev_30_days_pct": (
-                        round(monthly_comparison_pct, 2)
-                        if monthly_comparison_pct != 0
-                        else 0
-                    ),
-                },
-            }
-            report_data.append(report_item)
-
-        logger.info(
-            f"Successfully generated dynamic report with {len(report_data)} items for period {period_name}."
-        )
-
-        # Sort by item name, city (no warehouse sorting needed)
-        sorted_report_data = sorted(
-            report_data, key=lambda d: (d["item_name"], d["city"])
-        )
-
-        return {
-            "message": f"Successfully generated dynamic report for {period_name} with {len(report_data)} items.",
-            "data": sorted_report_data,
-            "period_info": {
-                "start_month": start_month,
-                "start_year": start_year,
-                "end_month": end_month,
-                "end_year": end_year,
-                "period_name": period_name,
-                "common_dates_count": n_common_days,
-            },
-        }
-
-    except PyMongoError as e:
-        logger.info(f"Database error during report generation for {period_name}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error for {period_name}: {e}",
-        )
-    except Exception as e:
-        logger.info(f"Error generating report for {period_name}: {e}")
-        import traceback
-
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred generating report for {period_name}: {str(e)}",
-        )
-
-
-@router.get("/download_report")
-async def download_report(
-    start_month: int,
-    start_year: int,
-    end_month: int,
-    end_year: int,
-    database=Depends(get_database),
-):
-    """
-    Generates report data dynamically for the specified date range,
-    creates an Excel file, and returns it for download.
-    """
-    if not (
-        1 <= start_month <= 12
-        and 1 <= end_month <= 12
-        and start_year > 0
-        and end_year > 0
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid month or year provided in the range.",
-        )
-
-    try:
-        # Generate report data dynamically by calling the generate_report function
-        report_response = await generate_report(
-            start_month=start_month,
-            start_year=start_year,
-            end_month=end_month,
-            end_year=end_year,
-            database=database,
-        )
-
-        report_data_list = report_response.get("data", [])
-        period_info = report_response.get("period_info", {})
-
-        if not report_data_list:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No report data found for {period_info.get('period_name', 'the specified period')} to download.",
-            )
-
-        # --- Generate Excel File in Memory ---
-        flattened_data = []
-        for item in report_data_list:
-            metrics = item.get("metrics", {})
-            logger.info(json.dumps(metrics, indent=4))
-            flat_item = {
-                "Item Name": item.get("item_name", "Unknown Item"),
-                "Item ID": item.get("item_id", "Unknown ID"),
-                "City": item.get("city", "Unknown"),
-                "Sku Code": item.get("sku_code", "Unknown"),
-                "Warehouse": item.get("warehouse", "Unknown Warehouse"),
-                "Start Month": period_info.get("start_month"),
-                "Start Year": period_info.get("start_year"),
-                "End Month": period_info.get("end_month"),
-                "End Year": period_info.get("end_year"),
-                "Period Name": period_info.get("period_name"),
-                "Avg Daily Sales (Stock Days)": metrics.get(
-                    "avg_daily_on_stock_days", 0
-                ),
-                "Avg Weekly Sales (Stock Days)": metrics.get(
-                    "avg_weekly_on_stock_days", 0
-                ),
-                "Avg Monthly Sales (Stock Days)": metrics.get(
-                    "avg_monthly_on_stock_days", 0
-                ),
-                "Total Sales (Period)": metrics.get("total_sales_in_period", 0),
-                "Days of Coverage (DOC)": metrics.get("days_of_coverage", 0),
-                "Days with Inventory": metrics.get("days_with_inventory", 0),
-                "Closing Stock": metrics.get("closing_stock", 0),
-                "Sales Last 7 Days": metrics.get("sales_last_7_days_ending_lcd", 0),
-                "Sales Prev 7 Days": metrics.get("sales_prev_7_days_before_that", 0),
-                "Performance vs Prev 7 Days (%)": metrics.get(
-                    "performance_vs_prev_7_days_pct", 0
-                ),
-                "Sales Last 30 Days": metrics.get("sales_last_30_days_ending_lcd", 0),
-                "Sales Prev 30 Days": metrics.get("sales_prev_30_days_before_that", 0),
-                "Performance vs Prev 30 Days (%)": metrics.get(
-                    "performance_vs_prev_30_days_pct", 0
-                ),
-                "Best Performing Month": item.get("best_performing_month", ""),
-                "Quantity Sold in Best Performing Month": item.get(
-                    "best_performing_month_details", {"quantity_sold": 0}
-                ).get("quantity_sold"),
-            }
-            flattened_data.append(flat_item)
-
-        # Create DataFrame
-        df = pd.DataFrame(flattened_data)
-
-        # Define desired column order
-        column_order = [
-            "Item Name",
-            "Item ID",
-            "Sku Code",
-            "City",
-            "Warehouse",
-            "Start Month",
-            "Start Year",
-            "End Month",
-            "End Year",
-            "Period Name",
-            "Avg Daily Sales (Stock Days)",
-            "Avg Weekly Sales (Stock Days)",
-            "Avg Monthly Sales (Stock Days)",
-            "Total Sales (Period)",
-            "Days of Coverage (DOC)",
-            "Days with Inventory",
-            "Closing Stock",
-            "Sales Last 7 Days",
-            "Sales Prev 7 Days",
-            "Performance vs Prev 7 Days (%)",
-            "Sales Last 30 Days",
-            "Sales Prev 30 Days",
-            "Performance vs Prev 30 Days (%)",
-            "Best Performing Month",
-            "Quantity Sold in Best Performing Month",
-        ]
-
-        df = df.reindex(columns=column_order, fill_value=None)
-
-        # Create a BytesIO buffer to write the Excel file into memory
-        excel_buffer = io.BytesIO()
-        df.to_excel(excel_buffer, index=False, sheet_name="Sales Inventory Report")
-        excel_buffer.seek(0)
-
-        # --- Return as StreamingResponse ---
-        filename = f"sales_inventory_report_{start_year}_{start_month}_to_{end_year}_{end_month}.xlsx"
-
-        headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Access-Control-Expose-Headers": "Content-Disposition",
-        }
-
-        return StreamingResponse(
-            excel_buffer,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers=headers,
-        )
-
-    except HTTPException as e:
-        raise e
-    except PyMongoError as e:
-        logger.info(f"Database error during report download generation: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {e}",
-        )
-    except Exception as e:
-        logger.info(f"Error generating report Excel file: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An internal error occurred while generating the Excel file: {e}",
-        )
-
-
-@router.get("/get_report_data")
-async def get_report_data(
-    start_month: int,
-    start_year: int,
-    end_month: int,
-    end_year: int,
-    database=Depends(get_database),
-):
-    """
-    Generates and returns report data dynamically for the specified date range.
-    This endpoint is for frontend consumption to display the report data.
-    """
-    if not (
-        1 <= start_month <= 12
-        and 1 <= end_month <= 12
-        and start_year > 0
-        and end_year > 0
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid month or year provided in the range.",
-        )
-
-    try:
-        # Generate report data dynamically by calling the generate_report function
-        report_response = await generate_report(
-            start_month=start_month,
-            start_year=start_year,
-            end_month=end_month,
-            end_year=end_year,
-            database=database,
-        )
-
-        logger.info(
-            f"Retrieved dynamic report data for {report_response.get('period_info', {}).get('period_name', 'specified period')}."
-        )
-
-        return report_response
-
-    except HTTPException as e:
-        raise e
-    except PyMongoError as e:
-        logger.info(f"Database error during report data retrieval: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {e}",
-        )
-    except Exception as e:
-        logger.info(f"Error retrieving report data: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred retrieving the report data: {e}",
-        )
-
-
 @router.get("/generate_report_by_date_range")
 async def generate_report_by_date_range(
     start_date: str,  # Format: YYYY-MM-DD
@@ -1595,6 +1054,7 @@ async def generate_report_by_date_range(
     """
     Generates the Sales vs Inventory report dynamically based on the specified date range.
     Accepts any date range (start_date to end_date) instead of month ranges.
+    Now includes returns data for the specified date range.
     """
     try:
         # Parse and validate dates
@@ -1628,9 +1088,10 @@ async def generate_report_by_date_range(
 
         sales_collection = database.get_collection(SALES_COLLECTION)
         inventory_collection = database.get_collection(INVENTORY_COLLECTION)
+        returns_collection = database.get_collection(RETURN_COLLECTION)
 
         logger.info(
-            f"Querying sales and inventory data for {period_name} to generate dynamic report..."
+            f"Querying sales, inventory, and returns data for {period_name} to generate dynamic report..."
         )
 
         # Query sales data for the date range
@@ -1642,8 +1103,28 @@ async def generate_report_by_date_range(
             f"Found {len(sales_data)} sales records in DB for the period {period_name}."
         )
 
+        # Query returns data for the date range
+        returns_cursor = returns_collection.find(
+            {
+                "return_date": {
+                    "$gte": overall_start_date.replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    ),
+                    "$lte": overall_end_date.replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    ),
+                }
+            }
+        )
+        returns_data = list(returns_cursor)
+        logger.info(
+            f"Found {len(returns_data)} returns records in DB for the period {period_name}."
+        )
+
         # Query ALL sales data for lifetime best performing month calculation
-        logger.info("Querying lifetime sales data for best performing month calculation...")
+        logger.info(
+            "Querying lifetime sales data for best performing month calculation..."
+        )
         lifetime_sales_cursor = sales_collection.find({})
         lifetime_sales_data = list(lifetime_sales_cursor)
         logger.info(
@@ -1668,9 +1149,9 @@ async def generate_report_by_date_range(
             f"Found {len(inventory_data)} city-aggregated inventory records in DB for the period {period_name}."
         )
 
-        if not sales_data and not inventory_data:
+        if not sales_data and not inventory_data and not returns_data:
             return {
-                "message": f"No sales or inventory data found for {period_name}. No report generated.",
+                "message": f"No sales, inventory, or returns data found for {period_name}. No report generated.",
                 "data": [],
                 "period_info": {
                     "start_date": start_date,
@@ -1685,11 +1166,17 @@ async def generate_report_by_date_range(
         sales_item_info = {}
         all_sales_dates = set()
 
+        # --- Process Returns Data for Current Period ---
+        current_period_returns = {}
+        returns_item_info = {}
+
         # Lifetime monthly sales tracking for best performing month calculation
         lifetime_monthly_sales = {}
 
         # Process lifetime sales data for best performing month calculation
-        logger.info("Processing lifetime sales data for best performing month calculation...")
+        logger.info(
+            "Processing lifetime sales data for best performing month calculation..."
+        )
         for record in lifetime_sales_data:
             sku = record.get("sku_code")
             city = record.get("city")
@@ -1740,6 +1227,29 @@ async def generate_report_by_date_range(
             key = (sku, city, date_key_str)
             current_period_sales[key] = current_period_sales.get(key, 0) + quantity
             all_sales_dates.add(date_key_str)
+
+        # Process current period returns data
+        logger.info("Processing returns data for the current period...")
+        for record in returns_data:
+            sku = record.get("sku_code")
+            city = record.get("city")
+            return_date_dt = record.get("return_date")
+            quantity = record.get("quantity", 0)
+            item_name = record.get("item_name", "Unknown Item")
+            item_id = record.get("item_id", "Unknown ID")
+
+            if not sku or not city or not return_date_dt:
+                continue
+            quantity = float(quantity) if isinstance(quantity, (int, float)) else 0
+
+            if sku not in returns_item_info:
+                returns_item_info[sku] = {"item_name": item_name, "item_id": item_id}
+
+            # Aggregate returns by sku_code and city for the entire period
+            sku_city_key = (sku, city)
+            current_period_returns[sku_city_key] = (
+                current_period_returns.get(sku_city_key, 0) + quantity
+            )
 
         # Process city-aggregated inventory data
         inventory_map = {}
@@ -1913,6 +1423,10 @@ async def generate_report_by_date_range(
             if date_s in common_dates:
                 valid_sku_city_pairs.add((sku, city))
 
+        # Add SKU/City combinations from returns data
+        for sku_city_key in current_period_returns.keys():
+            valid_sku_city_pairs.add(sku_city_key)
+
         logger.info(
             f"Calculating metrics for {len(valid_sku_city_pairs)} unique SKU/City combinations for period {period_name}..."
         )
@@ -1950,10 +1464,14 @@ async def generate_report_by_date_range(
 
         # Process each SKU/City combination
         for sku, city in valid_sku_city_pairs:
+            # Determine item info from available sources
             item_info = inventory_item_info.get(
                 sku,
                 sales_item_info.get(
-                    sku, {"item_name": "Unknown Item", "item_id": "Unknown ID"}
+                    sku,
+                    returns_item_info.get(
+                        sku, {"item_name": "Unknown Item", "item_id": "Unknown ID"}
+                    ),
                 ),
             )
             item_name = item_info["item_name"]
@@ -2052,6 +1570,9 @@ async def generate_report_by_date_range(
             # Get best performing month data
             best_month_info = get_best_performing_month(sku_city_key)
 
+            # Get returns data for this SKU/City combination
+            total_returns_in_period = current_period_returns.get(sku_city_key, 0)
+
             # Create report item
             report_item = {
                 "item_name": item_name,
@@ -2070,6 +1591,10 @@ async def generate_report_by_date_range(
                     "avg_weekly_on_stock_days": round(avg_weekly_on_stock_days, 2),
                     "avg_monthly_on_stock_days": round(avg_monthly_val_for_period, 2),
                     "total_sales_in_period": round(total_sales_on_common_days, 2),
+                    "total_returns_in_period": round(total_returns_in_period, 2),
+                    "net_sales_in_period": round(
+                        total_sales_on_common_days - total_returns_in_period, 2
+                    ),
                     "days_of_coverage": round(doc_calc, 2),
                     "days_with_inventory": days_with_inventory,
                     "closing_stock": round(last_day_inventory, 2),
@@ -2115,6 +1640,7 @@ async def generate_report_by_date_range(
                 "period_name": period_name,
                 "common_dates_count": n_common_days,
                 "days_in_range": date_range_days,
+                "total_returns_records": len(returns_data),
             },
         }
 
@@ -2134,7 +1660,6 @@ async def generate_report_by_date_range(
             detail=f"An error occurred generating report for : {str(e)}",
         )
 
-
 @router.get("/download_report_by_date_range")
 async def download_report_by_date_range(
     start_date: str,  # Format: YYYY-MM-DD
@@ -2143,6 +1668,7 @@ async def download_report_by_date_range(
 ):
     """
     Downloads report for a specific date range as Excel file.
+    Now includes returns data in the Excel export.
     """
     try:
         # Generate report data dynamically
@@ -2161,7 +1687,7 @@ async def download_report_by_date_range(
                 detail=f"No report data found for {period_info.get('period_name', 'the specified period')} to download.",
             )
 
-        # Generate Excel file (same logic as existing download_report)
+        # Generate Excel file with returns data included
         flattened_data = []
         for item in report_data_list:
             metrics = item.get("metrics", {})
@@ -2185,6 +1711,8 @@ async def download_report_by_date_range(
                     "avg_monthly_on_stock_days", 0
                 ),
                 "Total Sales (Period)": metrics.get("total_sales_in_period", 0),
+                "Total Returns (Period)": metrics.get("total_returns_in_period", 0),
+                "Net Sales (Period)": metrics.get("net_sales_in_period", 0),
                 "Days of Coverage (DOC)": metrics.get("days_of_coverage", 0),
                 "Days with Inventory": metrics.get("days_with_inventory", 0),
                 "Closing Stock": metrics.get("closing_stock", 0),
@@ -2222,6 +1750,8 @@ async def download_report_by_date_range(
             "Avg Weekly Sales (Stock Days)",
             "Avg Monthly Sales (Stock Days)",
             "Total Sales (Period)",
+            "Total Returns (Period)",
+            "Net Sales (Period)",
             "Days of Coverage (DOC)",
             "Days with Inventory",
             "Closing Stock",
@@ -2261,8 +1791,7 @@ async def download_report_by_date_range(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An internal error occurred while generating the Excel file: {e}",
         )
-
-
+        
 @router.get("/get_report_data_by_date_range")
 async def get_report_data_by_date_range(
     start_date: str,  # Format: YYYY-MM-DD
