@@ -1032,6 +1032,7 @@ async def fetch_all_products_indexed(db) -> Dict:
         logger.error(f"Error fetching products: {e}")
         return {}
 
+
 def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Dict:
     items = []
     total_units = 0
@@ -1042,7 +1043,7 @@ def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Di
         item_id = item["_id"]
         units_sold = item.get("total_units_sold", 0)
         amount = item.get("total_amount", 0.0)
-        
+
         # Get SKU and stock data...
         sku_code = products_map.get(item_id, "")
         stock_info = stock_data.get(item_id, {})
@@ -1055,7 +1056,7 @@ def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Di
             total_units += units_sold
             total_amount += amount
             total_stock += closing_stock
-            
+
             items.append(
                 SalesReportItem(
                     item_name=item.get("item_name", ""),
@@ -1075,10 +1076,11 @@ def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Di
         "stock": total_stock,
     }
 
+
 @lru_cache(maxsize=100)
 def get_excluded_customer_list() -> str:
     patterns = [
-        "(EC)",
+        # "(EC)",
         "(NA)",
         "(amzb2b)",
         "(amz2b2)",
@@ -1089,11 +1091,15 @@ def get_excluded_customer_list() -> str:
         "(SSAM)",
         "(OSAM)",
         "(OSAMP)",
+        "(DON)",
+        "(Jiomart b2c)",
         "Blinkit",
-        "Blinkit-",
+        "KIRANAKART",
+        "Mr. Tikoti Laxman",
+        "Rushil Kalsi",
         "ETRADE",
         "Pupscribe",
-        "Flipkart"
+        "Flipkart",
     ]
 
     escaped_patterns = [re.escape(pattern) for pattern in patterns]
@@ -1167,6 +1173,7 @@ def build_optimized_pipeline_with_credit_notes(
                             }
                         }
                     },
+                    {"invoice_number": {"$regex": "INV/", "$options": "i"}},
                 ]
             }
         },
@@ -1191,7 +1198,7 @@ def build_optimized_pipeline_with_credit_notes(
                         "$match": {
                             "$and": [
                                 {"date": {"$gte": start_date, "$lte": end_date}},
-                                {"status": {"$nin": ["draft", "void"]}},
+                                # {"status": {"$nin": ["draft", "void"]}},
                                 {
                                     "customer_name": {
                                         "$not": {
@@ -1223,7 +1230,6 @@ def build_optimized_pipeline_with_credit_notes(
             "$group": {
                 "_id": "$line_items.item_id",
                 "item_name": {"$first": "$line_items.name"},
-                # Separate invoice and credit note quantities
                 "invoice_units": {
                     "$sum": {
                         "$cond": [
@@ -1242,7 +1248,6 @@ def build_optimized_pipeline_with_credit_notes(
                         ]
                     }
                 },
-                # Separate invoice and credit note amounts
                 "invoice_amount": {
                     "$sum": {
                         "$cond": [
@@ -1261,7 +1266,6 @@ def build_optimized_pipeline_with_credit_notes(
                         ]
                     }
                 },
-                # Collect document numbers for reference
                 "invoice_numbers": {
                     "$addToSet": {
                         "$cond": [
@@ -1292,8 +1296,12 @@ def build_optimized_pipeline_with_credit_notes(
                 "invoice_amount": 1,
                 "credit_note_amount": 1,
                 # Calculate net values (invoices minus credit notes)
-                "total_units_sold": {"$subtract": ["$invoice_units", "$credit_note_units"]},
-                "total_amount": {"$subtract": ["$invoice_amount", "$credit_note_amount"]},
+                "total_units_sold": {
+                    "$subtract": ["$invoice_units", "$credit_note_units"]
+                },
+                "total_amount": {
+                    "$subtract": ["$invoice_amount", "$credit_note_amount"]
+                },
                 # Clean up document number arrays (remove Nones)
                 "invoice_numbers": {
                     "$filter": {
@@ -1329,11 +1337,11 @@ def process_batch_with_credit_notes(
 
     for item in batch:
         item_id = item["_id"]
-        
+
         # Net quantities (already calculated in the pipeline)
         units_sold = item.get("total_units_sold", 0)
         amount = item.get("total_amount", 0.0)
-        
+
         # Additional data for debugging/logging (can be removed in production)
         invoice_units = item.get("invoice_units", 0)
         credit_note_units = item.get("credit_note_units", 0)
@@ -1416,7 +1424,7 @@ async def get_sales_report_fast(
 
         # OPTIMIZATION 2: Use efficient customer filtering
         excluded_customers = get_excluded_customer_list()
-        
+
         # OPTIMIZATION 3: Use the NEW pipeline that includes credit notes
         invoices_collection = db[INVOICES_COLLECTION]
 
@@ -1453,7 +1461,9 @@ async def get_sales_report_fast(
         for item in result_cursor:
             batch.append(item)
             if len(batch) >= batch_size:
-                processed = process_batch_with_credit_notes(batch, stock_data, products_map)
+                processed = process_batch_with_credit_notes(
+                    batch, stock_data, products_map
+                )
                 sales_report_items.extend(processed["items"])
                 total_units += processed["units"]
                 total_amount += processed["amount"]
@@ -1562,7 +1572,7 @@ async def download_sales_report(
 
         excluded_customers = get_excluded_customer_list()
         invoices_collection = db[INVOICES_COLLECTION]
-        
+
         # Use the NEW pipeline with credit notes
         pipeline = build_optimized_pipeline_with_credit_notes(
             start_date, end_date, excluded_customers
@@ -1589,7 +1599,9 @@ async def download_sales_report(
         for item in result_cursor:
             batch.append(item)
             if len(batch) >= batch_size:
-                processed = process_batch_with_credit_notes(batch, stock_data, products_map)
+                processed = process_batch_with_credit_notes(
+                    batch, stock_data, products_map
+                )
                 sales_report_items.extend(processed["items"])
                 total_units += processed["units"]
                 total_amount += processed["amount"]
@@ -1612,19 +1624,21 @@ async def download_sales_report(
 
         # Create Excel file
         output = io.BytesIO()
-        
+
         # Convert SalesReportItem objects to dictionaries for DataFrame
         sales_data = []
         for item in sales_report_items:
-            sales_data.append({
-                "Item Name": item.item_name,
-                "SKU Code": item.sku_code,
-                "Units Sold": item.units_sold,
-                "Total Amount (₹)": item.total_amount,
-                "Closing Stock": item.closing_stock,
-                "Days In Stock": item.total_days_in_stock,
-                "DRR (Daily Run Rate)": item.drr
-            })
+            sales_data.append(
+                {
+                    "Item Name": item.item_name,
+                    "SKU Code": item.sku_code,
+                    "Units Sold": item.units_sold,
+                    "Total Amount (₹)": item.total_amount,
+                    "Closing Stock": item.closing_stock,
+                    "Days In Stock": item.total_days_in_stock,
+                    "DRR (Daily Run Rate)": item.drr,
+                }
+            )
 
         # Create DataFrame
         df = pd.DataFrame(sales_data)
@@ -1633,23 +1647,23 @@ async def download_sales_report(
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             # Main data sheet
             df.to_excel(writer, sheet_name="Sales Report", index=False)
-            
+
             # Summary sheet
             summary_data = {
                 "Metric": [
                     "Report Period",
-                    "Generated On", 
+                    "Generated On",
                     "Processing Method",
                     "Credit Notes Integrated",
                     "",
                     "NET SALES SUMMARY",
                     "Total Items",
-                    "Net Units Sold", 
+                    "Net Units Sold",
                     "Net Amount (₹)",
                     "Total Closing Stock",
                     "Items With Stock",
                     "Items Out of Stock",
-                    "Average DRR"
+                    "Average DRR",
                 ],
                 "Value": [
                     f"{start_date} to {end_date}",
@@ -1664,24 +1678,34 @@ async def download_sales_report(
                     total_closing_stock,
                     sum(1 for item in sales_report_items if item.closing_stock > 0),
                     sum(1 for item in sales_report_items if item.closing_stock == 0),
-                    f"{sum(item.drr for item in sales_report_items) / len(sales_report_items):.2f}" if sales_report_items else "0.00"
-                ]
+                    (
+                        f"{sum(item.drr for item in sales_report_items) / len(sales_report_items):.2f}"
+                        if sales_report_items
+                        else "0.00"
+                    ),
+                ],
             }
-            
+
             summary_df = pd.DataFrame(summary_data)
             summary_df.to_excel(writer, sheet_name="Summary", index=False)
-            
+
             # Format the main sheet
             workbook = writer.book
             worksheet = writer.sheets["Sales Report"]
-            
+
             # Auto-adjust column widths
             for column in df:
                 column_length = max(df[column].astype(str).map(len).max(), len(column))
                 col_idx = df.columns.get_loc(column)
                 # Convert column index to Excel column letter
-                col_letter = chr(65 + col_idx) if col_idx < 26 else chr(65 + col_idx // 26 - 1) + chr(65 + col_idx % 26)
-                worksheet.column_dimensions[col_letter].width = min(column_length + 2, 50)
+                col_letter = (
+                    chr(65 + col_idx)
+                    if col_idx < 26
+                    else chr(65 + col_idx // 26 - 1) + chr(65 + col_idx % 26)
+                )
+                worksheet.column_dimensions[col_letter].width = min(
+                    column_length + 2, 50
+                )
 
         output.seek(0)
 
@@ -1695,9 +1719,9 @@ async def download_sales_report(
         return StreamingResponse(
             io.BytesIO(output.read()),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
-        
+
     except HTTPException as e:
         raise e
     except Exception as e:
@@ -1706,6 +1730,8 @@ async def download_sales_report(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {str(e)}",
         )
+
+
 from functools import lru_cache
 from typing import Optional, Dict, Any
 import asyncio
