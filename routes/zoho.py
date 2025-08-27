@@ -904,6 +904,7 @@ class SalesReportItem(BaseModel):
     item_name: str
     sku_code: str
     units_sold: int
+    units_returned:int
     total_amount: float
     closing_stock: int
     total_days_in_stock: int
@@ -1042,6 +1043,7 @@ def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Di
     for item in batch:
         item_id = item["_id"]
         units_sold = item.get("total_units_sold", 0)
+        units_returned = item.get("total_units_returned", 0)
         amount = item.get("total_amount", 0.0)
 
         # Get SKU and stock data...
@@ -1334,7 +1336,7 @@ def process_batch_with_credit_notes(
     total_units = 0
     total_amount = 0
     total_stock = 0
-
+    total_returns = 0
     for item in batch:
         item_id = item["_id"]
 
@@ -1347,7 +1349,6 @@ def process_batch_with_credit_notes(
         credit_note_units = item.get("credit_note_units", 0)
         invoice_numbers = item.get("invoice_numbers", [])
         credit_note_numbers = item.get("credit_note_numbers", [])
-
         # Get SKU and stock data (same as before)
         sku_code = products_map.get(item_id, "")
         stock_info = stock_data.get(item_id, {})
@@ -1360,7 +1361,7 @@ def process_batch_with_credit_notes(
             total_units += units_sold
             total_amount += amount
             total_stock += closing_stock
-
+            total_returns += credit_note_units
             # Log credit note activity for items that have it (optional)
             if credit_note_units > 0:
                 logger.info(
@@ -1372,6 +1373,7 @@ def process_batch_with_credit_notes(
                 SalesReportItem(
                     item_name=item.get("item_name", ""),
                     sku_code=sku_code,
+                    units_returned=credit_note_units,
                     units_sold=units_sold,  # This is now net units (invoice - credit notes)
                     total_amount=round(amount, 2),  # This is now net amount
                     closing_stock=closing_stock,
@@ -1385,6 +1387,7 @@ def process_batch_with_credit_notes(
         "units": total_units,
         "amount": total_amount,
         "stock": total_stock,
+        "returns":total_returns,
     }
 
 
@@ -1451,6 +1454,7 @@ async def get_sales_report_fast(
         # Process results using the NEW batch processing function
         sales_report_items = []
         total_units = 0
+        total_returns = 0
         total_amount = 0.0
         total_closing_stock = 0
 
@@ -1467,6 +1471,7 @@ async def get_sales_report_fast(
                 sales_report_items.extend(processed["items"])
                 total_units += processed["units"]
                 total_amount += processed["amount"]
+                total_returns += processed["returns"]
                 total_closing_stock += processed["stock"]
                 batch = []
 
@@ -1476,6 +1481,7 @@ async def get_sales_report_fast(
             sales_report_items.extend(processed["items"])
             total_units += processed["units"]
             total_amount += processed["amount"]
+            total_returns += processed["returns"]
             total_closing_stock += processed["stock"]
 
         # Sort results (same as before)
@@ -1505,6 +1511,7 @@ async def get_sales_report_fast(
             "summary": {
                 "total_items": len(sales_report_items),
                 "total_units_sold": total_units,  # Now net units (invoice - credit notes)
+                "total_units_returned": total_returns,  # Now net units (invoice - credit notes)
                 "total_amount": round(total_amount, 2),  # Now net amount
                 "total_closing_stock": total_closing_stock,
                 "average_drr": round(avg_drr, 2),
@@ -1590,6 +1597,7 @@ async def download_sales_report(
 
         sales_report_items = []
         total_units = 0
+        total_returns = 0
         total_amount = 0.0
         total_closing_stock = 0
 
@@ -1604,6 +1612,7 @@ async def download_sales_report(
                 )
                 sales_report_items.extend(processed["items"])
                 total_units += processed["units"]
+                total_returns += processed["returns"]
                 total_amount += processed["amount"]
                 total_closing_stock += processed["stock"]
                 batch = []
@@ -1612,6 +1621,7 @@ async def download_sales_report(
             processed = process_batch_with_credit_notes(batch, stock_data, products_map)
             sales_report_items.extend(processed["items"])
             total_units += processed["units"]
+            total_returns += processed["returns"]
             total_amount += processed["amount"]
             total_closing_stock += processed["stock"]
 
@@ -1633,6 +1643,7 @@ async def download_sales_report(
                     "Item Name": item.item_name,
                     "SKU Code": item.sku_code,
                     "Units Sold": item.units_sold,
+                    "Units Returned": item.units_returned,
                     "Total Amount (₹)": item.total_amount,
                     "Closing Stock": item.closing_stock,
                     "Days In Stock": item.total_days_in_stock,
@@ -1659,6 +1670,7 @@ async def download_sales_report(
                     "NET SALES SUMMARY",
                     "Total Items",
                     "Net Units Sold",
+                    "Net Units Returned",
                     "Net Amount (₹)",
                     "Total Closing Stock",
                     "Items With Stock",
@@ -1674,6 +1686,7 @@ async def download_sales_report(
                     "",
                     len(sales_report_items),
                     total_units,
+                    total_returns,
                     f"₹{total_amount:,.2f}",
                     total_closing_stock,
                     sum(1 for item in sales_report_items if item.closing_stock > 0),
