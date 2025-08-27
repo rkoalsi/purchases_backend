@@ -46,7 +46,6 @@ sku_cache = SKUCache()
 # Use environment variables for production
 
 SKU_COLLECTION = "blinkit_sku_mapping"
-SALES_COLLECTION = "blinkit_sales"
 RETURN_COLLECTION = "blinkit_returns"
 TEMP_SALES_COLLECTION = "blinkit_sales_temp"
 INVENTORY_COLLECTION = "blinkit_inventory"
@@ -275,7 +274,7 @@ async def sync_status(start_date: str, end_date: str, db=Depends(get_database)):
         first_inventory_date = None
         last_inventory_date = None
 
-        sales_collection = SALES_COLLECTION
+        sales_collection = TEMP_SALES_COLLECTION
         inventory_collection = INVENTORY_COLLECTION
         # Get first and last sales dates in the date range
         sales_date_pipeline = [
@@ -1086,7 +1085,7 @@ async def generate_report_by_date_range(
 
         period_name = f"{start_date} to {end_date}"
 
-        sales_collection = database.get_collection(SALES_COLLECTION)
+        sales_collection = database.get_collection(TEMP_SALES_COLLECTION)
         inventory_collection = database.get_collection(INVENTORY_COLLECTION)
         returns_collection = database.get_collection(RETURN_COLLECTION)
 
