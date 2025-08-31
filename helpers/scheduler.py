@@ -74,6 +74,17 @@ class APIScheduler:
         except Exception as e:
             logger.error(f"Inventory Ledger API call failed: {str(e)}")
             raise
+   
+    async def get_returns(self):
+        try:
+            logger.info("Executing Amazon Returns API call...")
+            response = await self.client.post(f"/amazon/sync/daily-returns")
+            response.raise_for_status()
+            logger.info(f"returns Amazon Returns API call successful: {response.status_code}")
+            return response.json()
+        except Exception as e:
+            logger.error(f"returns Amazon Returns API call failed: {str(e)}")
+            raise
     
     async def daily_task_execution(self):
         try:
@@ -84,6 +95,8 @@ class APIScheduler:
             
             await self.get_vc_inventory()
             await self.get_vc_sales_traffic()
+            
+            await self.get_returns()
             
             logger.info("Daily task execution completed successfully")
             

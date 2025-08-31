@@ -12,6 +12,7 @@ import requests
 import json
 import time, io
 import gzip
+import re
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 import logging
@@ -474,6 +475,462 @@ async def insert_data_to_db(
         )
 
 
+def get_field_mapping_for_amazon_field(amazon_field: str) -> str:
+    """
+    Dynamically map Amazon field names to our expected field names
+    """
+    normalized = normalize_field_name(amazon_field)
+    
+    # Define mapping rules based on common patterns
+    field_mappings = {
+        # Order fields
+        'order_id': 'order_id',
+        'orderid': 'order_id', 
+        'amazon_order_id': 'order_id',
+        'amazonorderid': 'order_id',
+        
+        # Dates
+        'order_date': 'order_date',
+        'orderdate': 'order_date',
+        'return_request_date': 'return_request_date',
+        'returnrequestdate': 'return_request_date',
+        'return_delivery_date': 'return_delivery_date',
+        'returndeliverydate': 'return_delivery_date',
+        
+        # Return information
+        'return_request_status': 'return_request_status',
+        'returnrequeststatus': 'return_request_status',
+        'return_quantity': 'return_quantity',
+        'returnquantity': 'return_quantity',
+        'quantity': 'return_quantity',
+        'return_reason': 'return_reason',
+        'returnreason': 'return_reason',
+        'return_type': 'return_type',
+        'returntype': 'return_type',
+        
+        # RMA fields
+        'amazon_rma_id': 'amazon_rma_id',
+        'amazonrmaid': 'amazon_rma_id',
+        'merchant_rma_id': 'merchant_rma_id',
+        'merchantrmaid': 'merchant_rma_id',
+        
+        # Shipping/Label fields
+        'label_type': 'label_type',
+        'labeltype': 'label_type',
+        'label_cost': 'label_cost',
+        'labelcost': 'label_cost',
+        'currency_code': 'currency_code',
+        'currencycode': 'currency_code',
+        'return_carrier': 'return_carrier',
+        'returncarrier': 'return_carrier',
+        'tracking_id': 'tracking_id',
+        'trackingid': 'tracking_id',
+        'label_to_be_paid_by': 'label_to_be_paid_by',
+        'labeltobepaidby': 'label_to_be_paid_by',
+        
+        # Claims and prime
+        'a_to_z_claim': 'a_to_z_claim',
+        'atozclaim': 'a_to_z_claim',
+        'is_prime': 'is_prime',
+        'isprime': 'is_prime',
+        
+        # Product fields
+        'asin': 'asin',
+        'merchant_sku': 'merchant_sku',
+        'merchantsku': 'merchant_sku',
+        'sku': 'merchant_sku',
+        'item_name': 'item_name',
+        'itemname': 'item_name',
+        'product_name': 'item_name',
+        'productname': 'item_name',
+        'category': 'category',
+        
+        # Policy and resolution
+        'in_policy': 'in_policy',
+        'inpolicy': 'in_policy',
+        'resolution': 'resolution',
+        
+        # Financial fields
+        'order_amount': 'order_amount',
+        'orderamount': 'order_amount',
+        'order_quantity': 'order_quantity',
+        'orderquantity': 'order_quantity',
+        'refunded_amount': 'refunded_amount',
+        'refundedamount': 'refunded_amount',
+        
+        # Other fields
+        'invoice_number': 'invoice_number',
+        'invoicenumber': 'invoice_number',
+        'order_item_id': 'order_item_id',
+        'orderitemid': 'order_item_id',
+    }
+    
+    return field_mappings.get(normalized, normalized)
+
+
+def normalize_amazon_sc_fields(record: Dict) -> Dict:
+    """
+    Normalize Amazon SC returns record to our expected structure
+    """
+    normalized_record = {}
+    
+    for amazon_field, value in record.items():
+        # Get the mapped field name
+        our_field = get_field_mapping_for_amazon_field(amazon_field)
+        
+        # Handle null/empty values
+        if pd.isna(value) or value == "" or value == " ":
+            normalized_record[our_field] = None
+        else:
+            # Handle special data type conversions
+            if our_field in ["order_date", "return_request_date", "return_delivery_date"]:
+                try:
+                    normalized_record[our_field] = pd.to_datetime(value).to_pydatetime()
+                except:
+                    normalized_record[our_field] = value
+            elif our_field in ["label_cost"]:
+                try:
+                    normalized_record[our_field] = float(value)
+                except:
+                    normalized_record[our_field] = value
+            elif our_field in ["return_quantity"]:
+                try:
+                    normalized_record[our_field] = int(float(value))
+                except:
+                    normalized_record[our_field] = value
+            elif our_field == "tracking_id":
+                try:
+                    # Handle long tracking IDs
+                    normalized_record[our_field] = int(float(value))
+                except:
+                    normalized_record[our_field] = value
+            else:
+                normalized_record[our_field] = value
+    
+    return normalized_record
+
+def normalize_field_name(field_name: str) -> str:
+    """
+    Convert Amazon field names to our snake_case format
+    """
+    if not field_name:
+        return ""
+    
+    # Remove extra spaces and convert to lowercase
+    field_name = field_name.strip().lower()
+    
+    # Replace spaces, hyphens, and other separators with underscores
+    field_name = re.sub(r'[\s\-\.]+', '_', field_name)
+    
+    # Remove special characters but keep underscores
+    field_name = re.sub(r'[^a-z0-9_]', '', field_name)
+    
+    # Remove multiple consecutive underscores
+    field_name = re.sub(r'_+', '_', field_name)
+    
+    # Remove leading/trailing underscores
+    field_name = field_name.strip('_')
+    
+    return field_name
+
+def normalize_amazon_fba_fields(record: Dict) -> Dict:
+    """
+    Normalize Amazon FBA returns record to our expected structure
+    """
+    normalized_record = {}
+    
+    # FBA field mappings
+    fba_field_mappings = {
+        'return_date': 'return_date',
+        'returndate': 'return_date',
+        'order_id': 'amazon_order_id',
+        'orderid': 'amazon_order_id',
+        'amazon_order_id': 'amazon_order_id',
+        'amazonorderid': 'amazon_order_id',
+        'sku': 'sku_code',
+        'sku_code': 'sku_code',
+        'skucode': 'sku_code',
+        'asin': 'asin',
+        'fnsku': 'fnsku',
+        'product_name': 'product_name',
+        'productname': 'product_name',
+        'item_name': 'product_name',
+        'itemname': 'product_name',
+        'quantity': 'quantity',
+        'fulfillment_center_id': 'fulfillment_center_id',
+        'fulfillmentcenterid': 'fulfillment_center_id',
+        'detailed_disposition': 'detailed_disposition',
+        'detaileddisposition': 'detailed_disposition',
+        'reason': 'reason',
+        'license_plate_number': 'license_plate_number',
+        'licenseplatenumber': 'license_plate_number',
+        'customer_comments': 'customer_comments',
+        'customercomments': 'customer_comments',
+    }
+    
+    for amazon_field, value in record.items():
+        # Get normalized field name
+        normalized_field = normalize_field_name(amazon_field)
+        
+        # Get our target field name
+        our_field = fba_field_mappings.get(normalized_field, normalized_field)
+        
+        # Handle null/empty values
+        if pd.isna(value) or value == "" or value == " ":
+            normalized_record[our_field] = None
+        else:
+            # Handle special data type conversions
+            if our_field == "return_date":
+                try:
+                    normalized_record[our_field] = pd.to_datetime(value).to_pydatetime()
+                except:
+                    normalized_record[our_field] = value
+            elif our_field == "quantity":
+                try:
+                    normalized_record[our_field] = int(float(value))
+                except:
+                    normalized_record[our_field] = value
+            else:
+                normalized_record[our_field] = value
+    
+    return normalized_record
+
+
+    
+
+
+def get_amazon_fba_returns_data(
+    start_date: str, end_date: str, db: Any, marketplace_ids: List[str] = None
+) -> List[Dict]:
+    """
+    Fetch FBA returns data from Amazon SP API
+    """
+    if marketplace_ids is None:
+        marketplace_ids = [MARKETPLACE_ID]
+
+    try:
+        # Create FBA returns report
+        report_id = create_report(
+            report_type="GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA",
+            start_date=start_date,
+            end_date=end_date,
+            marketplace_ids=marketplace_ids,
+        )
+
+        # Add validation for report_id
+        if not report_id:
+            raise ValueError("Failed to create FBA returns report - no report ID returned")
+
+        # Wait for report to be ready (with timeout)
+        max_wait_time = 300  # 5 minutes
+        wait_time = 0
+
+        while wait_time < max_wait_time:
+            report_status = get_report_status(report_id)
+
+            # Add validation for report_status
+            if not report_status:
+                raise ValueError("Failed to get FBA returns report status - empty response")
+
+            processing_status = report_status.get("processingStatus")
+            report_document_id = report_status.get("reportDocumentId")
+
+            if processing_status == "DONE":
+                break
+            elif processing_status == "FATAL":
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="FBA returns report processing failed",
+                )
+
+            time.sleep(10)
+            wait_time += 10
+
+        if wait_time >= max_wait_time:
+            raise HTTPException(
+                status_code=status.HTTP_408_REQUEST_TIMEOUT,
+                detail="FBA returns report processing timed out",
+            )
+
+        # Validate report_document_id before downloading
+        if not report_document_id:
+            raise ValueError("No FBA returns report document ID available")
+
+        # Download and parse report data (TSV format)
+        report_data = download_report_data(report_document_id, is_gzipped=False)
+
+        # Add validation for report_data
+        if not report_data:
+            raise ValueError("Downloaded FBA returns report data is empty")
+
+        # Convert TSV data to list of dictionaries
+        try:
+            df = pd.read_csv(io.StringIO(report_data), sep="\t", low_memory=False)
+            fba_returns_raw = df.to_dict("records")
+        except Exception as parse_error:
+            raise ValueError(f"Failed to parse FBA returns TSV data: {parse_error}")
+
+        # Process and normalize data according to your document structure
+        normalized_data = []
+        for record in fba_returns_raw:
+            # Apply dynamic field mapping
+            normalized_record = normalize_amazon_fba_fields(record)
+
+            # Check for duplicate using amazon_order_id + sku_code + return_date
+            should_insert = True
+            if all(key in normalized_record and normalized_record[key] is not None for key in ["amazon_order_id", "sku_code", "return_date"]):
+                duplicate_check = {
+                    "amazon_order_id": normalized_record["amazon_order_id"],
+                    "sku_code": normalized_record["sku_code"],
+                    "return_date": normalized_record["return_date"]
+                }
+                
+                existing_record = db[FBA_RETURNS_COLLECTION].find_one(duplicate_check)
+                if existing_record:
+                    should_insert = False
+                    logger.debug(f"Skipping duplicate FBA return: {normalized_record['amazon_order_id']} - {normalized_record['sku_code']}")
+            
+            if should_insert:
+                normalized_data.append(normalized_record)
+
+        logger.info(f"Processed {len(fba_returns_raw)} FBA returns records, {len(normalized_data)} new records to insert")
+        return normalized_data
+
+    except HTTPException:
+        # Re-raise HTTPExceptions as-is
+        raise
+    except ValueError as ve:
+        logger.error(f"Validation error in FBA returns data: {ve}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"FBA returns data validation error: {str(ve)}",
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error fetching FBA returns data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch FBA returns data: {str(e)}",
+        )
+
+
+
+def get_amazon_sc_returns_data(
+    start_date: str, end_date: str, db: Any, marketplace_ids: List[str] = None
+) -> List[Dict]:
+    """
+    Fetch Seller Central returns data from Amazon SP API
+    """
+    if marketplace_ids is None:
+        marketplace_ids = [MARKETPLACE_ID]
+
+    try:
+        # Create Seller Central returns report
+        report_id = create_report(
+            report_type="GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE",
+            start_date=start_date,
+            end_date=end_date,
+            marketplace_ids=marketplace_ids,
+        )
+
+        # Add validation for report_id
+        if not report_id:
+            raise ValueError("Failed to create SC returns report - no report ID returned")
+
+        # Wait for report to be ready (with timeout)
+        max_wait_time = 300  # 5 minutes
+        wait_time = 0
+
+        while wait_time < max_wait_time:
+            report_status = get_report_status(report_id)
+
+            # Add validation for report_status
+            if not report_status:
+                raise ValueError("Failed to get SC returns report status - empty response")
+
+            processing_status = report_status.get("processingStatus")
+            report_document_id = report_status.get("reportDocumentId")
+
+            if processing_status == "DONE":
+                break
+            elif processing_status == "FATAL":
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="SC returns report processing failed",
+                )
+
+            time.sleep(10)
+            wait_time += 10
+
+        if wait_time >= max_wait_time:
+            raise HTTPException(
+                status_code=status.HTTP_408_REQUEST_TIMEOUT,
+                detail="SC returns report processing timed out",
+            )
+
+        # Validate report_document_id before downloading
+        if not report_document_id:
+            raise ValueError("No SC returns report document ID available")
+
+        # Download and parse report data (TSV format)
+        report_data = download_report_data(report_document_id, is_gzipped=False)
+
+        # Add validation for report_data
+        if not report_data:
+            raise ValueError("Downloaded SC returns report data is empty")
+
+        # Convert TSV data to list of dictionaries
+        try:
+            df = pd.read_csv(io.StringIO(report_data), sep="\t", low_memory=False)
+            sc_returns_raw = df.to_dict("records")
+        except Exception as parse_error:
+            raise ValueError(f"Failed to parse SC returns TSV data: {parse_error}")
+
+        # Process and normalize data according to your document structure
+        normalized_data = []
+        for record in sc_returns_raw:
+            # Map Amazon column names to your document structure
+            normalized_record = {}
+            
+            # Apply dynamic field mapping
+            normalized_record = normalize_amazon_sc_fields(record)
+
+            # Check for duplicate using order_id + merchant_sku + return_request_date
+            should_insert = True
+            if all(key in normalized_record and normalized_record[key] is not None for key in ["order_id", "merchant_sku", "return_request_date"]):
+                duplicate_check = {
+                    "order_id": normalized_record["order_id"],
+                    "merchant_sku": normalized_record["merchant_sku"],
+                    "return_request_date": normalized_record["return_request_date"]
+                }
+                
+                existing_record = db[SC_RETURNS_COLLECTION].find_one(duplicate_check)
+                if existing_record:
+                    should_insert = False
+                    logger.debug(f"Skipping duplicate SC return: {normalized_record['order_id']} - {normalized_record['merchant_sku']}")
+            
+            if should_insert:
+                normalized_data.append(normalized_record)
+
+        logger.info(f"Processed {len(sc_returns_raw)} SC returns records, {len(normalized_data)} new records to insert")
+        return normalized_data
+
+    except HTTPException:
+        # Re-raise HTTPExceptions as-is
+        raise
+    except ValueError as ve:
+        logger.error(f"Validation error in SC returns data: {ve}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"SC returns data validation error: {str(ve)}",
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error fetching SC returns data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch SC returns data: {str(e)}",
+        )
+
+
 # API Endpoints
 
 
@@ -737,6 +1194,242 @@ async def sync_status(
         logger.error(f"Error getting sync status: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+@router.post("/sync/fba-returns")
+async def sync_fba_returns_data(
+    start_date: str,
+    end_date: str,
+    marketplace_ids: Optional[List[str]] = None,
+    db=Depends(get_database),
+):
+    """
+    Fetch FBA returns data from Amazon and insert into database
+    Format: YYYY-MM-DD
+    """
+    try:
+        # Validate date format
+        datetime.strptime(start_date, "%Y-%m-%d")
+        datetime.strptime(end_date, "%Y-%m-%d")
+
+        # Convert to ISO format for API
+        start_datetime = f"{start_date}T00:00:00Z"
+        end_datetime = f"{end_date}T23:59:59Z"
+
+        # Fetch FBA returns data
+        fba_returns_data = get_amazon_fba_returns_data(
+            start_datetime, end_datetime, db, marketplace_ids
+        )
+
+        # Insert into database
+        inserted_count = await insert_data_to_db(
+            FBA_RETURNS_COLLECTION, fba_returns_data, db
+        )
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "FBA returns data synced successfully",
+                "records_inserted": inserted_count,
+                "date_range": f"{start_date} to {end_date}",
+                "marketplace_ids": marketplace_ids or [MARKETPLACE_ID],
+            },
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid date format. Use YYYY-MM-DD",
+        )
+    except Exception as e:
+        logger.error(f"Error syncing FBA returns data: {e}")
+        raise
+
+
+@router.post("/sync/sc-returns")
+async def sync_sc_returns_data(
+    start_date: str,
+    end_date: str,
+    marketplace_ids: Optional[List[str]] = None,
+    db=Depends(get_database),
+):
+    """
+    Fetch Seller Central returns data from Amazon and insert into database
+    Format: YYYY-MM-DD
+    """
+    try:
+        # Validate date format
+        datetime.strptime(start_date, "%Y-%m-%d")
+        datetime.strptime(end_date, "%Y-%m-%d")
+
+        # Convert to ISO format for API
+        start_datetime = f"{start_date}T00:00:00Z"
+        end_datetime = f"{end_date}T23:59:59Z"
+
+        # Fetch SC returns data
+        sc_returns_data = get_amazon_sc_returns_data(
+            start_datetime, end_datetime, db, marketplace_ids
+        )
+
+        # Insert into database
+        inserted_count = await insert_data_to_db(
+            SC_RETURNS_COLLECTION, sc_returns_data, db
+        )
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Seller Central returns data synced successfully",
+                "records_inserted": inserted_count,
+                "date_range": f"{start_date} to {end_date}",
+                "marketplace_ids": marketplace_ids or [MARKETPLACE_ID],
+            },
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid date format. Use YYYY-MM-DD",
+        )
+    except Exception as e:
+        logger.error(f"Error syncing SC returns data: {e}")
+        raise
+
+
+@router.post("/sync/daily-returns")
+async def sync_daily_returns_data(
+    db=Depends(get_database),
+):
+    """
+    Fetch both FBA and SC returns data for a specific date (default: yesterday)
+    This endpoint is designed for daily cron jobs
+    Format: YYYY-MM-DD
+    """
+    try:
+        start_date = datetime.now().replace(day=1).strftime("%Y-%m-%d")
+        end_date = datetime.now().strftime("%Y-%m-%d")
+
+        # Use the same date for start and end to get that specific day's data
+        start_datetime = f"{start_date}T00:00:00Z"
+        end_datetime = f"{end_date}T23:59:59Z"
+
+        # Fetch both types of returns data
+        fba_returns_data = get_amazon_fba_returns_data(start_datetime, end_datetime, db)
+
+        sc_returns_data = get_amazon_sc_returns_data(start_datetime, end_datetime, db)
+
+        # Insert into respective databases
+        fba_inserted_count = await insert_data_to_db(
+            FBA_RETURNS_COLLECTION, fba_returns_data, db
+        )
+
+        sc_inserted_count = await insert_data_to_db(
+            SC_RETURNS_COLLECTION, sc_returns_data, db
+        )
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": f"Daily returns data synced successfully for {start_date}",
+                "fba_returns": {
+                    "records_inserted": fba_inserted_count,
+                },
+                "sc_returns": {
+                    "records_inserted": sc_inserted_count,
+                },
+                "start_date": start_date,
+                "end_date": end_date,
+                "marketplace_ids": [MARKETPLACE_ID],
+            },
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid date format. Use YYYY-MM-DD",
+        )
+    except Exception as e:
+        logger.error(f"Error syncing daily returns data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to sync daily returns data: {str(e)}",
+        )
+
+
+@router.post("/sync/monthly-returns")
+async def sync_monthly_returns_data(
+    year: int,
+    month: int,
+    marketplace_ids: Optional[List[str]] = None,
+    db=Depends(get_database),
+):
+    """
+    Fetch both FBA and SC returns data for the entire month till current date
+    """
+    try:
+        # Calculate date range for the month
+        from calendar import monthrange
+
+        # Get first day of the month
+        start_date = datetime(year, month, 1)
+
+        # Get current date or last day of month, whichever is earlier
+        current_date = datetime.now()
+        last_day_of_month = monthrange(year, month)[1]
+
+        if year == current_date.year and month == current_date.month:
+            # Current month - sync till today
+            end_date = current_date
+        else:
+            # Past month - sync entire month
+            end_date = datetime(year, month, last_day_of_month)
+
+        # Format dates for API
+        start_date_str = start_date.strftime("%Y-%m-%d")
+        end_date_str = end_date.strftime("%Y-%m-%d")
+        start_datetime = start_date.strftime("%Y-%m-%dT00:00:00Z")
+        end_datetime = end_date.strftime("%Y-%m-%dT23:59:59Z")
+
+        # Fetch both types of returns data
+        fba_returns_data = get_amazon_fba_returns_data(
+            start_datetime, end_datetime, db, marketplace_ids
+        )
+
+        sc_returns_data = get_amazon_sc_returns_data(
+            start_datetime, end_datetime, db, marketplace_ids
+        )
+
+        # Insert into respective databases
+        fba_inserted_count = await insert_data_to_db(
+            FBA_RETURNS_COLLECTION, fba_returns_data, db
+        )
+
+        sc_inserted_count = await insert_data_to_db(
+            SC_RETURNS_COLLECTION, sc_returns_data, db
+        )
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Monthly returns data synced successfully",
+                "fba_returns": {
+                    "records_inserted": fba_inserted_count,
+                },
+                "sc_returns": {
+                    "records_inserted": sc_inserted_count,
+                },
+                "date_range": f"{start_date_str} to {end_date_str}",
+                "month": f"{year}-{month:02d}",
+                "marketplace_ids": marketplace_ids or [MARKETPLACE_ID],
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Error syncing monthly returns data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to sync monthly returns data: {str(e)}",
         )
 
 
@@ -1012,9 +1705,7 @@ async def generate_report_by_date_range(
 
         else:
             # Handle fba, seller_flex, fba+seller_flex
-            return await generate_amazon_data(
-                start, end, database, report_type
-            )
+            return await generate_amazon_data(start, end, database, report_type)
 
     except Exception as e:
         import traceback
@@ -1261,7 +1952,7 @@ async def generate_amazon_data(start, end, database, report_type):
                                 "$and": [
                                     {"$eq": ["$asin", "$$sales_asin"]},
                                     {"$gte": ["$return_date", start]},
-                                    {"$lte": ["$return_date", end]}
+                                    {"$lte": ["$return_date", end]},
                                 ]
                             }
                         }
@@ -1269,15 +1960,19 @@ async def generate_amazon_data(start, end, database, report_type):
                     {
                         "$group": {
                             "_id": "$asin",
-                            "fba_returns": {"$sum": {"$toInt": {"$ifNull": ["$quantity", 1]}}}
+                            "fba_returns": {
+                                "$sum": {"$toInt": {"$ifNull": ["$quantity", 1]}}
+                            },
                         }
-                    }
+                    },
                 ],
-                "as": "fba_returns_data"
+                "as": "fba_returns_data",
             }
         }
         base_pipeline.append(fba_returns_lookup_stage)
-        base_pipeline.append({"$addFields": {"fba_returns_data": {"$first": "$fba_returns_data"}}})
+        base_pipeline.append(
+            {"$addFields": {"fba_returns_data": {"$first": "$fba_returns_data"}}}
+        )
 
     # Add SC returns lookup for all report types
     sc_returns_lookup_stage = {
@@ -1291,7 +1986,7 @@ async def generate_amazon_data(start, end, database, report_type):
                             "$and": [
                                 {"$eq": ["$asin", "$$sales_asin"]},
                                 {"$gte": ["$order_date", start]},
-                                {"$lte": ["$order_date", end]}
+                                {"$lte": ["$order_date", end]},
                             ]
                         }
                     }
@@ -1299,15 +1994,19 @@ async def generate_amazon_data(start, end, database, report_type):
                 {
                     "$group": {
                         "_id": "$asin",
-                        "sc_returns": {"$sum": {"$toInt": {"$ifNull": ["$return_quantity", 1]}}}
+                        "sc_returns": {
+                            "$sum": {"$toInt": {"$ifNull": ["$return_quantity", 1]}}
+                        },
                     }
-                }
+                },
             ],
-            "as": "sc_returns_data"
+            "as": "sc_returns_data",
         }
     }
     base_pipeline.append(sc_returns_lookup_stage)
-    base_pipeline.append({"$addFields": {"sc_returns_data": {"$first": "$sc_returns_data"}}})
+    base_pipeline.append(
+        {"$addFields": {"sc_returns_data": {"$first": "$sc_returns_data"}}}
+    )
 
     # Continue with the rest of the pipeline
     group_stage = {
@@ -1325,9 +2024,7 @@ async def generate_amazon_data(start, end, database, report_type):
             "daily_data": {
                 "$push": {
                     "date": "$_id.date",
-                    "closing_stock": {
-                        "$ifNull": ["$ledger_data.closing_stock", 0]
-                    },
+                    "closing_stock": {"$ifNull": ["$ledger_data.closing_stock", 0]},
                     "units_sold": "$units_sold",
                     "sessions": "$sessions",
                 }
@@ -1342,7 +2039,7 @@ async def generate_amazon_data(start, end, database, report_type):
             "$last": {
                 "$add": [
                     {"$ifNull": ["$fba_returns_data.fba_returns", 0]},
-                    {"$ifNull": ["$sc_returns_data.sc_returns", 0]}
+                    {"$ifNull": ["$sc_returns_data.sc_returns", 0]},
                 ]
             }
         }
@@ -1357,7 +2054,7 @@ async def generate_amazon_data(start, end, database, report_type):
             "$last": {
                 "$add": [
                     {"$ifNull": ["$fba_returns_data.fba_returns", 0]},
-                    {"$ifNull": ["$sc_returns_data.sc_returns", 0]}
+                    {"$ifNull": ["$sc_returns_data.sc_returns", 0]},
                 ]
             }
         }
@@ -1365,65 +2062,67 @@ async def generate_amazon_data(start, end, database, report_type):
     base_pipeline.append(group_stage)
 
     # Add remaining pipeline stages
-    base_pipeline.extend([
-        {
-            "$addFields": {
-                "total_days_in_stock": {
-                    "$cond": {
-                        "if": {
-                            "$and": [
-                                {"$ne": ["$daily_data", None]},
-                                {"$gt": [{"$size": "$daily_data"}, 0]},
-                            ]
-                        },
-                        "then": {
-                            "$let": {
-                                "vars": {
-                                    "sorted_data": {
-                                        "$sortArray": {
-                                            "input": "$daily_data",
-                                            "sortBy": {"date": 1},
+    base_pipeline.extend(
+        [
+            {
+                "$addFields": {
+                    "total_days_in_stock": {
+                        "$cond": {
+                            "if": {
+                                "$and": [
+                                    {"$ne": ["$daily_data", None]},
+                                    {"$gt": [{"$size": "$daily_data"}, 0]},
+                                ]
+                            },
+                            "then": {
+                                "$let": {
+                                    "vars": {
+                                        "sorted_data": {
+                                            "$sortArray": {
+                                                "input": "$daily_data",
+                                                "sortBy": {"date": 1},
+                                            }
                                         }
-                                    }
-                                },
-                                "in": {
-                                    "$size": {
-                                        "$filter": {
-                                            "input": "$$sorted_data",
-                                            "cond": {
-                                                "$gt": ["$$this.closing_stock", 0]
-                                            },
+                                    },
+                                    "in": {
+                                        "$size": {
+                                            "$filter": {
+                                                "input": "$$sorted_data",
+                                                "cond": {
+                                                    "$gt": ["$$this.closing_stock", 0]
+                                                },
+                                            }
                                         }
-                                    }
-                                },
-                            }
-                        },
-                        "else": 0,
-                    }
-                },
-                "warehouses": {
-                    "$reduce": {
-                        "input": "$all_warehouses",
-                        "initialValue": [],
-                        "in": {"$setUnion": ["$$value", "$$this"]},
-                    }
-                },
-            }
-        },
-        {
-            "$addFields": {
-                "drr": {
-                    "$cond": {
-                        "if": {"$gt": ["$total_days_in_stock", 0]},
-                        "then": {
-                            "$divide": ["$total_units_sold", "$total_days_in_stock"]
-                        },
-                        "else": 0,
+                                    },
+                                }
+                            },
+                            "else": 0,
+                        }
+                    },
+                    "warehouses": {
+                        "$reduce": {
+                            "input": "$all_warehouses",
+                            "initialValue": [],
+                            "in": {"$setUnion": ["$$value", "$$this"]},
+                        }
+                    },
+                }
+            },
+            {
+                "$addFields": {
+                    "drr": {
+                        "$cond": {
+                            "if": {"$gt": ["$total_days_in_stock", 0]},
+                            "then": {
+                                "$divide": ["$total_units_sold", "$total_days_in_stock"]
+                            },
+                            "else": 0,
+                        }
                     }
                 }
-            }
-        }
-    ])
+            },
+        ]
+    )
 
     # Build project stage dynamically based on report type
     project_stage = {
@@ -1444,20 +2143,23 @@ async def generate_amazon_data(start, end, database, report_type):
         }
     }
 
-    base_pipeline.extend([
-        project_stage,
-        {
-            "$sort": {
-                "sku_code": -1,
-                "asin": -1,
-            }
-        },
-    ])
+    base_pipeline.extend(
+        [
+            project_stage,
+            {
+                "$sort": {
+                    "sku_code": -1,
+                    "asin": -1,
+                }
+            },
+        ]
+    )
 
     collection = database.get_collection(SALES_COLLECTION)
     cursor = list(collection.aggregate(base_pipeline))
     result = serialize_mongo_document(cursor)
     return result
+
 
 def combine_report_data(vendor_data, fba_seller_flex_data):
     """Combine vendor central and fba/seller flex data"""
