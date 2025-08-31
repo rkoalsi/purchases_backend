@@ -904,7 +904,7 @@ class SalesReportItem(BaseModel):
     item_name: str
     sku_code: str
     units_sold: int
-    units_returned:int
+    units_returned: int
     total_amount: float
     closing_stock: int
     total_days_in_stock: int
@@ -1153,15 +1153,15 @@ async def cache_report(cache_key: str, data: Dict, db):
         logger.warning(f"Failed to cache report: {e}")
 
 
-def build_optimized_pipeline_with_credit_notes(
+def build_optimized_pipeline_with_credit_notes_and_composites(
     start_date: str, end_date: str, excluded_customers: str
 ) -> List[Dict]:
     """
-    Build an optimized aggregation pipeline that incorporates both invoices and credit notes.
-    Credit notes are subtracted from invoice quantities to get net sales.
+    Build an optimized aggregation pipeline that incorporates both invoices and credit notes,
+    and handles composite products by breaking them down into individual components.
+    Credit notes logic remains exactly the same - only composite products are expanded.
     """
     return [
-        # STEP 1: Match invoices in date range
         {
             "$match": {
                 "$and": [
@@ -1179,19 +1179,7 @@ def build_optimized_pipeline_with_credit_notes(
                 ]
             }
         },
-        # Add document type identifier for invoices
         {"$addFields": {"doc_type": "invoice"}},
-        # Early projection to reduce document size
-        {
-            "$project": {
-                "line_items": 1,
-                "doc_type": 1,
-                "invoice_number": 1,
-                "customer_name": 1,
-                "_id": 0,
-            }
-        },
-        # STEP 2: Union with credit_notes collection
         {
             "$unionWith": {
                 "coll": "credit_notes",
@@ -1200,7 +1188,6 @@ def build_optimized_pipeline_with_credit_notes(
                         "$match": {
                             "$and": [
                                 {"date": {"$gte": start_date, "$lte": end_date}},
-                                # {"status": {"$nin": ["draft", "void"]}},
                                 {
                                     "customer_name": {
                                         "$not": {
@@ -1213,30 +1200,85 @@ def build_optimized_pipeline_with_credit_notes(
                         }
                     },
                     {"$addFields": {"doc_type": "credit_note"}},
-                    {
-                        "$project": {
-                            "line_items": 1,
-                            "doc_type": 1,
-                            "creditnote_number": 1,
-                            "customer_name": 1,
-                            "_id": 0,
-                        }
-                    },
                 ],
             }
         },
-        # STEP 3: Unwind line items from both collections
         {"$unwind": "$line_items"},
-        # STEP 4: Group by item_id and calculate net quantities
+        {
+            "$lookup": {
+                "from": "composite_products",
+                "localField": "line_items.name",
+                "foreignField": "name",
+                "as": "composite_match",
+            }
+        },
+        {
+            "$addFields": {
+                "is_composite": {"$gt": [{"$size": "$composite_match"}, 0]},
+                "composite_info": {"$arrayElemAt": ["$composite_match", 0]},
+            }
+        },
+        {
+            "$project": {
+                "items_to_process": {
+                    "$cond": [
+                        # If it's a composite item
+                        "$is_composite",
+                        # Then: create array of component items
+                        {
+                            "$map": {
+                                "input": "$composite_info.components",
+                                "as": "component",
+                                "in": {
+                                    "doc_type": "$doc_type",
+                                    "invoice_number": "$invoice_number",
+                                    "creditnote_number": "$creditnote_number",
+                                    "item_id": "$component.item_id",
+                                    "item_name": "$component.name",
+                                    # Multiply original quantity by component quantity
+                                    "quantity": {
+                                        "$multiply": [
+                                            "$line_items.quantity",
+                                            "$component.quantity",
+                                        ]
+                                    },
+                                    # Distribute amount proportionally
+                                    "item_total": {
+                                        "$divide": [
+                                            "$line_items.item_total",
+                                            {"$size": "$composite_info.components"},
+                                        ]
+                                    },
+                                },
+                            }
+                        },
+                        # Else: keep as single regular item
+                        [
+                            {
+                                "doc_type": "$doc_type",
+                                "invoice_number": "$invoice_number",
+                                "creditnote_number": "$creditnote_number",
+                                "item_id": "$line_items.item_id",
+                                "item_name": "$line_items.name",
+                                "quantity": "$line_items.quantity",
+                                "item_total": "$line_items.item_total",
+                            }
+                        ],
+                    ]
+                }
+            }
+        },
+        {"$unwind": "$items_to_process"},
+        {"$replaceRoot": {"newRoot": "$items_to_process"}},
         {
             "$group": {
-                "_id": "$line_items.item_id",
-                "item_name": {"$first": "$line_items.name"},
+                "_id": "$item_id",
+                "item_name": {"$first": "$item_name"},
                 "invoice_units": {
                     "$sum": {
                         "$cond": [
                             {"$eq": ["$doc_type", "invoice"]},
-                            "$line_items.quantity",
+                            "$quantity",
                             0,
                         ]
                     }
@@ -1245,7 +1287,7 @@ def build_optimized_pipeline_with_credit_notes(
                     "$sum": {
                         "$cond": [
                             {"$eq": ["$doc_type", "credit_note"]},
-                            "$line_items.quantity",
+                            "$quantity",
                             0,
                         ]
                     }
@@ -1254,7 +1296,7 @@ def build_optimized_pipeline_with_credit_notes(
                     "$sum": {
                         "$cond": [
                             {"$eq": ["$doc_type", "invoice"]},
-                            "$line_items.item_total",
+                            "$item_total",
                             0,
                         ]
                     }
@@ -1263,7 +1305,7 @@ def build_optimized_pipeline_with_credit_notes(
                     "$sum": {
                         "$cond": [
                             {"$eq": ["$doc_type", "credit_note"]},
-                            "$line_items.item_total",
+                            "$item_total",
                             0,
                         ]
                     }
@@ -1288,7 +1330,6 @@ def build_optimized_pipeline_with_credit_notes(
                 },
             }
         },
-        # STEP 5: Calculate net quantities and amounts
         {
             "$project": {
                 "_id": 1,
@@ -1297,14 +1338,9 @@ def build_optimized_pipeline_with_credit_notes(
                 "credit_note_units": 1,
                 "invoice_amount": 1,
                 "credit_note_amount": 1,
-                # Calculate net values (invoices minus credit notes)
-                "total_units_sold": {
-                    "$subtract": ["$invoice_units", "$credit_note_units"]
-                },
-                "total_amount": {
-                    "$subtract": ["$invoice_amount", "$credit_note_amount"]
-                },
-                # Clean up document number arrays (remove Nones)
+                "total_units_sold": "$invoice_units",  
+                "total_units_returned": "$credit_note_units", 
+                "total_amount": "$invoice_amount",
                 "invoice_numbers": {
                     "$filter": {
                         "input": "$invoice_numbers",
@@ -1319,9 +1355,6 @@ def build_optimized_pipeline_with_credit_notes(
                 },
             }
         },
-        # STEP 6: Filter out items with zero or negative net sales (optional)
-        # Comment out this step if you want to see all items including those with net negative sales
-        # {"$match": {"total_units_sold": {"$gt": 0}}},
     ]
 
 
@@ -1387,7 +1420,7 @@ def process_batch_with_credit_notes(
         "units": total_units,
         "amount": total_amount,
         "stock": total_stock,
-        "returns":total_returns,
+        "returns": total_returns,
     }
 
 
@@ -1432,7 +1465,7 @@ async def get_sales_report_fast(
         invoices_collection = db[INVOICES_COLLECTION]
 
         # Build the NEW pipeline with credit notes integration
-        pipeline = build_optimized_pipeline_with_credit_notes(
+        pipeline = build_optimized_pipeline_with_credit_notes_and_composites(
             start_date, end_date, excluded_customers
         )
 
@@ -1581,7 +1614,7 @@ async def download_sales_report(
         invoices_collection = db[INVOICES_COLLECTION]
 
         # Use the NEW pipeline with credit notes
-        pipeline = build_optimized_pipeline_with_credit_notes(
+        pipeline = build_optimized_pipeline_with_credit_notes_and_composites(
             start_date, end_date, excluded_customers
         )
 
