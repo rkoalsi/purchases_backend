@@ -186,78 +186,26 @@ class OptimizedMasterReportService:
             return default
 
     def normalize_single_source_data(
-        self, source: str, data: List[Dict], product_name_map: Dict[str, str]
-    ) -> List[Dict]:
-        """Optimized normalization for a single data source"""
+    self, source: str, data: List[Dict], product_name_map: Dict[str, str]
+) -> List[Dict]:
+        """Optimized normalization for a single data source with conditional SKU-level aggregation"""
         if not isinstance(data, list):
             return []
 
-        normalized_data = []
-        
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-
-            try:
-                # Get SKU and canonical name
-                sku_code = (item.get("sku_code") or "Unknown SKU").strip()
-                if not sku_code:
-                    sku_code = "Unknown SKU"
+        # For Zoho, data is already aggregated by the API, so don't re-aggregate
+        if source == "zoho":
+            normalized_data = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
                 
-                canonical_name = product_name_map.get(sku_code, "Unknown Item")
-
-                # Source-specific normalization
-                if source == "blinkit":
-                    metrics = item.get("metrics", {}) or {}
-                    normalized_item = {
-                        "source": "blinkit",
-                        "item_name": canonical_name,
-                        "item_id": str(item.get("item_id", "")),
-                        "sku_code": sku_code,
-                        "city": item.get("city", "Unknown City"),
-                        "warehouse": item.get("warehouse", "Unknown Warehouse"),
-                        "units_sold": self.safe_float(metrics.get("total_sales_in_period")),
-                        "units_returned": self.safe_float(metrics.get("total_returns_in_period")),
-                        "total_amount": 0.0,
-                        "closing_stock": self.safe_float(metrics.get("closing_stock")),
-                        "days_in_stock": self.safe_int(metrics.get("days_with_inventory")),
-                        "daily_run_rate": self.safe_float(metrics.get("avg_daily_on_stock_days")),
-                        "days_of_coverage": self.safe_float(metrics.get("days_of_coverage")),
-                        "sessions": 0,
-                        "additional_metrics": {
-                            "avg_weekly_on_stock_days": self.safe_float(metrics.get("avg_weekly_on_stock_days")),
-                            "performance_vs_prev_7_days_pct": self.safe_float(metrics.get("performance_vs_prev_7_days_pct")),
-                            "performance_vs_prev_30_days_pct": self.safe_float(metrics.get("performance_vs_prev_30_days_pct")),
-                            "best_performing_month": item.get("best_performing_month", ""),
-                        },
-                    }
-
-                elif source == "amazon":
-                    warehouses = item.get("warehouses", []) or []
-                    warehouse_str = ", ".join(warehouses) if isinstance(warehouses, list) and warehouses else "Unknown Warehouse"
-
-                    normalized_item = {
-                        "source": "amazon",
-                        "item_name": canonical_name,
-                        "item_id": item.get("asin", ""),
-                        "sku_code": sku_code,
-                        "city": "Multiple",
-                        "warehouse": warehouse_str,
-                        "units_sold": self.safe_float(item.get("units_sold")),
-                        "units_returned": self.safe_float(item.get("units_returned")),
-                        "total_amount": self.safe_float(item.get("total_amount")),
-                        "closing_stock": self.safe_float(item.get("closing_stock")),
-                        "days_in_stock": self.safe_int(item.get("total_days_in_stock")),
-                        "daily_run_rate": self.safe_float(item.get("drr")),
-                        "days_of_coverage": 0.0,
-                        "sessions": self.safe_int(item.get("sessions")),
-                        "additional_metrics": {
-                            "data_source_type": item.get("data_source", ""),
-                            "stock": self.safe_float(item.get("stock")),
-                        },
-                    }
-
-                elif source == "zoho":
+                try:
+                    sku_code = (item.get("sku_code") or "Unknown SKU").strip()
+                    if not sku_code:
+                        sku_code = "Unknown SKU"
+                    
+                    canonical_name = product_name_map.get(sku_code, "Unknown Item")
+                    
                     normalized_item = {
                         "source": "zoho",
                         "item_name": canonical_name,
@@ -271,29 +219,137 @@ class OptimizedMasterReportService:
                         "closing_stock": self.safe_float(item.get("closing_stock")),
                         "days_in_stock": self.safe_int(item.get("total_days_in_stock")),
                         "daily_run_rate": self.safe_float(item.get("drr")),
-                        "days_of_coverage": 0.0,
                         "sessions": 0,
+                        "days_of_coverage": 0.0,
                         "additional_metrics": {},
                     }
-                else:
+                    
+                    # Calculate days of coverage
+                    if normalized_item["daily_run_rate"] > 0:
+                        normalized_item["days_of_coverage"] = round(
+                            normalized_item["closing_stock"] / normalized_item["daily_run_rate"], 2
+                        )
+                    
+                    # Only add items with sales or returns
+                    if normalized_item["units_sold"] > 0 or normalized_item["units_returned"] > 0:
+                        normalized_data.append(normalized_item)
+                        
+                except Exception as e:
+                    logger.error(f"Error normalizing Zoho item: {e}")
                     continue
+            
+            return normalized_data
 
-                # Calculate days of coverage if needed
-                if normalized_item["daily_run_rate"] > 0 and normalized_item["days_of_coverage"] == 0:
+        # For Blinkit and Amazon, use SKU-level aggregation as before
+        sku_aggregated = defaultdict(lambda: {
+            "sku_code": "",
+            "item_name": "",
+            "item_id": "",
+            "city": "",
+            "warehouse": set(),
+            "units_sold": 0.0,
+            "units_returned": 0.0,
+            "total_amount": 0.0,
+            "closing_stock": 0.0,
+            "sessions": 0,
+            "days_in_stock": 0,
+            "daily_run_rate": 0.0,
+            "days_of_coverage": 0.0,
+            "additional_metrics": {}
+        })
+        
+        # Aggregate by SKU for Blinkit and Amazon
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                sku_code = (item.get("sku_code") or "Unknown SKU").strip()
+                if not sku_code:
+                    sku_code = "Unknown SKU"
+                    
+                agg = sku_aggregated[sku_code]
+                
+                # Set basic info (first occurrence)
+                if not agg["sku_code"]:
+                    agg["sku_code"] = sku_code
+                    agg["item_name"] = product_name_map.get(sku_code, "Unknown Item")
+                    if source == "amazon":
+                        agg["item_id"] = item.get("asin", "")
+                    else:
+                        agg["item_id"] = str(item.get("item_id", ""))
+                    agg["city"] = item.get("city", "Multiple" if source == "amazon" else "Unknown City")
+                
+                # Source-specific aggregation
+                if source == "blinkit":
+                    metrics = item.get("metrics", {}) or {}
+                    agg["units_sold"] += self.safe_float(metrics.get("total_sales_in_period"))
+                    agg["units_returned"] += self.safe_float(metrics.get("total_returns_in_period"))
+                    agg["closing_stock"] += self.safe_float(metrics.get("closing_stock"))
+                    agg["days_in_stock"] += self.safe_int(metrics.get("days_with_inventory"))
+                    # Take last/max for rates
+                    agg["daily_run_rate"] = max(agg["daily_run_rate"], self.safe_float(metrics.get("avg_daily_on_stock_days")))
+                    warehouse = item.get("warehouse", "Unknown Warehouse")
+                    if warehouse:
+                        agg["warehouse"].add(warehouse)
+                        
+                elif source == "amazon":
+                    agg["units_sold"] += self.safe_float(item.get("units_sold"))
+                    agg["units_returned"] += self.safe_float(item.get("total_returns"))
+                    agg["total_amount"] += self.safe_float(item.get("total_amount"))
+                    agg["closing_stock"] += self.safe_float(item.get("closing_stock"))
+                    agg["sessions"] += self.safe_int(item.get("sessions"))
+                    agg["days_in_stock"] += self.safe_int(item.get("total_days_in_stock"))
+                    agg["daily_run_rate"] = max(agg["daily_run_rate"], self.safe_float(item.get("drr")))
+                    
+                    warehouses = item.get("warehouses", []) or []
+                    if isinstance(warehouses, list):
+                        agg["warehouse"].update(warehouses)
+                        
+            except Exception as e:
+                logger.error(f"Error aggregating item from {source}: {e}")
+                continue
+        
+        # Convert aggregated data to normalized format for Blinkit and Amazon
+        normalized_data = []
+        for sku_code, agg in sku_aggregated.items():
+            try:
+                # Convert warehouse set to string
+                warehouse_str = ", ".join(sorted(agg["warehouse"])) if agg["warehouse"] else "Unknown Warehouse"
+                
+                normalized_item = {
+                    "source": source,
+                    "item_name": agg["item_name"],
+                    "item_id": agg["item_id"],
+                    "sku_code": agg["sku_code"],
+                    "city": agg["city"],
+                    "warehouse": warehouse_str,
+                    "units_sold": agg["units_sold"],
+                    "units_returned": agg["units_returned"],
+                    "total_amount": agg["total_amount"],
+                    "closing_stock": agg["closing_stock"],
+                    "days_in_stock": agg["days_in_stock"],
+                    "daily_run_rate": agg["daily_run_rate"],
+                    "sessions": agg["sessions"],
+                    "days_of_coverage": 0.0,
+                    "additional_metrics": agg["additional_metrics"],
+                }
+                
+                # Calculate days of coverage
+                if normalized_item["daily_run_rate"] > 0:
                     normalized_item["days_of_coverage"] = round(
                         normalized_item["closing_stock"] / normalized_item["daily_run_rate"], 2
                     )
-
+                
                 # Only add items with sales or returns
                 if normalized_item["units_sold"] > 0 or normalized_item["units_returned"] > 0:
                     normalized_data.append(normalized_item)
-
+                    
             except Exception as e:
-                logger.error(f"Error normalizing item from {source}: {e}")
+                logger.error(f"Error creating normalized item for {sku_code} from {source}: {e}")
                 continue
 
         return normalized_data
-
     def combine_data_by_sku_optimized(self, all_normalized_data: List[List[Dict]]) -> List[Dict]:
         """Optimized SKU combination using defaultdict and single pass"""
         sku_data = defaultdict(lambda: {

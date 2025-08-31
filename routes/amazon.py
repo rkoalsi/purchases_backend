@@ -16,6 +16,7 @@ from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 import logging
 from .amazon_vc import router as amazon_vendor_router
+
 # --- Configuration ---
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,10 +28,12 @@ load_dotenv()
 SKU_COLLECTION = "amazon_sku_mapping"
 SALES_COLLECTION = "amazon_sales_traffic"
 INVENTORY_COLLECTION = "amazon_ledger"
+FBA_RETURNS_COLLECTION = "amazon_fba_returns"
+SC_RETURNS_COLLECTION = "amazon_seller_central_returns"
 
 router = APIRouter()
 
-router.include_router(amazon_vendor_router,prefix='/vendor')
+router.include_router(amazon_vendor_router, prefix="/vendor")
 
 # SP API Configuration
 REFRESH_TOKEN = os.getenv("SP_REFRESH_TOKEN")
@@ -618,57 +621,67 @@ async def sync_status(
             """Helper function to get status for a collection pair"""
             # Get first and last sales dates in the date range
             sales_date_pipeline = [
-                {
-                    "$match": {
-                        "date": {"$gte": start, "$lte": end}
-                    }
-                },
+                {"$match": {"date": {"$gte": start, "$lte": end}}},
                 {
                     "$group": {
                         "_id": None,
                         "first_date": {"$min": "$date"},
-                        "last_date": {"$max": "$date"}
+                        "last_date": {"$max": "$date"},
                     }
-                }
+                },
             ]
-            
+
             sales_dates = list(db[sales_collection].aggregate(sales_date_pipeline))
             first_sales_date = None
             last_sales_date = None
             if sales_dates:
-                first_sales_date = sales_dates[0]["first_date"].isoformat() if sales_dates[0]["first_date"] else None
-                last_sales_date = sales_dates[0]["last_date"].isoformat() if sales_dates[0]["last_date"] else None
+                first_sales_date = (
+                    sales_dates[0]["first_date"].isoformat()
+                    if sales_dates[0]["first_date"]
+                    else None
+                )
+                last_sales_date = (
+                    sales_dates[0]["last_date"].isoformat()
+                    if sales_dates[0]["last_date"]
+                    else None
+                )
 
             # Get first and last inventory dates in the date range
             inventory_date_pipeline = [
-                {
-                    "$match": {
-                        "date": {"$gte": start, "$lte": end}
-                    }
-                },
+                {"$match": {"date": {"$gte": start, "$lte": end}}},
                 {
                     "$group": {
                         "_id": None,
                         "first_date": {"$min": "$date"},
-                        "last_date": {"$max": "$date"}
+                        "last_date": {"$max": "$date"},
                     }
-                }
+                },
             ]
-            
-            inventory_dates = list(db[inventory_collection].aggregate(inventory_date_pipeline))
+
+            inventory_dates = list(
+                db[inventory_collection].aggregate(inventory_date_pipeline)
+            )
             first_inventory_date = None
             last_inventory_date = None
             if inventory_dates:
-                first_inventory_date = inventory_dates[0]["first_date"].isoformat() if inventory_dates[0]["first_date"] else None
-                last_inventory_date = inventory_dates[0]["last_date"].isoformat() if inventory_dates[0]["last_date"] else None
+                first_inventory_date = (
+                    inventory_dates[0]["first_date"].isoformat()
+                    if inventory_dates[0]["first_date"]
+                    else None
+                )
+                last_inventory_date = (
+                    inventory_dates[0]["last_date"].isoformat()
+                    if inventory_dates[0]["last_date"]
+                    else None
+                )
 
             # Get total counts
-            sales_count = db[sales_collection].count_documents({
-                "date": {"$gte": start, "$lte": end}
-            })
-            inventory_count = db[inventory_collection].count_documents({
-                "date": {"$gte": start, "$lte": end}
-            })
+            sales_count = db[sales_collection].count_documents(
+                {"date": {"$gte": start, "$lte": end}}
+            )
+            inventory_count = db[inventory_collection].count_documents(
+                {"date": {"$gte": start, "$lte": end}}
+            )
 
             return {
                 "sales_data": {
@@ -680,22 +693,21 @@ async def sync_status(
                     "records_count": inventory_count,
                     "first_inventory_date": first_inventory_date,
                     "last_inventory_date": last_inventory_date,
-                }
+                },
             }
 
         # Handle different report types
         if report_type == "all":
             # Get both vendor_central and fba/seller_flex data
-            vendor_status = await get_data_status("amazon_vendor_sales", "amazon_vendor_inventory")
+            vendor_status = await get_data_status(
+                "amazon_vendor_sales", "amazon_vendor_inventory"
+            )
             fba_status = await get_data_status(SALES_COLLECTION, INVENTORY_COLLECTION)
-            
+
             return JSONResponse(
                 status_code=status.HTTP_200_OK,
                 content={
-                    "date_range": {
-                        "start_date": start_date,
-                        "end_date": end_date
-                    },
+                    "date_range": {"start_date": start_date, "end_date": end_date},
                     "vendor_central": vendor_status,
                     "fba_seller_flex": fba_status,
                     "report_type": report_type,
@@ -703,7 +715,9 @@ async def sync_status(
             )
 
         elif report_type == "vendor_central":
-            status_data = await get_data_status("amazon_vendor_sales", "amazon_vendor_inventory")
+            status_data = await get_data_status(
+                "amazon_vendor_sales", "amazon_vendor_inventory"
+            )
         else:
             # fba, seller_flex, fba+seller_flex
             status_data = await get_data_status(SALES_COLLECTION, INVENTORY_COLLECTION)
@@ -712,10 +726,7 @@ async def sync_status(
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
-                "date_range": {
-                    "start_date": start_date,
-                    "end_date": end_date
-                },
+                "date_range": {"start_date": start_date, "end_date": end_date},
                 "sales_data": status_data["sales_data"],
                 "inventory_data": status_data["inventory_data"],
                 "report_type": report_type,
@@ -725,8 +736,10 @@ async def sync_status(
     except Exception as e:
         logger.error(f"Error getting sync status: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-        
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
 @router.get("/sales-traffic/{asin}")
 async def get_asin_sales_data(
     asin: str,
@@ -983,24 +996,29 @@ async def generate_report_by_date_range(
         if report_type == "all":
             # Get vendor_central data
             vendor_data = await generate_vendor_central_data(start, end, database)
-            
+
             # Get fba+seller_flex data
-            fba_seller_flex_data = await generate_fba_seller_flex_data(start, end, database, "fba+seller_flex")
-            
+            fba_seller_flex_data = await generate_amazon_data(
+                start, end, database, "fba+seller_flex"
+            )
+
             # Combine the data
             combined_data = combine_report_data(vendor_data, fba_seller_flex_data)
-            
+
             return combined_data
 
         elif report_type == "vendor_central":
             return await generate_vendor_central_data(start, end, database)
-        
+
         else:
             # Handle fba, seller_flex, fba+seller_flex
-            return await generate_fba_seller_flex_data(start, end, database, report_type)
+            return await generate_amazon_data(
+                start, end, database, report_type
+            )
 
     except Exception as e:
         import traceback
+
         logger.info(str(e))
         traceback.print_exc()
         raise HTTPException(
@@ -1042,9 +1060,7 @@ async def generate_vendor_central_data(start, end, database):
                     {
                         "$group": {
                             "_id": {"asin": "$asin", "date": "$date"},
-                            "closing_stock": {
-                                "$sum": "$sellableOnHandInventoryUnits"
-                            },
+                            "closing_stock": {"$sum": "$sellableOnHandInventoryUnits"},
                         }
                     },
                 ],
@@ -1161,15 +1177,15 @@ async def generate_vendor_central_data(start, end, database):
             }
         },
     ]
-    
+
     collection = database.get_collection("amazon_vendor_sales")
     cursor = list(collection.aggregate(vendor_pipeline))
     result = serialize_mongo_document(cursor)
     return result
 
 
-async def generate_fba_seller_flex_data(start, end, database, report_type):
-    """Generate FBA/Seller Flex report data"""
+async def generate_amazon_data(start, end, database, report_type):
+    """Generate FBA/Seller Flex report data with returns information (FBA only)"""
     ledger_match_conditions = [
         {"$eq": ["$asin", "$$sales_asin"]},
         {"$eq": ["$date", "$$sales_date"]},
@@ -1230,30 +1246,126 @@ async def generate_fba_seller_flex_data(start, end, database, report_type):
             }
         },
         {"$addFields": {"item_info": {"$last": "$item_info"}}},
-        {
-            "$group": {
-                "_id": {"asin": "$_id.asin"},
-                "total_units_sold": {"$sum": "$units_sold"},
-                "total_amount": {"$sum": "$amount"},
-                "total_sessions": {"$sum": "$sessions"},
-                "total_closing_stock": {
-                    "$last": {"$ifNull": ["$ledger_data.closing_stock", 0]}
-                },
-                "item_name": {"$last": "$item_info.item_name"},
-                "sku_code": {"$last": "$item_info.sku_code"},
-                "all_warehouses": {"$addToSet": "$ledger_data.warehouses"},
-                "daily_data": {
-                    "$push": {
-                        "date": "$_id.date",
-                        "closing_stock": {
-                            "$ifNull": ["$ledger_data.closing_stock", 0]
-                        },
-                        "units_sold": "$units_sold",
-                        "sessions": "$sessions",
+    ]
+
+    # Add FBA returns lookup for FBA reports (not seller_flex)
+    if report_type in ["fba", "fba+seller_flex", "all"]:
+        fba_returns_lookup_stage = {
+            "$lookup": {
+                "from": FBA_RETURNS_COLLECTION,
+                "let": {"sales_asin": "$_id.asin"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$asin", "$$sales_asin"]},
+                                    {"$gte": ["$return_date", start]},
+                                    {"$lte": ["$return_date", end]}
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": "$asin",
+                            "fba_returns": {"$sum": {"$toInt": {"$ifNull": ["$quantity", 1]}}}
+                        }
+                    }
+                ],
+                "as": "fba_returns_data"
+            }
+        }
+        base_pipeline.append(fba_returns_lookup_stage)
+        base_pipeline.append({"$addFields": {"fba_returns_data": {"$first": "$fba_returns_data"}}})
+
+    # Add SC returns lookup for all report types
+    sc_returns_lookup_stage = {
+        "$lookup": {
+            "from": SC_RETURNS_COLLECTION,
+            "let": {"sales_asin": "$_id.asin"},
+            "pipeline": [
+                {
+                    "$match": {
+                        "$expr": {
+                            "$and": [
+                                {"$eq": ["$asin", "$$sales_asin"]},
+                                {"$gte": ["$order_date", start]},
+                                {"$lte": ["$order_date", end]}
+                            ]
+                        }
                     }
                 },
+                {
+                    "$group": {
+                        "_id": "$asin",
+                        "sc_returns": {"$sum": {"$toInt": {"$ifNull": ["$return_quantity", 1]}}}
+                    }
+                }
+            ],
+            "as": "sc_returns_data"
+        }
+    }
+    base_pipeline.append(sc_returns_lookup_stage)
+    base_pipeline.append({"$addFields": {"sc_returns_data": {"$first": "$sc_returns_data"}}})
+
+    # Continue with the rest of the pipeline
+    group_stage = {
+        "$group": {
+            "_id": {"asin": "$_id.asin"},
+            "total_units_sold": {"$sum": "$units_sold"},
+            "total_amount": {"$sum": "$amount"},
+            "total_sessions": {"$sum": "$sessions"},
+            "total_closing_stock": {
+                "$last": {"$ifNull": ["$ledger_data.closing_stock", 0]}
+            },
+            "item_name": {"$last": "$item_info.item_name"},
+            "sku_code": {"$last": "$item_info.sku_code"},
+            "all_warehouses": {"$addToSet": "$ledger_data.warehouses"},
+            "daily_data": {
+                "$push": {
+                    "date": "$_id.date",
+                    "closing_stock": {
+                        "$ifNull": ["$ledger_data.closing_stock", 0]
+                    },
+                    "units_sold": "$units_sold",
+                    "sessions": "$sessions",
+                }
+            },
+        }
+    }
+
+    # Add combined returns field
+    if report_type in ["fba", "fba+seller_flex"]:
+        # FBA reports: FBA returns + SC returns
+        group_stage["$group"]["total_returns"] = {
+            "$last": {
+                "$add": [
+                    {"$ifNull": ["$fba_returns_data.fba_returns", 0]},
+                    {"$ifNull": ["$sc_returns_data.sc_returns", 0]}
+                ]
             }
-        },
+        }
+    elif report_type == "seller_flex":
+        # Seller Flex reports: Only SC returns (no FBA returns)
+        group_stage["$group"]["total_returns"] = {
+            "$last": {"$ifNull": ["$sc_returns_data.sc_returns", 0]}
+        }
+    elif report_type == "all":
+        # All reports: FBA returns + SC returns (same as FBA reports)
+        group_stage["$group"]["total_returns"] = {
+            "$last": {
+                "$add": [
+                    {"$ifNull": ["$fba_returns_data.fba_returns", 0]},
+                    {"$ifNull": ["$sc_returns_data.sc_returns", 0]}
+                ]
+            }
+        }
+
+    base_pipeline.append(group_stage)
+
+    # Add remaining pipeline stages
+    base_pipeline.extend([
         {
             "$addFields": {
                 "total_days_in_stock": {
@@ -1310,113 +1422,134 @@ async def generate_fba_seller_flex_data(start, end, database, report_type):
                     }
                 }
             }
-        },
-        {
-            "$project": {
-                "_id": 0,
-                "asin": "$_id.asin",
-                "sku_code": "$sku_code",
-                "item_name": "$item_name",
-                "warehouses": "$warehouses",
-                "units_sold": "$total_units_sold",
-                "total_amount": "$total_amount",
-                "sessions": "$total_sessions",
-                "closing_stock": "$total_closing_stock",
-                "total_days_in_stock": "$total_days_in_stock",
-                "drr": {"$round": ["$drr", 2]},
-                "data_source": {"$literal": report_type},  # Add source identifier
-            }
-        },
+        }
+    ])
+
+    # Build project stage dynamically based on report type
+    project_stage = {
+        "$project": {
+            "_id": 0,
+            "asin": "$_id.asin",
+            "sku_code": "$sku_code",
+            "item_name": "$item_name",
+            "warehouses": "$warehouses",
+            "units_sold": "$total_units_sold",
+            "total_amount": "$total_amount",
+            "sessions": "$total_sessions",
+            "closing_stock": "$total_closing_stock",
+            "total_returns": "$total_returns",  # Always include total_returns
+            "total_days_in_stock": "$total_days_in_stock",
+            "drr": {"$round": ["$drr", 2]},
+            "data_source": {"$literal": report_type},
+        }
+    }
+
+    base_pipeline.extend([
+        project_stage,
         {
             "$sort": {
                 "sku_code": -1,
                 "asin": -1,
             }
         },
-    ]
+    ])
 
     collection = database.get_collection(SALES_COLLECTION)
     cursor = list(collection.aggregate(base_pipeline))
     result = serialize_mongo_document(cursor)
     return result
 
-
 def combine_report_data(vendor_data, fba_seller_flex_data):
     """Combine vendor central and fba/seller flex data"""
     # Create lookup dictionaries
     vendor_lookup = {}
     fba_lookup = {}
-    
+
     # Index vendor data by sku_code and asin
     for item in vendor_data:
-        key = (item.get('sku_code'), item.get('asin'))
+        key = (item.get("sku_code"), item.get("asin"))
         vendor_lookup[key] = item
-    
+
     # Index fba data by sku_code and asin
     for item in fba_seller_flex_data:
-        key = (item.get('sku_code'), item.get('asin'))
+        key = (item.get("sku_code"), item.get("asin"))
         fba_lookup[key] = item
-    
+
     combined_results = []
     processed_keys = set()
-    
+
     # Combine matching records
     for key in vendor_lookup:
         if key in fba_lookup:
             vendor_item = vendor_lookup[key]
             fba_item = fba_lookup[key]
-            
+
             combined_item = {
-                "asin": vendor_item.get('asin') or fba_item.get('asin'),
-                "sku_code": vendor_item.get('sku_code') or fba_item.get('sku_code'),
-                "item_name": vendor_item.get('item_name') or fba_item.get('item_name'),
-                "warehouses": fba_item.get('warehouses', []),  # Only from FBA data
-                "units_sold": (vendor_item.get('units_sold', 0) + fba_item.get('units_sold', 0)),
-                "total_amount": round((vendor_item.get('total_amount', 0) + fba_item.get('total_amount', 0)), 2),
-                "sessions": fba_item.get('sessions', 0),  # Only from FBA data
-                "closing_stock": (vendor_item.get('closing_stock', 0) + fba_item.get('closing_stock', 0)),
-                "stock": (vendor_item.get('stock', 0) + fba_item.get('closing_stock', 0)),  # Combined stock
-                "total_days_in_stock": max(vendor_item.get('total_days_in_stock', 0), 
-                                         fba_item.get('total_days_in_stock', 0)),
+                "asin": vendor_item.get("asin") or fba_item.get("asin"),
+                "sku_code": vendor_item.get("sku_code") or fba_item.get("sku_code"),
+                "item_name": vendor_item.get("item_name") or fba_item.get("item_name"),
+                "warehouses": fba_item.get("warehouses", []),  # Only from FBA data
+                "units_sold": (
+                    vendor_item.get("units_sold", 0) + fba_item.get("units_sold", 0)
+                ),
+                "total_amount": round(
+                    (
+                        vendor_item.get("total_amount", 0)
+                        + fba_item.get("total_amount", 0)
+                    ),
+                    2,
+                ),
+                "sessions": fba_item.get("sessions", 0),  # Only from FBA data
+                "closing_stock": (
+                    vendor_item.get("closing_stock", 0)
+                    + fba_item.get("closing_stock", 0)
+                ),
+                "stock": (
+                    vendor_item.get("stock", 0) + fba_item.get("closing_stock", 0)
+                ),  # Combined stock
+                "total_days_in_stock": max(
+                    vendor_item.get("total_days_in_stock", 0),
+                    fba_item.get("total_days_in_stock", 0),
+                ),
+                "total_returns": fba_item.get("total_returns", 0),
                 "drr": 0,  # Will be recalculated
                 "data_source": "combined",
             }
-            
+
             # Recalculate DRR
-            if combined_item['total_days_in_stock'] > 0:
-                combined_item['drr'] = round(combined_item['units_sold'] / combined_item['total_days_in_stock'], 2)
-            
+            if combined_item["total_days_in_stock"] > 0:
+                combined_item["drr"] = round(
+                    combined_item["units_sold"] / combined_item["total_days_in_stock"],
+                    2,
+                )
+
             combined_results.append(combined_item)
             processed_keys.add(key)
-    
+
     # Add vendor-only records
     for key, vendor_item in vendor_lookup.items():
         if key not in processed_keys:
             # Add missing fields with default values
-            vendor_item['warehouses'] = []
-            vendor_item['sessions'] = 0
-            if 'stock' not in vendor_item:
-                vendor_item['stock'] = vendor_item.get('closing_stock', 0)
-            vendor_item['data_source'] = 'vendor_only'
+            vendor_item["warehouses"] = []
+            vendor_item["sessions"] = 0
+            if "stock" not in vendor_item:
+                vendor_item["stock"] = vendor_item.get("closing_stock", 0)
+            vendor_item["data_source"] = "vendor_only"
             combined_results.append(vendor_item)
-    
+
     # Add FBA-only records
     for key, fba_item in fba_lookup.items():
         if key not in processed_keys:
             # Add missing fields with default values
-            fba_item['stock'] = fba_item.get('closing_stock', 0)
-            fba_item['data_source'] = 'fba_only'
+            fba_item["stock"] = fba_item.get("closing_stock", 0)
+            fba_item["data_source"] = "fba_only"
             combined_results.append(fba_item)
-    
+
     # Sort the results
     combined_results.sort(
-        key=lambda x: (
-            x.get('sku_code') or '', 
-            x.get('asin') or ''
-        ), 
-        reverse=True
+        key=lambda x: (x.get("sku_code") or "", x.get("asin") or ""), reverse=True
     )
-    
+
     return combined_results
 
 
@@ -1453,7 +1586,8 @@ async def get_report_data_by_date_range(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred retrieving the report data: {e}",
         )
-        
+
+
 def format_column_name(column_name):
     """Convert snake_case column names to proper formatted names"""
     # Replace underscores with spaces and title case
@@ -1472,6 +1606,7 @@ def format_column_name(column_name):
     }
 
     return replacements.get(formatted, formatted)
+
 
 @router.get("/download_report_by_date_range")
 async def download_report_by_date_range(
@@ -1546,6 +1681,7 @@ async def download_report_by_date_range(
                 "Sessions",
                 "Closing Stock",
                 "Stock",  # Combined reports include both closing_stock and stock
+                "Total Returns",
                 "Total Days In Stock",
                 "Drr",
                 "Data Source",  # Show which source the data came from
@@ -1561,6 +1697,7 @@ async def download_report_by_date_range(
                 "Total Amount",
                 "Sessions",
                 "Closing Stock",
+                "Total Returns",
                 "Total Days In Stock",
                 "Drr",
             ]
@@ -1613,21 +1750,31 @@ async def download_report_by_date_range(
             # Special formatting for "all" report type - color code rows by data source
             if report_type == "all" and "Data Source" in df.columns:
                 from openpyxl.styles import PatternFill
-                
+
                 # Define colors for different data sources
                 color_mapping = {
-                    "combined": PatternFill(start_color="E8F5E8", end_color="E8F5E8", fill_type="solid"),     # Light green
-                    "vendor_only": PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"),  # Light yellow
-                    "fba_only": PatternFill(start_color="E1F5FE", end_color="E1F5FE", fill_type="solid"),     # Light blue
+                    "combined": PatternFill(
+                        start_color="E8F5E8", end_color="E8F5E8", fill_type="solid"
+                    ),  # Light green
+                    "vendor_only": PatternFill(
+                        start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"
+                    ),  # Light yellow
+                    "fba_only": PatternFill(
+                        start_color="E1F5FE", end_color="E1F5FE", fill_type="solid"
+                    ),  # Light blue
                 }
-                
+
                 # Apply color coding to rows based on data source
-                data_source_col_index = df.columns.get_loc("Data Source") + 1  # +1 because Excel is 1-indexed
-                
+                data_source_col_index = (
+                    df.columns.get_loc("Data Source") + 1
+                )  # +1 because Excel is 1-indexed
+
                 for row_num in range(2, len(df) + 2):  # Start from row 2 (after header)
-                    data_source_value = worksheet.cell(row=row_num, column=data_source_col_index).value
+                    data_source_value = worksheet.cell(
+                        row=row_num, column=data_source_col_index
+                    ).value
                     row_fill = color_mapping.get(data_source_value)
-                    
+
                     if row_fill:
                         for col_num in range(1, len(df.columns) + 1):
                             worksheet.cell(row=row_num, column=col_num).fill = row_fill
@@ -1648,7 +1795,9 @@ async def download_report_by_date_range(
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
-        logger.info(f"Generated Excel report for report_type: {report_type}, rows: {len(df)}")
+        logger.info(
+            f"Generated Excel report for report_type: {report_type}, rows: {len(df)}"
+        )
         return response
 
     except HTTPException as e:
@@ -1685,6 +1834,7 @@ def format_column_name(column_name):
         "Data Source": "Data Source",
         "Total Days In Stock": "Total Days In Stock",
         "Drr": "DRR",
+        "Total Returns": "Total Returns",
         "Stock": "Stock",
     }
 

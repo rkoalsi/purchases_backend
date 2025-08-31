@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional, Dict, Any, Set
 from fastapi import Query
 from pydantic import BaseModel
@@ -6,16 +6,11 @@ import calendar
 import asyncio
 import logging
 import traceback
-import json
 from collections import defaultdict
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-
-from pymongo import ASCENDING
+from fastapi import APIRouter, HTTPException, status, Depends
 from pymongo.errors import PyMongoError
-from ..database import get_database, serialize_mongo_document
+from ..database import get_database
 
 logger = logging.getLogger(__name__)
 
@@ -496,6 +491,7 @@ def get_month_date_range(year: int, month: int):
     end_date = datetime(year, month, last_day, 23, 59, 59)
     return start_date, end_date
 
+
 @router.get("/top-products", response_model=TopProductsResponse)
 async def get_top_performing_products(
     limit: int = Query(10, ge=1, le=50, description="Number of top products to return"),
@@ -542,7 +538,9 @@ async def get_top_performing_products(
                 target_year, target_month
             )
 
-        logger.info(f"FIXED: Generating dashboard with consistent metrics for {parsed_start_date} to {parsed_end_date}")
+        logger.info(
+            f"FIXED: Generating dashboard with consistent metrics for {parsed_start_date} to {parsed_end_date}"
+        )
 
         # Initialize service
         dashboard_service = MultiSourceDashboardService(db)
@@ -550,11 +548,17 @@ async def get_top_performing_products(
         # Step 1: Fetch all data
         tasks = []
         if include_blinkit:
-            tasks.append(dashboard_service.get_blinkit_data(parsed_start_date, parsed_end_date))
+            tasks.append(
+                dashboard_service.get_blinkit_data(parsed_start_date, parsed_end_date)
+            )
         if include_amazon:
-            tasks.append(dashboard_service.get_amazon_data(parsed_start_date, parsed_end_date))
+            tasks.append(
+                dashboard_service.get_amazon_data(parsed_start_date, parsed_end_date)
+            )
         if include_zoho:
-            tasks.append(dashboard_service.get_zoho_data(parsed_start_date, parsed_end_date))
+            tasks.append(
+                dashboard_service.get_zoho_data(parsed_start_date, parsed_end_date)
+            )
 
         if not tasks:
             raise HTTPException(
@@ -567,7 +571,7 @@ async def get_top_performing_products(
         # Process results - filter out exceptions and empty results
         raw_source_data = []
         source_names = []
-        
+
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Task {i} failed: {str(result)}")
@@ -577,7 +581,9 @@ async def get_top_performing_products(
                 # Determine source name based on order
                 if include_blinkit and len(raw_source_data) == 1:
                     source_names.append("blinkit")
-                elif include_amazon and len(raw_source_data) == (2 if include_blinkit else 1):
+                elif include_amazon and len(raw_source_data) == (
+                    2 if include_blinkit else 1
+                ):
                     source_names.append("amazon")
                 elif include_zoho:
                     source_names.append("zoho")
@@ -599,23 +605,29 @@ async def get_top_performing_products(
                     if sku and sku.strip():
                         all_sku_codes.add(sku.strip())
 
-        product_name_map = await dashboard_service.batch_load_product_names(all_sku_codes)
+        product_name_map = await dashboard_service.batch_load_product_names(
+            all_sku_codes
+        )
         logger.info(f"Loaded names for {len(product_name_map)} products")
 
         # Step 3: Normalize data
         all_normalized_data = []
-        
+
         for i, source_data in enumerate(raw_source_data):
             # Map to correct source names
             if include_blinkit and i == 0:
                 source_name = "blinkit"
             elif include_amazon and i == (1 if include_blinkit else 0):
-                source_name = "amazon"  
-            elif include_zoho and i == ((1 if include_blinkit else 0) + (1 if include_amazon else 0)):
+                source_name = "amazon"
+            elif include_zoho and i == (
+                (1 if include_blinkit else 0) + (1 if include_amazon else 0)
+            ):
                 source_name = "zoho"
             else:
                 source_name = f"unknown_{i}"
-            normalized = dashboard_service.normalize_single_source_data(source_name, source_data, product_name_map)
+            normalized = dashboard_service.normalize_single_source_data(
+                source_name, source_data, product_name_map
+            )
             if normalized:
                 all_normalized_data.append(normalized)
                 logger.info(f"Normalized {len(normalized)} {source_name} items")
@@ -632,32 +644,52 @@ async def get_top_performing_products(
         combined_data = dashboard_service.combine_normalized_data_for_dashboard(
             all_normalized_data, parsed_start_date, parsed_end_date
         )
-        
+
         logger.info(f"Combined data for {len(combined_data)} unique SKUs")
 
         # VALIDATION: Check that all items have metrics structure
-        items_without_metrics = [item for item in combined_data if 'metrics' not in item]
+        items_without_metrics = [
+            item for item in combined_data if "metrics" not in item
+        ]
         if items_without_metrics:
-            logger.error(f"FOUND {len(items_without_metrics)} items without metrics structure!")
+            logger.error(
+                f"FOUND {len(items_without_metrics)} items without metrics structure!"
+            )
             for item in items_without_metrics[:3]:  # Log first 3 for debugging
-                logger.error(f"Item without metrics: {item.get('sku_code', 'Unknown')} - {item.keys()}")
+                logger.error(
+                    f"Item without metrics: {item.get('sku_code', 'Unknown')} - {item.keys()}"
+                )
         else:
-            logger.info(f"✓ ALL {len(combined_data)} items have consistent metrics structure")
+            logger.info(
+                f"✓ ALL {len(combined_data)} items have consistent metrics structure"
+            )
 
         # Step 5: Sort by total sales and limit
         sorted_products = sorted(
             combined_data,
-            key=lambda x: x.get("metrics", {}).get("total_sales_in_period", 0),  # Safe access
+            key=lambda x: x.get("metrics", {}).get(
+                "total_sales_in_period", 0
+            ),  # Safe access
             reverse=True,
         )[:limit]
-        print(json.dumps(sorted_products, indent=4))
         # Log summary for verification
-        total_sales = sum(p.get("metrics", {}).get("total_sales_in_period", 0) for p in sorted_products)
-        total_stock = sum(p.get("metrics", {}).get("closing_stock", 0) for p in sorted_products)
-        total_amount = sum(p.get("metrics", {}).get("total_amount", 0) for p in sorted_products)
-        
-        logger.info(f"DASHBOARD TOTALS - Sales: {total_sales}, Stock: {total_stock}, Amount: {total_amount}")
-        logger.info(f"Returning {len(sorted_products)} products from {len(combined_data)} total SKUs")
+        total_sales = sum(
+            p.get("metrics", {}).get("total_sales_in_period", 0)
+            for p in sorted_products
+        )
+        total_stock = sum(
+            p.get("metrics", {}).get("closing_stock", 0) for p in sorted_products
+        )
+        total_amount = sum(
+            p.get("metrics", {}).get("total_amount", 0) for p in sorted_products
+        )
+
+        logger.info(
+            f"DASHBOARD TOTALS - Sales: {total_sales}, Stock: {total_stock}, Amount: {total_amount}"
+        )
+        logger.info(
+            f"Returning {len(sorted_products)} products from {len(combined_data)} total SKUs"
+        )
 
         return TopProductsResponse(
             products=sorted_products,
@@ -678,6 +710,7 @@ async def get_top_performing_products(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal server error: {str(e)}",
         )
+
 
 @router.get("/top-products/summary")
 async def get_top_products_summary_fixed(
@@ -724,18 +757,26 @@ async def get_top_products_summary_fixed(
                 target_year, target_month
             )
 
-        logger.info(f"FIXED: Generating summary with consistent metrics for {parsed_start_date} to {parsed_end_date}")
+        logger.info(
+            f"FIXED: Generating summary with consistent metrics for {parsed_start_date} to {parsed_end_date}"
+        )
 
         # Use the EXACT same logic as top products up to the combination step
         dashboard_service = MultiSourceDashboardService(db)
-        
+
         tasks = []
         if include_blinkit:
-            tasks.append(dashboard_service.get_blinkit_data(parsed_start_date, parsed_end_date))
+            tasks.append(
+                dashboard_service.get_blinkit_data(parsed_start_date, parsed_end_date)
+            )
         if include_amazon:
-            tasks.append(dashboard_service.get_amazon_data(parsed_start_date, parsed_end_date))
+            tasks.append(
+                dashboard_service.get_amazon_data(parsed_start_date, parsed_end_date)
+            )
         if include_zoho:
-            tasks.append(dashboard_service.get_zoho_data(parsed_start_date, parsed_end_date))
+            tasks.append(
+                dashboard_service.get_zoho_data(parsed_start_date, parsed_end_date)
+            )
 
         if not tasks:
             raise HTTPException(
@@ -744,11 +785,11 @@ async def get_top_products_summary_fixed(
             )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         # Process results (same as top products)
         raw_source_data = []
         source_names = []
-        
+
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Task {i} failed: {str(result)}")
@@ -757,7 +798,9 @@ async def get_top_products_summary_fixed(
                 raw_source_data.append(result)
                 if include_blinkit and len(raw_source_data) == 1:
                     source_names.append("blinkit")
-                elif include_amazon and len(raw_source_data) == (2 if include_blinkit else 1):
+                elif include_amazon and len(raw_source_data) == (
+                    2 if include_blinkit else 1
+                ):
                     source_names.append("amazon")
                 elif include_zoho:
                     source_names.append("zoho")
@@ -786,22 +829,28 @@ async def get_top_products_summary_fixed(
                     if sku and sku.strip():
                         all_sku_codes.add(sku.strip())
 
-        product_name_map = await dashboard_service.batch_load_product_names(all_sku_codes)
+        product_name_map = await dashboard_service.batch_load_product_names(
+            all_sku_codes
+        )
 
         all_normalized_data = []
         source_counts = {}
-        
+
         for i, source_data in enumerate(raw_source_data):
             if include_blinkit and i == 0:
                 source_name = "blinkit"
             elif include_amazon and i == (1 if include_blinkit else 0):
-                source_name = "amazon"  
-            elif include_zoho and i == ((1 if include_blinkit else 0) + (1 if include_amazon else 0)):
+                source_name = "amazon"
+            elif include_zoho and i == (
+                (1 if include_blinkit else 0) + (1 if include_amazon else 0)
+            ):
                 source_name = "zoho"
             else:
                 source_name = f"unknown_{i}"
-            
-            normalized = dashboard_service.normalize_single_source_data(source_name, source_data, product_name_map)
+
+            normalized = dashboard_service.normalize_single_source_data(
+                source_name, source_data, product_name_map
+            )
             if normalized:
                 all_normalized_data.append(normalized)
                 source_counts[source_name] = len(normalized)
@@ -826,7 +875,7 @@ async def get_top_products_summary_fixed(
         combined_data = dashboard_service.combine_normalized_data_for_dashboard(
             all_normalized_data, parsed_start_date, parsed_end_date
         )
-        
+
         logger.info(f"Combined data for {len(combined_data)} unique SKUs")
 
         # FIXED: Aggregate from the same metrics structure as top products
@@ -834,21 +883,29 @@ async def get_top_products_summary_fixed(
         total_sales = 0.0
         total_closing_stock = 0.0
         total_amount = 0.0
-        
+
         for item in combined_data:
             metrics = item.get("metrics", {})
             if not metrics:  # Log items without metrics for debugging
-                logger.warning(f"Item {item.get('sku_code', 'Unknown')} has no metrics structure")
+                logger.warning(
+                    f"Item {item.get('sku_code', 'Unknown')} has no metrics structure"
+                )
                 continue
-                
-            total_sales += dashboard_service.safe_float(metrics.get("total_sales_in_period", 0))
-            total_closing_stock += dashboard_service.safe_float(metrics.get("closing_stock", 0))
+
+            total_sales += dashboard_service.safe_float(
+                metrics.get("total_sales_in_period", 0)
+            )
+            total_closing_stock += dashboard_service.safe_float(
+                metrics.get("closing_stock", 0)
+            )
             total_amount += dashboard_service.safe_float(metrics.get("total_amount", 0))
 
         avg_sales = total_sales / total_products if total_products > 0 else 0
 
         # Validation logging
-        logger.info(f"SUMMARY TOTALS - Products: {total_products}, Sales: {total_sales}, Stock: {total_closing_stock}, Amount: {total_amount}")
+        logger.info(
+            f"SUMMARY TOTALS - Products: {total_products}, Sales: {total_sales}, Stock: {total_closing_stock}, Amount: {total_amount}"
+        )
 
         return {
             "total_products": total_products,
