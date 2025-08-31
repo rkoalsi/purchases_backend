@@ -642,7 +642,6 @@ async def get_master_report(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate optimized master report: {str(e)}",
         )
-        
 @router.get("/master-report/download")
 async def download_master_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
@@ -704,6 +703,9 @@ async def download_master_report(
                         "Total Units Sold": item.get("combined_metrics", {}).get(
                             "total_units_sold", 0
                         ),
+                        "Total Units Returned": item.get("combined_metrics", {}).get(
+                            "total_units_returned", 0
+                        ),
                         "Total Amount": item.get("combined_metrics", {}).get(
                             "total_amount", 0
                         ),
@@ -719,24 +721,46 @@ async def download_master_report(
                         "Avg Days of Coverage": item.get("combined_metrics", {}).get(
                             "avg_days_of_coverage", 0
                         ),
-                        "Blinkit Units": item.get("source_breakdown", {})
+                        # Platform-wise Units Sold
+                        "Blinkit Units Sold": item.get("source_breakdown", {})
                         .get("blinkit", {})
                         .get("units_sold", 0),
-                        "Amazon Units": item.get("source_breakdown", {})
+                        "Amazon Units Sold": item.get("source_breakdown", {})
                         .get("amazon", {})
                         .get("units_sold", 0),
-                        "Zoho Units": item.get("source_breakdown", {})
+                        "Zoho Units Sold": item.get("source_breakdown", {})
                         .get("zoho", {})
                         .get("units_sold", 0),
-                        "Blinkit Stock": item.get("source_breakdown", {})
+                        # Platform-wise Units Returned
+                        "Blinkit Units Returned": item.get("source_breakdown", {})
+                        .get("blinkit", {})
+                        .get("units_returned", 0),
+                        "Amazon Units Returned": item.get("source_breakdown", {})
+                        .get("amazon", {})
+                        .get("units_returned", 0),
+                        "Zoho Units Returned": item.get("source_breakdown", {})
+                        .get("zoho", {})
+                        .get("units_returned", 0),
+                        # Platform-wise Closing Stock
+                        "Blinkit Closing Stock": item.get("source_breakdown", {})
                         .get("blinkit", {})
                         .get("closing_stock", 0),
-                        "Amazon Stock": item.get("source_breakdown", {})
+                        "Amazon Closing Stock": item.get("source_breakdown", {})
                         .get("amazon", {})
                         .get("closing_stock", 0),
-                        "Zoho Stock": item.get("source_breakdown", {})
+                        "Zoho Closing Stock": item.get("source_breakdown", {})
                         .get("zoho", {})
                         .get("closing_stock", 0),
+                        # Platform-wise Amount
+                        "Blinkit Amount": item.get("source_breakdown", {})
+                        .get("blinkit", {})
+                        .get("amount", 0),
+                        "Amazon Amount": item.get("source_breakdown", {})
+                        .get("amazon", {})
+                        .get("amount", 0),
+                        "Zoho Amount": item.get("source_breakdown", {})
+                        .get("zoho", {})
+                        .get("amount", 0),
                     }
                 )
 
@@ -750,8 +774,10 @@ async def download_master_report(
                 ["Report Period", f"{start_date} to {end_date}"],
                 ["Total Unique SKUs", summary.get("total_unique_skus", 0)],
                 ["Total Units Sold", summary.get("total_units_sold", 0)],
+                ["Total Units Returned", summary.get("total_units_returned", 0)],
                 ["Total Amount", summary.get("total_amount", 0)],
                 ["Total Closing Stock", summary.get("total_closing_stock", 0)],
+                ["Average Daily Run Rate", summary.get("avg_drr", 0)],
                 ["Sources Included", ", ".join(summary.get("sources_included", []))],
                 ["", ""],
                 ["Source Record Counts", ""],
