@@ -514,23 +514,23 @@ async def get_sales(
         )
 
 
-_sku_cache = {}
+_item_name_cache = {}
 _cache_ttl = 300  # 5 minutes
 _cache_lock = threading.Lock()
 
 
-def get_skus_by_brand(db, brand: str) -> List[str]:
+def get_item_names_by_brand(db, brand: str) -> List[str]:
     """
-    Cached version of SKU lookup with TTL for better performance.
+    Cached version of item name lookup with TTL for better performance.
     """
     current_time = datetime.now().timestamp()
 
     with _cache_lock:
-        if brand in _sku_cache:
-            cache_entry = _sku_cache[brand]
+        if brand in _item_name_cache:  # Change cache name
+            cache_entry = _item_name_cache[brand]
             if current_time - cache_entry["timestamp"] < _cache_ttl:
-                logger.info(f"Using cached SKUs for brand {brand}")
-                return cache_entry["skus"]
+                logger.info(f"Using cached item names for brand {brand}")
+                return cache_entry["item_names"]
 
     # Fetch from database
     try:
@@ -538,44 +538,42 @@ def get_skus_by_brand(db, brand: str) -> List[str]:
 
         pipeline = [
             {"$match": {"brand": brand}},
-            {"$project": {"cf_sku_code": 1, "_id": 0}},
-            {"$group": {"_id": None, "skus": {"$addToSet": "$cf_sku_code"}}},
+            {"$project": {"name": 1, "_id": 0}},  # Get item names instead of SKUs
+            {"$group": {"_id": None, "item_names": {"$addToSet": "$name"}}},
         ]
 
         result = list(products_collection.aggregate(pipeline))
 
-        if result and "skus" in result[0]:
-            skus = result[0]["skus"]
+        if result and "item_names" in result[0]:
+            item_names = result[0]["item_names"]
             # Filter out None/null values
-            skus = [sku for sku in skus if sku is not None]
+            item_names = [name for name in item_names if name is not None]
 
             # Cache the result
             with _cache_lock:
-                _sku_cache[brand] = {"skus": skus, "timestamp": current_time}
+                _item_name_cache[brand] = {"item_names": item_names, "timestamp": current_time}
 
-            logger.info(f"Found {len(skus)} SKUs for brand {brand}")
-            return skus
+            logger.info(f"Found {len(item_names)} item names for brand {brand}")
+            return item_names
         else:
-            logger.warning(f"No SKUs found for brand {brand}")
+            logger.warning(f"No item names found for brand {brand}")
             return []
 
     except Exception as e:
-        logger.error(f"Error getting SKUs for brand {brand}: {e}")
+        logger.error(f"Error getting item names for brand {brand}: {e}")
         raise HTTPException(
-            status_code=500, detail=f"Error retrieving SKUs for brand {brand}"
+            status_code=500, detail=f"Error retrieving item names for brand {brand}"
         )
 
-
-def query_invoices_for_skus(
+def query_invoices_for_item_names(
     db,
-    skus: List[str],
+    item_names: List[str],
     start_date: datetime,
     end_date: datetime,
     exclude_customers: bool,
 ) -> List[dict]:
     """
-    Optimized query that processes all SKUs in a single aggregation pipeline.
-    This is the biggest performance improvement.
+    Query invoices by matching item names directly - much simpler!
     """
     customer_list = [
         "(amzb2b) Pupscribe Enterprises Pvt Ltd",
@@ -584,11 +582,12 @@ def query_invoices_for_skus(
         "(PUPEV) PUPSCRIBE EVENTS",
         "(SSAM) Sales samples",
         "(RS) Retail samples",
-        "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
-        "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
+        # Remove Blinkit exclusions as you mentioned
     ]
+    
     try:
         invoices_collection = db.get_collection(INVOICES_COLLECTION)
+        
         match_statement = (
             {
                 "$match": {
@@ -600,12 +599,10 @@ def query_invoices_for_skus(
                     },
                     "status": {"$nin": ["draft", "void"]},
                     "customer_name": {"$nin": customer_list},
-                    # Match any line item that has any of our target SKUs
+                    # Much simpler - just match item names directly
                     "line_items": {
                         "$elemMatch": {
-                            "item_custom_fields": {
-                                "$elemMatch": {"value": {"$in": skus}}
-                            }
+                            "name": {"$in": item_names}
                         }
                     },
                 }
@@ -620,61 +617,38 @@ def query_invoices_for_skus(
                         ]
                     },
                     "status": {"$nin": ["draft", "void"]},
-                    # Match any line item that has any of our target SKUs
+                    # Just match item names
                     "line_items": {
                         "$elemMatch": {
-                            "item_custom_fields": {
-                                "$elemMatch": {"value": {"$in": skus}}
-                            }
+                            "name": {"$in": item_names}
                         }
                     },
                 }
             }
         )
-        # Single aggregation pipeline that handles ALL SKUs at once
+
+        # Simplified aggregation pipeline
         pipeline = [
-            # Stage 1: Match documents by date range and status
+            # Stage 1: Match documents
             match_statement,
-            # Stage 2: Add field with all matching items for ANY of our SKUs
+            
+            # Stage 2: Filter line items to only matching ones
             {
                 "$addFields": {
                     "_matchingItems": {
                         "$filter": {
                             "input": "$line_items",
                             "as": "item",
-                            "cond": {
-                                "$anyElementTrue": {
-                                    "$map": {
-                                        "input": "$$item.item_custom_fields",
-                                        "as": "customField",
-                                        "in": {"$in": ["$$customField.value", skus]},
-                                    }
-                                }
-                            },
+                            "cond": {"$in": ["$$item.name", item_names]}
                         }
                     }
                 }
             },
+            
             # Stage 3: Unwind matching items
             {"$unwind": "$_matchingItems"},
-            # Stage 4: Add the actual SKU that matched
-            {
-                "$addFields": {
-                    "_matchedSku": {
-                        "$arrayElemAt": [
-                            {
-                                "$filter": {
-                                    "input": "$_matchingItems.item_custom_fields",
-                                    "as": "field",
-                                    "cond": {"$in": ["$$field.value", skus]},
-                                }
-                            },
-                            0,
-                        ]
-                    }
-                }
-            },
-            # Stage 5: Project final fields
+            
+            # Stage 4: Project final fields - much simpler!
             {
                 "$project": {
                     "_id": 1,
@@ -683,17 +657,24 @@ def query_invoices_for_skus(
                     "created_at": 1,
                     "quantity": "$_matchingItems.quantity",
                     "item_name": "$_matchingItems.name",
-                    "sku_code": "$_matchedSku.value",
+                    "sku_code": {
+                        "$ifNull": [
+                            "$_matchingItems.sku",  # Try direct SKU field first
+                            {
+                                "$arrayElemAt": [
+                                    "$_matchingItems.item_custom_fields.value", 
+                                    0
+                                ]
+                            }  # Fallback to custom fields if available
+                        ]
+                    }
                 }
             },
         ]
 
-        logger.info(f"Executing optimized aggregation for {len(skus)} SKUs")
-
-        # Execute single aggregation
+        logger.info(f"Executing item name aggregation for {len(item_names)} items")
         results = list(invoices_collection.aggregate(pipeline, allowDiskUse=True))
-
-        logger.info(f"Found {len(results)} total matching invoices for all SKUs")
+        logger.info(f"Found {len(results)} total matching invoices for all items")
 
         # Process results
         all_results = []
@@ -713,8 +694,7 @@ def query_invoices_for_skus(
         return all_results
 
     except Exception as e:
-        logger.info(e)
-        logger.error(f"Error in optimized invoice query: {e}")
+        logger.error(f"Error in item name invoice query: {e}")
         raise HTTPException(status_code=500, detail="Error querying invoice data")
 
 
@@ -787,11 +767,6 @@ def create_excel_file(data: List[dict]) -> io.BytesIO:
 async def generate_invoice_report(
     request: ReportRequest, background_tasks: BackgroundTasks, db=Depends(get_database)
 ):
-    """
-    Generate invoice report for the specified date range and brand.
-    Returns an Excel file with the results.
-    Optimized for better performance.
-    """
     try:
         start_time = datetime.now()
         logger.info(
@@ -802,21 +777,21 @@ async def generate_invoice_report(
         start_date = datetime.strptime(request.start_date, "%Y-%m-%d")
         end_date = datetime.strptime(request.end_date, "%Y-%m-%d")
 
-        # STEP 1: Get SKUs (cached)
-        sku_start = datetime.now()
-        skus = get_skus_by_brand(db, request.brand)
-        sku_duration = (datetime.now() - sku_start).total_seconds()
-        logger.info(f"SKU lookup took {sku_duration:.2f} seconds")
+        # STEP 1: Get item names instead of SKUs
+        item_name_start = datetime.now()
+        item_names = get_item_names_by_brand(db, request.brand)
+        item_name_duration = (datetime.now() - item_name_start).total_seconds()
+        logger.info(f"Item name lookup took {item_name_duration:.2f} seconds")
 
-        if not skus:
+        if not item_names:
             raise HTTPException(
-                status_code=404, detail=f"No SKUs found for brand '{request.brand}'"
+                status_code=404, detail=f"No items found for brand '{request.brand}'"
             )
 
-        # STEP 2: Query invoices (optimized single aggregation)
+        # STEP 2: Query invoices by item names
         query_start = datetime.now()
-        invoice_data = query_invoices_for_skus(
-            db, skus, start_date, end_date, request.exclude_customers
+        invoice_data = query_invoices_for_item_names(
+            db, item_names, start_date, end_date, request.exclude_customers
         )
         query_duration = (datetime.now() - query_start).total_seconds()
         logger.info(f"Invoice query took {query_duration:.2f} seconds")
@@ -825,7 +800,7 @@ async def generate_invoice_report(
             raise HTTPException(
                 status_code=404, detail="No invoices found for the specified criteria"
             )
-
+        print(json.dumps(serialize_mongo_document(invoice_data), indent=4))
         # STEP 3: Create Excel file (parallel processing for large datasets)
         excel_start = datetime.now()
         excel_file = create_excel_file(invoice_data)
