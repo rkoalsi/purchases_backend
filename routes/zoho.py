@@ -800,7 +800,6 @@ async def generate_invoice_report(
             raise HTTPException(
                 status_code=404, detail="No invoices found for the specified criteria"
             )
-        print(json.dumps(serialize_mongo_document(invoice_data), indent=4))
         # STEP 3: Create Excel file (parallel processing for large datasets)
         excel_start = datetime.now()
         excel_file = create_excel_file(invoice_data)
