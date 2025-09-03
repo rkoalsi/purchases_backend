@@ -582,7 +582,8 @@ def query_invoices_for_item_names(
         "(PUPEV) PUPSCRIBE EVENTS",
         "(SSAM) Sales samples",
         "(RS) Retail samples",
-        # Remove Blinkit exclusions as you mentioned
+        "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
+        "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
     ]
     
     try:
