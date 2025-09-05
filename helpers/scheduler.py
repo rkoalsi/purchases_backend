@@ -170,6 +170,7 @@ class APIScheduler:
                         for c in components:
                             product = db.products.find_one({"name": c["name"]})
                             c["product_id"] = product.get("_id")
+                            c["sku_code"] = product.get("cf_sku_code")
                         # Structure the data for MongoDB storage
                         sku_code = None
                         custom_fields = item_data.get("custom_fields", [])
@@ -186,6 +187,7 @@ class APIScheduler:
                                     "name": c["name"],
                                     "quantity": c["quantity"],
                                     "item_id": c["item_id"],
+                                    "sku_code": c["sku_code"],
                                     "product_id": ObjectId(c["product_id"]),
                                 }
                                 for c in components
@@ -322,15 +324,6 @@ def setup_scheduler():
         misfire_grace_time=300,
     )
 
-    # Weekly tasks (runs every Sunday at 1 AM UTC)
-    scheduler.add_job(
-        scheduled_weekly_task,
-        trigger=CronTrigger(day_of_week="sun", hour=1, minute=0, timezone="UTC"),
-        id="weekly_tasks",
-        name="Weekly Tasks",
-        replace_existing=True,
-        misfire_grace_time=300,
-    )
 
     # Optional: Separate composite items sync (runs twice daily at 6 AM and 6 PM UTC)
     scheduler.add_job(

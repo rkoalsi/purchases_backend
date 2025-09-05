@@ -81,6 +81,7 @@ class OptimizedMasterReportService:
             report_data = []
             if hasattr(response, "body"):
                 import json
+
                 content = json.loads(response.body)
                 report_data = content.get("data", [])
             elif isinstance(response, dict):
@@ -103,24 +104,24 @@ class OptimizedMasterReportService:
         """Batch load all product names in a single database query"""
         if not sku_codes:
             return {}
-        
+
         try:
             # Filter out invalid SKUs
             valid_skus = {sku for sku in sku_codes if sku and sku != "Unknown SKU"}
-            
+
             if not valid_skus:
                 return {}
 
             products_collection = self.database.get_collection("products")
-            
+
             # Single query to get all products
             cursor = products_collection.find(
                 {"cf_sku_code": {"$in": list(valid_skus)}},
-                {"cf_sku_code": 1, "name": 1, "_id": 0}
+                {"cf_sku_code": 1, "name": 1, "_id": 0},
             )
-            
+
             products = list(cursor)
-            
+
             # Create mapping
             sku_to_name = {}
             for product in products:
@@ -128,19 +129,19 @@ class OptimizedMasterReportService:
                 name = product.get("name")
                 if sku_code and name:
                     sku_to_name[sku_code] = name
-            
+
             # Cache the results
             self._product_name_cache.update(sku_to_name)
-            
+
             # Add unknown items to cache to avoid future queries
             for sku in valid_skus:
                 if sku not in sku_to_name:
                     sku_to_name[sku] = "Unknown Item"
                     self._product_name_cache[sku] = "Unknown Item"
-            
+
             logger.info(f"Batch loaded {len(sku_to_name)} product names")
             return sku_to_name
-            
+
         except Exception as e:
             logger.error(f"Error in batch loading product names: {e}")
             return {}
@@ -148,21 +149,21 @@ class OptimizedMasterReportService:
     def extract_all_sku_codes(self, all_reports: List[Dict[str, Any]]) -> Set[str]:
         """Extract all unique SKU codes from all reports"""
         sku_codes = set()
-        
+
         for report in all_reports:
             if not report.get("success") or not report.get("data"):
                 continue
-                
+
             data = report["data"]
             if not isinstance(data, list):
                 continue
-                
+
             for item in data:
                 if isinstance(item, dict):
                     sku = item.get("sku_code")
                     if sku and sku.strip():
                         sku_codes.add(sku.strip())
-        
+
         return sku_codes
 
     @staticmethod
@@ -186,8 +187,8 @@ class OptimizedMasterReportService:
             return default
 
     def normalize_single_source_data(
-    self, source: str, data: List[Dict], product_name_map: Dict[str, str]
-) -> List[Dict]:
+        self, source: str, data: List[Dict], product_name_map: Dict[str, str]
+    ) -> List[Dict]:
         """Optimized normalization for a single data source with conditional SKU-level aggregation"""
         if not isinstance(data, list):
             return []
@@ -198,14 +199,14 @@ class OptimizedMasterReportService:
             for item in data:
                 if not isinstance(item, dict):
                     continue
-                
+
                 try:
                     sku_code = (item.get("sku_code") or "Unknown SKU").strip()
                     if not sku_code:
                         sku_code = "Unknown SKU"
-                    
+
                     canonical_name = product_name_map.get(sku_code, "Unknown Item")
-                    
+
                     normalized_item = {
                         "source": "zoho",
                         "item_name": canonical_name,
@@ -223,41 +224,48 @@ class OptimizedMasterReportService:
                         "days_of_coverage": 0.0,
                         "additional_metrics": {},
                     }
-                    
+
                     # Calculate days of coverage
                     if normalized_item["daily_run_rate"] > 0:
                         normalized_item["days_of_coverage"] = round(
-                            normalized_item["closing_stock"] / normalized_item["daily_run_rate"], 2
+                            normalized_item["closing_stock"]
+                            / normalized_item["daily_run_rate"],
+                            2,
                         )
-                    
+
                     # Only add items with sales or returns
-                    if normalized_item["units_sold"] > 0 or normalized_item["units_returned"] > 0:
+                    if (
+                        normalized_item["units_sold"] > 0
+                        or normalized_item["units_returned"] > 0
+                    ):
                         normalized_data.append(normalized_item)
-                        
+
                 except Exception as e:
                     logger.error(f"Error normalizing Zoho item: {e}")
                     continue
-            
+
             return normalized_data
 
         # For Blinkit and Amazon, use SKU-level aggregation as before
-        sku_aggregated = defaultdict(lambda: {
-            "sku_code": "",
-            "item_name": "",
-            "item_id": "",
-            "city": "",
-            "warehouse": set(),
-            "units_sold": 0.0,
-            "units_returned": 0.0,
-            "total_amount": 0.0,
-            "closing_stock": 0.0,
-            "sessions": 0,
-            "days_in_stock": 0,
-            "daily_run_rate": 0.0,
-            "days_of_coverage": 0.0,
-            "additional_metrics": {}
-        })
-        
+        sku_aggregated = defaultdict(
+            lambda: {
+                "sku_code": "",
+                "item_name": "",
+                "item_id": "",
+                "city": "",
+                "warehouse": set(),
+                "units_sold": 0.0,
+                "units_returned": 0.0,
+                "total_amount": 0.0,
+                "closing_stock": 0.0,
+                "sessions": 0,
+                "days_in_stock": 0,
+                "daily_run_rate": 0.0,
+                "days_of_coverage": 0.0,
+                "additional_metrics": {},
+            }
+        )
+
         # Aggregate by SKU for Blinkit and Amazon
         for item in data:
             if not isinstance(item, dict):
@@ -267,9 +275,9 @@ class OptimizedMasterReportService:
                 sku_code = (item.get("sku_code") or "Unknown SKU").strip()
                 if not sku_code:
                     sku_code = "Unknown SKU"
-                    
+
                 agg = sku_aggregated[sku_code]
-                
+
                 # Set basic info (first occurrence)
                 if not agg["sku_code"]:
                     agg["sku_code"] = sku_code
@@ -278,45 +286,66 @@ class OptimizedMasterReportService:
                         agg["item_id"] = item.get("asin", "")
                     else:
                         agg["item_id"] = str(item.get("item_id", ""))
-                    agg["city"] = item.get("city", "Multiple" if source == "amazon" else "Unknown City")
-                
+                    agg["city"] = item.get(
+                        "city", "Multiple" if source == "amazon" else "Unknown City"
+                    )
+
                 # Source-specific aggregation
                 if source == "blinkit":
                     metrics = item.get("metrics", {}) or {}
-                    agg["units_sold"] += self.safe_float(metrics.get("total_sales_in_period"))
-                    agg["units_returned"] += self.safe_float(metrics.get("total_returns_in_period"))
-                    agg["closing_stock"] += self.safe_float(metrics.get("closing_stock"))
-                    agg["days_in_stock"] += self.safe_int(metrics.get("days_with_inventory"))
+                    agg["units_sold"] += self.safe_float(
+                        metrics.get("total_sales_in_period")
+                    )
+                    agg["units_returned"] += self.safe_float(
+                        metrics.get("total_returns_in_period")
+                    )
+                    agg["closing_stock"] += self.safe_float(
+                        metrics.get("closing_stock")
+                    )
+                    agg["days_in_stock"] += self.safe_int(
+                        metrics.get("days_with_inventory")
+                    )
                     # Take last/max for rates
-                    agg["daily_run_rate"] = max(agg["daily_run_rate"], self.safe_float(metrics.get("avg_daily_on_stock_days")))
+                    agg["daily_run_rate"] = max(
+                        agg["daily_run_rate"],
+                        self.safe_float(metrics.get("avg_daily_on_stock_days")),
+                    )
                     warehouse = item.get("warehouse", "Unknown Warehouse")
                     if warehouse:
                         agg["warehouse"].add(warehouse)
-                        
+
                 elif source == "amazon":
                     agg["units_sold"] += self.safe_float(item.get("units_sold"))
                     agg["units_returned"] += self.safe_float(item.get("total_returns"))
                     agg["total_amount"] += self.safe_float(item.get("total_amount"))
                     agg["closing_stock"] += self.safe_float(item.get("closing_stock"))
                     agg["sessions"] += self.safe_int(item.get("sessions"))
-                    agg["days_in_stock"] += self.safe_int(item.get("total_days_in_stock"))
-                    agg["daily_run_rate"] = max(agg["daily_run_rate"], self.safe_float(item.get("drr")))
-                    
+                    agg["days_in_stock"] += self.safe_int(
+                        item.get("total_days_in_stock")
+                    )
+                    agg["daily_run_rate"] = max(
+                        agg["daily_run_rate"], self.safe_float(item.get("drr"))
+                    )
+
                     warehouses = item.get("warehouses", []) or []
                     if isinstance(warehouses, list):
                         agg["warehouse"].update(warehouses)
-                        
+
             except Exception as e:
                 logger.error(f"Error aggregating item from {source}: {e}")
                 continue
-        
+
         # Convert aggregated data to normalized format for Blinkit and Amazon
         normalized_data = []
         for sku_code, agg in sku_aggregated.items():
             try:
                 # Convert warehouse set to string
-                warehouse_str = ", ".join(sorted(agg["warehouse"])) if agg["warehouse"] else "Unknown Warehouse"
-                
+                warehouse_str = (
+                    ", ".join(sorted(agg["warehouse"]))
+                    if agg["warehouse"]
+                    else "Unknown Warehouse"
+                )
+
                 normalized_item = {
                     "source": source,
                     "item_name": agg["item_name"],
@@ -334,88 +363,183 @@ class OptimizedMasterReportService:
                     "days_of_coverage": 0.0,
                     "additional_metrics": agg["additional_metrics"],
                 }
-                
+
                 # Calculate days of coverage
                 if normalized_item["daily_run_rate"] > 0:
                     normalized_item["days_of_coverage"] = round(
-                        normalized_item["closing_stock"] / normalized_item["daily_run_rate"], 2
+                        normalized_item["closing_stock"]
+                        / normalized_item["daily_run_rate"],
+                        2,
                     )
-                
+
                 # Only add items with sales or returns
-                if normalized_item["units_sold"] > 0 or normalized_item["units_returned"] > 0:
+                if (
+                    normalized_item["units_sold"] > 0
+                    or normalized_item["units_returned"] > 0
+                ):
                     normalized_data.append(normalized_item)
-                    
+
             except Exception as e:
-                logger.error(f"Error creating normalized item for {sku_code} from {source}: {e}")
+                logger.error(
+                    f"Error creating normalized item for {sku_code} from {source}: {e}"
+                )
                 continue
 
         return normalized_data
-    def combine_data_by_sku_optimized(self, all_normalized_data: List[List[Dict]]) -> List[Dict]:
-        """Optimized SKU combination using defaultdict and single pass"""
-        sku_data = defaultdict(lambda: {
-            "sku_code": "",
-            "item_name": "Unknown Item",
-            "sources": set(),
-            "combined_metrics": {
-                "total_units_sold": 0.0,
-                "total_units_returned": 0.0,
-                "total_amount": 0.0,
-                "total_closing_stock": 0.0,
-                "total_sessions": 0.0,
-                "total_days_in_stock": 0.0,
-                "avg_daily_run_rate": 0.0,
-                "avg_days_of_coverage": 0.0,
-            },
-            "source_breakdown": {
-                "blinkit": {"units_sold": 0.0, "units_returned": 0.0, "closing_stock": 0.0, "amount": 0.0},
-                "amazon": {"units_sold": 0.0, "units_returned": 0.0, "closing_stock": 0.0, "amount": 0.0},
-                "zoho": {"units_sold": 0.0, "units_returned": 0.0, "closing_stock": 0.0, "amount": 0.0},
-            },
-        })
+
+    def combine_data_by_sku_optimized(
+        self, all_normalized_data: List[List[Dict]]
+    ) -> List[Dict]:
+        """Optimized SKU combination using defaultdict and single pass, with composite product handling"""
+        sku_data = defaultdict(
+            lambda: {
+                "sku_code": "",
+                "item_name": "Unknown Item",
+                "sources": set(),
+                "combined_metrics": {
+                    "total_units_sold": 0.0,
+                    "total_units_returned": 0.0,
+                    "total_amount": 0.0,
+                    "total_closing_stock": 0.0,
+                    "total_sessions": 0.0,
+                    "total_days_in_stock": 0.0,
+                    "avg_daily_run_rate": 0.0,
+                    "avg_days_of_coverage": 0.0,
+                },
+                "source_breakdown": {
+                    "blinkit": {
+                        "units_sold": 0.0,
+                        "units_returned": 0.0,
+                        "closing_stock": 0.0,
+                        "amount": 0.0,
+                    },
+                    "amazon": {
+                        "units_sold": 0.0,
+                        "units_returned": 0.0,
+                        "closing_stock": 0.0,
+                        "amount": 0.0,
+                    },
+                    "zoho": {
+                        "units_sold": 0.0,
+                        "units_returned": 0.0,
+                        "closing_stock": 0.0,
+                        "amount": 0.0,
+                    },
+                },
+            }
+        )
+
+        def get_composite_product_components(self, sku_code):
+            """Fetch composite product components from the collection"""
+            try:
+                # Assuming you have access to your MongoDB collection
+                # Replace 'composite_products' with your actual collection reference
+                composite_product = (
+                    get_database()
+                    .get_collection("composite_products")
+                    .find_one({"sku_code": sku_code})
+                )
+                if composite_product and "components" in composite_product:
+                    return composite_product["components"]
+                return None
+            except Exception as e:
+                print(f"Error fetching composite product for SKU {sku_code}: {e}")
+                return None
+
+        def process_item_data(self, item, sku_code, item_name, multiplier=1.0):
+            """Process individual item data with optional quantity multiplier"""
+            source = item.get("source", "unknown")
+
+            # Initialize if first time seeing this SKU
+            if sku_data[sku_code]["sku_code"] == "":
+                sku_data[sku_code]["sku_code"] = sku_code
+                sku_data[sku_code]["item_name"] = item_name
+
+            # Add source
+            sku_data[sku_code]["sources"].add(source)
+
+            # Update metrics efficiently with multiplier
+            metrics = sku_data[sku_code]["combined_metrics"]
+            metrics["total_units_sold"] += (
+                self.safe_float(item.get("units_sold")) * multiplier
+            )
+            metrics["total_units_returned"] += (
+                self.safe_float(item.get("units_returned")) * multiplier
+            )
+            metrics["total_amount"] += (
+                self.safe_float(item.get("total_amount")) * multiplier
+            )
+            metrics["total_closing_stock"] += (
+                self.safe_float(item.get("closing_stock")) * multiplier
+            )
+            metrics["total_sessions"] += self.safe_float(
+                item.get("sessions")
+            )  # Sessions don't multiply
+            metrics["total_days_in_stock"] += self.safe_float(
+                item.get("days_in_stock")
+            )  # Days don't multiply
+
+            # Update source breakdown with multiplier
+            if source in sku_data[sku_code]["source_breakdown"]:
+                breakdown = sku_data[sku_code]["source_breakdown"][source]
+                breakdown["units_sold"] += (
+                    self.safe_float(item.get("units_sold")) * multiplier
+                )
+                breakdown["units_returned"] += (
+                    self.safe_float(item.get("units_returned")) * multiplier
+                )
+                breakdown["closing_stock"] += (
+                    self.safe_float(item.get("closing_stock")) * multiplier
+                )
+                breakdown["amount"] += (
+                    self.safe_float(item.get("total_amount")) * multiplier
+                )
 
         # Single pass through all data
         for source_data in all_normalized_data:
             if not isinstance(source_data, list):
                 continue
-                
+
             for item in source_data:
                 if not isinstance(item, dict):
                     continue
 
-                sku = item.get("sku_code", "Unknown SKU") or "Unknown SKU"
-                source = item.get("source", "unknown")
+                original_sku = item.get("sku_code", "Unknown SKU") or "Unknown SKU"
 
-                # Initialize if first time seeing this SKU
-                if sku_data[sku]["sku_code"] == "":
-                    sku_data[sku]["sku_code"] = sku
-                    sku_data[sku]["item_name"] = item.get("item_name", "Unknown Item")
+                # Check if this SKU is a composite product
+                composite_components = get_composite_product_components(
+                    self, original_sku
+                )
 
-                # Add source
-                sku_data[sku]["sources"].add(source)
+                if composite_components:
+                    # This is a composite product - process each component
+                    for component in composite_components:
+                        
+                        component_sku = component.get(
+                            "sku_code", "Unknown Component SKU"
+                        )
+                        component_name = component.get("name", "Unknown Component")
+                        component_quantity = float(component.get("quantity", 1))
 
-                # Update metrics efficiently
-                metrics = sku_data[sku]["combined_metrics"]
-                metrics["total_units_sold"] += self.safe_float(item.get("units_sold"))
-                metrics["total_units_returned"] += self.safe_float(item.get("units_returned"))
-                metrics["total_amount"] += self.safe_float(item.get("total_amount"))
-                metrics["total_closing_stock"] += self.safe_float(item.get("closing_stock"))
-                metrics["total_sessions"] += self.safe_float(item.get("sessions"))
-                metrics["total_days_in_stock"] += self.safe_float(item.get("days_in_stock"))
-
-                # Update source breakdown
-                if source in sku_data[sku]["source_breakdown"]:
-                    breakdown = sku_data[sku]["source_breakdown"][source]
-                    breakdown["units_sold"] += self.safe_float(item.get("units_sold"))
-                    breakdown["units_returned"] += self.safe_float(item.get("units_returned"))
-                    breakdown["closing_stock"] += self.safe_float(item.get("closing_stock"))
-                    breakdown["amount"] += self.safe_float(item.get("total_amount"))
+                        # Process the component with multiplied quantities
+                        process_item_data(
+                            self,
+                            item,
+                            component_sku,
+                            component_name,
+                            component_quantity,
+                        )
+                else:
+                    # Regular product - process normally
+                    item_name = item.get("item_name", "Unknown Item")
+                    process_item_data(self, item, original_sku, item_name)
 
         # Calculate averages in a single pass
         result = []
         for sku, data in sku_data.items():
             # Convert sources set to list
             data["sources"] = list(data["sources"])
-            
+
             # Calculate averages
             metrics = data["combined_metrics"]
             total_units = metrics["total_units_sold"] + metrics["total_units_returned"]
@@ -463,7 +587,9 @@ async def get_master_report(
                 detail="Invalid date format. Use YYYY-MM-DD",
             )
 
-        logger.info(f"Generating optimized master report for {start_date} to {end_date}")
+        logger.info(
+            f"Generating optimized master report for {start_date} to {end_date}"
+        )
         start_time = datetime.now()
 
         # Initialize service
@@ -474,7 +600,11 @@ async def get_master_report(
         if include_blinkit:
             tasks.append(report_service.get_blinkit_report(start_date, end_date))
         if include_amazon:
-            tasks.append(report_service.get_amazon_report(start_date, end_date, amazon_report_type))
+            tasks.append(
+                report_service.get_amazon_report(
+                    start_date, end_date, amazon_report_type
+                )
+            )
         if include_zoho:
             tasks.append(report_service.get_zoho_report(start_date, end_date))
 
@@ -488,7 +618,7 @@ async def get_master_report(
         try:
             results = await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
-                timeout=60.0  # Reduced timeout since we're optimizing
+                timeout=60.0,  # Reduced timeout since we're optimizing
             )
         except asyncio.TimeoutError:
             raise HTTPException(
@@ -509,7 +639,7 @@ async def get_master_report(
             if isinstance(result, dict):
                 source = result.get("source", "unknown")
                 individual_reports[source] = result
-                
+
                 if result.get("success") and result.get("data"):
                     successful_reports.append(result)
                 elif result.get("error"):
@@ -533,19 +663,23 @@ async def get_master_report(
         for report in successful_reports:
             source = report["source"]
             data = report["data"]
-            
+
             # Create task for parallel normalization
             task = asyncio.create_task(
                 asyncio.to_thread(
                     report_service.normalize_single_source_data,
-                    source, data, product_name_map
+                    source,
+                    data,
+                    product_name_map,
                 )
             )
             normalization_tasks.append(task)
 
         # Execute normalization in parallel
         try:
-            normalized_results = await asyncio.gather(*normalization_tasks, return_exceptions=True)
+            normalized_results = await asyncio.gather(
+                *normalization_tasks, return_exceptions=True
+            )
         except Exception as e:
             errors.append(f"Normalization error: {str(e)}")
             normalized_results = []
@@ -564,8 +698,7 @@ async def get_master_report(
         if all_normalized_data:
             try:
                 combined_data = await asyncio.to_thread(
-                    report_service.combine_data_by_sku_optimized,
-                    all_normalized_data
+                    report_service.combine_data_by_sku_optimized, all_normalized_data
                 )
                 logger.info(f"Combined data for {len(combined_data)} unique SKUs")
             except Exception as e:
@@ -588,17 +721,23 @@ async def get_master_report(
             for item in combined_data:
                 metrics = item.get("combined_metrics", {})
                 summary_stats["total_units_sold"] += metrics.get("total_units_sold", 0)
-                summary_stats["total_units_returned"] += metrics.get("total_units_returned", 0)
+                summary_stats["total_units_returned"] += metrics.get(
+                    "total_units_returned", 0
+                )
                 summary_stats["total_amount"] += metrics.get("total_amount", 0)
-                summary_stats["total_closing_stock"] += metrics.get("total_closing_stock", 0)
+                summary_stats["total_closing_stock"] += metrics.get(
+                    "total_closing_stock", 0
+                )
                 summary_stats["avg_drr"] += metrics.get("avg_daily_run_rate", 0)
 
             if total_skus > 0:
-                summary_stats["avg_drr"] = round(summary_stats["avg_drr"] / total_skus, 2)
+                summary_stats["avg_drr"] = round(
+                    summary_stats["avg_drr"] / total_skus, 2
+                )
 
         # Source counts
         source_counts = {
-            source: len(report["data"]) 
+            source: len(report["data"])
             for source, report in individual_reports.items()
             if report.get("success") and report.get("data")
         }
@@ -614,9 +753,13 @@ async def get_master_report(
                 "summary": {
                     "total_unique_skus": total_skus,
                     "total_units_sold": round(summary_stats["total_units_sold"], 2),
-                    "total_units_returned": round(summary_stats["total_units_returned"], 2),
+                    "total_units_returned": round(
+                        summary_stats["total_units_returned"], 2
+                    ),
                     "total_amount": round(summary_stats["total_amount"], 2),
-                    "total_closing_stock": round(summary_stats["total_closing_stock"], 2),
+                    "total_closing_stock": round(
+                        summary_stats["total_closing_stock"], 2
+                    ),
                     "avg_drr": summary_stats["avg_drr"],
                     "sources_included": list(individual_reports.keys()),
                     "source_record_counts": source_counts,
@@ -642,6 +785,8 @@ async def get_master_report(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate optimized master report: {str(e)}",
         )
+
+
 @router.get("/master-report/download")
 async def download_master_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
