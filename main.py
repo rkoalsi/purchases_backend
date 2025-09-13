@@ -4,6 +4,7 @@ from .routes.auth import router as auth_router
 from .routes.users import router as user_router
 from .routes.amazon import router as amazon_router
 from .routes.blinkit import router as blinkit_router
+from .routes.blinkit_ads import router as blinkit_ads_router
 from .routes.dashboard import router as dashboard_router
 from .routes.zoho import router as zoho_router
 from .routes.master import router as master_router
@@ -68,13 +69,14 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"Hello": "World"}
+    return "Purchase Backend Running Successfully"
 
 
 # --- Include Routers ---
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(user_router, prefix="/users", tags=["user"])
 app.include_router(blinkit_router, prefix="/blinkit", tags=["blinkit"])
+app.include_router(blinkit_ads_router, prefix="/blinkit_ads", tags=["blinkit_ads"])
 app.include_router(amazon_router, prefix="/amazon", tags=["amazon"])
 app.include_router(zoho_router, prefix="/zoho", tags=["zoho"])
 app.include_router(master_router, prefix="/master", tags=["master"])
