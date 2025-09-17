@@ -25,6 +25,12 @@ ADS_COLLECTION = "blinkit_ads"
 # --- FastAPI App ---
 router = APIRouter()
 
+def calculate_cpm(budget_consumed, impressions):
+    """Calculate CPM using the formula: CPM = Spend/Impressions*1000"""
+    if impressions == 0:
+        return 0
+    return (budget_consumed / impressions) * 1000
+
 
 def convert_column_name(column_name):
     """Convert column name to lowercase with underscores"""
@@ -351,17 +357,13 @@ def parse_date_string(date_str: str):
                 raise ValueError(f"Unable to parse date: {date_str}")
 
 
-# Fixed API endpoints for better frontend compatibility
-
-# Fix for campaign count mismatch in blinkit_ads.py
-
 @router.get("/campaigns/summary")
 def get_campaigns_summary(
     start_date: str = None,
     end_date: str = None,
     sheet_type: str = None
 ):
-    """Get high-level summary - FIXED to match campaigns count"""
+    """Get high-level summary - UPDATED with calculated CPM and total units"""
     
     try:
         db = get_database()
@@ -408,7 +410,7 @@ def get_campaigns_summary(
             }
         ]
 
-        # Get overall statistics
+        # Get overall statistics - UPDATED with calculated CPM and total units
         overall_pipeline = [
             {"$match": match_filter},
             {
@@ -419,6 +421,10 @@ def get_campaigns_summary(
                     "total_direct_sales": {"$sum": "$direct_sales"},
                     "total_indirect_sales": {"$sum": "$indirect_sales"},
                     "total_budget_consumed": {"$sum": "$estimated_budget_consumed"},
+                    "total_direct_units": {"$sum": "$direct_quantities_sold"},
+                    "total_indirect_units": {"$sum": "$indirect_quantities_sold"},
+                    "total_direct_atc": {"$sum": "$direct_atc"},
+                    "total_indirect_atc": {"$sum": "$indirect_atc"},
                     "sheet_types": {"$addToSet": "$sheet_type"}
                 }
             },
@@ -431,6 +437,19 @@ def get_campaigns_summary(
                     "total_indirect_sales": {"$round": ["$total_indirect_sales", 2]},
                     "total_sales": {"$round": [{"$add": ["$total_direct_sales", "$total_indirect_sales"]}, 2]},
                     "total_budget_consumed": {"$round": ["$total_budget_consumed", 2]},
+                    "total_direct_units": 1,
+                    "total_indirect_units": 1,
+                    "total_units": {"$add": ["$total_direct_units", "$total_indirect_units"]},
+                    "total_direct_atc": 1,
+                    "total_indirect_atc": 1,
+                    "total_atc": {"$add": ["$total_direct_atc", "$total_indirect_atc"]},
+                    "calculated_cpm": {
+                        "$cond": [
+                            {"$eq": ["$total_impressions", 0]},
+                            0,
+                            {"$round": [{"$multiply": [{"$divide": ["$total_budget_consumed", "$total_impressions"]}, 1000]}, 2]}
+                        ]
+                    },
                     "sheet_types": 1
                 }
             }
@@ -446,17 +465,20 @@ def get_campaigns_summary(
 
         # Combine results
         summary = {
-            "total_campaigns": campaign_count,  # Use the corrected count
+            "total_campaigns": campaign_count,
             "total_records": overall.get("total_records", 0),
             "total_impressions": overall.get("total_impressions", 0),
             "total_direct_sales": overall.get("total_direct_sales", 0),
             "total_indirect_sales": overall.get("total_indirect_sales", 0),
             "total_sales": overall.get("total_sales", 0),
             "total_budget_consumed": overall.get("total_budget_consumed", 0),
+            "total_units": overall.get("total_units", 0),
+            "total_atc": overall.get("total_atc", 0),
+            "calculated_cpm": overall.get("calculated_cpm", 0),
             "sheet_types": overall.get("sheet_types", [])
         }
 
-        # Get campaign summaries for the campaigns array
+        # Get campaign summaries for the campaigns array - UPDATED
         campaign_summary_pipeline = [
             {"$match": match_filter},
             {
@@ -470,6 +492,10 @@ def get_campaigns_summary(
                     "total_direct_sales": {"$sum": "$direct_sales"},
                     "total_indirect_sales": {"$sum": "$indirect_sales"},
                     "total_budget_consumed": {"$sum": "$estimated_budget_consumed"},
+                    "total_direct_units": {"$sum": "$direct_quantities_sold"},
+                    "total_indirect_units": {"$sum": "$indirect_quantities_sold"},
+                    "total_direct_atc": {"$sum": "$direct_atc"},
+                    "total_indirect_atc": {"$sum": "$indirect_atc"},
                     "avg_direct_roas": {"$avg": "$direct_roas"},
                     "avg_total_roas": {"$avg": "$total_roas"},
                     "unique_targeting_groups": {
@@ -495,6 +521,15 @@ def get_campaigns_summary(
                     "total_indirect_sales": {"$round": ["$total_indirect_sales", 2]},
                     "total_sales": {"$round": [{"$add": ["$total_direct_sales", "$total_indirect_sales"]}, 2]},
                     "total_budget_consumed": {"$round": ["$total_budget_consumed", 2]},
+                    "total_units": {"$add": ["$total_direct_units", "$total_indirect_units"]},
+                    "total_atc": {"$add": ["$total_direct_atc", "$total_indirect_atc"]},
+                    "calculated_cpm": {
+                        "$cond": [
+                            {"$eq": ["$total_impressions", 0]},
+                            0,
+                            {"$round": [{"$multiply": [{"$divide": ["$total_budget_consumed", "$total_impressions"]}, 1000]}, 2]}
+                        ]
+                    },
                     "avg_direct_roas": {"$round": ["$avg_direct_roas", 2]},
                     "avg_total_roas": {"$round": ["$avg_total_roas", 2]},
                     "targeting_groups_count": {"$size": "$unique_targeting_groups"},
@@ -528,6 +563,8 @@ def get_campaigns_summary(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error fetching campaign summary: {str(e)}"
         )
+
+
 @router.get("/campaigns")
 def get_campaigns_with_keywords(
     start_date: str = None,
@@ -535,7 +572,7 @@ def get_campaigns_with_keywords(
     campaign_name: str = None,
     sheet_type: str = None,
 ):
-    """Get campaign-wise data with keyword/targeting group information - FIXED VERSION"""
+    """Get campaign-wise data with keyword/targeting group information - UPDATED VERSION"""
 
     try:
         db = get_database()
@@ -563,7 +600,7 @@ def get_campaigns_with_keywords(
         if sheet_type:
             match_filter["sheet_type"] = sheet_type
 
-        # Aggregation pipeline - FIXED
+        # Aggregation pipeline - UPDATED with calculated CPM and new metrics
         pipeline = [
             {"$match": match_filter},
             {
@@ -593,7 +630,6 @@ def get_campaigns_with_keywords(
                     "total_indirect_sales": {"$sum": "$indirect_sales"},
                     "total_new_users_acquired": {"$sum": "$new_users_acquired"},
                     "total_budget_consumed": {"$sum": "$estimated_budget_consumed"},
-                    "avg_cpm": {"$avg": "$cpm"},
                     "avg_direct_roas": {"$avg": "$direct_roas"},
                     "avg_total_roas": {"$avg": "$total_roas"},
                     "date_range": {"$push": "$date"},
@@ -616,19 +652,30 @@ def get_campaigns_with_keywords(
                                 "total_impressions": "$total_impressions",
                                 "total_direct_atc": "$total_direct_atc",
                                 "total_indirect_atc": "$total_indirect_atc",
+                                "total_atc": {"$add": ["$total_direct_atc", "$total_indirect_atc"]},
                                 "total_direct_quantities_sold": "$total_direct_quantities_sold",
                                 "total_indirect_quantities_sold": "$total_indirect_quantities_sold",
+                                "total_units": {"$add": ["$total_direct_quantities_sold", "$total_indirect_quantities_sold"]},
                                 "total_direct_sales": {
                                     "$round": ["$total_direct_sales", 2]
                                 },
                                 "total_indirect_sales": {
                                     "$round": ["$total_indirect_sales", 2]
                                 },
+                                "total_sales": {
+                                    "$round": [{"$add": ["$total_direct_sales", "$total_indirect_sales"]}, 2]
+                                },
                                 "total_new_users_acquired": "$total_new_users_acquired",
                                 "total_budget_consumed": {
                                     "$round": ["$total_budget_consumed", 2]
                                 },
-                                "avg_cpm": {"$round": ["$avg_cpm", 2]},
+                                "calculated_cpm": {
+                                    "$cond": [
+                                        {"$eq": ["$total_impressions", 0]},
+                                        0,
+                                        {"$round": [{"$multiply": [{"$divide": ["$total_budget_consumed", "$total_impressions"]}, 1000]}, 2]}
+                                    ]
+                                },
                                 "avg_direct_roas": {"$round": ["$avg_direct_roas", 2]},
                                 "avg_total_roas": {"$round": ["$avg_total_roas", 2]},
                                 "record_count": "$record_count",
@@ -666,7 +713,6 @@ def get_campaigns_with_keywords(
                     "campaign_total_budget_consumed": {
                         "$sum": "$total_budget_consumed"
                     },
-                    "campaign_avg_cpm": {"$avg": "$avg_cpm"},
                     "campaign_avg_direct_roas": {"$avg": "$avg_direct_roas"},
                     "campaign_avg_total_roas": {"$avg": "$avg_total_roas"},
                 }
@@ -677,19 +723,30 @@ def get_campaigns_with_keywords(
                         "total_impressions": "$campaign_total_impressions",
                         "total_direct_atc": "$campaign_total_direct_atc",
                         "total_indirect_atc": "$campaign_total_indirect_atc",
+                        "total_atc": {"$add": ["$campaign_total_direct_atc", "$campaign_total_indirect_atc"]},
                         "total_direct_quantities_sold": "$campaign_total_direct_quantities_sold",
                         "total_indirect_quantities_sold": "$campaign_total_indirect_quantities_sold",
+                        "total_units": {"$add": ["$campaign_total_direct_quantities_sold", "$campaign_total_indirect_quantities_sold"]},
                         "total_direct_sales": {
                             "$round": ["$campaign_total_direct_sales", 2]
                         },
                         "total_indirect_sales": {
                             "$round": ["$campaign_total_indirect_sales", 2]
                         },
+                        "total_sales": {
+                            "$round": [{"$add": ["$campaign_total_direct_sales", "$campaign_total_indirect_sales"]}, 2]
+                        },
                         "total_new_users_acquired": "$campaign_total_new_users_acquired",
                         "total_budget_consumed": {
                             "$round": ["$campaign_total_budget_consumed", 2]
                         },
-                        "avg_cpm": {"$round": ["$campaign_avg_cpm", 2]},
+                        "calculated_cpm": {
+                            "$cond": [
+                                {"$eq": ["$campaign_total_impressions", 0]},
+                                0,
+                                {"$round": [{"$multiply": [{"$divide": ["$campaign_total_budget_consumed", "$campaign_total_impressions"]}, 1000]}, 2]}
+                            ]
+                        },
                         "avg_direct_roas": {"$round": ["$campaign_avg_direct_roas", 2]},
                         "avg_total_roas": {"$round": ["$campaign_avg_total_roas", 2]},
                     }
@@ -731,8 +788,7 @@ def get_campaigns_with_keywords(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error fetching campaign data: {str(e)}",
         )
-
-
+        
 @router.get("/data/raw")
 def get_raw_data(
     start_date: str = None,
