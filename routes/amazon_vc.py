@@ -350,7 +350,7 @@ def get_vendor_inventory(
         # Report options for inventory data
         report_options = {
             "reportPeriod": "DAY",
-            "distributorView": "SOURCING",
+            "distributorView": "MANUFACTURING",
             "sellingProgram": "RETAIL",
         }
 
