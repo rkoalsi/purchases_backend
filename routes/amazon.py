@@ -1731,6 +1731,10 @@ async def generate_vendor_central_data(start, end, database):
                 "_id": {"asin": "$asin", "date": "$date"},
                 "units_sold": {"$sum": "$orderedUnits"},
                 "amount": {"$sum": "$orderedRevenue.amount"},
+                # Handle missing customerReturns field with $ifNull
+                "customer_returns": {
+                    "$sum": {"$ifNull": ["$customerReturns", 0]}
+                },
             }
         },
         {
@@ -1774,6 +1778,7 @@ async def generate_vendor_central_data(start, end, database):
                 "_id": {"asin": "$_id.asin"},
                 "total_units_sold": {"$sum": "$units_sold"},
                 "total_amount": {"$sum": "$amount"},
+                "total_returns": {"$sum": "$customer_returns"},
                 "last_day_closing_stock": {
                     "$first": {"$ifNull": ["$inventory_data.closing_stock", 0]}
                 },
@@ -1786,6 +1791,7 @@ async def generate_vendor_central_data(start, end, database):
                             "$ifNull": ["$inventory_data.closing_stock", 0]
                         },
                         "units_sold": "$units_sold",
+                        "returns": "$customer_returns",  # ADD THIS for debugging
                     }
                 },
             }
@@ -1858,7 +1864,8 @@ async def generate_vendor_central_data(start, end, database):
                 "stock": "$last_day_closing_stock",
                 "total_days_in_stock": "$total_days_in_stock",
                 "drr": {"$round": ["$drr", 2]},
-                "data_source": {"$literal": "vendor_central"},  # Add source identifier
+                "total_returns": {"$ifNull": ["$total_returns", 0]},  # Handle null returns
+                "data_source": {"$literal": "vendor_central"},
             }
         },
         {
@@ -1873,7 +1880,6 @@ async def generate_vendor_central_data(start, end, database):
     cursor = list(collection.aggregate(vendor_pipeline))
     result = serialize_mongo_document(cursor)
     return result
-
 
 async def generate_amazon_data(start, end, database, report_type):
     """Generate FBA/Seller Flex report data with returns information (FBA only)"""
@@ -2048,16 +2054,7 @@ async def generate_amazon_data(start, end, database, report_type):
         group_stage["$group"]["total_returns"] = {
             "$last": {"$ifNull": ["$sc_returns_data.sc_returns", 0]}
         }
-    elif report_type == "all":
-        # All reports: FBA returns + SC returns (same as FBA reports)
-        group_stage["$group"]["total_returns"] = {
-            "$last": {
-                "$add": [
-                    {"$ifNull": ["$fba_returns_data.fba_returns", 0]},
-                    {"$ifNull": ["$sc_returns_data.sc_returns", 0]},
-                ]
-            }
-        }
+   
 
     base_pipeline.append(group_stage)
 
@@ -2213,7 +2210,9 @@ def combine_report_data(vendor_data, fba_seller_flex_data):
                     vendor_item.get("total_days_in_stock", 0),
                     fba_item.get("total_days_in_stock", 0),
                 ),
-                "total_returns": fba_item.get("total_returns", 0),
+                "total_returns": (
+                    vendor_item.get("total_returns", 0) + fba_item.get("total_returns", 0)
+                ),
                 "drr": 0,  # Will be recalculated
                 "data_source": "combined",
             }
@@ -2236,6 +2235,8 @@ def combine_report_data(vendor_data, fba_seller_flex_data):
             vendor_item["sessions"] = 0
             if "stock" not in vendor_item:
                 vendor_item["stock"] = vendor_item.get("closing_stock", 0)
+            if "total_returns" not in vendor_item:
+                vendor_item["total_returns"] = 0
             vendor_item["data_source"] = "vendor_only"
             combined_results.append(vendor_item)
 
