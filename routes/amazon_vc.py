@@ -405,9 +405,9 @@ def get_vendor_inventory(
 
 def background_refetch_sales(start_date_str: str, end_date_str: str, marketplace_ids: List[str], db, task_id: str):
     """
-    Background task to delete and refetch sales data for last 11 days - OPTIMIZED
+    Background task to delete and refetch sales data for last 10 days - OPTIMIZED
     """
-    logger.info(f"🚀 [TASK-{task_id}] Starting background refetch task for last 11 days")
+    logger.info(f"🚀 [TASK-{task_id}] Starting background refetch task for last 10 days")
     
     try:
         collection = db[SALES_COLLECTION]
@@ -719,22 +719,22 @@ async def sync_inventory_data(
         raise
     
 @router.post("/sync/cron/sales")
-async def refetch_last_11_days_sales(
+async def refetch_last_10_days_sales(
     background_tasks: BackgroundTasks,
     marketplace_ids: Optional[List[str]] = None,
     db=Depends(get_database),
 ):
     """
-    Delete and refetch sales traffic data for the last 11 days (Background Task)
+    Delete and refetch sales traffic data for the last 10 days (Background Task)
     This endpoint will:
-    1. Calculate date range for last 11 days
+    1. Calculate date range for last 10 days
     2. Delete existing records for this period
     3. Fetch fresh data from Amazon for each day
     4. Insert new data into database
     
-    No parameters required - automatically processes last 11 days from today
+    No parameters required - automatically processes last 10 days from today
     """
-    logger.info(f"🔄 Refetch last 11 days sales endpoint called")
+    logger.info(f"🔄 Refetch last 10 days sales endpoint called")
     
     try:
         today = datetime.now().date() 
@@ -764,10 +764,10 @@ async def refetch_last_11_days_sales(
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content={
-                "message": "Sales data refetch for last 11 days started in background",
+                "message": "Sales data refetch for last 10 days started in background",
                 "task_id": task_id,
                 "date_range": f"{start_date_str} to {end_date_str}",
-                "days_covered": 11,
+                "days_covered": 10,
                 "marketplace_ids": marketplace_ids or [MARKETPLACE_ID],
                 "status": "processing",
                 "note": "Existing data will be deleted and refetched. Check console logs for progress updates"
