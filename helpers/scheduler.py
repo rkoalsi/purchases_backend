@@ -89,12 +89,7 @@ class APIScheduler:
     async def get_vc_sales_traffic(self):
         try:
             logger.info("Executing Sales Traffic API call...")
-            start_date = (datetime.now().date() - timedelta(days=2)).strftime(
-                "%Y-%m-%d"
-            )
-            response = await self.client.post(
-                f"/amazon/vendor/sync/sales?start_date={start_date}&end_date={start_date}"
-            )
+            response = await self.client.post(f"/amazon/vendor/sync/cron/sales")
             response.raise_for_status()
             logger.info(f"Sales Traffic API call successful: {response.status_code}")
             return response.json()
@@ -323,7 +318,6 @@ def setup_scheduler():
         replace_existing=True,
         misfire_grace_time=300,
     )
-
 
     # Optional: Separate composite items sync (runs twice daily at 6 AM and 6 PM UTC)
     scheduler.add_job(

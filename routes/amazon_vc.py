@@ -488,6 +488,79 @@ async def insert_data_to_db(
             detail=f"An unexpected error occurred: {str(e)}",
         )
 
+def background_refetch_sales(start_date_str: str, end_date_str: str, marketplace_ids: List[str], db, task_id: str):
+    """
+    Background task to delete and refetch sales data for last 11 days
+    This processes each day individually to handle the date filtering properly
+    """
+    logger.info(f"🚀 [TASK-{task_id}] Starting background refetch task for last 11 days")
+    
+    try:
+        collection = db[SALES_COLLECTION]
+        
+        # Parse dates
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        
+        # Calculate date range for deletion (last 11 days)
+        delete_start = start_date
+        delete_end = end_date + timedelta(days=1)  # Make it inclusive
+        
+        logger.info(f"🗑️ [TASK-{task_id}] Deleting existing records from {delete_start} to {end_date}")
+        
+        # Delete existing records for the last 11 days
+        delete_result = collection.delete_many({
+            "date": {
+                "$gte": datetime.combine(delete_start, datetime.min.time()),
+                "$lt": datetime.combine(delete_end, datetime.min.time())
+            }
+        })
+        
+        deleted_count = delete_result.deleted_count
+        logger.info(f"🗑️ [TASK-{task_id}] Deleted {deleted_count} existing records")
+        
+        # Process each day individually
+        total_inserted = 0
+        current_date = start_date
+        
+        while current_date <= end_date:
+            date_str = current_date.strftime("%Y-%m-%d")
+            logger.info(f"📅 [TASK-{task_id}] Processing date: {date_str}")
+            
+            try:
+                start_datetime = f"{date_str}T00:00:00Z"
+                end_datetime = f"{date_str}T23:59:59Z"
+                
+                sales_traffic_data = get_vendor_sales(start_datetime, end_datetime, db, marketplace_ids)
+                
+                if sales_traffic_data:
+                    new_records = []
+                    for asin_data in sales_traffic_data:
+                        asin_data["date"] = datetime.combine(current_date, datetime.min.time())
+                        asin_data["created_at"] = datetime.now()
+                        new_records.append(asin_data)
+                    
+                    if new_records:
+                        insert_result = collection.insert_many(new_records)
+                        day_inserted = len(insert_result.inserted_ids)
+                        total_inserted += day_inserted
+                        logger.info(f"✅ [TASK-{task_id}] Inserted {day_inserted} records for {date_str}")
+                    else:
+                        logger.info(f"ℹ️ [TASK-{task_id}] No records to insert for {date_str}")
+                else:
+                    logger.info(f"⚠️ [TASK-{task_id}] No sales data received for {date_str}")
+                
+            except Exception as day_error:
+                logger.error(f"❌ [TASK-{task_id}] Error processing {date_str}: {day_error}")
+            
+            current_date += timedelta(days=1)
+        
+        logger.info(f"✅ [TASK-{task_id}] Refetch completed! Deleted: {deleted_count}, Inserted: {total_inserted} records")
+        
+    except Exception as e:
+        logger.info(f"❌ [TASK-{task_id}] Background refetch failed: {e}")
+        logger.error(f"Background refetch failed: {e}")
+
 
 # Background task functions
 def background_sync_sales(start_datetime: str, end_datetime: str, marketplace_ids: List[str], db, task_id: str):
@@ -706,3 +779,67 @@ async def sync_inventory_data(
         logger.info(f"❌ Error starting inventory sync: {e}")
         logger.error(f"Error syncing inventory data: {e}")
         raise
+    
+@router.post("/sync/cron/sales")
+async def refetch_last_11_days_sales(
+    background_tasks: BackgroundTasks,
+    marketplace_ids: Optional[List[str]] = None,
+    db=Depends(get_database),
+):
+    """
+    Delete and refetch sales traffic data for the last 11 days (Background Task)
+    This endpoint will:
+    1. Calculate date range for last 11 days
+    2. Delete existing records for this period
+    3. Fetch fresh data from Amazon for each day
+    4. Insert new data into database
+    
+    No parameters required - automatically processes last 11 days from today
+    """
+    logger.info(f"🔄 Refetch last 11 days sales endpoint called")
+    
+    try:
+        # Calculate date range for last 11 days
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=10)  # 10 days back + today = 11 days
+        
+        start_date_str = start_date.strftime("%Y-%m-%d")
+        end_date_str = end_date.strftime("%Y-%m-%d")
+
+        # Generate a task ID for tracking
+        task_id = f"refetch_sales_{start_date_str}_{end_date_str}_{int(time.time())}"
+        
+        logger.info(f"📅 [TASK-{task_id}] Date range: {start_date_str} to {end_date_str}")
+        
+        # Add background task
+        background_tasks.add_task(
+            background_refetch_sales,
+            start_date_str,
+            end_date_str,
+            marketplace_ids or [MARKETPLACE_ID],
+            db,
+            task_id
+        )
+
+        logger.info(f"✅ Refetch sales background task {task_id} started")
+
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "message": "Sales data refetch for last 11 days started in background",
+                "task_id": task_id,
+                "date_range": f"{start_date_str} to {end_date_str}",
+                "days_covered": 11,
+                "marketplace_ids": marketplace_ids or [MARKETPLACE_ID],
+                "status": "processing",
+                "note": "Existing data will be deleted and refetched. Check console logs for progress updates"
+            },
+        )
+
+    except Exception as e:
+        logger.info(f"❌ Error starting sales refetch: {e}")
+        logger.error(f"Error starting sales refetch for last 11 days: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to start sales refetch: {str(e)}"
+        )
