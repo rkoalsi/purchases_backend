@@ -6,7 +6,7 @@ from ..database import get_database
 import os
 import requests
 import json
-import time, io
+import time
 import gzip
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
@@ -79,19 +79,16 @@ def get_amazon_token() -> str:
         _vc_token_expires_at = datetime.now() + timedelta(seconds=expires_in)
 
         logger.info("✅ Successfully obtained new Amazon SP API token")
-        logger.info("Successfully obtained new Amazon SP API token")
         return _vc_access_token
 
     except requests.exceptions.RequestException as e:
-        logger.info(f"❌ Error getting Amazon token: {e}")
-        logger.error(f"Error getting Amazon token: {e}")
+        logger.error(f"❌ Error getting Amazon token: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to authenticate with Amazon SP API: {str(e)}",
         )
     except Exception as e:
-        logger.info(f"❌ Unexpected error getting Amazon token: {e}")
-        logger.error(f"Unexpected error getting Amazon token: {e}")
+        logger.error(f"❌ Unexpected error getting Amazon token: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred during authentication: {str(e)}",
@@ -124,8 +121,7 @@ def make_sp_api_request(
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        logger.info(f"❌ API request failed: {e}")
-        logger.error(f"VC API request failed: {e}")
+        logger.error(f"❌ API request failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Amazon VC API request failed: {str(e)}",
@@ -140,7 +136,7 @@ def create_report(
     report_options: Dict = None,
 ) -> str:
     """
-    Create a report request and return the report document ID
+    Create a report request and return the report ID
     """
     logger.info(f"📊 Creating {report_type} report for {start_date} to {end_date}")
     
@@ -165,18 +161,70 @@ def create_report(
     return report_id
 
 
-def get_report_status(report_document_id: str) -> Dict:
-    endpoint = f"/reports/2021-06-30/reports/{report_document_id}"
+def get_report_status(report_id: str) -> Dict:
+    """Get report status"""
+    endpoint = f"/reports/2021-06-30/reports/{report_id}"
     return make_sp_api_request(endpoint)
 
 
+def wait_for_report_completion(report_id: str, report_type: str, max_wait_time: int = 900) -> str:
+    """
+    Wait for report to complete and return document ID
+    Increased default wait time to 15 minutes with progressive backoff
+    """
+    start_time = time.time()
+    check_interval = 30  # Start with 30 seconds
+    
+    logger.info(f"⏳ Waiting for {report_type} report {report_id} to complete (max: {max_wait_time}s)")
+    
+    while time.time() - start_time < max_wait_time:
+        elapsed = int(time.time() - start_time)
+        report_status = get_report_status(report_id)
+        
+        if not report_status:
+            raise ValueError("Failed to get report status - empty response")
+
+        processing_status = report_status.get("processingStatus")
+        report_document_id = report_status.get("reportDocumentId")
+
+        logger.info(f"📊 Report status: {processing_status} (elapsed: {elapsed}s / {max_wait_time}s)")
+
+        if processing_status == "DONE":
+            if not report_document_id:
+                raise ValueError("Report completed but no document ID available")
+            logger.info(f"✅ Report processing completed! Document ID: {report_document_id}")
+            return report_document_id
+            
+        elif processing_status == "FATAL":
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"{report_type} report processing failed with FATAL status",
+            )
+
+        # Progressive backoff - check less frequently as time goes on
+        if elapsed > 300:  # After 5 minutes
+            check_interval = 60
+        elif elapsed > 600:  # After 10 minutes
+            check_interval = 120
+
+        logger.info(f"⏳ Report still processing, waiting {check_interval} seconds...")
+        time.sleep(check_interval)
+
+    raise HTTPException(
+        status_code=status.HTTP_408_REQUEST_TIMEOUT,
+        detail=f"{report_type} report processing timed out after {max_wait_time}s",
+    )
+
+
 def download_report_data(report_document_id: str, is_gzipped: bool = False) -> str:
+    """
+    Download report data with timeout handling
+    """
     logger.info(f"📥 Downloading report data for document: {report_document_id}")
     
     endpoint = f"/reports/2021-06-30/documents/{report_document_id}"
     document_info = make_sp_api_request(endpoint)
 
-    # Get the download URL
     download_url = document_info.get("url")
     if not download_url:
         raise HTTPException(
@@ -185,18 +233,17 @@ def download_report_data(report_document_id: str, is_gzipped: bool = False) -> s
         )
 
     logger.info("📥 Downloading report from Amazon...")
-    # Download the actual report data
-    response = requests.get(download_url)
+    # Increased timeout for large reports
+    response = requests.get(download_url, timeout=300)
     response.raise_for_status()
 
-    # Handle gzipped content (for inventory reports)
+    # Handle gzipped content
     if is_gzipped:
         try:
             logger.info("🗜️ Decompressing gzipped report data...")
             return gzip.decompress(response.content).decode("utf-8")
         except Exception as e:
-            logger.info(f"⚠️ Error decompressing gzipped content: {e}")
-            logger.error(f"Error decompressing gzipped content: {e}")
+            logger.warning(f"⚠️ Error decompressing gzipped content: {e}")
             # Fallback to regular content if not actually gzipped
             return response.text
 
@@ -205,293 +252,160 @@ def download_report_data(report_document_id: str, is_gzipped: bool = False) -> s
 
 
 def get_vendor_sales(
-    start_date: str, end_date: str, db: Any, marketplace_ids: List[str] = None
-) -> List[Dict]:
+    start_date: str, end_date: str, max_retries: int = 3
+) -> Optional[List[Dict]]:
     """
-    Fetch sales and traffic data from Amazon SP API (ASIN-wise daily data)
+    Fetch sales data from Amazon SP API - OPTIMIZED VERSION
+    Returns raw data without database checks for better performance
     """
     logger.info(f"🛒 Starting sales data fetch for {start_date} to {end_date}")
     
-    if marketplace_ids is None:
-        marketplace_ids = [MARKETPLACE_ID]
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                wait_time = 60 * attempt
+                logger.info(f"🔄 Retry attempt {attempt + 1}/{max_retries} after {wait_time}s wait")
+                time.sleep(wait_time)
 
-    try:
-        # Create sales and traffic report
-        report_id = create_report(
-            report_type="GET_VENDOR_SALES_REPORT",
-            start_date=start_date,
-            end_date=end_date,
-            marketplace_ids=marketplace_ids,
-            report_options={
-                "reportPeriod": "DAY",
-                "distributorView": "MANUFACTURING",
-                "sellingProgram": "RETAIL",
-            },
-        )
-
-        # Add validation for report_id
-        if not report_id:
-            raise ValueError("Failed to create report - no report ID returned")
-
-        logger.info(f"⏳ Waiting for report {report_id} to be ready...")
-        # Wait for report to be ready (with timeout)
-        max_wait_time = 300  # 5 minutes
-        wait_time = 0
-
-        while wait_time < max_wait_time:
-            logger.info(f"⏱️ Checking report status... (waited {wait_time}s / {max_wait_time}s)")
-            report_status = get_report_status(report_id)
-
-            # Add validation for report_status
-            if not report_status:
-                raise ValueError("Failed to get report status - empty response")
-
-            processing_status = report_status.get("processingStatus")
-            report_document_id = report_status.get("reportDocumentId")
-
-            logger.info(f"📊 Report status: {processing_status}")
-
-            if processing_status == "DONE":
-                logger.info("✅ Report processing completed!")
-                break
-            elif processing_status == "FATAL":
-                logger.info("❌ Report processing failed with FATAL status")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Sales and traffic report processing failed",
-                )
-
-            logger.info("⏳ Report still processing, waiting 10 seconds...")
-            time.sleep(10)
-            wait_time += 10
-
-        if wait_time >= max_wait_time:
-            logger.info("⏰ Report processing timed out!")
-            raise HTTPException(
-                status_code=status.HTTP_408_REQUEST_TIMEOUT,
-                detail="Sales and traffic report processing timed out",
+            # Create sales report
+            report_id = create_report(
+                report_type="GET_VENDOR_SALES_REPORT",
+                start_date=start_date,
+                end_date=end_date,
+                marketplace_ids=[MARKETPLACE_ID],
+                report_options={
+                    "reportPeriod": "DAY",
+                    "distributorView": "MANUFACTURING",
+                    "sellingProgram": "RETAIL",
+                },
             )
 
-        if not report_document_id:
-            raise ValueError("No report document ID available")
+            if not report_id:
+                raise ValueError("Failed to create report - no report ID returned")
 
-        report_data = download_report_data(report_document_id, is_gzipped=True)
+            # Wait for report completion with longer timeout
+            report_document_id = wait_for_report_completion(report_id, "SALES", max_wait_time=900)
 
-        if not report_data:
-            raise ValueError("Downloaded report data is empty")
+            # Download and parse report
+            report_data = download_report_data(report_document_id, is_gzipped=True)
 
-        logger.info("📊 Parsing JSON report data...")
-        try:
+            if not report_data:
+                raise ValueError("Downloaded report data is empty")
+
+            logger.info("📊 Parsing JSON report data...")
             json_data = json.loads(report_data)
-        except json.JSONDecodeError as json_error:
-            raise ValueError(f"Failed to parse JSON report data: {json_error}")
 
-        if not isinstance(json_data, dict):
-            raise ValueError("Invalid JSON structure - expected dictionary")
+            if not isinstance(json_data, dict):
+                raise ValueError("Invalid JSON structure - expected dictionary")
+                
+            sales_by_asin = json_data.get("salesByAsin", [])
             
-        sales_by_asin = json_data.get("salesByAsin", [])
-        sales_data = []
-        
-        if sales_by_asin:
-            logger.info(f"📊 Found {len(sales_by_asin)} items in salesByAsin")
-            logger.info(f"Found {len(sales_by_asin)} items in salesByAsin")
-            
-            for i, asin_data in enumerate(sales_by_asin):
-                if i % 10 == 0:  # Print progress every 10 items
-                    logger.info(f"📝 Processing item {i+1}/{len(sales_by_asin)}")
-                    
-                asin = asin_data["asin"]
-                asin_data["date"] = datetime.fromisoformat(start_date)
-                asin_data["created_at"] = datetime.now()
-                result = db[SALES_COLLECTION].find_one(
-                    {"asin": asin, "date": asin_data["date"]}
+            if sales_by_asin:
+                logger.info(f"✅ Found {len(sales_by_asin)} items in salesByAsin")
+                return sales_by_asin
+            else:
+                logger.warning("⚠️ No salesByAsin data found in report")
+                return None
+
+        except HTTPException:
+            raise
+        except ValueError as ve:
+            logger.error(f"❌ Validation error (attempt {attempt + 1}): {ve}")
+            if attempt == max_retries - 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Data validation error: {str(ve)}",
                 )
-                if not result:
-                    sales_data.append(asin_data)
-                    
-            logger.info(f"✅ Sales data processing completed! {len(sales_data)} new records to insert")
-            return sales_by_asin
-        else:
-            logger.info("⚠️ No salesByAsin data found in report")
-            logger.warning(f"No salesByAsin data found in report")
-            return None
-
-    except HTTPException:
-        # Re-raise HTTPExceptions as-is
-        raise
-    except ValueError as ve:
-        logger.info(f"❌ Validation error: {ve}")
-        logger.error(f"Validation error in sales and traffic data: {ve}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Data validation error: {str(ve)}",
-        )
-    except Exception as e:
-        logger.info(f"❌ Unexpected error: {e}")
-        logger.error(f"Unexpected error fetching sales and traffic data: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch sales and traffic data: {str(e)}",
-        )
+        except Exception as e:
+            logger.error(f"❌ Error (attempt {attempt + 1}): {e}")
+            if attempt == max_retries - 1:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to fetch sales data after {max_retries} attempts: {str(e)}",
+                )
+    
+    return None
 
 
 def get_vendor_inventory(
-    start_date: str,
-    end_date: str,
-    db: Any,
-    marketplace_ids: List[str] = None,
-) -> List[Dict]:
+    start_date: str, end_date: str, max_retries: int = 3
+) -> Optional[List[Dict]]:
+    """
+    Fetch inventory data from Amazon SP API - OPTIMIZED VERSION
+    Returns raw data without database checks for better performance
+    """
     logger.info(f"📦 Starting inventory data fetch for {start_date} to {end_date}")
     
-    if marketplace_ids is None:
-        marketplace_ids = [MARKETPLACE_ID]
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                wait_time = 60 * attempt
+                logger.info(f"🔄 Retry attempt {attempt + 1}/{max_retries} after {wait_time}s wait")
+                time.sleep(wait_time)
 
-    try:
-        # Report options for inventory data
-        report_options = {
-            "reportPeriod": "DAY",
-            "distributorView": "MANUFACTURING",
-            "sellingProgram": "RETAIL",
-        }
-
-        # Create inventory report
-        report_id = create_report(
-            report_type="GET_VENDOR_INVENTORY_REPORT",
-            start_date=start_date,
-            end_date=end_date,
-            marketplace_ids=marketplace_ids,
-            report_options=report_options,
-        )
-
-        logger.info(f"⏳ Waiting for inventory report {report_id} to be ready...")
-        # Wait for report to be ready (with timeout)
-        max_wait_time = 300  # 5 minutes
-        wait_time = 0
-        report_document_id = ""
-        
-        while wait_time < max_wait_time:
-            logger.info(f"⏱️ Checking inventory report status... (waited {wait_time}s / {max_wait_time}s)")
-            report_status = get_report_status(report_id)
-            processing_status = report_status.get("processingStatus")
-            report_document_id = report_status.get("reportDocumentId")
-
-            logger.info(f"📦 Inventory report status: {processing_status}")
-
-            if processing_status == "DONE":
-                logger.info("✅ Inventory report processing completed!")
-                break
-            elif processing_status == "FATAL":
-                logger.info("❌ Inventory report processing failed with FATAL status")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Ledger report processing failed",
-                )
-
-            logger.info("⏳ Inventory report still processing, waiting 10 seconds...")
-            time.sleep(10)
-            wait_time += 10
-
-        if wait_time >= max_wait_time:
-            logger.info("⏰ Inventory report processing timed out!")
-            raise HTTPException(
-                status_code=status.HTTP_408_REQUEST_TIMEOUT,
-                detail="Ledger report processing timed out",
+            # Create inventory report
+            report_id = create_report(
+                report_type="GET_VENDOR_INVENTORY_REPORT",
+                start_date=start_date,
+                end_date=end_date,
+                marketplace_ids=[MARKETPLACE_ID],
+                report_options={
+                    "reportPeriod": "DAY",
+                    "distributorView": "MANUFACTURING",
+                    "sellingProgram": "RETAIL",
+                },
             )
 
-        # Download and parse report data (TSV format, gzipped)
-        report_data = download_report_data(report_document_id, is_gzipped=True)
+            if not report_id:
+                raise ValueError("Failed to create report - no report ID returned")
 
-        if not report_data:
-            raise ValueError("Downloaded report data is empty")
+            # Wait for report completion with longer timeout
+            report_document_id = wait_for_report_completion(report_id, "INVENTORY", max_wait_time=900)
 
-        logger.info("📦 Parsing JSON inventory data...")
-        try:
+            # Download and parse report
+            report_data = download_report_data(report_document_id, is_gzipped=True)
+
+            if not report_data:
+                raise ValueError("Downloaded report data is empty")
+
+            logger.info("📦 Parsing JSON inventory data...")
             json_data = json.loads(report_data)
-        except json.JSONDecodeError as json_error:
-            raise ValueError(f"Failed to parse JSON report data: {json_error}")
 
-        if not isinstance(json_data, dict):
-            raise ValueError("Invalid JSON structure - expected dictionary")
+            if not isinstance(json_data, dict):
+                raise ValueError("Invalid JSON structure - expected dictionary")
+                
+            inventory_by_asin = json_data.get("inventoryByAsin", [])
             
-        inventory_by_asin = json_data.get("inventoryByAsin", [])
-        inventory_data = []
-        
-        if inventory_by_asin:
-            logger.info(f"📦 Found {len(inventory_by_asin)} items in inventoryByAsin")
-            logger.info(f"Found {len(inventory_by_asin)} items in inventoryByAsin")
-            
-            for i, asin_data in enumerate(inventory_by_asin):
-                if i % 10 == 0:  # Print progress every 10 items
-                    logger.info(f"📝 Processing inventory item {i+1}/{len(inventory_by_asin)}")
-                    
-                asin = asin_data["asin"]
-                asin_data["date"] = datetime.fromisoformat(start_date)
-                asin_data["created_at"] = datetime.now()
-                result = db[INVENTORY_COLLECTION].find_one(
-                    {"asin": asin, "date": asin_data["date"]}
+            if inventory_by_asin:
+                logger.info(f"✅ Found {len(inventory_by_asin)} items in inventoryByAsin")
+                return inventory_by_asin
+            else:
+                logger.warning("⚠️ No inventoryByAsin data found in report")
+                return None
+
+        except HTTPException:
+            raise
+        except ValueError as ve:
+            logger.error(f"❌ Validation error (attempt {attempt + 1}): {ve}")
+            if attempt == max_retries - 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Data validation error: {str(ve)}",
                 )
-                if not result:
-                    inventory_data.append(asin_data)
-                    
-            logger.info(f"✅ Inventory data processing completed! {len(inventory_data)} new records to insert")
-            return inventory_by_asin
-        else:
-            logger.info("⚠️ No inventoryByAsin data found in report")
-            logger.warning(f"No inventoryByAsin data found in report")
-            return None
-            
-    except Exception as e:
-        logger.info(f"❌ Error fetching inventory data: {e}")
-        logger.error(f"Error fetching inventory data: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch inventory data: {str(e)}",
-        )
-
-
-async def insert_data_to_db(
-    collection_name: str, data: List[Dict], db=Depends(get_database)
-) -> int:
-    """
-    Insert data into MongoDB collection
-    """
-    logger.info(f"💾 Inserting {len(data) if data else 0} records into {collection_name}")
+        except Exception as e:
+            logger.error(f"❌ Error (attempt {attempt + 1}): {e}")
+            if attempt == max_retries - 1:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to fetch inventory data after {max_retries} attempts: {str(e)}",
+                )
     
-    try:
-        if not data:
-            logger.info("⚠️ No data to insert")
-            return 0
+    return None
 
-        collection = db[collection_name]
-
-        # Insert data
-        result = collection.insert_many(data)
-        logger.info(f"✅ Successfully inserted {len(result.inserted_ids)} records into {collection_name}")
-        logger.info(
-            f"Inserted {len(result.inserted_ids)} records into {collection_name}"
-        )
-
-        return len(result.inserted_ids)
-
-    except PyMongoError as e:
-        logger.info(f"❌ Database error inserting data: {e}")
-        logger.error(f"Database error inserting data: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}",
-        )
-    except Exception as e:
-        logger.info(f"❌ Unexpected error inserting data: {e}")
-        logger.error(f"Unexpected error inserting data: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An unexpected error occurred: {str(e)}",
-        )
 
 def background_refetch_sales(start_date_str: str, end_date_str: str, marketplace_ids: List[str], db, task_id: str):
     """
-    Background task to delete and refetch sales data for last 11 days
-    This processes each day individually to handle the date filtering properly
+    Background task to delete and refetch sales data for last 11 days - OPTIMIZED
     """
     logger.info(f"🚀 [TASK-{task_id}] Starting background refetch task for last 11 days")
     
@@ -499,20 +413,18 @@ def background_refetch_sales(start_date_str: str, end_date_str: str, marketplace
         collection = db[SALES_COLLECTION]
         
         # Parse dates
-        start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+        end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
         
-        # Calculate date range for deletion (last 11 days)
-        delete_start = start_date
-        delete_end = end_date + timedelta(days=1)  # Make it inclusive
+        # Delete existing records for the entire date range at once
+        delete_end = end_date + timedelta(days=1)
         
-        logger.info(f"🗑️ [TASK-{task_id}] Deleting existing records from {delete_start} to {end_date}")
+        logger.info(f"🗑️ [TASK-{task_id}] Deleting existing records from {start_date.date()} to {end_date.date()}")
         
-        # Delete existing records for the last 11 days
         delete_result = collection.delete_many({
             "date": {
-                "$gte": datetime.combine(delete_start, datetime.min.time()),
-                "$lt": datetime.combine(delete_end, datetime.min.time())
+                "$gte": start_date,
+                "$lt": delete_end
             }
         })
         
@@ -531,17 +443,23 @@ def background_refetch_sales(start_date_str: str, end_date_str: str, marketplace
                 start_datetime = f"{date_str}T00:00:00Z"
                 end_datetime = f"{date_str}T23:59:59Z"
                 
-                sales_traffic_data = get_vendor_sales(start_datetime, end_datetime, db, marketplace_ids)
+                # Get sales data (no DB checks in this function anymore)
+                sales_traffic_data = get_vendor_sales(start_datetime, end_datetime)
                 
                 if sales_traffic_data:
+                    # Prepare all documents at once
                     new_records = []
+                    current_time = datetime.now()
+                    date_obj = datetime.combine(current_date.date(), datetime.min.time())
+                    
                     for asin_data in sales_traffic_data:
-                        asin_data["date"] = datetime.combine(current_date, datetime.min.time())
-                        asin_data["created_at"] = datetime.now()
+                        asin_data["date"] = date_obj
+                        asin_data["created_at"] = current_time
                         new_records.append(asin_data)
                     
                     if new_records:
-                        insert_result = collection.insert_many(new_records)
+                        # Bulk insert all records at once
+                        insert_result = collection.insert_many(new_records, ordered=False)
                         day_inserted = len(insert_result.inserted_ids)
                         total_inserted += day_inserted
                         logger.info(f"✅ [TASK-{task_id}] Inserted {day_inserted} records for {date_str}")
@@ -554,39 +472,51 @@ def background_refetch_sales(start_date_str: str, end_date_str: str, marketplace
                 logger.error(f"❌ [TASK-{task_id}] Error processing {date_str}: {day_error}")
             
             current_date += timedelta(days=1)
+            
+            # Small delay between dates to avoid rate limits
+            if current_date <= end_date:
+                time.sleep(30)
         
         logger.info(f"✅ [TASK-{task_id}] Refetch completed! Deleted: {deleted_count}, Inserted: {total_inserted} records")
         
     except Exception as e:
-        logger.info(f"❌ [TASK-{task_id}] Background refetch failed: {e}")
-        logger.error(f"Background refetch failed: {e}")
+        logger.error(f"❌ [TASK-{task_id}] Background refetch failed: {e}")
 
 
-# Background task functions
 def background_sync_sales(start_datetime: str, end_datetime: str, marketplace_ids: List[str], db, task_id: str):
-    """Background task for sales data sync"""
+    """
+    Background task for sales data sync - OPTIMIZED
+    """
     logger.info(f"🚀 [TASK-{task_id}] Starting background sales sync task")
     try:
-        sales_traffic_data = get_vendor_sales(start_datetime, end_datetime, db, marketplace_ids)
+        # Get sales data (no DB checks in this function anymore)
+        sales_traffic_data = get_vendor_sales(start_datetime, end_datetime)
         
         if sales_traffic_data:
             logger.info(f"💾 [TASK-{task_id}] Starting database insertion...")
-            # Note: We can't use await here since this is a sync function
-            # You might want to convert this to async or use a different approach
             collection = db[SALES_COLLECTION]
+            
+            # Parse date from datetime string
+            date_obj = datetime.fromisoformat(start_datetime.replace('Z', '+00:00')).replace(hour=0, minute=0, second=0, microsecond=0)
+            current_time = datetime.now()
+            
+            # Get existing ASINs for this date in one query
+            existing_asins = set(
+                collection.distinct("asin", {"date": date_obj})
+            )
+            logger.info(f"📋 [TASK-{task_id}] Found {len(existing_asins)} existing ASINs for this date")
             
             # Filter out existing records
             new_records = []
             for asin_data in sales_traffic_data:
-                asin = asin_data["asin"]
-                asin_data["date"] = datetime.fromisoformat(start_datetime)
-                asin_data["created_at"] = datetime.now()
-                result = collection.find_one({"asin": asin, "date": asin_data["date"]})
-                if not result:
+                if asin_data["asin"] not in existing_asins:
+                    asin_data["date"] = date_obj
+                    asin_data["created_at"] = current_time
                     new_records.append(asin_data)
             
             if new_records:
-                result = collection.insert_many(new_records)
+                # Bulk insert all at once
+                result = collection.insert_many(new_records, ordered=False)
                 logger.info(f"✅ [TASK-{task_id}] Background sales sync completed! Inserted {len(result.inserted_ids)} records")
             else:
                 logger.info(f"ℹ️ [TASK-{task_id}] No new sales records to insert")
@@ -594,32 +524,43 @@ def background_sync_sales(start_datetime: str, end_datetime: str, marketplace_id
             logger.info(f"⚠️ [TASK-{task_id}] No sales data received")
             
     except Exception as e:
-        logger.info(f"❌ [TASK-{task_id}] Background sales sync failed: {e}")
-        logger.error(f"Background sales sync failed: {e}")
+        logger.error(f"❌ [TASK-{task_id}] Background sales sync failed: {e}")
 
 
 def background_sync_inventory(start_datetime: str, end_datetime: str, marketplace_ids: List[str], db, task_id: str):
-    """Background task for inventory data sync"""
+    """
+    Background task for inventory data sync - OPTIMIZED
+    """
     logger.info(f"🚀 [TASK-{task_id}] Starting background inventory sync task")
     try:
-        inventory_data = get_vendor_inventory(start_datetime, end_datetime, db, marketplace_ids)
+        # Get inventory data (no DB checks in this function anymore)
+        inventory_data = get_vendor_inventory(start_datetime, end_datetime)
         
         if inventory_data:
             logger.info(f"💾 [TASK-{task_id}] Starting database insertion...")
             collection = db[INVENTORY_COLLECTION]
             
+            # Parse date from datetime string
+            date_obj = datetime.fromisoformat(start_datetime.replace('Z', '+00:00')).replace(hour=0, minute=0, second=0, microsecond=0)
+            current_time = datetime.now()
+            
+            # Get existing ASINs for this date in one query
+            existing_asins = set(
+                collection.distinct("asin", {"date": date_obj})
+            )
+            logger.info(f"📋 [TASK-{task_id}] Found {len(existing_asins)} existing ASINs for this date")
+            
             # Filter out existing records
             new_records = []
             for asin_data in inventory_data:
-                asin = asin_data["asin"]
-                asin_data["date"] = datetime.fromisoformat(start_datetime)
-                asin_data["created_at"] = datetime.now()
-                result = collection.find_one({"asin": asin, "date": asin_data["date"]})
-                if not result:
+                if asin_data["asin"] not in existing_asins:
+                    asin_data["date"] = date_obj
+                    asin_data["created_at"] = current_time
                     new_records.append(asin_data)
             
             if new_records:
-                result = collection.insert_many(new_records)
+                # Bulk insert all at once
+                result = collection.insert_many(new_records, ordered=False)
                 logger.info(f"✅ [TASK-{task_id}] Background inventory sync completed! Inserted {len(result.inserted_ids)} records")
             else:
                 logger.info(f"ℹ️ [TASK-{task_id}] No new inventory records to insert")
@@ -627,11 +568,10 @@ def background_sync_inventory(start_datetime: str, end_datetime: str, marketplac
             logger.info(f"⚠️ [TASK-{task_id}] No inventory data received")
             
     except Exception as e:
-        logger.info(f"❌ [TASK-{task_id}] Background inventory sync failed: {e}")
-        logger.error(f"Background inventory sync failed: {e}")
+        logger.error(f"❌ [TASK-{task_id}] Background inventory sync failed: {e}")
 
 
-# API Endpoints
+# API Endpoints (unchanged)
 
 @router.post("/auth/token")
 async def refresh_amazon_token():
@@ -651,7 +591,7 @@ async def refresh_amazon_token():
             },
         )
     except Exception as e:
-        logger.info(f"❌ Token refresh failed: {e}")
+        logger.error(f"❌ Token refresh failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
@@ -666,7 +606,7 @@ async def sync_sales_data(
     db=Depends(get_database),
 ):
     """
-    Fetch ASIN-wise daily sales and traffic data from Amazon and insert into database (Background Task)
+    Fetch ASIN-wise daily sales data from Amazon and insert into database (Background Task)
     Format: YYYY-MM-DD
     """
     logger.info(f"🛒 Sales sync endpoint called for {start_date} to {end_date}")
@@ -708,14 +648,13 @@ async def sync_sales_data(
         )
 
     except ValueError as e:
-        logger.info(f"❌ Invalid date format: {e}")
+        logger.error(f"❌ Invalid date format: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid date format. Use YYYY-MM-DD",
         )
     except Exception as e:
-        logger.info(f"❌ Error starting sales sync: {e}")
-        logger.error(f"Error syncing sales and traffic data: {e}")
+        logger.error(f"❌ Error starting sales sync: {e}")
         raise
 
 
@@ -770,14 +709,13 @@ async def sync_inventory_data(
         )
 
     except ValueError as e:
-        logger.info(f"❌ Invalid date format: {e}")
+        logger.error(f"❌ Invalid date format: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid date format. Use YYYY-MM-DD",
         )
     except Exception as e:
-        logger.info(f"❌ Error starting inventory sync: {e}")
-        logger.error(f"Error syncing inventory data: {e}")
+        logger.error(f"❌ Error starting inventory sync: {e}")
         raise
     
 @router.post("/sync/cron/sales")
@@ -837,8 +775,7 @@ async def refetch_last_11_days_sales(
         )
 
     except Exception as e:
-        logger.info(f"❌ Error starting sales refetch: {e}")
-        logger.error(f"Error starting sales refetch for last 11 days: {e}")
+        logger.error(f"❌ Error starting sales refetch: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to start sales refetch: {str(e)}"
