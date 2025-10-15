@@ -737,9 +737,9 @@ async def refetch_last_11_days_sales(
     logger.info(f"🔄 Refetch last 11 days sales endpoint called")
     
     try:
-        # Calculate date range for last 11 days
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=10)  # 10 days back + today = 11 days
+        today = datetime.now().date() 
+        end_date = today - timedelta(days=2)
+        start_date = end_date - timedelta(days=10) 
         
         start_date_str = start_date.strftime("%Y-%m-%d")
         end_date_str = end_date.strftime("%Y-%m-%d")
