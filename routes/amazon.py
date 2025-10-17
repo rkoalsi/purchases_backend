@@ -2542,3 +2542,301 @@ def format_column_name(column_name):
     }
 
     return replacements.get(formatted, formatted)
+
+@router.post("/sync/settlements")
+async def sync_settlement_reports(
+    days_back: Optional[int] = 7,
+    db=Depends(get_database),
+):
+    try:
+        logger.info(f"Starting settlement reports sync for last {days_back} days")
+        from io import StringIO
+        import pandas as pd
+        marketplace_endpoints = {
+            "A21TJRUUN4KGV": "https://sellingpartnerapi-eu.amazon.com",
+            "A1F83G8C2ARO7P": "https://sellingpartnerapi-eu.amazon.com",
+            "A1PA6795UKMFR9": "https://sellingpartnerapi-eu.amazon.com",
+            "ATVPDKIKX0DER": "https://sellingpartnerapi-na.amazon.com",
+            "A2EUQ1WTGCTBG2": "https://sellingpartnerapi-na.amazon.com",
+            "A1VC38T7YXB528": "https://sellingpartnerapi-fe.amazon.com",
+        }
+        
+        base_url = marketplace_endpoints.get(
+            MARKETPLACE_ID, "https://sellingpartnerapi-eu.amazon.com"
+        )
+        
+        # Get access token
+        access_token = get_amazon_token()
+        
+        # Create compound index for faster duplicate checking
+        collection = db["amazon_settlements"]
+        
+        # Get settlement reports
+        reports_url = f"{base_url}/reports/2021-06-30/reports"
+        headers = {"x-amz-access-token": access_token}
+        
+        created_since = datetime.now() - timedelta(days=days_back)
+        
+        params = {
+            "reportTypes": "GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2",
+            "createdSince": created_since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "pageSize": 100,
+        }
+        
+        response = requests.get(reports_url, headers=headers, params=params)
+        response.raise_for_status()
+        
+        reports = response.json().get("reports", [])
+        
+        if not reports:
+            logger.info("No settlement reports found")
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "message": "No settlement reports found",
+                    "reports_processed": 0,
+                    "records_inserted": 0,
+                    "records_skipped": 0,
+                }
+            )
+        
+        # Filter completed reports
+        done_reports = [r for r in reports if r.get("processingStatus") == "DONE"]
+        
+        logger.info(f"Found {len(done_reports)} completed settlement reports")
+        
+        total_inserted = 0
+        total_skipped = 0
+        reports_processed = 0
+        
+        # Process each report
+        for report in done_reports:
+            report_id = report.get("reportId")
+            report_date = report.get("dataStartTime", "")[:10]
+            
+            # Check if already processed
+            existing_count = collection.count_documents({"report_id": report_id})
+            if existing_count > 0:
+                logger.info(f"Report {report_id} already processed ({existing_count} records)")
+                continue
+            
+            try:
+                # Get report document ID
+                report_url = f"{base_url}/reports/2021-06-30/reports/{report_id}"
+                report_response = requests.get(report_url, headers=headers)
+                report_response.raise_for_status()
+                
+                report_data = report_response.json()
+                document_id = report_data.get("reportDocumentId")
+                
+                if not document_id:
+                    logger.warning(f"No document ID for report {report_id}")
+                    continue
+                
+                # Get document download URL
+                doc_url = f"{base_url}/reports/2021-06-30/documents/{document_id}"
+                doc_response = requests.get(doc_url, headers=headers)
+                doc_response.raise_for_status()
+                
+                download_url = doc_response.json().get("url")
+                
+                # Download report data
+                data_response = requests.get(download_url)
+                data_response.raise_for_status()
+                
+                # Parse TSV data
+                df = pd.read_csv(
+                    StringIO(data_response.text),
+                    sep="\t",
+                    encoding="utf-8",
+                    low_memory=False
+                )
+                
+                # Extract required fields
+                required_fields = [
+                    "order-id",
+                    "amount-description",
+                    "amount",
+                    "sku",
+                    "quantity-purchased",
+                    "posted-date",
+                ]
+                
+                existing_fields = [field for field in required_fields if field in df.columns]
+                
+                if not existing_fields:
+                    logger.warning(f"No required fields found in report {report_id}")
+                    continue
+                
+                extracted_df = df[existing_fields].copy()
+                records = extracted_df.to_dict("records")
+                
+                # Process records
+                processed_records = []
+                
+                for record in records:
+                    new_record = {}
+                    
+                    # Map fields
+                    field_mapping = {
+                        "order-id": "order_id",
+                        "amount-description": "amount_description",
+                        "amount": "amount",
+                        "sku": "sku",
+                        "quantity-purchased": "quantity_purchased",
+                        "posted-date": "posted_date",
+                    }
+                    
+                    for old_key, new_key in field_mapping.items():
+                        if old_key in record:
+                            value = record[old_key]
+                            if pd.isna(value) or value == "":
+                                new_record[new_key] = None
+                            else:
+                                new_record[new_key] = value
+                    
+                    # Skip if order_id is null
+                    if not new_record.get("order_id"):
+                        continue
+                    
+                    # Add metadata
+                    new_record["report_id"] = report_id
+                    new_record["report_date"] = report_date
+                    new_record["created_at"] = datetime.now()
+                    
+                    # Handle data type conversions
+                    if new_record.get("amount") is not None:
+                        try:
+                            new_record["amount"] = float(new_record["amount"])
+                        except:
+                            pass
+                    
+                    if new_record.get("posted_date") is not None:
+                        try:
+                            new_record["posted_date"] = datetime.strptime(
+                                new_record["posted_date"], '%d.%m.%Y'
+                            )
+                        except:
+                            pass
+                    
+                    try:
+                        new_record["report_date"] = datetime.strptime(
+                            report_date, "%Y-%m-%d"
+                        )
+                    except:
+                        pass
+                    
+                    if new_record.get("quantity_purchased") is not None:
+                        try:
+                            new_record["quantity_purchased"] = int(
+                                new_record["quantity_purchased"]
+                            )
+                        except:
+                            pass
+                    
+                    processed_records.append(new_record)
+                
+                if not processed_records:
+                    logger.warning(f"No valid records in report {report_id}")
+                    continue
+                
+                # Check for duplicates efficiently
+                filter_queries = []
+                for record in processed_records:
+                    filter_queries.append({
+                        "order_id": record.get("order_id"),
+                        "amount_description": record.get("amount_description"),
+                        "amount": record.get("amount"),
+                        "sku": record.get("sku"),
+                        "quantity_purchased": record.get("quantity_purchased"),
+                        "posted_date": record.get("posted_date"),
+                        "report_id": record.get("report_id")
+                    })
+                
+                # Find existing records
+                existing_records = list(collection.find(
+                    {"$or": filter_queries},
+                    {
+                        "order_id": 1,
+                        "amount_description": 1,
+                        "amount": 1,
+                        "sku": 1,
+                        "quantity_purchased": 1,
+                        "posted_date": 1,
+                        "report_id": 1
+                    }
+                ))
+                
+                # Create signature set
+                existing_signatures = set()
+                for existing in existing_records:
+                    signature = (
+                        existing.get("order_id"),
+                        existing.get("amount_description"),
+                        existing.get("amount"),
+                        existing.get("sku"),
+                        existing.get("quantity_purchased"),
+                        existing.get("posted_date"),
+                        existing.get("report_id")
+                    )
+                    existing_signatures.add(signature)
+                
+                # Filter out duplicates
+                records_to_insert = []
+                duplicate_count = 0
+                
+                for record in processed_records:
+                    signature = (
+                        record.get("order_id"),
+                        record.get("amount_description"),
+                        record.get("amount"),
+                        record.get("sku"),
+                        record.get("quantity_purchased"),
+                        record.get("posted_date"),
+                        record.get("report_id")
+                    )
+                    
+                    if signature not in existing_signatures:
+                        records_to_insert.append(record)
+                        existing_signatures.add(signature)
+                    else:
+                        duplicate_count += 1
+                
+                # Insert records
+                if records_to_insert:
+                    result = collection.insert_many(records_to_insert, ordered=False)
+                    inserted = len(result.inserted_ids)
+                    total_inserted += inserted
+                    total_skipped += duplicate_count
+                    reports_processed += 1
+                    
+                    logger.info(
+                        f"Report {report_id}: Inserted {inserted}, Skipped {duplicate_count}"
+                    )
+                else:
+                    logger.info(f"Report {report_id}: All records already exist")
+                
+                # Small delay to avoid rate limiting
+                time.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Error processing report {report_id}: {e}")
+                continue
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Settlement reports sync completed",
+                "reports_processed": reports_processed,
+                "records_inserted": total_inserted,
+                "records_skipped": total_skipped,
+                "days_back": days_back,
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error syncing settlement reports: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to sync settlement reports: {str(e)}",
+        )
