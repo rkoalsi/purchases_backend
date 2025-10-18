@@ -480,91 +480,82 @@ def get_field_mapping_for_amazon_field(amazon_field: str) -> str:
     Dynamically map Amazon field names to our expected field names
     """
     normalized = normalize_field_name(amazon_field)
-    
+
     # Define mapping rules based on common patterns
     field_mappings = {
         # Order fields
-        'order_id': 'order_id',
-        'orderid': 'order_id', 
-        'amazon_order_id': 'order_id',
-        'amazonorderid': 'order_id',
-        
+        "order_id": "order_id",
+        "orderid": "order_id",
+        "amazon_order_id": "order_id",
+        "amazonorderid": "order_id",
         # Dates
-        'order_date': 'order_date',
-        'orderdate': 'order_date',
-        'return_request_date': 'return_request_date',
-        'returnrequestdate': 'return_request_date',
-        'return_delivery_date': 'return_delivery_date',
-        'returndeliverydate': 'return_delivery_date',
-        
+        "order_date": "order_date",
+        "orderdate": "order_date",
+        "return_request_date": "return_request_date",
+        "returnrequestdate": "return_request_date",
+        "return_delivery_date": "return_delivery_date",
+        "returndeliverydate": "return_delivery_date",
         # Return information
-        'return_request_status': 'return_request_status',
-        'returnrequeststatus': 'return_request_status',
-        'return_quantity': 'return_quantity',
-        'returnquantity': 'return_quantity',
-        'quantity': 'return_quantity',
-        'return_reason': 'return_reason',
-        'returnreason': 'return_reason',
-        'return_type': 'return_type',
-        'returntype': 'return_type',
-        
+        "return_request_status": "return_request_status",
+        "returnrequeststatus": "return_request_status",
+        "return_quantity": "return_quantity",
+        "returnquantity": "return_quantity",
+        "quantity": "return_quantity",
+        "return_reason": "return_reason",
+        "returnreason": "return_reason",
+        "return_type": "return_type",
+        "returntype": "return_type",
         # RMA fields
-        'amazon_rma_id': 'amazon_rma_id',
-        'amazonrmaid': 'amazon_rma_id',
-        'merchant_rma_id': 'merchant_rma_id',
-        'merchantrmaid': 'merchant_rma_id',
-        
+        "amazon_rma_id": "amazon_rma_id",
+        "amazonrmaid": "amazon_rma_id",
+        "merchant_rma_id": "merchant_rma_id",
+        "merchantrmaid": "merchant_rma_id",
         # Shipping/Label fields
-        'label_type': 'label_type',
-        'labeltype': 'label_type',
-        'label_cost': 'label_cost',
-        'labelcost': 'label_cost',
-        'currency_code': 'currency_code',
-        'currencycode': 'currency_code',
-        'return_carrier': 'return_carrier',
-        'returncarrier': 'return_carrier',
-        'tracking_id': 'tracking_id',
-        'trackingid': 'tracking_id',
-        'label_to_be_paid_by': 'label_to_be_paid_by',
-        'labeltobepaidby': 'label_to_be_paid_by',
-        
+        "label_type": "label_type",
+        "labeltype": "label_type",
+        "label_cost": "label_cost",
+        "labelcost": "label_cost",
+        "currency_code": "currency_code",
+        "currencycode": "currency_code",
+        "return_carrier": "return_carrier",
+        "returncarrier": "return_carrier",
+        "tracking_id": "tracking_id",
+        "trackingid": "tracking_id",
+        "label_to_be_paid_by": "label_to_be_paid_by",
+        "labeltobepaidby": "label_to_be_paid_by",
         # Claims and prime
-        'a_to_z_claim': 'a_to_z_claim',
-        'atozclaim': 'a_to_z_claim',
-        'is_prime': 'is_prime',
-        'isprime': 'is_prime',
-        
+        "a_to_z_claim": "a_to_z_claim",
+        "atozclaim": "a_to_z_claim",
+        "is_prime": "is_prime",
+        "isprime": "is_prime",
         # Product fields
-        'asin': 'asin',
-        'merchant_sku': 'merchant_sku',
-        'merchantsku': 'merchant_sku',
-        'sku': 'merchant_sku',
-        'item_name': 'item_name',
-        'itemname': 'item_name',
-        'product_name': 'item_name',
-        'productname': 'item_name',
-        'category': 'category',
-        
+        "asin": "asin",
+        "merchant_sku": "merchant_sku",
+        "merchantsku": "merchant_sku",
+        "sku": "merchant_sku",
+        "item_name": "item_name",
+        "itemname": "item_name",
+        "product_name": "item_name",
+        "productname": "item_name",
+        "category": "category",
         # Policy and resolution
-        'in_policy': 'in_policy',
-        'inpolicy': 'in_policy',
-        'resolution': 'resolution',
-        
+        "in_policy": "in_policy",
+        "inpolicy": "in_policy",
+        "resolution": "resolution",
         # Financial fields
-        'order_amount': 'order_amount',
-        'orderamount': 'order_amount',
-        'order_quantity': 'order_quantity',
-        'orderquantity': 'order_quantity',
-        'refunded_amount': 'refunded_amount',
-        'refundedamount': 'refunded_amount',
-        
+        "order_amount": "order_amount",
+        "orderamount": "order_amount",
+        "order_quantity": "order_quantity",
+        "orderquantity": "order_quantity",
+        "refunded_amount": "refunded_amount",
+        "refundedamount": "refunded_amount",
         # Other fields
-        'invoice_number': 'invoice_number',
-        'invoicenumber': 'invoice_number',
-        'order_item_id': 'order_item_id',
-        'orderitemid': 'order_item_id',
+        "invoice_number": "invoice_number",
+        "invoicenumber": "invoice_number",
+        "order_item_id": "order_item_id",
+        "orderitemid": "order_item_id",
     }
-    
+
     return field_mappings.get(normalized, normalized)
 
 
@@ -573,17 +564,21 @@ def normalize_amazon_sc_fields(record: Dict) -> Dict:
     Normalize Amazon SC returns record to our expected structure
     """
     normalized_record = {}
-    
+
     for amazon_field, value in record.items():
         # Get the mapped field name
         our_field = get_field_mapping_for_amazon_field(amazon_field)
-        
+
         # Handle null/empty values
         if pd.isna(value) or value == "" or value == " ":
             normalized_record[our_field] = None
         else:
             # Handle special data type conversions
-            if our_field in ["order_date", "return_request_date", "return_delivery_date"]:
+            if our_field in [
+                "order_date",
+                "return_request_date",
+                "return_delivery_date",
+            ]:
                 try:
                     normalized_record[our_field] = pd.to_datetime(value).to_pydatetime()
                 except:
@@ -606,8 +601,9 @@ def normalize_amazon_sc_fields(record: Dict) -> Dict:
                     normalized_record[our_field] = value
             else:
                 normalized_record[our_field] = value
-    
+
     return normalized_record
+
 
 def normalize_field_name(field_name: str) -> str:
     """
@@ -615,66 +611,67 @@ def normalize_field_name(field_name: str) -> str:
     """
     if not field_name:
         return ""
-    
+
     # Remove extra spaces and convert to lowercase
     field_name = field_name.strip().lower()
-    
+
     # Replace spaces, hyphens, and other separators with underscores
-    field_name = re.sub(r'[\s\-\.]+', '_', field_name)
-    
+    field_name = re.sub(r"[\s\-\.]+", "_", field_name)
+
     # Remove special characters but keep underscores
-    field_name = re.sub(r'[^a-z0-9_]', '', field_name)
-    
+    field_name = re.sub(r"[^a-z0-9_]", "", field_name)
+
     # Remove multiple consecutive underscores
-    field_name = re.sub(r'_+', '_', field_name)
-    
+    field_name = re.sub(r"_+", "_", field_name)
+
     # Remove leading/trailing underscores
-    field_name = field_name.strip('_')
-    
+    field_name = field_name.strip("_")
+
     return field_name
+
 
 def normalize_amazon_fba_fields(record: Dict) -> Dict:
     """
     Normalize Amazon FBA returns record to our expected structure
     """
     normalized_record = {}
-    
+
     # FBA field mappings
     fba_field_mappings = {
-        'return_date': 'return_date',
-        'returndate': 'return_date',
-        'order_id': 'amazon_order_id',
-        'orderid': 'amazon_order_id',
-        'amazon_order_id': 'amazon_order_id',
-        'amazonorderid': 'amazon_order_id',
-        'sku': 'sku_code',
-        'sku_code': 'sku_code',
-        'skucode': 'sku_code',
-        'asin': 'asin',
-        'fnsku': 'fnsku',
-        'product_name': 'product_name',
-        'productname': 'product_name',
-        'item_name': 'product_name',
-        'itemname': 'product_name',
-        'quantity': 'quantity',
-        'fulfillment_center_id': 'fulfillment_center_id',
-        'fulfillmentcenterid': 'fulfillment_center_id',
-        'detailed_disposition': 'detailed_disposition',
-        'detaileddisposition': 'detailed_disposition',
-        'reason': 'reason',
-        'license_plate_number': 'license_plate_number',
-        'licenseplatenumber': 'license_plate_number',
-        'customer_comments': 'customer_comments',
-        'customercomments': 'customer_comments',
+        "return_date": "return_date",
+        "returndate": "return_date",
+        "order_id": "amazon_order_id",
+        "orderid": "amazon_order_id",
+        "amazon_order_id": "amazon_order_id",
+        "amazonorderid": "amazon_order_id",
+        "sku": "sku_code",
+        "sku_code": "sku_code",
+        "skucode": "sku_code",
+        "asin": "asin",
+        "fnsku": "fnsku",
+        "product_name": "product_name",
+        "productname": "product_name",
+        "item_name": "product_name",
+        "itemname": "product_name",
+        "quantity": "quantity",
+        "fulfillment_center_id": "fulfillment_center_id",
+        "fulfillmentcenterid": "fulfillment_center_id",
+        "detailed_disposition": "detailed_disposition",
+        "detaileddisposition": "detailed_disposition",
+        "reason": "reason",
+        "license_plate_number": "license_plate_number",
+        "licenseplatenumber": "license_plate_number",
+        "customer_comments": "customer_comments",
+        "customercomments": "customer_comments",
     }
-    
+
     for amazon_field, value in record.items():
         # Get normalized field name
         normalized_field = normalize_field_name(amazon_field)
-        
+
         # Get our target field name
         our_field = fba_field_mappings.get(normalized_field, normalized_field)
-        
+
         # Handle null/empty values
         if pd.isna(value) or value == "" or value == " ":
             normalized_record[our_field] = None
@@ -692,11 +689,8 @@ def normalize_amazon_fba_fields(record: Dict) -> Dict:
                     normalized_record[our_field] = value
             else:
                 normalized_record[our_field] = value
-    
+
     return normalized_record
-
-
-    
 
 
 def get_amazon_fba_returns_data(
@@ -719,7 +713,9 @@ def get_amazon_fba_returns_data(
 
         # Add validation for report_id
         if not report_id:
-            raise ValueError("Failed to create FBA returns report - no report ID returned")
+            raise ValueError(
+                "Failed to create FBA returns report - no report ID returned"
+            )
 
         # Wait for report to be ready (with timeout)
         max_wait_time = 300  # 5 minutes
@@ -730,7 +726,9 @@ def get_amazon_fba_returns_data(
 
             # Add validation for report_status
             if not report_status:
-                raise ValueError("Failed to get FBA returns report status - empty response")
+                raise ValueError(
+                    "Failed to get FBA returns report status - empty response"
+                )
 
             processing_status = report_status.get("processingStatus")
             report_document_id = report_status.get("reportDocumentId")
@@ -778,22 +776,29 @@ def get_amazon_fba_returns_data(
 
             # Check for duplicate using amazon_order_id + sku_code + return_date
             should_insert = True
-            if all(key in normalized_record and normalized_record[key] is not None for key in ["amazon_order_id", "sku_code", "return_date"]):
+            if all(
+                key in normalized_record and normalized_record[key] is not None
+                for key in ["amazon_order_id", "sku_code", "return_date"]
+            ):
                 duplicate_check = {
                     "amazon_order_id": normalized_record["amazon_order_id"],
                     "sku_code": normalized_record["sku_code"],
-                    "return_date": normalized_record["return_date"]
+                    "return_date": normalized_record["return_date"],
                 }
-                
+
                 existing_record = db[FBA_RETURNS_COLLECTION].find_one(duplicate_check)
                 if existing_record:
                     should_insert = False
-                    logger.debug(f"Skipping duplicate FBA return: {normalized_record['amazon_order_id']} - {normalized_record['sku_code']}")
-            
+                    logger.debug(
+                        f"Skipping duplicate FBA return: {normalized_record['amazon_order_id']} - {normalized_record['sku_code']}"
+                    )
+
             if should_insert:
                 normalized_data.append(normalized_record)
 
-        logger.info(f"Processed {len(fba_returns_raw)} FBA returns records, {len(normalized_data)} new records to insert")
+        logger.info(
+            f"Processed {len(fba_returns_raw)} FBA returns records, {len(normalized_data)} new records to insert"
+        )
         return normalized_data
 
     except HTTPException:
@@ -811,7 +816,6 @@ def get_amazon_fba_returns_data(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch FBA returns data: {str(e)}",
         )
-
 
 
 def get_amazon_sc_returns_data(
@@ -834,7 +838,9 @@ def get_amazon_sc_returns_data(
 
         # Add validation for report_id
         if not report_id:
-            raise ValueError("Failed to create SC returns report - no report ID returned")
+            raise ValueError(
+                "Failed to create SC returns report - no report ID returned"
+            )
 
         # Wait for report to be ready (with timeout)
         max_wait_time = 300  # 5 minutes
@@ -845,7 +851,9 @@ def get_amazon_sc_returns_data(
 
             # Add validation for report_status
             if not report_status:
-                raise ValueError("Failed to get SC returns report status - empty response")
+                raise ValueError(
+                    "Failed to get SC returns report status - empty response"
+                )
 
             processing_status = report_status.get("processingStatus")
             report_document_id = report_status.get("reportDocumentId")
@@ -890,28 +898,35 @@ def get_amazon_sc_returns_data(
         for record in sc_returns_raw:
             # Map Amazon column names to your document structure
             normalized_record = {}
-            
+
             # Apply dynamic field mapping
             normalized_record = normalize_amazon_sc_fields(record)
 
             # Check for duplicate using order_id + merchant_sku + return_request_date
             should_insert = True
-            if all(key in normalized_record and normalized_record[key] is not None for key in ["order_id", "merchant_sku", "return_request_date"]):
+            if all(
+                key in normalized_record and normalized_record[key] is not None
+                for key in ["order_id", "merchant_sku", "return_request_date"]
+            ):
                 duplicate_check = {
                     "order_id": normalized_record["order_id"],
                     "merchant_sku": normalized_record["merchant_sku"],
-                    "return_request_date": normalized_record["return_request_date"]
+                    "return_request_date": normalized_record["return_request_date"],
                 }
-                
+
                 existing_record = db[SC_RETURNS_COLLECTION].find_one(duplicate_check)
                 if existing_record:
                     should_insert = False
-                    logger.debug(f"Skipping duplicate SC return: {normalized_record['order_id']} - {normalized_record['merchant_sku']}")
-            
+                    logger.debug(
+                        f"Skipping duplicate SC return: {normalized_record['order_id']} - {normalized_record['merchant_sku']}"
+                    )
+
             if should_insert:
                 normalized_data.append(normalized_record)
 
-        logger.info(f"Processed {len(sc_returns_raw)} SC returns records, {len(normalized_data)} new records to insert")
+        logger.info(
+            f"Processed {len(sc_returns_raw)} SC returns records, {len(normalized_data)} new records to insert"
+        )
         return normalized_data
 
     except HTTPException:
@@ -1732,9 +1747,7 @@ async def generate_vendor_central_data(start, end, database):
                 "units_sold": {"$sum": "$orderedUnits"},
                 "amount": {"$sum": "$orderedRevenue.amount"},
                 # Handle missing customerReturns field with $ifNull
-                "customer_returns": {
-                    "$sum": {"$ifNull": ["$customerReturns", 0]}
-                },
+                "customer_returns": {"$sum": {"$ifNull": ["$customerReturns", 0]}},
             }
         },
         {
@@ -1864,7 +1877,9 @@ async def generate_vendor_central_data(start, end, database):
                 "stock": "$last_day_closing_stock",
                 "total_days_in_stock": "$total_days_in_stock",
                 "drr": {"$round": ["$drr", 2]},
-                "total_returns": {"$ifNull": ["$total_returns", 0]},  # Handle null returns
+                "total_returns": {
+                    "$ifNull": ["$total_returns", 0]
+                },  # Handle null returns
                 "data_source": {"$literal": "vendor_central"},
             }
         },
@@ -1880,6 +1895,7 @@ async def generate_vendor_central_data(start, end, database):
     cursor = list(collection.aggregate(vendor_pipeline))
     result = serialize_mongo_document(cursor)
     return result
+
 
 async def generate_amazon_data(start, end, database, report_type):
     """Generate FBA/Seller Flex report data with returns information (FBA only)"""
@@ -2054,7 +2070,6 @@ async def generate_amazon_data(start, end, database, report_type):
         group_stage["$group"]["total_returns"] = {
             "$last": {"$ifNull": ["$sc_returns_data.sc_returns", 0]}
         }
-   
 
     base_pipeline.append(group_stage)
 
@@ -2211,7 +2226,8 @@ def combine_report_data(vendor_data, fba_seller_flex_data):
                     fba_item.get("total_days_in_stock", 0),
                 ),
                 "total_returns": (
-                    vendor_item.get("total_returns", 0) + fba_item.get("total_returns", 0)
+                    vendor_item.get("total_returns", 0)
+                    + fba_item.get("total_returns", 0)
                 ),
                 "drr": 0,  # Will be recalculated
                 "data_source": "combined",
@@ -2543,6 +2559,7 @@ def format_column_name(column_name):
 
     return replacements.get(formatted, formatted)
 
+
 @router.post("/sync/settlements")
 async def sync_settlement_reports(
     days_back: Optional[int] = 7,
@@ -2552,6 +2569,7 @@ async def sync_settlement_reports(
         logger.info(f"Starting settlement reports sync for last {days_back} days")
         from io import StringIO
         import pandas as pd
+
         marketplace_endpoints = {
             "A21TJRUUN4KGV": "https://sellingpartnerapi-eu.amazon.com",
             "A1F83G8C2ARO7P": "https://sellingpartnerapi-eu.amazon.com",
@@ -2560,34 +2578,34 @@ async def sync_settlement_reports(
             "A2EUQ1WTGCTBG2": "https://sellingpartnerapi-na.amazon.com",
             "A1VC38T7YXB528": "https://sellingpartnerapi-fe.amazon.com",
         }
-        
+
         base_url = marketplace_endpoints.get(
             MARKETPLACE_ID, "https://sellingpartnerapi-eu.amazon.com"
         )
-        
+
         # Get access token
         access_token = get_amazon_token()
-        
+
         # Create compound index for faster duplicate checking
         collection = db["amazon_settlements"]
-        
+
         # Get settlement reports
         reports_url = f"{base_url}/reports/2021-06-30/reports"
         headers = {"x-amz-access-token": access_token}
-        
+
         created_since = datetime.now() - timedelta(days=days_back)
-        
+
         params = {
             "reportTypes": "GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2",
             "createdSince": created_since.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "pageSize": 100,
         }
-        
+
         response = requests.get(reports_url, headers=headers, params=params)
         response.raise_for_status()
-        
+
         reports = response.json().get("reports", [])
-        
+
         if not reports:
             logger.info("No settlement reports found")
             return JSONResponse(
@@ -2597,61 +2615,63 @@ async def sync_settlement_reports(
                     "reports_processed": 0,
                     "records_inserted": 0,
                     "records_skipped": 0,
-                }
+                },
             )
-        
+
         # Filter completed reports
         done_reports = [r for r in reports if r.get("processingStatus") == "DONE"]
-        
+
         logger.info(f"Found {len(done_reports)} completed settlement reports")
-        
+
         total_inserted = 0
         total_skipped = 0
         reports_processed = 0
-        
+
         # Process each report
         for report in done_reports:
             report_id = report.get("reportId")
             report_date = report.get("dataStartTime", "")[:10]
-            
+
             # Check if already processed
             existing_count = collection.count_documents({"report_id": report_id})
             if existing_count > 0:
-                logger.info(f"Report {report_id} already processed ({existing_count} records)")
+                logger.info(
+                    f"Report {report_id} already processed ({existing_count} records)"
+                )
                 continue
-            
+
             try:
                 # Get report document ID
                 report_url = f"{base_url}/reports/2021-06-30/reports/{report_id}"
                 report_response = requests.get(report_url, headers=headers)
                 report_response.raise_for_status()
-                
+
                 report_data = report_response.json()
                 document_id = report_data.get("reportDocumentId")
-                
+
                 if not document_id:
                     logger.warning(f"No document ID for report {report_id}")
                     continue
-                
+
                 # Get document download URL
                 doc_url = f"{base_url}/reports/2021-06-30/documents/{document_id}"
                 doc_response = requests.get(doc_url, headers=headers)
                 doc_response.raise_for_status()
-                
+
                 download_url = doc_response.json().get("url")
-                
+
                 # Download report data
                 data_response = requests.get(download_url)
                 data_response.raise_for_status()
-                
+
                 # Parse TSV data
                 df = pd.read_csv(
                     StringIO(data_response.text),
                     sep="\t",
                     encoding="utf-8",
-                    low_memory=False
+                    low_memory=False,
                 )
-                
+
                 # Extract required fields
                 required_fields = [
                     "order-id",
@@ -2661,22 +2681,24 @@ async def sync_settlement_reports(
                     "quantity-purchased",
                     "posted-date",
                 ]
-                
-                existing_fields = [field for field in required_fields if field in df.columns]
-                
+
+                existing_fields = [
+                    field for field in required_fields if field in df.columns
+                ]
+
                 if not existing_fields:
                     logger.warning(f"No required fields found in report {report_id}")
                     continue
-                
+
                 extracted_df = df[existing_fields].copy()
                 records = extracted_df.to_dict("records")
-                
+
                 # Process records
                 processed_records = []
-                
+
                 for record in records:
                     new_record = {}
-                    
+
                     # Map fields
                     field_mapping = {
                         "order-id": "order_id",
@@ -2686,7 +2708,7 @@ async def sync_settlement_reports(
                         "quantity-purchased": "quantity_purchased",
                         "posted-date": "posted_date",
                     }
-                    
+
                     for old_key, new_key in field_mapping.items():
                         if old_key in record:
                             value = record[old_key]
@@ -2694,38 +2716,38 @@ async def sync_settlement_reports(
                                 new_record[new_key] = None
                             else:
                                 new_record[new_key] = value
-                    
+
                     # Skip if order_id is null
                     if not new_record.get("order_id"):
                         continue
-                    
+
                     # Add metadata
                     new_record["report_id"] = report_id
                     new_record["report_date"] = report_date
                     new_record["created_at"] = datetime.now()
-                    
+
                     # Handle data type conversions
                     if new_record.get("amount") is not None:
                         try:
                             new_record["amount"] = float(new_record["amount"])
                         except:
                             pass
-                    
+
                     if new_record.get("posted_date") is not None:
                         try:
                             new_record["posted_date"] = datetime.strptime(
-                                new_record["posted_date"], '%d.%m.%Y'
+                                new_record["posted_date"], "%d.%m.%Y"
                             )
                         except:
                             pass
-                    
+
                     try:
                         new_record["report_date"] = datetime.strptime(
                             report_date, "%Y-%m-%d"
                         )
                     except:
                         pass
-                    
+
                     if new_record.get("quantity_purchased") is not None:
                         try:
                             new_record["quantity_purchased"] = int(
@@ -2733,40 +2755,44 @@ async def sync_settlement_reports(
                             )
                         except:
                             pass
-                    
+
                     processed_records.append(new_record)
-                
+
                 if not processed_records:
                     logger.warning(f"No valid records in report {report_id}")
                     continue
-                
+
                 # Check for duplicates efficiently
                 filter_queries = []
                 for record in processed_records:
-                    filter_queries.append({
-                        "order_id": record.get("order_id"),
-                        "amount_description": record.get("amount_description"),
-                        "amount": record.get("amount"),
-                        "sku": record.get("sku"),
-                        "quantity_purchased": record.get("quantity_purchased"),
-                        "posted_date": record.get("posted_date"),
-                        "report_id": record.get("report_id")
-                    })
-                
+                    filter_queries.append(
+                        {
+                            "order_id": record.get("order_id"),
+                            "amount_description": record.get("amount_description"),
+                            "amount": record.get("amount"),
+                            "sku": record.get("sku"),
+                            "quantity_purchased": record.get("quantity_purchased"),
+                            "posted_date": record.get("posted_date"),
+                            "report_id": record.get("report_id"),
+                        }
+                    )
+
                 # Find existing records
-                existing_records = list(collection.find(
-                    {"$or": filter_queries},
-                    {
-                        "order_id": 1,
-                        "amount_description": 1,
-                        "amount": 1,
-                        "sku": 1,
-                        "quantity_purchased": 1,
-                        "posted_date": 1,
-                        "report_id": 1
-                    }
-                ))
-                
+                existing_records = list(
+                    collection.find(
+                        {"$or": filter_queries},
+                        {
+                            "order_id": 1,
+                            "amount_description": 1,
+                            "amount": 1,
+                            "sku": 1,
+                            "quantity_purchased": 1,
+                            "posted_date": 1,
+                            "report_id": 1,
+                        },
+                    )
+                )
+
                 # Create signature set
                 existing_signatures = set()
                 for existing in existing_records:
@@ -2777,14 +2803,14 @@ async def sync_settlement_reports(
                         existing.get("sku"),
                         existing.get("quantity_purchased"),
                         existing.get("posted_date"),
-                        existing.get("report_id")
+                        existing.get("report_id"),
                     )
                     existing_signatures.add(signature)
-                
+
                 # Filter out duplicates
                 records_to_insert = []
                 duplicate_count = 0
-                
+
                 for record in processed_records:
                     signature = (
                         record.get("order_id"),
@@ -2793,15 +2819,15 @@ async def sync_settlement_reports(
                         record.get("sku"),
                         record.get("quantity_purchased"),
                         record.get("posted_date"),
-                        record.get("report_id")
+                        record.get("report_id"),
                     )
-                    
+
                     if signature not in existing_signatures:
                         records_to_insert.append(record)
                         existing_signatures.add(signature)
                     else:
                         duplicate_count += 1
-                
+
                 # Insert records
                 if records_to_insert:
                     result = collection.insert_many(records_to_insert, ordered=False)
@@ -2809,20 +2835,20 @@ async def sync_settlement_reports(
                     total_inserted += inserted
                     total_skipped += duplicate_count
                     reports_processed += 1
-                    
+
                     logger.info(
                         f"Report {report_id}: Inserted {inserted}, Skipped {duplicate_count}"
                     )
                 else:
                     logger.info(f"Report {report_id}: All records already exist")
-                
+
                 # Small delay to avoid rate limiting
                 time.sleep(0.5)
-                
+
             except Exception as e:
                 logger.error(f"Error processing report {report_id}: {e}")
                 continue
-        
+
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
@@ -2831,9 +2857,9 @@ async def sync_settlement_reports(
                 "records_inserted": total_inserted,
                 "records_skipped": total_skipped,
                 "days_back": days_back,
-            }
+            },
         )
-        
+
     except Exception as e:
         logger.error(f"Error syncing settlement reports: {e}")
         raise HTTPException(
@@ -2844,18 +2870,20 @@ async def sync_settlement_reports(
 
 @router.get("/settlements/pivot")
 async def get_settlements_pivot(
-    start_date: Optional[str] = Query(None, description="Start date in YYYY-MM-DD format"),
+    start_date: Optional[str] = Query(
+        None, description="Start date in YYYY-MM-DD format"
+    ),
     end_date: Optional[str] = Query(None, description="End date in YYYY-MM-DD format"),
     sku: Optional[str] = Query(None, description="Filter by SKU"),
     order_id: Optional[str] = Query(None, description="Filter by order ID"),
     format: str = Query("json", description="Response format: 'json' or 'excel'"),
-    db=Depends(get_database)
+    db=Depends(get_database),
 ):
     """Get Amazon settlements data in pivot table format."""
     try:
         # Build MongoDB query
         query = {}
-        
+
         if start_date or end_date:
             query["posted_date"] = {}
             if start_date:
@@ -2865,7 +2893,7 @@ async def get_settlements_pivot(
                 except ValueError:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Invalid start_date format. Use YYYY-MM-DD"
+                        detail="Invalid start_date format. Use YYYY-MM-DD",
                     )
             if end_date:
                 try:
@@ -2874,62 +2902,75 @@ async def get_settlements_pivot(
                 except ValueError:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Invalid end_date format. Use YYYY-MM-DD"
+                        detail="Invalid end_date format. Use YYYY-MM-DD",
                     )
-        
+
         if sku:
             query["sku"] = sku
-        
+
         if order_id:
             query["order_id"] = order_id
-        
+
         # Fetch data from MongoDB
         collection = db["amazon_settlements"]
         cursor = collection.find(query)
         settlements = list(cursor)
-        
+
         if not settlements:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="No settlement records found for the given criteria"
+                detail="No settlement records found for the given criteria",
             )
-        
+
         # Convert to DataFrame
         df = pd.DataFrame(settlements)
-        df = df[["order_id", "posted_date", "sku", "amount_description", "amount"]]
+        df = df[
+            [
+                "order_id",
+                "posted_date",
+                "sku",
+                "quantity_purchased",
+                "amount_description",
+                "amount",
+            ]
+        ]
         df["posted_date"] = pd.to_datetime(df["posted_date"]).dt.strftime("%Y-%m-%d")
-        
+
         # Create pivot table
         pivot_df = df.pivot_table(
-            index=["order_id", "posted_date", "sku"],
+            index=["order_id", "posted_date", "sku", "quantity_purchased"],
             columns="amount_description",
             values="amount",
             aggfunc="sum",
-            fill_value=None
+            fill_value=None,
         )
-        
+
         pivot_df = pivot_df.reset_index()
-        
+
         # Calculate Grand Total (sum of all amount columns)
-        amount_columns = [col for col in pivot_df.columns if col not in ["order_id", "posted_date", "sku"]]
+        amount_columns = [
+            col
+            for col in pivot_df.columns
+            if col not in ["order_id", "posted_date", "sku", "quantity_purchased"]
+        ]
         pivot_df["Grand Total"] = pivot_df[amount_columns].sum(axis=1)
-        
+
         # 🔧 FIX: Replace NaN/inf values with None for JSON serialization
-        pivot_df = pivot_df.replace([float('nan'), float('inf'), float('-inf')], None)
-        
+        pivot_df = pivot_df.replace([float("nan"), float("inf"), float("-inf")], None)
+
         # Sort by posted_date
         pivot_df = pivot_df.sort_values("posted_date", ascending=False)
-        
+
         # Format response based on requested format
         if format.lower() == "excel":
             output = BytesIO()
-            
+
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 pivot_df.to_excel(writer, sheet_name="Sheet1", index=False)
-                
+
                 workbook = writer.book
                 worksheet = writer.sheets["Sheet1"]
-                
+
                 for column in worksheet.columns:
                     max_length = 0
                     column_letter = column[0].column_letter
@@ -2941,26 +2982,26 @@ async def get_settlements_pivot(
                             pass
                     adjusted_width = min(max_length + 2, 50)
                     worksheet.column_dimensions[column_letter].width = adjusted_width
-            
+
             output.seek(0)
-            
+
             filename = "amazon_settlements_pivot"
             if start_date:
                 filename += f"_{start_date}"
             if end_date:
                 filename += f"_to_{end_date}"
             filename += ".xlsx"
-            
+
             return StreamingResponse(
                 output,
                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                headers={"Content-Disposition": f"attachment; filename={filename}"}
+                headers={"Content-Disposition": f"attachment; filename={filename}"},
             )
-        
+
         else:
             # Return as JSON
             result = pivot_df.to_dict(orient="records")
-            
+
             return {
                 "success": True,
                 "count": len(result),
@@ -2968,76 +3009,76 @@ async def get_settlements_pivot(
                     "start_date": start_date,
                     "end_date": end_date,
                     "sku": sku,
-                    "order_id": order_id
+                    "order_id": order_id,
                 },
-                "data": result
+                "data": result,
             }
-    
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error generating settlements pivot: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate settlements pivot: {str(e)}"
+            detail=f"Failed to generate settlements pivot: {str(e)}",
         )
 
+
 @router.get("/settlements/pivot/columns")
-async def get_pivot_columns(
-    db=Depends(get_database)
-):
+async def get_pivot_columns(db=Depends(get_database)):
     """
     Get list of all unique amount_description values (column names in pivot table).
-    
+
     This is useful for understanding what charge types exist in your data.
     """
     try:
         collection = db["amazon_settlements"]
-        
+
         # Get distinct amount_description values
         columns = collection.distinct("amount_description")
-        
+
         # Remove None values
         columns = [col for col in columns if col is not None]
-        
+
         # Sort alphabetically
         columns.sort()
-        
-        return {
-            "success": True,
-            "count": len(columns),
-            "columns": columns
-        }
-    
+
+        return {"success": True, "count": len(columns), "columns": columns}
+
     except Exception as e:
         logger.error(f"Error fetching pivot columns: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch pivot columns: {str(e)}"
+            detail=f"Failed to fetch pivot columns: {str(e)}",
         )
 
 
 @router.get("/settlements/summary")
 async def get_settlements_summary(
-    start_date: Optional[str] = Query(None, description="Start date in YYYY-MM-DD format"),
+    start_date: Optional[str] = Query(
+        None, description="Start date in YYYY-MM-DD format"
+    ),
     end_date: Optional[str] = Query(None, description="End date in YYYY-MM-DD format"),
-    group_by: str = Query("amount_description", description="Group by: 'amount_description', 'sku', or 'date'"),
-    db=Depends(get_database)
+    group_by: str = Query(
+        "amount_description",
+        description="Group by: 'amount_description', 'sku', or 'date'",
+    ),
+    db=Depends(get_database),
 ):
     """
     Get summary statistics for settlements data.
-    
+
     Query Parameters:
     - start_date: Filter by posted date (start)
     - end_date: Filter by posted date (end)
     - group_by: How to group the summary - 'amount_description', 'sku', or 'date'
-    
+
     Returns summary totals grouped by the specified field.
     """
     try:
         # Build match stage
         match_stage = {}
-        
+
         if start_date or end_date:
             match_stage["posted_date"] = {}
             if start_date:
@@ -3046,76 +3087,74 @@ async def get_settlements_summary(
             if end_date:
                 end_dt = datetime.strptime(end_date, "%Y-%m-%d")
                 match_stage["posted_date"]["$lte"] = end_dt
-        
+
         # Build aggregation pipeline
         collection = db["amazon_settlements"]
-        
+
         group_field_map = {
             "amount_description": "$amount_description",
             "sku": "$sku",
-            "date": {
-                "$dateToString": {
-                    "format": "%Y-%m-%d",
-                    "date": "$posted_date"
-                }
-            }
+            "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$posted_date"}},
         }
-        
+
         if group_by not in group_field_map:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid group_by value. Must be one of: {', '.join(group_field_map.keys())}"
+                detail=f"Invalid group_by value. Must be one of: {', '.join(group_field_map.keys())}",
             )
-        
+
         pipeline = []
-        
+
         if match_stage:
             pipeline.append({"$match": match_stage})
-        
-        pipeline.extend([
-            {
-                "$group": {
-                    "_id": group_field_map[group_by],
-                    "total_amount": {"$sum": "$amount"},
-                    "count": {"$sum": 1},
-                    "avg_amount": {"$avg": "$amount"}
-                }
-            },
-            {
-                "$sort": {"total_amount": -1}
-            }
-        ])
-        
+
+        pipeline.extend(
+            [
+                {
+                    "$group": {
+                        "_id": group_field_map[group_by],
+                        "total_amount": {"$sum": "$amount"},
+                        "count": {"$sum": 1},
+                        "avg_amount": {"$avg": "$amount"},
+                    }
+                },
+                {"$sort": {"total_amount": -1}},
+            ]
+        )
+
         results = list(collection.aggregate(pipeline))
-        
+
         # Format results
         formatted_results = []
         for result in results:
-            formatted_results.append({
-                group_by: result["_id"],
-                "total_amount": round(result["total_amount"], 2) if result["total_amount"] else 0,
-                "count": result["count"],
-                "average_amount": round(result["avg_amount"], 2) if result["avg_amount"] else 0
-            })
-        
+            formatted_results.append(
+                {
+                    group_by: result["_id"],
+                    "total_amount": (
+                        round(result["total_amount"], 2)
+                        if result["total_amount"]
+                        else 0
+                    ),
+                    "count": result["count"],
+                    "average_amount": (
+                        round(result["avg_amount"], 2) if result["avg_amount"] else 0
+                    ),
+                }
+            )
+
         return {
             "success": True,
             "group_by": group_by,
-            "filters": {
-                "start_date": start_date,
-                "end_date": end_date
-            },
+            "filters": {"start_date": start_date, "end_date": end_date},
             "count": len(formatted_results),
-            "data": formatted_results
+            "data": formatted_results,
         }
-    
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error generating settlements summary: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate settlements summary: {str(e)}"
+            detail=f"Failed to generate settlements summary: {str(e)}",
         )
-
-
