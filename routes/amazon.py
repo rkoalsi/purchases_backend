@@ -1,7 +1,7 @@
 import pandas as pd
 from io import BytesIO
 from bson import ObjectId
-from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends
+from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta, timezone
 from pymongo import ASCENDING
@@ -2840,3 +2840,282 @@ async def sync_settlement_reports(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to sync settlement reports: {str(e)}",
         )
+
+
+@router.get("/settlements/pivot")
+async def get_settlements_pivot(
+    start_date: Optional[str] = Query(None, description="Start date in YYYY-MM-DD format"),
+    end_date: Optional[str] = Query(None, description="End date in YYYY-MM-DD format"),
+    sku: Optional[str] = Query(None, description="Filter by SKU"),
+    order_id: Optional[str] = Query(None, description="Filter by order ID"),
+    format: str = Query("json", description="Response format: 'json' or 'excel'"),
+    db=Depends(get_database)
+):
+    """Get Amazon settlements data in pivot table format."""
+    try:
+        # Build MongoDB query
+        query = {}
+        
+        if start_date or end_date:
+            query["posted_date"] = {}
+            if start_date:
+                try:
+                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                    query["posted_date"]["$gte"] = start_dt
+                except ValueError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid start_date format. Use YYYY-MM-DD"
+                    )
+            if end_date:
+                try:
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                    query["posted_date"]["$lte"] = end_dt
+                except ValueError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid end_date format. Use YYYY-MM-DD"
+                    )
+        
+        if sku:
+            query["sku"] = sku
+        
+        if order_id:
+            query["order_id"] = order_id
+        
+        # Fetch data from MongoDB
+        collection = db["amazon_settlements"]
+        cursor = collection.find(query)
+        settlements = list(cursor)
+        
+        if not settlements:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No settlement records found for the given criteria"
+            )
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(settlements)
+        df = df[["order_id", "posted_date", "sku", "amount_description", "amount"]]
+        df["posted_date"] = pd.to_datetime(df["posted_date"]).dt.strftime("%Y-%m-%d")
+        
+        # Create pivot table
+        pivot_df = df.pivot_table(
+            index=["order_id", "posted_date", "sku"],
+            columns="amount_description",
+            values="amount",
+            aggfunc="sum",
+            fill_value=None
+        )
+        
+        pivot_df = pivot_df.reset_index()
+        
+        # Calculate Grand Total (sum of all amount columns)
+        amount_columns = [col for col in pivot_df.columns if col not in ["order_id", "posted_date", "sku"]]
+        pivot_df["Grand Total"] = pivot_df[amount_columns].sum(axis=1)
+        
+        # 🔧 FIX: Replace NaN/inf values with None for JSON serialization
+        pivot_df = pivot_df.replace([float('nan'), float('inf'), float('-inf')], None)
+        
+        # Sort by posted_date
+        pivot_df = pivot_df.sort_values("posted_date", ascending=False)
+        
+        # Format response based on requested format
+        if format.lower() == "excel":
+            output = BytesIO()
+            
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                pivot_df.to_excel(writer, sheet_name="Sheet1", index=False)
+                
+                workbook = writer.book
+                worksheet = writer.sheets["Sheet1"]
+                
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+            
+            output.seek(0)
+            
+            filename = "amazon_settlements_pivot"
+            if start_date:
+                filename += f"_{start_date}"
+            if end_date:
+                filename += f"_to_{end_date}"
+            filename += ".xlsx"
+            
+            return StreamingResponse(
+                output,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
+        
+        else:
+            # Return as JSON
+            result = pivot_df.to_dict(orient="records")
+            
+            return {
+                "success": True,
+                "count": len(result),
+                "filters": {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "sku": sku,
+                    "order_id": order_id
+                },
+                "data": result
+            }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating settlements pivot: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate settlements pivot: {str(e)}"
+        )
+
+@router.get("/settlements/pivot/columns")
+async def get_pivot_columns(
+    db=Depends(get_database)
+):
+    """
+    Get list of all unique amount_description values (column names in pivot table).
+    
+    This is useful for understanding what charge types exist in your data.
+    """
+    try:
+        collection = db["amazon_settlements"]
+        
+        # Get distinct amount_description values
+        columns = collection.distinct("amount_description")
+        
+        # Remove None values
+        columns = [col for col in columns if col is not None]
+        
+        # Sort alphabetically
+        columns.sort()
+        
+        return {
+            "success": True,
+            "count": len(columns),
+            "columns": columns
+        }
+    
+    except Exception as e:
+        logger.error(f"Error fetching pivot columns: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch pivot columns: {str(e)}"
+        )
+
+
+@router.get("/settlements/summary")
+async def get_settlements_summary(
+    start_date: Optional[str] = Query(None, description="Start date in YYYY-MM-DD format"),
+    end_date: Optional[str] = Query(None, description="End date in YYYY-MM-DD format"),
+    group_by: str = Query("amount_description", description="Group by: 'amount_description', 'sku', or 'date'"),
+    db=Depends(get_database)
+):
+    """
+    Get summary statistics for settlements data.
+    
+    Query Parameters:
+    - start_date: Filter by posted date (start)
+    - end_date: Filter by posted date (end)
+    - group_by: How to group the summary - 'amount_description', 'sku', or 'date'
+    
+    Returns summary totals grouped by the specified field.
+    """
+    try:
+        # Build match stage
+        match_stage = {}
+        
+        if start_date or end_date:
+            match_stage["posted_date"] = {}
+            if start_date:
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                match_stage["posted_date"]["$gte"] = start_dt
+            if end_date:
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                match_stage["posted_date"]["$lte"] = end_dt
+        
+        # Build aggregation pipeline
+        collection = db["amazon_settlements"]
+        
+        group_field_map = {
+            "amount_description": "$amount_description",
+            "sku": "$sku",
+            "date": {
+                "$dateToString": {
+                    "format": "%Y-%m-%d",
+                    "date": "$posted_date"
+                }
+            }
+        }
+        
+        if group_by not in group_field_map:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid group_by value. Must be one of: {', '.join(group_field_map.keys())}"
+            )
+        
+        pipeline = []
+        
+        if match_stage:
+            pipeline.append({"$match": match_stage})
+        
+        pipeline.extend([
+            {
+                "$group": {
+                    "_id": group_field_map[group_by],
+                    "total_amount": {"$sum": "$amount"},
+                    "count": {"$sum": 1},
+                    "avg_amount": {"$avg": "$amount"}
+                }
+            },
+            {
+                "$sort": {"total_amount": -1}
+            }
+        ])
+        
+        results = list(collection.aggregate(pipeline))
+        
+        # Format results
+        formatted_results = []
+        for result in results:
+            formatted_results.append({
+                group_by: result["_id"],
+                "total_amount": round(result["total_amount"], 2) if result["total_amount"] else 0,
+                "count": result["count"],
+                "average_amount": round(result["avg_amount"], 2) if result["avg_amount"] else 0
+            })
+        
+        return {
+            "success": True,
+            "group_by": group_by,
+            "filters": {
+                "start_date": start_date,
+                "end_date": end_date
+            },
+            "count": len(formatted_results),
+            "data": formatted_results
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating settlements summary: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate settlements summary: {str(e)}"
+        )
+
+
