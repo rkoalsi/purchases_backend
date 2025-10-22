@@ -272,12 +272,12 @@ class APIScheduler:
         try:
             logger.info(f"Starting daily task execution at {datetime.now()}")
 
-            await self.get_sc_sales_traffic()
             await self.get_sc_inventory()
             await self.get_vc_inventory()
             await self.get_vc_sales_traffic()
             await self.get_returns()
             await self.get_settlements()
+            await self.get_sc_sales_traffic()
 
             logger.info("Daily task execution completed successfully")
 
