@@ -2559,7 +2559,6 @@ def format_column_name(column_name):
 
     return replacements.get(formatted, formatted)
 
-
 @router.post("/sync/settlements")
 async def sync_settlement_reports(
     days_back: Optional[int] = 7,
@@ -2569,6 +2568,11 @@ async def sync_settlement_reports(
         logger.info(f"Starting settlement reports sync for last {days_back} days")
         from io import StringIO
         import pandas as pd
+        import time
+        import requests
+        from datetime import datetime, timedelta
+        from fastapi.responses import JSONResponse
+        from fastapi import status, HTTPException
 
         marketplace_endpoints = {
             "A21TJRUUN4KGV": "https://sellingpartnerapi-eu.amazon.com",
@@ -2586,7 +2590,7 @@ async def sync_settlement_reports(
         # Get access token
         access_token = get_amazon_token()
 
-        # Create compound index for faster duplicate checking
+        # MongoDB collection
         collection = db["amazon_settlements"]
 
         # Get settlement reports
@@ -2614,7 +2618,6 @@ async def sync_settlement_reports(
                     "message": "No settlement reports found",
                     "reports_processed": 0,
                     "records_inserted": 0,
-                    "records_skipped": 0,
                 },
             )
 
@@ -2624,21 +2627,12 @@ async def sync_settlement_reports(
         logger.info(f"Found {len(done_reports)} completed settlement reports")
 
         total_inserted = 0
-        total_skipped = 0
         reports_processed = 0
 
         # Process each report
         for report in done_reports:
             report_id = report.get("reportId")
             report_date = report.get("dataStartTime", "")[:10]
-
-            # Check if already processed
-            existing_count = collection.count_documents({"report_id": report_id})
-            if existing_count > 0:
-                logger.info(
-                    f"Report {report_id} already processed ({existing_count} records)"
-                )
-                continue
 
             try:
                 # Get report document ID
@@ -2712,12 +2706,9 @@ async def sync_settlement_reports(
                     for old_key, new_key in field_mapping.items():
                         if old_key in record:
                             value = record[old_key]
-                            if pd.isna(value) or value == "":
-                                new_record[new_key] = None
-                            else:
-                                new_record[new_key] = value
+                            new_record[new_key] = None if pd.isna(value) or value == "" else value
 
-                    # Skip if order_id is null
+                    # Skip if order_id is missing
                     if not new_record.get("order_id"):
                         continue
 
@@ -2726,35 +2717,31 @@ async def sync_settlement_reports(
                     new_record["report_date"] = report_date
                     new_record["created_at"] = datetime.now()
 
-                    # Handle data type conversions
-                    if new_record.get("amount") is not None:
-                        try:
-                            new_record["amount"] = float(new_record["amount"])
-                        except:
-                            pass
-
-                    if new_record.get("posted_date") is not None:
-                        try:
-                            new_record["posted_date"] = datetime.strptime(
-                                new_record["posted_date"], "%d.%m.%Y"
-                            )
-                        except:
-                            pass
-
+                    # Data type conversions
                     try:
-                        new_record["report_date"] = datetime.strptime(
-                            report_date, "%Y-%m-%d"
-                        )
+                        if new_record.get("amount") is not None:
+                            new_record["amount"] = float(new_record["amount"])
                     except:
                         pass
 
-                    if new_record.get("quantity_purchased") is not None:
-                        try:
-                            new_record["quantity_purchased"] = int(
-                                new_record["quantity_purchased"]
+                    try:
+                        if new_record.get("posted_date") is not None:
+                            new_record["posted_date"] = datetime.strptime(
+                                new_record["posted_date"], "%d.%m.%Y"
                             )
-                        except:
-                            pass
+                    except:
+                        pass
+
+                    try:
+                        new_record["report_date"] = datetime.strptime(report_date, "%Y-%m-%d")
+                    except:
+                        pass
+
+                    try:
+                        if new_record.get("quantity_purchased") is not None:
+                            new_record["quantity_purchased"] = int(new_record["quantity_purchased"])
+                    except:
+                        pass
 
                     processed_records.append(new_record)
 
@@ -2762,85 +2749,13 @@ async def sync_settlement_reports(
                     logger.warning(f"No valid records in report {report_id}")
                     continue
 
-                # Check for duplicates efficiently
-                filter_queries = []
-                for record in processed_records:
-                    filter_queries.append(
-                        {
-                            "order_id": record.get("order_id"),
-                            "amount_description": record.get("amount_description"),
-                            "amount": record.get("amount"),
-                            "sku": record.get("sku"),
-                            "quantity_purchased": record.get("quantity_purchased"),
-                            "posted_date": record.get("posted_date"),
-                            "report_id": record.get("report_id"),
-                        }
-                    )
+                # 🚀 Insert all records (no duplicate checking)
+                result = collection.insert_many(processed_records, ordered=False)
+                inserted = len(result.inserted_ids)
+                total_inserted += inserted
+                reports_processed += 1
 
-                # Find existing records
-                existing_records = list(
-                    collection.find(
-                        {"$or": filter_queries},
-                        {
-                            "order_id": 1,
-                            "amount_description": 1,
-                            "amount": 1,
-                            "sku": 1,
-                            "quantity_purchased": 1,
-                            "posted_date": 1,
-                            "report_id": 1,
-                        },
-                    )
-                )
-
-                # Create signature set
-                existing_signatures = set()
-                for existing in existing_records:
-                    signature = (
-                        existing.get("order_id"),
-                        existing.get("amount_description"),
-                        existing.get("amount"),
-                        existing.get("sku"),
-                        existing.get("quantity_purchased"),
-                        existing.get("posted_date"),
-                        existing.get("report_id"),
-                    )
-                    existing_signatures.add(signature)
-
-                # Filter out duplicates
-                records_to_insert = []
-                duplicate_count = 0
-
-                for record in processed_records:
-                    signature = (
-                        record.get("order_id"),
-                        record.get("amount_description"),
-                        record.get("amount"),
-                        record.get("sku"),
-                        record.get("quantity_purchased"),
-                        record.get("posted_date"),
-                        record.get("report_id"),
-                    )
-
-                    if signature not in existing_signatures:
-                        records_to_insert.append(record)
-                        existing_signatures.add(signature)
-                    else:
-                        duplicate_count += 1
-
-                # Insert records
-                if records_to_insert:
-                    result = collection.insert_many(records_to_insert, ordered=False)
-                    inserted = len(result.inserted_ids)
-                    total_inserted += inserted
-                    total_skipped += duplicate_count
-                    reports_processed += 1
-
-                    logger.info(
-                        f"Report {report_id}: Inserted {inserted}, Skipped {duplicate_count}"
-                    )
-                else:
-                    logger.info(f"Report {report_id}: All records already exist")
+                logger.info(f"Report {report_id}: Inserted {inserted} records (duplicates allowed)")
 
                 # Small delay to avoid rate limiting
                 time.sleep(0.5)
@@ -2855,7 +2770,6 @@ async def sync_settlement_reports(
                 "message": "Settlement reports sync completed",
                 "reports_processed": reports_processed,
                 "records_inserted": total_inserted,
-                "records_skipped": total_skipped,
                 "days_back": days_back,
             },
         )
