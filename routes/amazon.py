@@ -2850,9 +2850,21 @@ async def get_settlements_pivot(
         ]
         df["posted_date"] = pd.to_datetime(df["posted_date"]).dt.strftime("%Y-%m-%d")
 
-        # Create pivot table
+        # Check for and handle duplicate documents
+        # Group by all fields except we aggregate quantity_purchased and amount
+        # This deduplicates and sums quantities for the same order+sku+amount_description
+        grouping_cols = ["order_id", "posted_date", "sku", "amount_description"]
+        df = df.groupby(grouping_cols, as_index=False).agg({
+            "quantity_purchased": "sum",
+            "amount": "sum"
+        })
+
+        # Get total quantity per order (max across all amount_descriptions to handle any discrepancies)
+        quantity_per_order = df.groupby(["order_id", "posted_date", "sku"])["quantity_purchased"].max().reset_index()
+
+        # Create pivot table WITHOUT quantity_purchased in index to ensure one row per order
         pivot_df = df.pivot_table(
-            index=["order_id", "posted_date", "sku", "quantity_purchased"],
+            index=["order_id", "posted_date", "sku"],
             columns="amount_description",
             values="amount",
             aggfunc="sum",
@@ -2860,6 +2872,13 @@ async def get_settlements_pivot(
         )
 
         pivot_df = pivot_df.reset_index()
+
+        # Merge the quantity back in
+        pivot_df = pivot_df.merge(
+            quantity_per_order,
+            on=["order_id", "posted_date", "sku"],
+            how="left"
+        )
 
         # Calculate Grand Total (sum of all amount columns)
         amount_columns = [
