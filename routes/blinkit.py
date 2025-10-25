@@ -824,6 +824,7 @@ async def upload_inventory_data(
     """
     Optimized inventory data upload with city-level aggregation.
     FIXED: Ensures SKU mapping is applied correctly before aggregation.
+    Supports both old and new inventory file formats.
     """
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(
@@ -832,12 +833,54 @@ async def upload_inventory_data(
         )
 
     try:
+        import re
+
         file_content = await file.read()
+
+        # Detect file format by checking the first row
+        def detect_and_parse_format(file_content):
+            # Read first row to detect format
+            df_check = pd.read_excel(BytesIO(file_content), engine="openpyxl", header=None, nrows=1)
+            first_cell = str(df_check.iloc[0, 0])
+
+            # New format detection: first cell contains timestamp
+            if "This sheet was generated at" in first_cell:
+                logger.info("Detected NEW inventory format")
+
+                # Extract date from timestamp
+                match = re.search(r'(\d{4}-\d{2}-\d{2})', first_cell)
+                if match:
+                    extracted_date = match.group(1)
+                else:
+                    # Fallback to today's date
+                    extracted_date = datetime.now().strftime("%Y-%m-%d")
+
+                logger.info(f"Extracted date from new format: {extracted_date}")
+
+                # Read actual data (skip first 2 rows, row 2 is header)
+                df = pd.read_excel(BytesIO(file_content), engine="openpyxl", skiprows=2)
+
+                # Map new format columns to old format column names
+                if "Warehouse Facility Name" in df.columns:
+                    df["Backend Outlet"] = df["Warehouse Facility Name"]
+                if "Total sellable" in df.columns:
+                    df["Qty"] = df["Total sellable"]
+
+                # Add Date column with extracted date
+                df["Date"] = extracted_date
+
+                return df
+            else:
+                logger.info("Detected OLD inventory format")
+                # Old format: read normally
+                df = pd.read_excel(BytesIO(file_content), engine="openpyxl")
+                return df
 
         with ThreadPoolExecutor() as executor:
             df = await asyncio.get_event_loop().run_in_executor(
                 executor,
-                lambda: pd.read_excel(BytesIO(file_content), engine="openpyxl"),
+                detect_and_parse_format,
+                file_content
             )
 
         # Validate required columns
@@ -846,7 +889,7 @@ async def upload_inventory_data(
             missing = [col for col in required_cols if col not in df.columns]
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Missing required columns: {', '.join(missing)}",
+                detail=f"Missing required columns: {', '.join(missing)}. Available columns: {', '.join(df.columns)}",
             )
 
         inventory_collection = database.get_collection(INVENTORY_COLLECTION)
