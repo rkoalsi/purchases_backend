@@ -908,11 +908,22 @@ async def fetch_stock_data_optimized(
     Optimized stock data fetching with better aggregation pipeline.
     """
     try:
-        stock_collection = db["zoho_stock"]
+        stock_collection = db["zoho_warehouse_stock"]
 
-        # More efficient pipeline
+        # More efficient pipeline - extract Pupscribe warehouse stock
         pipeline = [
             {"$match": {"date": {"$gte": start_datetime, "$lte": end_datetime}}},
+            # Extract Pupscribe warehouse stock from warehouses object
+            {
+                "$addFields": {
+                    "pupscribe_stock": {
+                        "$ifNull": [
+                            "$warehouses.Pupscribe Enterprises Private Limited",
+                            0
+                        ]
+                    }
+                }
+            },
             # Group first, then calculate
             {
                 "$group": {
@@ -922,7 +933,7 @@ async def fetch_stock_data_optimized(
                             "$dateToString": {"format": "%Y-%m-%d", "date": "$date"}
                         },
                     },
-                    "daily_stock": {"$last": "$stock"},  # Last entry of the day
+                    "daily_stock": {"$last": "$pupscribe_stock"},  # Last entry of the day
                 }
             },
             # Re-group to get item-level stats
@@ -1796,7 +1807,7 @@ async def get_data_metadata(
 
         # Get collections
         invoices_collection = db[INVOICES_COLLECTION]
-        stock_collection = db["zoho_stock"]
+        stock_collection = db["zoho_warehouse_stock"]
 
         # OPTIMIZATION: Run both aggregations in parallel
         sales_task = asyncio.create_task(
