@@ -906,13 +906,15 @@ async def fetch_stock_data_optimized(
 ) -> Dict:
     """
     Optimized stock data fetching with better aggregation pipeline.
+    Fetches latest stock snapshot for each item and calculates days in stock
+    from ALL available historical data (not filtered by date range).
     """
     try:
         stock_collection = db["zoho_warehouse_stock"]
 
-        # More efficient pipeline - extract Pupscribe warehouse stock
+        # Modified pipeline - get ALL stock data to calculate days in stock properly
         pipeline = [
-            {"$match": {"date": {"$gte": start_datetime, "$lte": end_datetime}}},
+            # Don't filter by date - we want all historical data for accurate days_in_stock
             # Extract Pupscribe warehouse stock from warehouses object
             {
                 "$addFields": {
@@ -924,36 +926,42 @@ async def fetch_stock_data_optimized(
                     }
                 }
             },
-            # Group first, then calculate
+            # Sort by date descending to get latest stock first
+            {"$sort": {"zoho_item_id": 1, "date": -1}},
+            # Group by item to get latest stock and count days
             {
                 "$group": {
-                    "_id": {
-                        "item_id": "$zoho_item_id",
-                        "date": {
-                            "$dateToString": {"format": "%Y-%m-%d", "date": "$date"}
-                        },
-                    },
-                    "daily_stock": {"$last": "$pupscribe_stock"},  # Last entry of the day
+                    "_id": "$zoho_item_id",
+                    "closing_stock": {"$first": "$pupscribe_stock"},  # Most recent stock
+                    "latest_date": {"$first": "$date"},
+                    "all_stocks": {
+                        "$push": {
+                            "stock": "$pupscribe_stock",
+                            "date": "$date"
+                        }
+                    }
                 }
             },
-            # Re-group to get item-level stats
+            # Calculate days in stock from historical data
             {
-                "$group": {
-                    "_id": "$_id.item_id",
-                    "closing_stock": {
-                        "$last": "$daily_stock"
-                    },  # Most recent day's stock
-                    "stock_days": {
-                        "$sum": {"$cond": [{"$gt": ["$daily_stock", 0]}, 1, 0]}
-                    },
-                    "all_daily_stocks": {"$push": "$daily_stock"},
+                "$addFields": {
+                    "total_days_in_stock": {
+                        "$size": {
+                            "$filter": {
+                                "input": "$all_stocks",
+                                "as": "item",
+                                "cond": {"$gt": ["$$item.stock", 0]}
+                            }
+                        }
+                    }
                 }
             },
             {
                 "$project": {
                     "_id": 1,
                     "closing_stock": 1,
-                    "total_days_in_stock": "$stock_days",
+                    "total_days_in_stock": 1,
+                    "latest_date": 1
                 }
             },
         ]
@@ -973,7 +981,7 @@ async def fetch_stock_data_optimized(
                 "total_days_in_stock": doc.get("total_days_in_stock", 0),
             }
 
-        logger.info(f"Fetched {len(stock_data)} stock records")
+        logger.info(f"Fetched {len(stock_data)} stock records (latest snapshots)")
         return stock_data
 
     except Exception as e:
@@ -1977,20 +1985,18 @@ async def get_sales_metadata_optimized(
 
 
 async def get_inventory_metadata_optimized(
-    collection, start_datetime: Optional[datetime], end_datetime: Optional[datetime]
+    collection, start_datetime: Optional[datetime] = None, end_datetime: Optional[datetime] = None
 ) -> Dict[str, Any]:
     """
     Optimized inventory metadata retrieval.
+    Returns the actual date range available in the collection (not filtered by user's date selection).
+    Note: start_datetime and end_datetime parameters are kept for API compatibility but not used.
     """
     try:
-        # Build match condition
-        match_condition = {}
-        if start_datetime and end_datetime:
-            match_condition = {"date": {"$gte": start_datetime, "$lte": end_datetime}}
-
+        # Don't filter by date - show the actual available data range
         # OPTIMIZATION: Single aggregation for all metrics
         pipeline = [
-            {"$match": match_condition} if match_condition else {"$match": {}},
+            {"$match": {}},  # No date filter - get all available data
             {
                 "$group": {
                     "_id": None,
