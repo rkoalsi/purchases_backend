@@ -2795,15 +2795,18 @@ async def get_settlements_pivot(
 ):
     """Get Amazon settlements data in pivot table format."""
     try:
+        collection = db["amazon_settlements"]
+
         # Build MongoDB query
         query = {}
 
+        # Step 1: If date range is specified, first find all order_ids within that range
         if start_date or end_date:
-            query["posted_date"] = {}
+            date_query = {}
             if start_date:
                 try:
                     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-                    query["posted_date"]["$gte"] = start_dt
+                    date_query["$gte"] = start_dt
                 except ValueError:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
@@ -2812,21 +2815,27 @@ async def get_settlements_pivot(
             if end_date:
                 try:
                     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-                    query["posted_date"]["$lte"] = end_dt
+                    date_query["$lte"] = end_dt
                 except ValueError:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="Invalid end_date format. Use YYYY-MM-DD",
                     )
 
+            # Find all order_ids that have at least one record in the date range
+            orders_in_range = collection.distinct("order_id", {"posted_date": date_query})
+
+            # Now fetch ALL records for those orders (regardless of date)
+            query["order_id"] = {"$in": orders_in_range}
+
         if sku:
             query["sku"] = sku
 
         if order_id:
+            # If specific order_id is provided, override the date-based order filtering
             query["order_id"] = order_id
 
         # Fetch data from MongoDB
-        collection = db["amazon_settlements"]
         cursor = collection.find(query)
         settlements = list(cursor)
 
@@ -2841,30 +2850,27 @@ async def get_settlements_pivot(
         df = df[
             [
                 "order_id",
-                "posted_date",
                 "sku",
                 "quantity_purchased",
                 "amount_description",
                 "amount",
             ]
         ]
-        df["posted_date"] = pd.to_datetime(df["posted_date"]).dt.strftime("%Y-%m-%d")
 
-        # Check for and handle duplicate documents
-        # Group by all fields except we aggregate quantity_purchased and amount
-        # This deduplicates and sums quantities for the same order+sku+amount_description
-        grouping_cols = ["order_id", "posted_date", "sku", "amount_description"]
+        # Group by order+sku+amount_description and sum quantities and amounts
+        # This aggregates all records across ALL dates for the same order
+        grouping_cols = ["order_id", "sku", "amount_description"]
         df = df.groupby(grouping_cols, as_index=False).agg({
             "quantity_purchased": "sum",
             "amount": "sum"
         })
 
         # Get total quantity per order (max across all amount_descriptions to handle any discrepancies)
-        quantity_per_order = df.groupby(["order_id", "posted_date", "sku"])["quantity_purchased"].max().reset_index()
+        quantity_per_order = df.groupby(["order_id", "sku"])["quantity_purchased"].max().reset_index()
 
-        # Create pivot table WITHOUT quantity_purchased in index to ensure one row per order
+        # Create pivot table - one row per order+sku
         pivot_df = df.pivot_table(
-            index=["order_id", "posted_date", "sku"],
+            index=["order_id", "sku"],
             columns="amount_description",
             values="amount",
             aggfunc="sum",
@@ -2876,7 +2882,7 @@ async def get_settlements_pivot(
         # Merge the quantity back in
         pivot_df = pivot_df.merge(
             quantity_per_order,
-            on=["order_id", "posted_date", "sku"],
+            on=["order_id", "sku"],
             how="left"
         )
 
@@ -2884,15 +2890,15 @@ async def get_settlements_pivot(
         amount_columns = [
             col
             for col in pivot_df.columns
-            if col not in ["order_id", "posted_date", "sku", "quantity_purchased"]
+            if col not in ["order_id", "sku", "quantity_purchased"]
         ]
         pivot_df["Grand Total"] = pivot_df[amount_columns].sum(axis=1)
 
         # 🔧 FIX: Replace NaN/inf values with None for JSON serialization
         pivot_df = pivot_df.replace([float("nan"), float("inf"), float("-inf")], None)
 
-        # Sort by posted_date
-        pivot_df = pivot_df.sort_values("posted_date", ascending=False)
+        # Sort by order_id
+        pivot_df = pivot_df.sort_values("order_id", ascending=False)
 
         # Format response based on requested format
         if format.lower() == "excel":
@@ -3009,20 +3015,28 @@ async def get_settlements_summary(
     Returns summary totals grouped by the specified field.
     """
     try:
+        collection = db["amazon_settlements"]
+
         # Build match stage
         match_stage = {}
 
+        # Step 1: If date range is specified, first find all order_ids within that range
         if start_date or end_date:
-            match_stage["posted_date"] = {}
+            date_query = {}
             if start_date:
                 start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-                match_stage["posted_date"]["$gte"] = start_dt
+                date_query["$gte"] = start_dt
             if end_date:
                 end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-                match_stage["posted_date"]["$lte"] = end_dt
+                date_query["$lte"] = end_dt
+
+            # Find all order_ids that have at least one record in the date range
+            orders_in_range = collection.distinct("order_id", {"posted_date": date_query})
+
+            # Now match ALL records for those orders (regardless of date)
+            match_stage["order_id"] = {"$in": orders_in_range}
 
         # Build aggregation pipeline
-        collection = db["amazon_settlements"]
 
         group_field_map = {
             "amount_description": "$amount_description",
