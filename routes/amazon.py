@@ -1536,9 +1536,6 @@ async def get_ledger_summary(
 
 @router.get("/get_amazon_sku_mapping")
 async def get_sku_mapping(database=Depends(get_database)):
-    """
-    Retrieves all documents from the SKU mapping collection.
-    """
     try:
         sku_collection = database.get_collection(SKU_COLLECTION)
         sku_documents = serialize_mongo_document(
