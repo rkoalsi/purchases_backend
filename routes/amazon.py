@@ -64,8 +64,10 @@ def get_amazon_token() -> str:
         and _sc_token_expires_at
         and datetime.now() < (_sc_token_expires_at - timedelta(minutes=5))
     ):
+        logger.info("Using cached access token")
         return _sc_access_token
 
+    logger.info("Requesting new access token from Amazon")
     try:
         payload = {
             "grant_type": GRANT_TYPE,
@@ -84,11 +86,22 @@ def get_amazon_token() -> str:
         expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
         _sc_token_expires_at = datetime.now() + timedelta(seconds=expires_in)
 
-        logger.info("Successfully obtained new Amazon SP API token")
+        logger.info(f"Successfully obtained new Amazon SP API token (expires in {expires_in}s)")
+        logger.info(f"Token prefix: {_sc_access_token[:20]}..." if _sc_access_token else "No token received")
         return _sc_access_token
 
     except requests.exceptions.RequestException as e:
+        # Log detailed error information
         logger.error(f"Error getting Amazon token: {e}")
+
+        # Try to get error response body if available
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_body = e.response.json()
+                logger.error(f"Token error response: {json.dumps(error_body, indent=2)}")
+            except:
+                logger.error(f"Token error response text: {e.response.text}")
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to authenticate with Amazon SP API: {str(e)}",
@@ -125,7 +138,27 @@ def make_sp_api_request(
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"SP API request failed: {e}")
+        # Log detailed error information
+        error_details = {
+            "error": str(e),
+            "url": url,
+            "method": method,
+        }
+
+        # Try to get error response body if available
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_body = e.response.json()
+                error_details["response_body"] = error_body
+                logger.error(f"SP API request failed: {e}")
+                logger.error(f"Response body: {json.dumps(error_body, indent=2)}")
+            except:
+                error_details["response_text"] = e.response.text
+                logger.error(f"SP API request failed: {e}")
+                logger.error(f"Response text: {e.response.text}")
+        else:
+            logger.error(f"SP API request failed: {e}")
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Amazon SP API request failed: {str(e)}",

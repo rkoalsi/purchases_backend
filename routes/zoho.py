@@ -906,15 +906,22 @@ async def fetch_stock_data_optimized(
 ) -> Dict:
     """
     Optimized stock data fetching with better aggregation pipeline.
-    Fetches latest stock snapshot for each item and calculates days in stock
-    from ALL available historical data (not filtered by date range).
+    - Requires zoho_item_id field in stock records (run migration script first)
+    - Closing Stock: Most recent stock value on or before end_date
+    - Days in Stock: Count of days within date range where stock > 0
     """
     try:
         stock_collection = db["zoho_warehouse_stock"]
 
-        # Modified pipeline - get ALL stock data to calculate days in stock properly
+        # Get stock data up to end date (not filtered by start date for closing stock accuracy)
         pipeline = [
-            # Don't filter by date - we want all historical data for accurate days_in_stock
+            # Filter: Get all records up to end_date (needed for accurate closing stock)
+            {
+                "$match": {
+                    "date": {"$lte": end_datetime},
+                    "zoho_item_id": {"$exists": True}  # Only process records with item_id
+                }
+            },
             # Extract Pupscribe warehouse stock from warehouses object
             {
                 "$addFields": {
@@ -926,13 +933,13 @@ async def fetch_stock_data_optimized(
                     }
                 }
             },
-            # Sort by date descending to get latest stock first
+            # Sort by item_id and date descending to get latest stock first
             {"$sort": {"zoho_item_id": 1, "date": -1}},
-            # Group by item to get latest stock and count days
+            # Group by item_id
             {
                 "$group": {
                     "_id": "$zoho_item_id",
-                    "closing_stock": {"$first": "$pupscribe_stock"},  # Most recent stock
+                    "closing_stock": {"$first": "$pupscribe_stock"},  # Most recent stock <= end_date
                     "latest_date": {"$first": "$date"},
                     "all_stocks": {
                         "$push": {
@@ -942,7 +949,7 @@ async def fetch_stock_data_optimized(
                     }
                 }
             },
-            # Calculate days in stock from historical data
+            # Calculate days in stock ONLY within the specified date range
             {
                 "$addFields": {
                     "total_days_in_stock": {
@@ -950,7 +957,13 @@ async def fetch_stock_data_optimized(
                             "$filter": {
                                 "input": "$all_stocks",
                                 "as": "item",
-                                "cond": {"$gt": ["$$item.stock", 0]}
+                                "cond": {
+                                    "$and": [
+                                        {"$gte": ["$$item.date", start_datetime]},
+                                        {"$lte": ["$$item.date", end_datetime]},
+                                        {"$gt": ["$$item.stock", 0]}
+                                    ]
+                                }
                             }
                         }
                     }
@@ -981,7 +994,7 @@ async def fetch_stock_data_optimized(
                 "total_days_in_stock": doc.get("total_days_in_stock", 0),
             }
 
-        logger.info(f"Fetched {len(stock_data)} stock records (latest snapshots)")
+        logger.info(f"Fetched {len(stock_data)} stock records with zoho_item_id for date range up to {end_datetime.date()}")
         return stock_data
 
     except Exception as e:
@@ -1487,7 +1500,7 @@ async def get_sales_report_fast(
 
         # Process in batches for better memory management
         batch = []
-        batch_size = 100
+        batch_size = 500  # Increased for better performance
 
         for item in result_cursor:
             batch.append(item)
@@ -1629,7 +1642,7 @@ async def download_sales_report(
         total_closing_stock = 0
 
         batch = []
-        batch_size = 100
+        batch_size = 500  # Increased for better performance
 
         for item in result_cursor:
             batch.append(item)
