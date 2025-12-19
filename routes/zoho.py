@@ -2220,6 +2220,15 @@ async def get_estimates_vs_invoices(
     """
     Compare estimates and invoices line items to calculate fill rate per item.
 
+    Composite items are automatically expanded into their individual components.
+    For example, if an estimate has 2 units of a combo product containing:
+    - 1x Item A
+    - 2x Item B
+
+    This will be expanded to:
+    - 2 units of Item A
+    - 4 units of Item B
+
     Args:
         start_date: Start date for the report
         end_date: End date for the report
@@ -2281,7 +2290,7 @@ async def get_estimates_vs_invoices(
         logger.info(f"Fetching estimates from {start_date} to {end_date}")
         logger.info(f"Estimates query: {estimates_query}")
 
-        # Use aggregation to deduplicate estimates - take latest version of each estimate_id
+        # Use aggregation to deduplicate estimates and handle composite items
         estimates_pipeline = [
             {"$match": estimates_query},
             {"$sort": {"_id": -1}},  # Sort by _id descending (latest first)
@@ -2290,13 +2299,72 @@ async def get_estimates_vs_invoices(
                 "latest": {"$first": "$$ROOT"}  # Take first (latest) document
             }},
             {"$replaceRoot": {"newRoot": "$latest"}},  # Replace root with the latest document
-            {"$project": {"line_items": 1}}  # Only fetch needed fields
+            {"$unwind": "$line_items"},  # Unwind line items to process each one
+            # Lookup composite products by name
+            {
+                "$lookup": {
+                    "from": "composite_products",
+                    "localField": "line_items.name",
+                    "foreignField": "name",
+                    "as": "composite_match",
+                }
+            },
+            # Check if item is composite
+            {
+                "$addFields": {
+                    "is_composite": {"$gt": [{"$size": "$composite_match"}, 0]},
+                    "composite_info": {"$arrayElemAt": ["$composite_match", 0]},
+                }
+            },
+            # Expand composite items or keep regular items
+            {
+                "$project": {
+                    "items_to_process": {
+                        "$cond": [
+                            # If it's a composite item
+                            "$is_composite",
+                            # Then: create array of component items
+                            {
+                                "$map": {
+                                    "input": "$composite_info.components",
+                                    "as": "component",
+                                    "in": {
+                                        "item_id": "$$component.item_id",
+                                        "name": "$$component.name",
+                                        "sku": "$$component.sku_code",
+                                        # Multiply original quantity by component quantity
+                                        "quantity": {
+                                            "$multiply": [
+                                                "$line_items.quantity",
+                                                "$$component.quantity",
+                                            ]
+                                        },
+                                        "item_custom_fields": [],
+                                    },
+                                }
+                            },
+                            # Else: keep as single regular item
+                            [
+                                {
+                                    "item_id": "$line_items.item_id",
+                                    "name": "$line_items.name",
+                                    "sku": "$line_items.sku",
+                                    "quantity": "$line_items.quantity",
+                                    "item_custom_fields": "$line_items.item_custom_fields",
+                                }
+                            ],
+                        ]
+                    }
+                }
+            },
+            {"$unwind": "$items_to_process"},
+            {"$replaceRoot": {"newRoot": "$items_to_process"}},
         ]
         estimates = list(estimates_collection.aggregate(estimates_pipeline))
 
         logger.info(f"Fetching invoices from {start_date} to {end_date}")
 
-        # Use aggregation to deduplicate invoices - take latest version of each invoice_id
+        # Use aggregation to deduplicate invoices and handle composite items
         invoices_pipeline = [
             {"$match": invoices_query},
             {"$sort": {"_id": -1}},  # Sort by _id descending (latest first)
@@ -2305,14 +2373,73 @@ async def get_estimates_vs_invoices(
                 "latest": {"$first": "$$ROOT"}  # Take first (latest) document
             }},
             {"$replaceRoot": {"newRoot": "$latest"}},  # Replace root with the latest document
-            {"$project": {"line_items": 1}}  # Only fetch needed fields
+            {"$unwind": "$line_items"},  # Unwind line items to process each one
+            # Lookup composite products by name
+            {
+                "$lookup": {
+                    "from": "composite_products",
+                    "localField": "line_items.name",
+                    "foreignField": "name",
+                    "as": "composite_match",
+                }
+            },
+            # Check if item is composite
+            {
+                "$addFields": {
+                    "is_composite": {"$gt": [{"$size": "$composite_match"}, 0]},
+                    "composite_info": {"$arrayElemAt": ["$composite_match", 0]},
+                }
+            },
+            # Expand composite items or keep regular items
+            {
+                "$project": {
+                    "items_to_process": {
+                        "$cond": [
+                            # If it's a composite item
+                            "$is_composite",
+                            # Then: create array of component items
+                            {
+                                "$map": {
+                                    "input": "$composite_info.components",
+                                    "as": "component",
+                                    "in": {
+                                        "item_id": "$$component.item_id",
+                                        "name": "$$component.name",
+                                        "sku": "$$component.sku_code",
+                                        # Multiply original quantity by component quantity
+                                        "quantity": {
+                                            "$multiply": [
+                                                "$line_items.quantity",
+                                                "$$component.quantity",
+                                            ]
+                                        },
+                                        "item_custom_fields": [],
+                                    },
+                                }
+                            },
+                            # Else: keep as single regular item
+                            [
+                                {
+                                    "item_id": "$line_items.item_id",
+                                    "name": "$line_items.name",
+                                    "sku": "$line_items.sku",
+                                    "quantity": "$line_items.quantity",
+                                    "item_custom_fields": "$line_items.item_custom_fields",
+                                }
+                            ],
+                        ]
+                    }
+                }
+            },
+            {"$unwind": "$items_to_process"},
+            {"$replaceRoot": {"newRoot": "$items_to_process"}},
         ]
         invoices = list(invoices_collection.aggregate(invoices_pipeline))
 
-        logger.info(f"Found {len(estimates)} unique estimates and {len(invoices)} unique invoices")
+        logger.info(f"Found {len(estimates)} line items from estimates and {len(invoices)} line items from invoices (composite items expanded)")
 
         # Debug logging for specific item
-        logger.info(f"Debugging estimates aggregation...")
+        logger.info(f"Processing aggregated line items with composite expansion...")
 
         # Get warehouse stock collection
         warehouse_stock_collection = db["zoho_warehouse_stock"]
@@ -2325,58 +2452,54 @@ async def get_estimates_vs_invoices(
                     return field.get("value", "")
             return item.get("sku", "")
 
-        # Aggregate line items from estimates
+        # Aggregate line items from estimates (already expanded by pipeline)
         estimate_items = {}
         debug_item_name = ""
         debug_total = 0
 
-        for estimate in estimates:
-            line_items = estimate.get("line_items", [])
-            for item in line_items:
-                item_id = item.get("item_id")
-                if not item_id:
-                    continue
+        for item in estimates:
+            item_id = item.get("item_id")
+            if not item_id:
+                continue
 
-                quantity = item.get("quantity", 0)
-                item_name = item.get("name", "")
+            quantity = item.get("quantity", 0)
+            item_name = item.get("name", "")
 
-                # Debug logging for specific item
-                if debug_item_name in item_name:
-                    debug_total += quantity
-                    logger.info(f"Found estimate for {item_name}: qty={quantity}, running total={debug_total}")
+            # Debug logging for specific item
+            if debug_item_name in item_name:
+                debug_total += quantity
+                logger.info(f"Found estimate for {item_name}: qty={quantity}, running total={debug_total}")
 
-                if item_id not in estimate_items:
-                    estimate_items[item_id] = {
-                        "item_id": item_id,
-                        "item_name": item_name,
-                        "sku": get_cf_sku_code(item),
-                        "estimated_quantity": 0,
-                    }
+            if item_id not in estimate_items:
+                estimate_items[item_id] = {
+                    "item_id": item_id,
+                    "item_name": item_name,
+                    "sku": get_cf_sku_code(item),
+                    "estimated_quantity": 0,
+                }
 
-                estimate_items[item_id]["estimated_quantity"] += quantity
+            estimate_items[item_id]["estimated_quantity"] += quantity
 
         logger.info(f"Total estimated quantity for {debug_item_name}: {debug_total}")
 
-        # Aggregate line items from invoices
+        # Aggregate line items from invoices (already expanded by pipeline)
         invoice_items = {}
-        for invoice in invoices:
-            line_items = invoice.get("line_items", [])
-            for item in line_items:
-                item_id = item.get("item_id")
-                if not item_id:
-                    continue
+        for item in invoices:
+            item_id = item.get("item_id")
+            if not item_id:
+                continue
 
-                quantity = item.get("quantity", 0)
+            quantity = item.get("quantity", 0)
 
-                if item_id not in invoice_items:
-                    invoice_items[item_id] = {
-                        "item_id": item_id,
-                        "item_name": item.get("name", ""),
-                        "sku": get_cf_sku_code(item),
-                        "invoiced_quantity": 0,
-                    }
+            if item_id not in invoice_items:
+                invoice_items[item_id] = {
+                    "item_id": item_id,
+                    "item_name": item.get("name", ""),
+                    "sku": get_cf_sku_code(item),
+                    "invoiced_quantity": 0,
+                }
 
-                invoice_items[item_id]["invoiced_quantity"] += quantity
+            invoice_items[item_id]["invoiced_quantity"] += quantity
 
         # Get closing stock for all items on end_date
         all_item_ids = set(estimate_items.keys()) | set(invoice_items.keys())
