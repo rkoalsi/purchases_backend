@@ -551,7 +551,10 @@ def get_item_names_by_brand(db, brand: str) -> List[str]:
 
             # Cache the result
             with _cache_lock:
-                _item_name_cache[brand] = {"item_names": item_names, "timestamp": current_time}
+                _item_name_cache[brand] = {
+                    "item_names": item_names,
+                    "timestamp": current_time,
+                }
 
             logger.info(f"Found {len(item_names)} item names for brand {brand}")
             return item_names
@@ -564,6 +567,7 @@ def get_item_names_by_brand(db, brand: str) -> List[str]:
         raise HTTPException(
             status_code=500, detail=f"Error retrieving item names for brand {brand}"
         )
+
 
 def query_invoices_for_item_names(
     db,
@@ -585,10 +589,10 @@ def query_invoices_for_item_names(
         "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
         "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
     ]
-    
+
     try:
         invoices_collection = db.get_collection(INVOICES_COLLECTION)
-        
+
         match_statement = (
             {
                 "$match": {
@@ -601,11 +605,7 @@ def query_invoices_for_item_names(
                     "status": {"$nin": ["draft", "void"]},
                     "customer_name": {"$nin": customer_list},
                     # Much simpler - just match item names directly
-                    "line_items": {
-                        "$elemMatch": {
-                            "name": {"$in": item_names}
-                        }
-                    },
+                    "line_items": {"$elemMatch": {"name": {"$in": item_names}}},
                 }
             }
             if exclude_customers
@@ -619,11 +619,7 @@ def query_invoices_for_item_names(
                     },
                     "status": {"$nin": ["draft", "void"]},
                     # Just match item names
-                    "line_items": {
-                        "$elemMatch": {
-                            "name": {"$in": item_names}
-                        }
-                    },
+                    "line_items": {"$elemMatch": {"name": {"$in": item_names}}},
                 }
             }
         )
@@ -632,7 +628,6 @@ def query_invoices_for_item_names(
         pipeline = [
             # Stage 1: Match documents
             match_statement,
-            
             # Stage 2: Filter line items to only matching ones
             {
                 "$addFields": {
@@ -640,15 +635,13 @@ def query_invoices_for_item_names(
                         "$filter": {
                             "input": "$line_items",
                             "as": "item",
-                            "cond": {"$in": ["$$item.name", item_names]}
+                            "cond": {"$in": ["$$item.name", item_names]},
                         }
                     }
                 }
             },
-            
             # Stage 3: Unwind matching items
             {"$unwind": "$_matchingItems"},
-            
             # Stage 4: Project final fields - much simpler!
             {
                 "$project": {
@@ -663,12 +656,12 @@ def query_invoices_for_item_names(
                             "$_matchingItems.sku",  # Try direct SKU field first
                             {
                                 "$arrayElemAt": [
-                                    "$_matchingItems.item_custom_fields.value", 
-                                    0
+                                    "$_matchingItems.item_custom_fields.value",
+                                    0,
                                 ]
-                            }  # Fallback to custom fields if available
+                            },  # Fallback to custom fields if available
                         ]
-                    }
+                    },
                 }
             },
         ]
@@ -901,6 +894,107 @@ from functools import lru_cache
 executor = ThreadPoolExecutor(max_workers=4)
 
 
+async def fetch_stock_data_for_items(
+    db, start_datetime: datetime, end_datetime: datetime, item_ids: list
+) -> Dict:
+    """
+    Fetch stock data ONLY for specific items (not all items in database).
+    This is MUCH faster than scanning all 4.3M records.
+
+    Args:
+        db: Database connection
+        start_datetime: Start date for days in stock calculation
+        end_datetime: End date for closing stock
+        item_ids: List of zoho_item_ids to fetch stock for
+
+    Returns:
+        Dict mapping item_id to {closing_stock, total_days_in_stock}
+    """
+    try:
+        stock_collection = db["zoho_warehouse_stock"]
+
+        logger.info(
+            f"Fetching stock for {len(item_ids)} specific items up to {end_datetime.date()}"
+        )
+
+        # CRITICAL OPTIMIZATION: Only query stock for items that have sales
+        pipeline = [
+            # Match ONLY the specific items we need
+            {
+                "$match": {
+                    "zoho_item_id": {"$in": item_ids},  # ONLY these items!
+                    "date": {"$lte": end_datetime},
+                }
+            },
+            # Project only needed fields early
+            {
+                "$project": {
+                    "zoho_item_id": 1,
+                    "date": 1,
+                    "pupscribe_stock": {
+                        "$ifNull": [
+                            "$warehouses.Pupscribe Enterprises Private Limited",
+                            0,
+                        ]
+                    },
+                }
+            },
+            # Sort by item and date descending
+            {"$sort": {"zoho_item_id": 1, "date": -1}},
+            # Group and calculate using $sum (no arrays)
+            {
+                "$group": {
+                    "_id": "$zoho_item_id",
+                    "closing_stock": {"$first": "$pupscribe_stock"},
+                    "latest_date": {"$first": "$date"},
+                    "total_days_in_stock": {
+                        "$sum": {
+                            "$cond": {
+                                "if": {
+                                    "$and": [
+                                        {"$gte": ["$date", start_datetime]},
+                                        {"$lte": ["$date", end_datetime]},
+                                        {"$gt": ["$pupscribe_stock", 0]},
+                                    ]
+                                },
+                                "then": 1,
+                                "else": 0,
+                            }
+                        }
+                    },
+                }
+            },
+            {
+                "$project": {
+                    "_id": 1,
+                    "closing_stock": 1,
+                    "total_days_in_stock": 1,
+                    "latest_date": 1,
+                }
+            },
+        ]
+
+        # Execute with optimized settings
+        cursor = stock_collection.aggregate(
+            pipeline, allowDiskUse=True, batchSize=10000
+        )
+
+        # Convert to dictionary
+        stock_data = {}
+        for doc in cursor:
+            stock_data[doc["_id"]] = {
+                "closing_stock": doc.get("closing_stock", 0),
+                "total_days_in_stock": doc.get("total_days_in_stock", 0),
+            }
+
+        logger.info(f"Fetched stock data for {len(stock_data)} items")
+        return stock_data
+
+    except Exception as e:
+        logger.error(f"Error fetching stock data for items: {e}")
+        return {}
+
+
 async def fetch_stock_data_optimized(
     db, start_datetime: datetime, end_datetime: datetime
 ) -> Dict:
@@ -909,81 +1003,91 @@ async def fetch_stock_data_optimized(
     - Requires zoho_item_id field in stock records (run migration script first)
     - Closing Stock: Most recent stock value on or before end_date
     - Days in Stock: Count of days within date range where stock > 0
+
+    Performance optimizations:
+    - Limits lookback to 730 days (2 years) before start date for closing stock
+    - Uses $sum instead of $push to avoid building arrays
+    - Early projection to reduce data processing
     """
     try:
         stock_collection = db["zoho_warehouse_stock"]
 
-        # Get stock data up to end date (not filtered by start date for closing stock accuracy)
+        # PERFORMANCE: Limit lookback to 2 years for closing stock
+        lookback_limit = start_datetime - timedelta(days=730)
+
+        logger.info(
+            f"Fetching stock data from {lookback_limit.date()} to {end_datetime.date()}"
+        )
+
+        # Highly optimized pipeline using $sum instead of $push to avoid building arrays
         pipeline = [
-            # Filter: Get all records up to end_date (needed for accurate closing stock)
+            # OPTIMIZATION 1: Filter with 2-year lookback limit
             {
                 "$match": {
-                    "date": {"$lte": end_datetime},
-                    "zoho_item_id": {"$exists": True}  # Only process records with item_id
+                    "date": {
+                        "$gte": lookback_limit,  # 2 years lookback
+                        "$lte": end_datetime,
+                    },
+                    "zoho_item_id": {"$exists": True, "$ne": None},
                 }
             },
-            # Extract Pupscribe warehouse stock from warehouses object
+            # OPTIMIZATION 2: Project only needed fields and compute pupscribe_stock early
             {
-                "$addFields": {
+                "$project": {
+                    "zoho_item_id": 1,
+                    "date": 1,
                     "pupscribe_stock": {
                         "$ifNull": [
                             "$warehouses.Pupscribe Enterprises Private Limited",
-                            0
+                            0,
                         ]
-                    }
+                    },
                 }
             },
-            # Sort by item_id and date descending to get latest stock first
+            # OPTIMIZATION 3: Sort by item and date descending (latest first)
             {"$sort": {"zoho_item_id": 1, "date": -1}},
-            # Group by item_id
+            # OPTIMIZATION 4: Group and use $sum for days calculation (no arrays!)
             {
                 "$group": {
                     "_id": "$zoho_item_id",
-                    "closing_stock": {"$first": "$pupscribe_stock"},  # Most recent stock <= end_date
+                    "closing_stock": {
+                        "$first": "$pupscribe_stock"
+                    },  # Most recent stock
                     "latest_date": {"$first": "$date"},
-                    "all_stocks": {
-                        "$push": {
-                            "stock": "$pupscribe_stock",
-                            "date": "$date"
-                        }
-                    }
-                }
-            },
-            # Calculate days in stock ONLY within the specified date range
-            {
-                "$addFields": {
+                    # Count days in stock using $sum instead of $push
                     "total_days_in_stock": {
-                        "$size": {
-                            "$filter": {
-                                "input": "$all_stocks",
-                                "as": "item",
-                                "cond": {
+                        "$sum": {
+                            "$cond": {
+                                "if": {
                                     "$and": [
-                                        {"$gte": ["$$item.date", start_datetime]},
-                                        {"$lte": ["$$item.date", end_datetime]},
-                                        {"$gt": ["$$item.stock", 0]}
+                                        {"$gte": ["$date", start_datetime]},
+                                        {"$lte": ["$date", end_datetime]},
+                                        {"$gt": ["$pupscribe_stock", 0]},
                                     ]
-                                }
+                                },
+                                "then": 1,
+                                "else": 0,
                             }
                         }
-                    }
+                    },
                 }
             },
+            # OPTIMIZATION 5: Final projection
             {
                 "$project": {
                     "_id": 1,
                     "closing_stock": 1,
                     "total_days_in_stock": 1,
-                    "latest_date": 1
+                    "latest_date": 1,
                 }
             },
         ]
 
-        # Use cursor with batch processing
+        # Use cursor with optimized settings
         cursor = stock_collection.aggregate(
             pipeline,
             allowDiskUse=True,
-            batchSize=5000,  # Large batch for better performance
+            batchSize=10000,  # Larger batch for better throughput
         )
 
         # Convert to dictionary efficiently
@@ -994,7 +1098,9 @@ async def fetch_stock_data_optimized(
                 "total_days_in_stock": doc.get("total_days_in_stock", 0),
             }
 
-        logger.info(f"Fetched {len(stock_data)} stock records with zoho_item_id for date range up to {end_datetime.date()}")
+        logger.info(
+            f"Fetched {len(stock_data)} stock records with zoho_item_id for date range {start_datetime.date()} to {end_datetime.date()}"
+        )
         return stock_data
 
     except Exception as e:
@@ -1345,8 +1451,8 @@ def build_optimized_pipeline_with_credit_notes_and_composites(
                 "credit_note_units": 1,
                 "invoice_amount": 1,
                 "credit_note_amount": 1,
-                "total_units_sold": "$invoice_units",  
-                "total_units_returned": "$credit_note_units", 
+                "total_units_sold": "$invoice_units",
+                "total_units_returned": "$credit_note_units",
                 "total_amount": "$invoice_amount",
                 "invoice_numbers": {
                     "$filter": {
@@ -1459,7 +1565,7 @@ async def get_sales_report_fast(
         )
         start_time = datetime.now()
 
-        # OPTIMIZATION 1: Run stock and products fetching in parallel (same as before)
+        # OPTIMIZATION 1: Run stock and products fetching in parallel with 2-year lookback
         stock_task = asyncio.create_task(
             fetch_stock_data_optimized(db, start_datetime, end_datetime)
         )
@@ -1792,69 +1898,62 @@ import asyncio
 
 @router.get("/data-metadata")
 async def get_data_metadata(
-    start_date: str = Query(
-        None, description="Start date in YYYY-MM-DD format (optional)"
-    ),
-    end_date: str = Query(None, description="End date in YYYY-MM-DD format (optional)"),
+    start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
+    end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
     db=Depends(get_database),
 ):
     """
-    Optimized metadata retrieval for sales and inventory collections.
+    Get metadata for the SELECTED date range (not overall data availability).
     """
 
     try:
-        logger.info(f"Fetching optimized data metadata")
-        if start_date and end_date:
-            logger.info(f"Date range filter: {start_date} to {end_date}")
+        # Validate dates
+        try:
+            start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
+            end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
 
-        # Validate dates if provided
-        start_datetime = None
-        end_datetime = None
-        if start_date and end_date:
-            try:
-                start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
-                end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
-
-                if start_datetime > end_datetime:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="End date must be after start date",
-                    )
-            except ValueError:
+            if start_datetime > end_datetime:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid date format. Use YYYY-MM-DD",
+                    detail="End date must be after start date",
                 )
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid date format. Use YYYY-MM-DD",
+            )
 
         # Get collections
         invoices_collection = db[INVOICES_COLLECTION]
         stock_collection = db["zoho_warehouse_stock"]
 
-        # OPTIMIZATION: Run both aggregations in parallel
-        sales_task = asyncio.create_task(
-            get_sales_metadata_optimized(
-                invoices_collection, start_date, end_date, start_datetime, end_datetime
-            )
-        )
-        inventory_task = asyncio.create_task(
-            get_inventory_metadata_optimized(
-                stock_collection, start_datetime, end_datetime
-            )
+        # Query inventory and sales data for the SELECTED date range
+        inventory_count = await asyncio.to_thread(
+            stock_collection.count_documents,
+            {"date": {"$gte": start_datetime, "$lte": end_datetime}},
         )
 
-        # Wait for both tasks to complete
-        sales_metadata, inventory_metadata = await asyncio.gather(
-            sales_task, inventory_task
+        invoice_count = await asyncio.to_thread(
+            invoices_collection.count_documents,
+            {"date": {"$gte": start_date, "$lte": end_date}},
         )
 
-        # Prepare response
+        # Return metadata for selected date range
         metadata = {
-            "sales_data": sales_metadata,
-            "inventory_data": inventory_metadata,
+            "inventory_data": {
+                "first_inventory_date": start_date,
+                "last_inventory_date": end_date,
+                "total_stock_records": inventory_count,
+            },
+            "sales_data": {
+                "first_sales_date": start_date,
+                "last_sales_date": end_date,
+                "valid_invoices": invoice_count,
+            },
             "date_range": {
                 "start_date": start_date,
                 "end_date": end_date,
-                "filtered": bool(start_date and end_date),
+                "filtered": True,
             },
             "last_updated": datetime.now().isoformat(),
         }
@@ -1864,8 +1963,8 @@ async def get_data_metadata(
                 "data": metadata,
                 "meta": {
                     "timestamp": datetime.now().isoformat(),
-                    "query_type": "optimized_data_metadata",
-                    "date_filtered": bool(start_date and end_date),
+                    "query_type": "date_range_filtered_metadata",
+                    "date_filtered": True,
                 },
             }
         )
@@ -1998,7 +2097,9 @@ async def get_sales_metadata_optimized(
 
 
 async def get_inventory_metadata_optimized(
-    collection, start_datetime: Optional[datetime] = None, end_datetime: Optional[datetime] = None
+    collection,
+    start_datetime: Optional[datetime] = None,
+    end_datetime: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
     Optimized inventory metadata retrieval.
@@ -2108,3 +2209,307 @@ async def get_data_metadata_cached(
         return JSONResponse(content=content)
 
     return response
+
+
+@router.get("/estimates-vs-invoices")
+async def get_estimates_vs_invoices(
+    start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
+    end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
+    db=Depends(get_database),
+):
+    """
+    Compare estimates and invoices line items to calculate fill rate per item.
+
+    Args:
+        start_date: Start date for the report
+        end_date: End date for the report
+
+    Returns:
+        List of items with estimated quantities, invoiced quantities, and fill rate percentage
+    """
+    try:
+        # Validate date format
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+            end = datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="Invalid date format. Use YYYY-MM-DD format."
+            )
+
+        if start > end:
+            raise HTTPException(
+                status_code=400, detail="Start date must be before or equal to end date"
+            )
+
+        # Get collections
+        estimates_collection = db["estimates"]
+        invoices_collection = db["invoices"]
+        customer_list = [
+            "(amzb2b) Pupscribe Enterprises Pvt Ltd",
+            "Pupscribe Enterprises Private Limited",
+            "(OSAMP) Office samples",
+            "(PUPEV) PUPSCRIBE EVENTS",
+            "(SSAM) Sales samples",
+            "(RS) Retail samples",
+            "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
+            "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
+        ]
+
+        # Query estimates within date range - only invoiced estimates
+        # Handle both string and Date object formats in the database
+        estimates_query = {
+            "customer_name": {"$nin": customer_list},
+            "status": "invoiced",  # Only invoiced estimates
+            "$or": [
+                {"date": {"$gte": start, "$lte": end}},  # Date objects
+                {"date": {"$gte": start_date, "$lte": end_date}}  # Strings
+            ]
+        }
+
+        # Query invoices within date range
+        # Handle both string and Date object formats in the database
+        invoices_query = {
+            "customer_name": {"$nin": customer_list},
+            "status": {"$nin": ["void"]},
+            "$or": [
+                {"date": {"$gte": start, "$lte": end}},  # Date objects
+                {"date": {"$gte": start_date, "$lte": end_date}}  # Strings
+            ]
+        }
+
+        logger.info(f"Fetching estimates from {start_date} to {end_date}")
+        logger.info(f"Estimates query: {estimates_query}")
+
+        # Use aggregation to deduplicate estimates - take latest version of each estimate_id
+        estimates_pipeline = [
+            {"$match": estimates_query},
+            {"$sort": {"_id": -1}},  # Sort by _id descending (latest first)
+            {"$group": {
+                "_id": "$estimate_id",  # Group by estimate_id to deduplicate
+                "latest": {"$first": "$$ROOT"}  # Take first (latest) document
+            }},
+            {"$replaceRoot": {"newRoot": "$latest"}},  # Replace root with the latest document
+            {"$project": {"line_items": 1}}  # Only fetch needed fields
+        ]
+        estimates = list(estimates_collection.aggregate(estimates_pipeline))
+
+        logger.info(f"Fetching invoices from {start_date} to {end_date}")
+
+        # Use aggregation to deduplicate invoices - take latest version of each invoice_id
+        invoices_pipeline = [
+            {"$match": invoices_query},
+            {"$sort": {"_id": -1}},  # Sort by _id descending (latest first)
+            {"$group": {
+                "_id": "$invoice_id",  # Group by invoice_id to deduplicate
+                "latest": {"$first": "$$ROOT"}  # Take first (latest) document
+            }},
+            {"$replaceRoot": {"newRoot": "$latest"}},  # Replace root with the latest document
+            {"$project": {"line_items": 1}}  # Only fetch needed fields
+        ]
+        invoices = list(invoices_collection.aggregate(invoices_pipeline))
+
+        logger.info(f"Found {len(estimates)} unique estimates and {len(invoices)} unique invoices")
+
+        # Debug logging for specific item
+        logger.info(f"Debugging estimates aggregation...")
+
+        # Get warehouse stock collection
+        warehouse_stock_collection = db["zoho_warehouse_stock"]
+
+        # Helper function to extract cf_sku_code from item_custom_fields
+        def get_cf_sku_code(item):
+            item_custom_fields = item.get("item_custom_fields", [])
+            for field in item_custom_fields:
+                if field.get("api_name") == "cf_sku_code":
+                    return field.get("value", "")
+            return item.get("sku", "")
+
+        # Aggregate line items from estimates
+        estimate_items = {}
+        debug_item_name = ""
+        debug_total = 0
+
+        for estimate in estimates:
+            line_items = estimate.get("line_items", [])
+            for item in line_items:
+                item_id = item.get("item_id")
+                if not item_id:
+                    continue
+
+                quantity = item.get("quantity", 0)
+                item_name = item.get("name", "")
+
+                # Debug logging for specific item
+                if debug_item_name in item_name:
+                    debug_total += quantity
+                    logger.info(f"Found estimate for {item_name}: qty={quantity}, running total={debug_total}")
+
+                if item_id not in estimate_items:
+                    estimate_items[item_id] = {
+                        "item_id": item_id,
+                        "item_name": item_name,
+                        "sku": get_cf_sku_code(item),
+                        "estimated_quantity": 0,
+                    }
+
+                estimate_items[item_id]["estimated_quantity"] += quantity
+
+        logger.info(f"Total estimated quantity for {debug_item_name}: {debug_total}")
+
+        # Aggregate line items from invoices
+        invoice_items = {}
+        for invoice in invoices:
+            line_items = invoice.get("line_items", [])
+            for item in line_items:
+                item_id = item.get("item_id")
+                if not item_id:
+                    continue
+
+                quantity = item.get("quantity", 0)
+
+                if item_id not in invoice_items:
+                    invoice_items[item_id] = {
+                        "item_id": item_id,
+                        "item_name": item.get("name", ""),
+                        "sku": get_cf_sku_code(item),
+                        "invoiced_quantity": 0,
+                    }
+
+                invoice_items[item_id]["invoiced_quantity"] += quantity
+
+        # Get closing stock for all items on end_date
+        all_item_ids = set(estimate_items.keys()) | set(invoice_items.keys())
+
+        # Convert end_date string to datetime for comparison
+        end_datetime = datetime.combine(end, datetime.min.time())
+
+        logger.info(f"Fetching closing stock for {len(all_item_ids)} items")
+
+        # Use aggregation pipeline to efficiently get the latest stock for each item
+        closing_stock_map = {}
+        stock_date = None
+
+        try:
+            pipeline = [
+                # Match only items we care about and dates on or before end_date
+                {
+                    "$match": {
+                        "zoho_item_id": {"$in": list(all_item_ids)},
+                        "date": {"$lte": end_datetime},
+                    }
+                },
+                # Sort by date descending to get latest first
+                {"$sort": {"date": -1}},
+                # Group by item and take the first (latest) record
+                {
+                    "$group": {
+                        "_id": "$zoho_item_id",
+                        "warehouses": {"$first": "$warehouses"},
+                        "date": {"$first": "$date"},
+                    }
+                },
+            ]
+
+            warehouse_stocks = list(warehouse_stock_collection.aggregate(pipeline))
+
+            logger.info(f"Found stock data for {len(warehouse_stocks)} items")
+
+            # Create map of item_id to total closing stock and capture the stock date
+            for stock in warehouse_stocks:
+                item_id = stock.get("_id")
+                if item_id:
+                    warehouses = stock.get("warehouses", {})
+                    total_stock = (
+                        sum(warehouses.values()) if isinstance(warehouses, dict) else 0
+                    )
+                    closing_stock_map[item_id] = total_stock
+
+                    # Capture stock date (all should have the same or similar date)
+                    if stock_date is None and stock.get("date"):
+                        stock_date = (
+                            stock.get("date").strftime("%Y-%m-%d")
+                            if hasattr(stock.get("date"), "strftime")
+                            else str(stock.get("date"))
+                        )
+
+        except Exception as e:
+            logger.error(f"Error fetching warehouse stock: {str(e)}")
+            # Continue without stock data if there's an error
+            pass
+
+        # Combine and calculate fill rate
+        result = []
+        missed_items = 0
+        over_delivered_items = 0
+
+        for item_id in all_item_ids:
+            estimate_data = estimate_items.get(item_id, {})
+            invoice_data = invoice_items.get(item_id, {})
+
+            estimated_qty = estimate_data.get("estimated_quantity", 0)
+            invoiced_qty = invoice_data.get("invoiced_quantity", 0)
+            closing_stock = closing_stock_map.get(item_id, 0)
+
+            # Calculate fill rate
+            fill_rate = 0
+            if estimated_qty > 0:
+                fill_rate = (invoiced_qty / estimated_qty) * 100
+
+            # Count missed vs over-delivered
+            if invoiced_qty < estimated_qty:
+                missed_items += 1
+            elif invoiced_qty > estimated_qty:
+                over_delivered_items += 1
+
+            # Get item details (prefer invoice data if available, else use estimate data)
+            item_name = invoice_data.get("item_name") or estimate_data.get(
+                "item_name", ""
+            )
+            sku = invoice_data.get("sku") or estimate_data.get("sku", "")
+
+            result.append(
+                {
+                    "item_id": item_id,
+                    "item_name": item_name,
+                    "sku": sku,
+                    "estimated_quantity": estimated_qty,
+                    "invoiced_quantity": invoiced_qty,
+                    "fill_rate": round(fill_rate, 2),
+                    "closing_stock": closing_stock,
+                    "missed_quantity": max(0, estimated_qty - invoiced_qty),
+                }
+            )
+
+        # Sort by missed items first (invoiced < estimated), then by missed quantity descending
+        result.sort(
+            key=lambda x: (
+                0 if x["invoiced_quantity"] < x["estimated_quantity"] else 1,
+                -x["missed_quantity"],
+            )
+        )
+
+        return {
+            "data": result,
+            "meta": {
+                "start_date": start_date,
+                "end_date": end_date,
+                "total_items": len(result),
+                "total_estimates": len(estimates),
+                "total_invoices": len(invoices),
+                "missed_items": missed_items,
+                "over_delivered_items": over_delivered_items,
+                "fully_delivered_items": len(result)
+                - missed_items
+                - over_delivered_items,
+                "stock_date": stock_date,
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating estimates vs invoices report: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to generate report: {str(e)}"
+        )
