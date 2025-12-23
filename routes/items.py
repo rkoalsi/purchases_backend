@@ -5,7 +5,7 @@ from pymongo.errors import PyMongoError
 from ..database import get_database, serialize_mongo_document
 
 SKU_COLLECTION = "blinkit_sku_mapping"
-SALES_COLLECTION = "blinkit_sales"
+SALES_COLLECTION = "blinkit_sales_temp"
 INVENTORY_COLLECTION = "blinkit_inventory"
 REPORT_COLLECTION = "blinkit_sales_inventory_reports"
 PRODUCTS_COLLECTION = "products"

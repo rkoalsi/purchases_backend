@@ -23,14 +23,14 @@ class OptimizedMasterReportService:
         self._product_name_cache = {}
 
     async def get_blinkit_report(
-        self, start_date: str, end_date: str
+        self, start_date: str, end_date: str, any_last_90_days: bool = False
     ) -> Dict[str, Any]:
         """Get Blinkit report data"""
         try:
             from .blinkit import generate_report_by_date_range
 
             report_data = await generate_report_by_date_range(
-                start_date=start_date, end_date=end_date, database=self.database
+                start_date=start_date, end_date=end_date, database=self.database, any_last_90_days=any_last_90_days
             )
 
             return {
@@ -45,7 +45,7 @@ class OptimizedMasterReportService:
             return {"source": "blinkit", "data": [], "success": False, "error": str(e)}
 
     async def get_amazon_report(
-        self, start_date: str, end_date: str, report_type: str = "all"
+        self, start_date: str, end_date: str, report_type: str = "all", any_last_90_days: bool = False
     ) -> Dict[str, Any]:
         """Get Amazon report data"""
         try:
@@ -56,6 +56,7 @@ class OptimizedMasterReportService:
                 end_date=end_date,
                 database=self.database,
                 report_type=report_type,
+                any_last_90_days=any_last_90_days,
             )
 
             return {
@@ -69,13 +70,13 @@ class OptimizedMasterReportService:
             logger.error(f"Error fetching Amazon report: {e}")
             return {"source": "amazon", "data": [], "success": False, "error": str(e)}
 
-    async def get_zoho_report(self, start_date: str, end_date: str) -> Dict[str, Any]:
+    async def get_zoho_report(self, start_date: str, end_date: str, any_last_90_days: bool = False) -> Dict[str, Any]:
         """Get Zoho report data"""
         try:
             from .zoho import get_sales_report_fast
 
             response = await get_sales_report_fast(
-                start_date=start_date, end_date=end_date, db=self.database
+                start_date=start_date, end_date=end_date, db=self.database, any_last_90_days=any_last_90_days
             )
 
             report_data = []
@@ -223,6 +224,7 @@ class OptimizedMasterReportService:
                         "sessions": 0,
                         "days_of_coverage": 0.0,
                         "additional_metrics": {},
+                        "last_90_days_dates": item.get("last_90_days_dates", ""),
                     }
 
                     # Calculate days of coverage
@@ -263,6 +265,7 @@ class OptimizedMasterReportService:
                 "daily_run_rate": 0.0,
                 "days_of_coverage": 0.0,
                 "additional_metrics": {},
+                "last_90_days_dates": "",
             }
         )
 
@@ -289,6 +292,13 @@ class OptimizedMasterReportService:
                     agg["city"] = item.get(
                         "city", "Multiple" if source == "amazon" else "Unknown City"
                     )
+
+                # Capture last_90_days_dates if present (check on every item, not just first)
+                # Always capture if the key exists, even if empty string
+                if "last_90_days_dates" in item:
+                    # Only update if we have data or if current is empty
+                    if item.get("last_90_days_dates") or not agg["last_90_days_dates"]:
+                        agg["last_90_days_dates"] = item.get("last_90_days_dates", "")
 
                 # Source-specific aggregation
                 if source == "blinkit":
@@ -362,6 +372,7 @@ class OptimizedMasterReportService:
                     "sessions": agg["sessions"],
                     "days_of_coverage": 0.0,
                     "additional_metrics": agg["additional_metrics"],
+                    "last_90_days_dates": agg.get("last_90_days_dates", ""),
                 }
 
                 # Calculate days of coverage
@@ -412,18 +423,21 @@ class OptimizedMasterReportService:
                         "units_returned": 0.0,
                         "closing_stock": 0.0,
                         "amount": 0.0,
+                        "last_90_days_dates": "",
                     },
                     "amazon": {
                         "units_sold": 0.0,
                         "units_returned": 0.0,
                         "closing_stock": 0.0,
                         "amount": 0.0,
+                        "last_90_days_dates": "",
                     },
                     "zoho": {
                         "units_sold": 0.0,
                         "units_returned": 0.0,
                         "closing_stock": 0.0,
                         "amount": 0.0,
+                        "last_90_days_dates": "",
                     },
                 },
             }
@@ -494,6 +508,12 @@ class OptimizedMasterReportService:
                 breakdown["amount"] += (
                     self.safe_float(item.get("total_amount")) * multiplier
                 )
+                # Capture last_90_days_dates for this source
+                # Always capture if present, even if empty (to show N/A in frontend)
+                if "last_90_days_dates" in item:
+                    # Only update if we have data or if current is empty
+                    if item.get("last_90_days_dates") or not breakdown["last_90_days_dates"]:
+                        breakdown["last_90_days_dates"] = item.get("last_90_days_dates", "")
 
         # Single pass through all data
         for source_data in all_normalized_data:
@@ -571,6 +591,7 @@ async def get_master_report(
     include_amazon: bool = Query(True, description="Include Amazon data"),
     include_zoho: bool = Query(True, description="Include Zoho data"),
     amazon_report_type: str = Query("all", description="Amazon report type"),
+    any_last_90_days: bool = Query(False, description="Include last 90 days in stock dates"),
     db=Depends(get_database),
 ):
     """
@@ -598,15 +619,15 @@ async def get_master_report(
         # Step 1: Fetch all reports in parallel
         tasks = []
         if include_blinkit:
-            tasks.append(report_service.get_blinkit_report(start_date, end_date))
+            tasks.append(report_service.get_blinkit_report(start_date, end_date, any_last_90_days))
         if include_amazon:
             tasks.append(
                 report_service.get_amazon_report(
-                    start_date, end_date, amazon_report_type
+                    start_date, end_date, amazon_report_type, any_last_90_days
                 )
             )
         if include_zoho:
-            tasks.append(report_service.get_zoho_report(start_date, end_date))
+            tasks.append(report_service.get_zoho_report(start_date, end_date, any_last_90_days))
 
         if not tasks:
             raise HTTPException(
@@ -795,6 +816,7 @@ async def download_master_report(
     include_amazon: bool = Query(True, description="Include Amazon data"),
     include_zoho: bool = Query(True, description="Include Zoho data"),
     amazon_report_type: str = Query("all", description="Amazon report type"),
+    any_last_90_days: bool = Query(False, description="Include last 90 days in stock dates"),
     db=Depends(get_database),
 ):
     """
@@ -809,6 +831,7 @@ async def download_master_report(
             include_amazon=include_amazon,
             include_zoho=include_zoho,
             amazon_report_type=amazon_report_type,
+            any_last_90_days=any_last_90_days,
             db=db,
         )
 
@@ -906,6 +929,16 @@ async def download_master_report(
                         "Zoho Amount": item.get("source_breakdown", {})
                         .get("zoho", {})
                         .get("amount", 0),
+                        # Last 90 Days Dates
+                        "Blinkit Last 90 Days Dates": item.get("source_breakdown", {})
+                        .get("blinkit", {})
+                        .get("last_90_days_dates", ""),
+                        "Amazon Last 90 Days Dates": item.get("source_breakdown", {})
+                        .get("amazon", {})
+                        .get("last_90_days_dates", ""),
+                        "Zoho Last 90 Days Dates": item.get("source_breakdown", {})
+                        .get("zoho", {})
+                        .get("last_90_days_dates", ""),
                     }
                 )
 

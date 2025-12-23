@@ -55,7 +55,31 @@ PRODUCTS_COLLECTION = "products"
 INVOICES_COLLECTION = "invoices"
 PURCHASE_ORDER_COLLECTION = "purchase_orders"
 
+# Standardized excluded customers list - used across multiple endpoints
+EXCLUDED_CUSTOMERS_LIST = [
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd",
+    "Pupscribe Enterprises Private Limited",
+    "(OSAMP) Office samples",
+    "(PUPEV) PUPSCRIBE EVENTS",
+    "(SSAM) Sales samples",
+    "(RS) Retail samples",
+    "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
+    "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
+]
+
 router = APIRouter()
+
+
+@router.get("/excluded-customers")
+async def get_excluded_customers():
+    """
+    Get the standardized list of excluded customers.
+    This list is used across multiple endpoints for filtering out internal/sample customers.
+    """
+    return {
+        "excluded_customers": EXCLUDED_CUSTOMERS_LIST,
+        "count": len(EXCLUDED_CUSTOMERS_LIST)
+    }
 
 
 @router.get("/products")
@@ -579,17 +603,6 @@ def query_invoices_for_item_names(
     """
     Query invoices by matching item names directly - much simpler!
     """
-    customer_list = [
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd",
-        "Pupscribe Enterprises Private Limited",
-        "(OSAMP) Office samples",
-        "(PUPEV) PUPSCRIBE EVENTS",
-        "(SSAM) Sales samples",
-        "(RS) Retail samples",
-        "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
-        "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
-    ]
-
     try:
         invoices_collection = db.get_collection(INVOICES_COLLECTION)
 
@@ -603,7 +616,7 @@ def query_invoices_for_item_names(
                         ]
                     },
                     "status": {"$nin": ["draft", "void"]},
-                    "customer_name": {"$nin": customer_list},
+                    "customer_name": {"$nin": EXCLUDED_CUSTOMERS_LIST},
                     # Much simpler - just match item names directly
                     "line_items": {"$elemMatch": {"name": {"$in": item_names}}},
                 }
@@ -877,6 +890,7 @@ class SalesReportItem(BaseModel):
     closing_stock: int
     total_days_in_stock: int
     drr: float
+    last_90_days_dates: str = ""  # Optional field for last 90 days in stock date ranges
 
 
 class SalesReportResponse(BaseModel):
@@ -894,8 +908,166 @@ from functools import lru_cache
 executor = ThreadPoolExecutor(max_workers=4)
 
 
+def format_date_ranges(dates: List[datetime]) -> str:
+    """
+    Format a list of dates into ranges or individual dates.
+    Continuous dates are shown as ranges (e.g., "1 Jan 2025 - 5 Jan 2025")
+    Discontinuous dates are shown separated by commas.
+
+    Args:
+        dates: List of datetime objects
+
+    Returns:
+        Formatted string with date ranges
+    """
+    if not dates:
+        return ""
+
+    # Sort dates
+    sorted_dates = sorted(dates)
+
+    ranges = []
+    start_date = sorted_dates[0]
+    end_date = sorted_dates[0]
+
+    for i in range(1, len(sorted_dates)):
+        current_date = sorted_dates[i]
+        # Check if current date is consecutive to end_date
+        if (current_date - end_date).days == 1:
+            end_date = current_date
+        else:
+            # Save the current range
+            if start_date == end_date:
+                ranges.append(start_date.strftime("%d %b %Y"))
+            else:
+                ranges.append(f"{start_date.strftime('%d %b %Y')} - {end_date.strftime('%d %b %Y')}")
+            # Start new range
+            start_date = current_date
+            end_date = current_date
+
+    # Add the last range
+    if start_date == end_date:
+        ranges.append(start_date.strftime("%d %b %Y"))
+    else:
+        ranges.append(f"{start_date.strftime('%d %b %Y')} - {end_date.strftime('%d %b %Y')}")
+
+    return ", ".join(ranges)
+
+
+async def fetch_last_n_days_in_stock(
+    db, end_datetime: datetime, item_ids: list, n_days: int = 90
+) -> Dict:
+    """
+    Fetch the last N days an item was in stock, regardless of when those days occurred.
+    Returns formatted date ranges for each item.
+
+    Args:
+        db: Database connection
+        end_datetime: End date to look back from
+        item_ids: List of zoho_item_ids to fetch stock for
+        n_days: Number of days to fetch (default 90)
+
+    Returns:
+        Dict mapping item_id to formatted date ranges string
+    """
+    try:
+        stock_collection = db["zoho_warehouse_stock"]
+
+        # CRITICAL OPTIMIZATION: Limit lookback to prevent scanning millions of records
+        # Look back maximum 1 year to find the last 90 days in stock
+        lookback_limit = end_datetime - timedelta(days=365)
+
+        logger.info(f"Fetching last {n_days} days in stock for {len(item_ids)} items from {lookback_limit.date()} to {end_datetime.date()}")
+
+        # Aggregate to get the last N days where stock > 0 for each item
+        pipeline = [
+            {
+                "$match": {
+                    "zoho_item_id": {"$in": item_ids},
+                    "date": {"$gte": lookback_limit, "$lte": end_datetime},  # Only last 1 year
+                }
+            },
+            {
+                "$project": {
+                    "zoho_item_id": 1,
+                    "date": 1,
+                    "pupscribe_stock": {
+                        "$ifNull": [
+                            "$warehouses.Pupscribe Enterprises Private Limited",
+                            0,
+                        ]
+                    },
+                }
+            },
+            # Filter only days with stock > 0
+            {
+                "$match": {
+                    "pupscribe_stock": {"$gt": 0}
+                }
+            },
+            # Sort by item and date descending (most recent first)
+            {"$sort": {"zoho_item_id": 1, "date": -1}},
+            # Group by item and collect last N dates
+            {
+                "$group": {
+                    "_id": "$zoho_item_id",
+                    "stock_dates": {
+                        "$push": "$date"
+                    }
+                }
+            },
+            # Limit to last N days
+            {
+                "$project": {
+                    "_id": 1,
+                    "stock_dates": {
+                        "$slice": ["$stock_dates", n_days]
+                    }
+                }
+            }
+        ]
+
+        cursor = stock_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000)
+
+        # Convert to dictionary with formatted date ranges
+        stock_date_ranges = {}
+        processed_count = 0
+        for doc in cursor:
+            processed_count += 1
+            item_id = doc["_id"]
+            dates = doc.get("stock_dates", [])
+
+            # Debug logging for first few items
+            if processed_count <= 3:
+                logger.info(f"DEBUG: Item {item_id} has {len(dates)} stock dates")
+
+            if dates:
+                # Format the dates into ranges
+                formatted_ranges = format_date_ranges(dates)
+                stock_date_ranges[item_id] = formatted_ranges
+
+                # Debug log for first item
+                if processed_count == 1:
+                    logger.info(f"DEBUG: First item formatted ranges: {formatted_ranges[:100]}...")
+            else:
+                stock_date_ranges[item_id] = ""
+
+        logger.info(f"Fetched last {n_days} days in stock: processed {processed_count} items, returned {len(stock_date_ranges)} items with data")
+
+        # Debug: log sample item IDs
+        if stock_date_ranges:
+            sample_keys = list(stock_date_ranges.keys())[:3]
+            logger.info(f"DEBUG: Sample item IDs in result: {sample_keys}")
+
+        return stock_date_ranges
+
+    except Exception as e:
+        logger.error(f"Error fetching last N days in stock: {e}", exc_info=True)
+        return {}
+
+
 async def fetch_stock_data_for_items(
-    db, start_datetime: datetime, end_datetime: datetime, item_ids: list
+    db, start_datetime: datetime, end_datetime: datetime, item_ids: list, fetch_last_90_days: bool = False
 ) -> Dict:
     """
     Fetch stock data ONLY for specific items (not all items in database).
@@ -906,9 +1078,10 @@ async def fetch_stock_data_for_items(
         start_datetime: Start date for days in stock calculation
         end_datetime: End date for closing stock
         item_ids: List of zoho_item_ids to fetch stock for
+        fetch_last_90_days: If True, also fetch last 90 days in stock with date ranges
 
     Returns:
-        Dict mapping item_id to {closing_stock, total_days_in_stock}
+        Dict mapping item_id to {closing_stock, total_days_in_stock, last_90_days_dates (optional)}
     """
     try:
         stock_collection = db["zoho_warehouse_stock"]
@@ -986,6 +1159,20 @@ async def fetch_stock_data_for_items(
                 "closing_stock": doc.get("closing_stock", 0),
                 "total_days_in_stock": doc.get("total_days_in_stock", 0),
             }
+
+        # If requested, also fetch last 90 days in stock with date ranges
+        if fetch_last_90_days:
+            last_90_days_data = await fetch_last_n_days_in_stock(db, end_datetime, item_ids, 90)
+            # Merge the last 90 days data into stock_data
+            for item_id, date_ranges in last_90_days_data.items():
+                if item_id in stock_data:
+                    stock_data[item_id]["last_90_days_dates"] = date_ranges
+                else:
+                    stock_data[item_id] = {
+                        "closing_stock": 0,
+                        "total_days_in_stock": 0,
+                        "last_90_days_dates": date_ranges,
+                    }
 
         logger.info(f"Fetched stock data for {len(stock_data)} items")
         return stock_data
@@ -1500,6 +1687,7 @@ def process_batch_with_credit_notes(
         stock_info = stock_data.get(item_id, {})
         closing_stock = stock_info.get("closing_stock", 0)
         days_in_stock = stock_info.get("total_days_in_stock", 0)
+        last_90_days_dates = stock_info.get("last_90_days_dates", "")  # Get the new field
         drr = round(units_sold / days_in_stock, 2) if days_in_stock > 0 else 0
 
         # Only accumulate totals for items with names (same filtering as before)
@@ -1525,6 +1713,7 @@ def process_batch_with_credit_notes(
                     closing_stock=closing_stock,
                     total_days_in_stock=days_in_stock,
                     drr=drr,
+                    last_90_days_dates=last_90_days_dates,  # Add the new field
                 )
             )
 
@@ -1541,12 +1730,16 @@ def process_batch_with_credit_notes(
 async def get_sales_report_fast(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
+    any_last_90_days: bool = Query(False, description="Include last 90 days in stock with date ranges"),
     db=Depends(get_database),
 ):
     """
     Ultra-optimized sales report that incorporates credit notes.
     Net sales = Invoice quantities - Credit note quantities
     Response structure remains the same for frontend compatibility.
+
+    When any_last_90_days=True, includes a new field 'last_90_days_dates' with formatted date ranges
+    showing the last 90 days the item was in stock, regardless of when those days occurred.
     """
 
     try:
@@ -1561,7 +1754,7 @@ async def get_sales_report_fast(
             )
 
         logger.info(
-            f"Generating sales report with credit notes for {start_date} to {end_date}"
+            f"Generating sales report with credit notes for {start_date} to {end_date}, any_last_90_days={any_last_90_days}"
         )
         start_time = datetime.now()
 
@@ -1592,6 +1785,24 @@ async def get_sales_report_fast(
 
         # Get parallel task results
         stock_data, products_map = await asyncio.gather(stock_task, products_task)
+
+        # If any_last_90_days is requested, fetch the last 90 days in stock for all items
+        if any_last_90_days and stock_data:
+            item_ids = list(stock_data.keys())
+            logger.info(f"Fetching last 90 days in stock for {len(item_ids)} items")
+            logger.info(f"DEBUG: Sample stock_data keys: {item_ids[:3]}")
+
+            last_90_days_data = await fetch_last_n_days_in_stock(db, end_datetime, item_ids, 90)
+            logger.info(f"DEBUG: Received {len(last_90_days_data)} items from fetch_last_n_days_in_stock")
+
+            # Merge into stock_data
+            merged_count = 0
+            for item_id, date_ranges in last_90_days_data.items():
+                if item_id in stock_data:
+                    stock_data[item_id]["last_90_days_dates"] = date_ranges
+                    merged_count += 1
+
+            logger.info(f"DEBUG: Merged {merged_count} items with last_90_days_dates into stock_data")
 
         logger.info(
             f"Processing {len(stock_data)} stock items and {len(products_map)} products with credit notes"
@@ -1694,11 +1905,15 @@ async def get_sales_report_fast(
 async def download_sales_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
+    any_last_90_days: bool = Query(False, description="Include last 90 days in stock with date ranges"),
     db=Depends(get_database),
 ):
     """
     Download sales report as XLSX file with credit notes integration.
     Net sales = Invoice quantities - Credit note quantities
+
+    When any_last_90_days=True, includes a new column 'Last 90 Days In Stock (Dates)' with formatted date ranges
+    showing the last 90 days the item was in stock, regardless of when those days occurred.
     """
 
     try:
@@ -1713,7 +1928,7 @@ async def download_sales_report(
             )
 
         logger.info(
-            f"Generating sales report download with credit notes for {start_date} to {end_date}"
+            f"Generating sales report download with credit notes for {start_date} to {end_date}, any_last_90_days={any_last_90_days}"
         )
         start_time = datetime.now()
 
@@ -1740,6 +1955,24 @@ async def download_sales_report(
 
         # Process exactly the same way as the main API
         stock_data, products_map = await asyncio.gather(stock_task, products_task)
+
+        # If any_last_90_days is requested, fetch the last 90 days in stock for all items
+        if any_last_90_days and stock_data:
+            item_ids = list(stock_data.keys())
+            logger.info(f"Fetching last 90 days in stock for download: {len(item_ids)} items")
+            logger.info(f"DEBUG (download): Sample stock_data keys: {item_ids[:3]}")
+
+            last_90_days_data = await fetch_last_n_days_in_stock(db, end_datetime, item_ids, 90)
+            logger.info(f"DEBUG (download): Received {len(last_90_days_data)} items from fetch_last_n_days_in_stock")
+
+            # Merge into stock_data
+            merged_count = 0
+            for item_id, date_ranges in last_90_days_data.items():
+                if item_id in stock_data:
+                    stock_data[item_id]["last_90_days_dates"] = date_ranges
+                    merged_count += 1
+
+            logger.info(f"DEBUG (download): Merged {merged_count} items with last_90_days_dates into stock_data")
 
         sales_report_items = []
         total_units = 0
@@ -1784,18 +2017,20 @@ async def download_sales_report(
         # Convert SalesReportItem objects to dictionaries for DataFrame
         sales_data = []
         for item in sales_report_items:
-            sales_data.append(
-                {
-                    "Item Name": item.item_name,
-                    "SKU Code": item.sku_code,
-                    "Units Sold": item.units_sold,
-                    "Units Returned": item.units_returned,
-                    "Total Amount (₹)": item.total_amount,
-                    "Closing Stock": item.closing_stock,
-                    "Days In Stock": item.total_days_in_stock,
-                    "DRR (Daily Run Rate)": item.drr,
-                }
-            )
+            row_data = {
+                "Item Name": item.item_name,
+                "SKU Code": item.sku_code,
+                "Units Sold": item.units_sold,
+                "Units Returned": item.units_returned,
+                "Total Amount (₹)": item.total_amount,
+                "Closing Stock": item.closing_stock,
+                "Days In Stock": item.total_days_in_stock,
+                "DRR (Daily Run Rate)": item.drr,
+            }
+            # Add the Last 90 Days In Stock column only if requested
+            if any_last_90_days:
+                row_data["Last 90 Days In Stock (Dates)"] = item.last_90_days_dates
+            sales_data.append(row_data)
 
         # Create DataFrame
         df = pd.DataFrame(sales_data)
@@ -2254,37 +2489,26 @@ async def get_estimates_vs_invoices(
         # Get collections
         estimates_collection = db["estimates"]
         invoices_collection = db["invoices"]
-        customer_list = [
-            "(amzb2b) Pupscribe Enterprises Pvt Ltd",
-            "Pupscribe Enterprises Private Limited",
-            "(OSAMP) Office samples",
-            "(PUPEV) PUPSCRIBE EVENTS",
-            "(SSAM) Sales samples",
-            "(RS) Retail samples",
-            "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
-            "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
-        ]
-
         # Query estimates within date range - only invoiced estimates
         # Handle both string and Date object formats in the database
         estimates_query = {
-            "customer_name": {"$nin": customer_list},
+            "customer_name": {"$nin": EXCLUDED_CUSTOMERS_LIST},
             "status": "invoiced",  # Only invoiced estimates
             "$or": [
                 {"date": {"$gte": start, "$lte": end}},  # Date objects
-                {"date": {"$gte": start_date, "$lte": end_date}}  # Strings
-            ]
+                {"date": {"$gte": start_date, "$lte": end_date}},  # Strings
+            ],
         }
 
         # Query invoices within date range
         # Handle both string and Date object formats in the database
         invoices_query = {
-            "customer_name": {"$nin": customer_list},
+            "customer_name": {"$nin": EXCLUDED_CUSTOMERS_LIST},
             "status": {"$nin": ["void"]},
             "$or": [
                 {"date": {"$gte": start, "$lte": end}},  # Date objects
-                {"date": {"$gte": start_date, "$lte": end_date}}  # Strings
-            ]
+                {"date": {"$gte": start_date, "$lte": end_date}},  # Strings
+            ],
         }
 
         logger.info(f"Fetching estimates from {start_date} to {end_date}")
@@ -2294,11 +2518,15 @@ async def get_estimates_vs_invoices(
         estimates_pipeline = [
             {"$match": estimates_query},
             {"$sort": {"_id": -1}},  # Sort by _id descending (latest first)
-            {"$group": {
-                "_id": "$estimate_id",  # Group by estimate_id to deduplicate
-                "latest": {"$first": "$$ROOT"}  # Take first (latest) document
-            }},
-            {"$replaceRoot": {"newRoot": "$latest"}},  # Replace root with the latest document
+            {
+                "$group": {
+                    "_id": "$estimate_id",  # Group by estimate_id to deduplicate
+                    "latest": {"$first": "$$ROOT"},  # Take first (latest) document
+                }
+            },
+            {
+                "$replaceRoot": {"newRoot": "$latest"}
+            },  # Replace root with the latest document
             {"$unwind": "$line_items"},  # Unwind line items to process each one
             # Lookup composite products by name
             {
@@ -2360,7 +2588,7 @@ async def get_estimates_vs_invoices(
             {"$unwind": "$items_to_process"},
             {"$replaceRoot": {"newRoot": "$items_to_process"}},
         ]
-        estimates = list(estimates_collection.aggregate(estimates_pipeline))
+        estimates = list(estimates_collection.aggregate(estimates_pipeline, allowDiskUse=True, batchSize=1000))
 
         logger.info(f"Fetching invoices from {start_date} to {end_date}")
 
@@ -2368,11 +2596,15 @@ async def get_estimates_vs_invoices(
         invoices_pipeline = [
             {"$match": invoices_query},
             {"$sort": {"_id": -1}},  # Sort by _id descending (latest first)
-            {"$group": {
-                "_id": "$invoice_id",  # Group by invoice_id to deduplicate
-                "latest": {"$first": "$$ROOT"}  # Take first (latest) document
-            }},
-            {"$replaceRoot": {"newRoot": "$latest"}},  # Replace root with the latest document
+            {
+                "$group": {
+                    "_id": "$invoice_id",  # Group by invoice_id to deduplicate
+                    "latest": {"$first": "$$ROOT"},  # Take first (latest) document
+                }
+            },
+            {
+                "$replaceRoot": {"newRoot": "$latest"}
+            },  # Replace root with the latest document
             {"$unwind": "$line_items"},  # Unwind line items to process each one
             # Lookup composite products by name
             {
@@ -2434,9 +2666,11 @@ async def get_estimates_vs_invoices(
             {"$unwind": "$items_to_process"},
             {"$replaceRoot": {"newRoot": "$items_to_process"}},
         ]
-        invoices = list(invoices_collection.aggregate(invoices_pipeline))
+        invoices = list(invoices_collection.aggregate(invoices_pipeline, allowDiskUse=True, batchSize=1000))
 
-        logger.info(f"Found {len(estimates)} line items from estimates and {len(invoices)} line items from invoices (composite items expanded)")
+        logger.info(
+            f"Found {len(estimates)} line items from estimates and {len(invoices)} line items from invoices (composite items expanded)"
+        )
 
         # Debug logging for specific item
         logger.info(f"Processing aggregated line items with composite expansion...")
@@ -2468,7 +2702,9 @@ async def get_estimates_vs_invoices(
             # Debug logging for specific item
             if debug_item_name in item_name:
                 debug_total += quantity
-                logger.info(f"Found estimate for {item_name}: qty={quantity}, running total={debug_total}")
+                logger.info(
+                    f"Found estimate for {item_name}: qty={quantity}, running total={debug_total}"
+                )
 
             if item_id not in estimate_items:
                 estimate_items[item_id] = {
@@ -2612,6 +2848,7 @@ async def get_estimates_vs_invoices(
             )
         )
 
+        result.sort(key=lambda x:(x["item_name"]))
         return {
             "data": result,
             "meta": {

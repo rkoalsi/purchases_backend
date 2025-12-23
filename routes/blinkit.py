@@ -19,6 +19,167 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
+from typing import Dict, List
+
+
+def format_date_ranges(dates: List[datetime]) -> str:
+    """
+    Format a list of dates into ranges or individual dates.
+    Continuous dates are shown as ranges (e.g., "1 Jan 2025 - 5 Jan 2025")
+    Discontinuous dates are shown separated by commas.
+
+    Args:
+        dates: List of datetime objects
+
+    Returns:
+        Formatted string with date ranges
+    """
+    if not dates:
+        return ""
+
+    # Sort dates
+    sorted_dates = sorted(dates)
+
+    ranges = []
+    start_date = sorted_dates[0]
+    end_date = sorted_dates[0]
+
+    for i in range(1, len(sorted_dates)):
+        current_date = sorted_dates[i]
+        # Check if current date is consecutive to end_date
+        if (current_date - end_date).days == 1:
+            end_date = current_date
+        else:
+            # Save the current range
+            if start_date == end_date:
+                ranges.append(start_date.strftime("%d %b %Y"))
+            else:
+                ranges.append(f"{start_date.strftime('%d %b %Y')} - {end_date.strftime('%d %b %Y')}")
+            # Start new range
+            start_date = current_date
+            end_date = current_date
+
+    # Add the last range
+    if start_date == end_date:
+        ranges.append(start_date.strftime("%d %b %Y"))
+    else:
+        ranges.append(f"{start_date.strftime('%d %b %Y')} - {end_date.strftime('%d %b %Y')}")
+
+    return ", ".join(ranges)
+
+
+async def fetch_last_n_days_in_stock_blinkit(
+    db, end_datetime: datetime, sku_city_pairs: list, n_days: int = 90
+) -> Dict:
+    """
+    Fetch the last N days an item was in stock for Blinkit inventory, regardless of when those days occurred.
+    Returns formatted date ranges for each SKU/City combination.
+
+    Args:
+        db: Database connection
+        end_datetime: End date to look back from
+        sku_city_pairs: List of (sku_code, city) tuples
+        n_days: Number of days to fetch (default 90)
+
+    Returns:
+        Dict mapping (sku_code, city) to formatted date ranges string
+    """
+    try:
+        inventory_collection = db["blinkit_inventory"]
+
+        # CRITICAL OPTIMIZATION: Limit lookback to prevent scanning millions of records
+        # Look back maximum 1 year to find the last 90 days in stock
+        lookback_limit = end_datetime - timedelta(days=365)
+
+        logger.info(f"Fetching last {n_days} days in stock for {len(sku_city_pairs)} SKU/City pairs from {lookback_limit.date()} to {end_datetime.date()}")
+
+        # Extract unique SKUs and cities
+        skus = list(set([pair[0] for pair in sku_city_pairs]))
+        cities = list(set([pair[1] for pair in sku_city_pairs]))
+
+        # Aggregate to get the last N days where stock > 0 for each SKU/City
+        pipeline = [
+            {
+                "$match": {
+                    "sku_code": {"$in": skus},
+                    "city": {"$in": cities},
+                    "date": {"$gte": lookback_limit, "$lte": end_datetime},
+                }
+            },
+            {
+                "$project": {
+                    "sku_code": 1,
+                    "city": 1,
+                    "date": 1,
+                    "warehouse_inventory": 1,
+                }
+            },
+            # Filter only days with stock > 0
+            {
+                "$match": {
+                    "warehouse_inventory": {"$gt": 0}
+                }
+            },
+            # Sort by SKU, city, and date descending (most recent first)
+            {"$sort": {"sku_code": 1, "city": 1, "date": -1}},
+            # Group by SKU and city, collect last N dates
+            {
+                "$group": {
+                    "_id": {"sku_code": "$sku_code", "city": "$city"},
+                    "stock_dates": {
+                        "$push": "$date"
+                    }
+                }
+            },
+            # Limit to last N days
+            {
+                "$project": {
+                    "_id": 1,
+                    "stock_dates": {
+                        "$slice": ["$stock_dates", n_days]
+                    }
+                }
+            }
+        ]
+
+        cursor = inventory_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000)
+
+        # Convert to dictionary with formatted date ranges
+        stock_date_ranges = {}
+        processed_count = 0
+        for doc in cursor:
+            processed_count += 1
+            sku_city_key = (doc["_id"]["sku_code"], doc["_id"]["city"])
+            dates = doc.get("stock_dates", [])
+
+            # Debug logging for first few items
+            if processed_count <= 3:
+                logger.info(f"DEBUG (Blinkit): SKU/City {sku_city_key} has {len(dates)} stock dates")
+
+            if dates:
+                # Format the dates into ranges
+                formatted_ranges = format_date_ranges(dates)
+                stock_date_ranges[sku_city_key] = formatted_ranges
+
+                # Debug log for first item
+                if processed_count == 1:
+                    logger.info(f"DEBUG (Blinkit): First item formatted ranges: {formatted_ranges[:100]}...")
+            else:
+                stock_date_ranges[sku_city_key] = ""
+
+        logger.info(f"Fetched last {n_days} days in stock (Blinkit): processed {processed_count} SKU/City pairs, returned {len(stock_date_ranges)} pairs with data")
+
+        # Debug: log sample keys
+        if stock_date_ranges:
+            sample_keys = list(stock_date_ranges.keys())[:3]
+            logger.info(f"DEBUG (Blinkit): Sample SKU/City pairs in result: {sample_keys}")
+
+        return stock_date_ranges
+
+    except Exception as e:
+        logger.error(f"Error fetching last N days in stock (Blinkit): {e}", exc_info=True)
+        return {}
+
 
 # Optimize SKU mapping with caching
 class SKUCache:
@@ -1091,12 +1252,16 @@ def calculate_number_of_months(start_year, start_month, end_year, end_month):
 async def generate_report_by_date_range(
     start_date: str,  # Format: YYYY-MM-DD
     end_date: str,  # Format: YYYY-MM-DD
+    any_last_90_days: bool = False,  # Include last 90 days in stock with date ranges
     database=Depends(get_database),
 ):
     """
     Generates the Sales vs Inventory report dynamically based on the specified date range.
     Accepts any date range (start_date to end_date) instead of month ranges.
     Now includes returns data for the specified date range.
+
+    When any_last_90_days=True, includes a new field 'last_90_days_dates' with formatted date ranges
+    showing the last 90 days the item was in stock, regardless of when those days occurred.
     """
     try:
         # Parse and validate dates
@@ -1473,6 +1638,16 @@ async def generate_report_by_date_range(
             f"Calculating metrics for {len(valid_sku_city_pairs)} unique SKU/City combinations for period {period_name}..."
         )
 
+        # Fetch last 90 days in stock if requested
+        last_90_days_data = {}
+        if any_last_90_days and valid_sku_city_pairs:
+            sku_city_list = list(valid_sku_city_pairs)
+            logger.info(f"Fetching last 90 days in stock for {len(sku_city_list)} SKU/City pairs")
+            logger.info(f"DEBUG (Blinkit): Sample SKU/City pairs: {sku_city_list[:3]}")
+
+            last_90_days_data = await fetch_last_n_days_in_stock_blinkit(database, overall_end_date, sku_city_list, 90)
+            logger.info(f"DEBUG (Blinkit): Received {len(last_90_days_data)} SKU/City pairs from fetch_last_n_days_in_stock_blinkit")
+
         # Helper function for best performing month
         def get_best_performing_month(sku_city_key):
             if (
@@ -1615,6 +1790,9 @@ async def generate_report_by_date_range(
             # Get returns data for this SKU/City combination
             total_returns_in_period = current_period_returns.get(sku_city_key, 0)
 
+            # Get last 90 days in stock dates if available
+            last_90_days_dates = last_90_days_data.get(sku_city_key, "")
+
             # Create report item
             report_item = {
                 "item_name": item_name,
@@ -1622,6 +1800,7 @@ async def generate_report_by_date_range(
                 "city": city,
                 "warehouse": combined_warehouses,
                 "sku_code": sku,
+                "last_90_days_dates": last_90_days_dates,
                 "best_performing_month": best_month_info["formatted"],
                 "best_performing_month_details": {
                     "month_name": best_month_info["month_name"],
@@ -1706,17 +1885,21 @@ async def generate_report_by_date_range(
 async def download_report_by_date_range(
     start_date: str,  # Format: YYYY-MM-DD
     end_date: str,  # Format: YYYY-MM-DD
+    any_last_90_days: bool = False,  # Include last 90 days in stock with date ranges
     database=Depends(get_database),
 ):
     """
     Downloads report for a specific date range as Excel file.
     Now includes returns data in the Excel export.
+
+    When any_last_90_days=True, includes a new column 'Last 90 Days In Stock (Dates)' with formatted date ranges.
     """
     try:
         # Generate report data dynamically
         report_response = await generate_report_by_date_range(
             start_date=start_date,
             end_date=end_date,
+            any_last_90_days=any_last_90_days,
             database=database,
         )
 
@@ -1773,6 +1956,11 @@ async def download_report_by_date_range(
                     "best_performing_month_details", {"quantity_sold": 0}
                 ).get("quantity_sold"),
             }
+
+            # Add Last 90 Days In Stock column if requested
+            if any_last_90_days:
+                flat_item["Last 90 Days In Stock (Dates)"] = item.get("last_90_days_dates", "")
+
             flattened_data.append(flat_item)
 
         # Create DataFrame and Excel file
@@ -1807,6 +1995,10 @@ async def download_report_by_date_range(
             "Quantity Sold in Best Performing Month",
         ]
 
+        # Add Last 90 Days column to column order if requested
+        if any_last_90_days:
+            column_order.append("Last 90 Days In Stock (Dates)")
+
         df = df.reindex(columns=column_order, fill_value=None)
 
         excel_buffer = io.BytesIO()
@@ -1838,15 +2030,19 @@ async def download_report_by_date_range(
 async def get_report_data_by_date_range(
     start_date: str,  # Format: YYYY-MM-DD
     end_date: str,  # Format: YYYY-MM-DD
+    any_last_90_days: bool = False,  # Include last 90 days in stock with date ranges
     database=Depends(get_database),
 ):
     """
     Returns report data for a specific date range for frontend consumption.
+
+    When any_last_90_days=True, includes a new field 'last_90_days_dates' with formatted date ranges.
     """
     try:
         report_response = await generate_report_by_date_range(
             start_date=start_date,
             end_date=end_date,
+            any_last_90_days=any_last_90_days,
             database=database,
         )
 

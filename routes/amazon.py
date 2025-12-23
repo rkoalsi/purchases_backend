@@ -36,6 +36,200 @@ router = APIRouter()
 
 router.include_router(amazon_vendor_router, prefix="/vendor")
 
+
+def format_date_ranges(dates: List[datetime]) -> str:
+    """
+    Format a list of dates into ranges or individual dates.
+    Continuous dates are shown as ranges (e.g., "1 Jan 2025 - 5 Jan 2025")
+    Discontinuous dates are shown separated by commas.
+
+    Args:
+        dates: List of datetime objects
+
+    Returns:
+        Formatted string with date ranges
+    """
+    if not dates:
+        return ""
+
+    # Sort dates
+    sorted_dates = sorted(dates)
+
+    ranges = []
+    start_date = sorted_dates[0]
+    end_date = sorted_dates[0]
+
+    for i in range(1, len(sorted_dates)):
+        current_date = sorted_dates[i]
+        # Check if current date is consecutive to end_date
+        if (current_date - end_date).days == 1:
+            end_date = current_date
+        else:
+            # Save the current range
+            if start_date == end_date:
+                ranges.append(start_date.strftime("%d %b %Y"))
+            else:
+                ranges.append(f"{start_date.strftime('%d %b %Y')} - {end_date.strftime('%d %b %Y')}")
+            # Start new range
+            start_date = current_date
+            end_date = current_date
+
+    # Add the last range
+    if start_date == end_date:
+        ranges.append(start_date.strftime("%d %b %Y"))
+    else:
+        ranges.append(f"{start_date.strftime('%d %b %Y')} - {end_date.strftime('%d %b %Y')}")
+
+    return ", ".join(ranges)
+
+
+async def fetch_last_n_days_amazon_ledger(
+    db, end_datetime: datetime, asins: list, n_days: int = 90, report_type: str = "fba+seller_flex"
+) -> Dict:
+    """
+    Fetch the last N days an item was in stock for Amazon ledger (FBA/Seller Flex).
+
+    Args:
+        db: Database connection
+        end_datetime: End date to look back from
+        asins: List of ASINs
+        n_days: Number of days to fetch (default 90)
+        report_type: Type of report (fba, seller_flex, fba+seller_flex)
+
+    Returns:
+        Dict mapping ASIN to formatted date ranges string
+    """
+    try:
+        ledger_collection = db["amazon_ledger"]
+        lookback_limit = end_datetime - timedelta(days=730)  # Look back 2 years
+
+        logger.info(f"Fetching last {n_days} days in stock (Amazon Ledger) for {len(asins)} ASINs from {lookback_limit.date()} to {end_datetime.date()}")
+
+        # Build match conditions based on report type
+        match_condition = {
+            "asin": {"$in": asins},
+            "date": {"$gte": lookback_limit, "$lte": end_datetime},
+            "disposition": "SELLABLE",
+        }
+
+        if report_type == "fba":
+            match_condition["location"] = {"$ne": "VKSX"}
+        elif report_type == "seller_flex":
+            match_condition["location"] = "VKSX"
+
+        pipeline = [
+            {"$match": match_condition},
+            {
+                "$project": {
+                    "asin": 1,
+                    "date": 1,
+                    "stock": "$ending_warehouse_balance",
+                }
+            },
+            {"$match": {"stock": {"$gt": 0}}},
+            {"$sort": {"asin": 1, "date": -1}},
+            {
+                "$group": {
+                    "_id": "$asin",
+                    "stock_dates": {"$push": "$date"}
+                }
+            },
+            {
+                "$project": {
+                    "_id": 1,
+                    "stock_dates": {"$slice": ["$stock_dates", n_days]}
+                }
+            }
+        ]
+
+        cursor = ledger_collection.aggregate(pipeline, allowDiskUse=True)
+
+        stock_date_ranges = {}
+        for doc in cursor:
+            asin = doc["_id"]
+            dates = doc.get("stock_dates", [])
+            if dates:
+                stock_date_ranges[asin] = format_date_ranges(dates)
+            else:
+                stock_date_ranges[asin] = ""
+
+        logger.info(f"Fetched last {n_days} days (Amazon Ledger): {len(stock_date_ranges)} ASINs with data")
+        return stock_date_ranges
+
+    except Exception as e:
+        logger.error(f"Error fetching last N days (Amazon Ledger): {e}", exc_info=True)
+        return {}
+
+
+async def fetch_last_n_days_vendor_inventory(
+    db, end_datetime: datetime, asins: list, n_days: int = 90
+) -> Dict:
+    """
+    Fetch the last N days an item was in stock for Amazon Vendor Central inventory.
+
+    Args:
+        db: Database connection
+        end_datetime: End date to look back from
+        asins: List of ASINs
+        n_days: Number of days to fetch (default 90)
+
+    Returns:
+        Dict mapping ASIN to formatted date ranges string
+    """
+    try:
+        inventory_collection = db["amazon_vendor_inventory"]
+        lookback_limit = end_datetime - timedelta(days=730)  # Look back 2 years
+
+        logger.info(f"Fetching last {n_days} days in stock (Vendor) for {len(asins)} ASINs from {lookback_limit.date()} to {end_datetime.date()}")
+
+        pipeline = [
+            {
+                "$match": {
+                    "asin": {"$in": asins},
+                    "date": {"$gte": lookback_limit, "$lte": end_datetime},
+                }
+            },
+            {
+                "$project": {
+                    "asin": 1,
+                    "date": 1,
+                    "stock": "$sellableOnHandInventoryUnits",
+                }
+            },
+            {"$match": {"stock": {"$gt": 0}}},
+            {"$sort": {"asin": 1, "date": -1}},
+            {
+                "$group": {
+                    "_id": "$asin",
+                    "stock_dates": {"$push": "$date"}
+                }
+            },
+            {
+                "$project": {
+                    "_id": 1,
+                    "stock_dates": {"$slice": ["$stock_dates", n_days]}
+                }
+            }
+        ]
+
+        cursor = inventory_collection.aggregate(pipeline, allowDiskUse=True)
+
+        stock_date_ranges = {}
+        for doc in cursor:
+            asin = doc["_id"]
+            dates = doc.get("stock_dates", [])
+            if dates:
+                stock_date_ranges[asin] = format_date_ranges(dates)
+            else:
+                stock_date_ranges[asin] = ""
+
+        logger.info(f"Fetched last {n_days} days (Vendor): {len(stock_date_ranges)} ASINs with data")
+        return stock_date_ranges
+
+    except Exception as e:
+        logger.error(f"Error fetching last N days (Vendor): {e}", exc_info=True)
+        return {}
+
 # SP API Configuration
 REFRESH_TOKEN = os.getenv("SP_REFRESH_TOKEN")
 GRANT_TYPE = os.getenv("SP_GRANT_TYPE", "refresh_token")
@@ -1720,7 +1914,7 @@ async def delete_item(item_id: str):
 
 
 async def generate_report_by_date_range(
-    start_date: str, end_date: str, database: Any, report_type: str = "fba+seller_flex"
+    start_date: str, end_date: str, database: Any, report_type: str = "fba+seller_flex", any_last_90_days: bool = False
 ):
     try:
         start = datetime.strptime(start_date, "%Y-%m-%d").replace(
@@ -1733,11 +1927,11 @@ async def generate_report_by_date_range(
         # Handle the new "all" report type
         if report_type == "all":
             # Get vendor_central data
-            vendor_data = await generate_vendor_central_data(start, end, database)
+            vendor_data = await generate_vendor_central_data(start, end, database, any_last_90_days)
 
             # Get fba+seller_flex data
             fba_seller_flex_data = await generate_amazon_data(
-                start, end, database, "fba+seller_flex"
+                start, end, database, "fba+seller_flex", any_last_90_days
             )
 
             # Combine the data
@@ -1746,11 +1940,11 @@ async def generate_report_by_date_range(
             return combined_data
 
         elif report_type == "vendor_central":
-            return await generate_vendor_central_data(start, end, database)
+            return await generate_vendor_central_data(start, end, database, any_last_90_days)
 
         else:
             # Handle fba, seller_flex, fba+seller_flex
-            return await generate_amazon_data(start, end, database, report_type)
+            return await generate_amazon_data(start, end, database, report_type, any_last_90_days)
 
     except Exception as e:
         import traceback
@@ -1763,7 +1957,7 @@ async def generate_report_by_date_range(
         )
 
 
-async def generate_vendor_central_data(start, end, database):
+async def generate_vendor_central_data(start, end, database, any_last_90_days: bool = False):
     """Generate vendor central report data"""
     vendor_pipeline = [
         {
@@ -1924,10 +2118,24 @@ async def generate_vendor_central_data(start, end, database):
     collection = database.get_collection("amazon_vendor_sales")
     cursor = list(collection.aggregate(vendor_pipeline))
     result = serialize_mongo_document(cursor)
+
+    # Fetch last 90 days in stock if requested
+    if any_last_90_days and result:
+        asins = [item["asin"] for item in result if "asin" in item]
+        if asins:
+            logger.info(f"Fetching last 90 days in stock for {len(asins)} ASINs (Vendor Central)")
+            last_90_days_data = await fetch_last_n_days_vendor_inventory(database, end, asins, 90)
+
+            # Add the last 90 days data to each item in the result
+            for item in result:
+                asin = item.get("asin")
+                if asin:
+                    item["last_90_days_dates"] = last_90_days_data.get(asin, "")
+
     return result
 
 
-async def generate_amazon_data(start, end, database, report_type):
+async def generate_amazon_data(start, end, database, report_type, any_last_90_days: bool = False):
     """Generate FBA/Seller Flex report data with returns information (FBA only)"""
     ledger_match_conditions = [
         {"$eq": ["$asin", "$$sales_asin"]},
@@ -2200,6 +2408,20 @@ async def generate_amazon_data(start, end, database, report_type):
     collection = database.get_collection(SALES_COLLECTION)
     cursor = list(collection.aggregate(base_pipeline))
     result = serialize_mongo_document(cursor)
+
+    # Fetch last 90 days in stock if requested
+    if any_last_90_days and result:
+        asins = [item["asin"] for item in result if "asin" in item]
+        if asins:
+            logger.info(f"Fetching last 90 days in stock for {len(asins)} ASINs (Amazon Ledger - {report_type})")
+            last_90_days_data = await fetch_last_n_days_amazon_ledger(database, end, asins, 90, report_type)
+
+            # Add the last 90 days data to each item in the result
+            for item in result:
+                asin = item.get("asin")
+                if asin:
+                    item["last_90_days_dates"] = last_90_days_data.get(asin, "")
+
     return result
 
 
@@ -2307,6 +2529,7 @@ async def get_report_data_by_date_range(
     start_date: str,
     end_date: str,
     report_type: str = "fba+seller_flex",
+    any_last_90_days: bool = False,
     database=Depends(get_database),
 ):
     try:
@@ -2323,6 +2546,7 @@ async def get_report_data_by_date_range(
             end_date=end_date,
             database=database,
             report_type=report_type,
+            any_last_90_days=any_last_90_days,
         )
         logger.info(f"Retrieved dynamic report data of type: {report_type}")
         return report_response
@@ -2352,6 +2576,7 @@ def format_column_name(column_name):
         "Closing Stock": "Closing Stock",
         "Sessions": "Sessions",
         "Warehouses": "Warehouses",
+        "Last 90 Days Dates": "Last 90 Days Dates",
     }
 
     return replacements.get(formatted, formatted)
@@ -2362,6 +2587,7 @@ async def download_report_by_date_range(
     start_date: str,
     end_date: str,
     report_type: str = "fba+seller_flex",  # "fba+seller_flex", "fba", "seller_flex", "vendor_central", or "all"
+    any_last_90_days: bool = False,
     database=Depends(get_database),
 ):
 
@@ -2380,6 +2606,7 @@ async def download_report_by_date_range(
             end_date=end_date,
             database=database,
             report_type=report_type,
+            any_last_90_days=any_last_90_days,
         )
 
         if not report_data:
@@ -2450,6 +2677,10 @@ async def download_report_by_date_range(
                 "Total Days In Stock",
                 "Drr",
             ]
+
+        # Add Last 90 Days column if requested
+        if any_last_90_days:
+            preferred_order.append("Last 90 Days Dates")
 
         # Only include columns that exist in the DataFrame
         column_order = [col for col in preferred_order if col in df.columns]

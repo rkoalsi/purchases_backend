@@ -23,7 +23,7 @@ AMAZON_INVENTORY_COLLECTION = "amazon_inventory"
 AMAZON_REPORT_COLLECTION = "amazon_sales_inventory_reports"
 
 BLINKIT_SKU_COLLECTION = "blinkit_sku_mapping"
-BLINKIT_SALES_COLLECTION = "blinkit_sales"
+BLINKIT_SALES_COLLECTION = "blinkit_sales_temp"
 BLINKIT_INVENTORY_COLLECTION = "blinkit_inventory"
 BLINKIT_REPORT_COLLECTION = "blinkit_sales_inventory_reports"
 
