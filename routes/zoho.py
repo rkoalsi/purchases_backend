@@ -1039,7 +1039,7 @@ async def fetch_last_n_days_in_stock(
 
             # Debug logging for first few items
             if processed_count <= 3:
-                logger.info(f"DEBUG: Item {item_id} has {len(dates)} stock dates")
+                logger.debug(f"DEBUG: Item {item_id} has {len(dates)} stock dates")
 
             if dates:
                 # Format the dates into ranges
@@ -1048,7 +1048,7 @@ async def fetch_last_n_days_in_stock(
 
                 # Debug log for first item
                 if processed_count == 1:
-                    logger.info(f"DEBUG: First item formatted ranges: {formatted_ranges[:100]}...")
+                    logger.debug(f"DEBUG: First item formatted ranges: {formatted_ranges[:100]}...")
             else:
                 stock_date_ranges[item_id] = ""
 
@@ -1057,7 +1057,7 @@ async def fetch_last_n_days_in_stock(
         # Debug: log sample item IDs
         if stock_date_ranges:
             sample_keys = list(stock_date_ranges.keys())[:3]
-            logger.info(f"DEBUG: Sample item IDs in result: {sample_keys}")
+            logger.debug(f"DEBUG: Sample item IDs in result: {sample_keys}")
 
         return stock_date_ranges
 
@@ -1696,9 +1696,9 @@ def process_batch_with_credit_notes(
             total_amount += amount
             total_stock += closing_stock
             total_returns += credit_note_units
-            # Log credit note activity for items that have it (optional)
+            # Log credit note activity for items that have it (optional, only for debugging)
             if credit_note_units > 0:
-                logger.info(
+                logger.debug(
                     f"Item {item.get('item_name')} - Invoice units: {invoice_units}, "
                     f"Credit note units: {credit_note_units}, Net units: {units_sold}"
                 )
@@ -1790,10 +1790,10 @@ async def get_sales_report_fast(
         if any_last_90_days and stock_data:
             item_ids = list(stock_data.keys())
             logger.info(f"Fetching last 90 days in stock for {len(item_ids)} items")
-            logger.info(f"DEBUG: Sample stock_data keys: {item_ids[:3]}")
+            logger.debug(f"DEBUG: Sample stock_data keys: {item_ids[:3]}")
 
             last_90_days_data = await fetch_last_n_days_in_stock(db, end_datetime, item_ids, 90)
-            logger.info(f"DEBUG: Received {len(last_90_days_data)} items from fetch_last_n_days_in_stock")
+            logger.debug(f"DEBUG: Received {len(last_90_days_data)} items from fetch_last_n_days_in_stock")
 
             # Merge into stock_data
             merged_count = 0
@@ -1802,7 +1802,7 @@ async def get_sales_report_fast(
                     stock_data[item_id]["last_90_days_dates"] = date_ranges
                     merged_count += 1
 
-            logger.info(f"DEBUG: Merged {merged_count} items with last_90_days_dates into stock_data")
+            logger.debug(f"DEBUG: Merged {merged_count} items with last_90_days_dates into stock_data")
 
         logger.info(
             f"Processing {len(stock_data)} stock items and {len(products_map)} products with credit notes"
@@ -1960,10 +1960,10 @@ async def download_sales_report(
         if any_last_90_days and stock_data:
             item_ids = list(stock_data.keys())
             logger.info(f"Fetching last 90 days in stock for download: {len(item_ids)} items")
-            logger.info(f"DEBUG (download): Sample stock_data keys: {item_ids[:3]}")
+            logger.debug(f"DEBUG (download): Sample stock_data keys: {item_ids[:3]}")
 
             last_90_days_data = await fetch_last_n_days_in_stock(db, end_datetime, item_ids, 90)
-            logger.info(f"DEBUG (download): Received {len(last_90_days_data)} items from fetch_last_n_days_in_stock")
+            logger.debug(f"DEBUG (download): Received {len(last_90_days_data)} items from fetch_last_n_days_in_stock")
 
             # Merge into stock_data
             merged_count = 0
@@ -1972,7 +1972,7 @@ async def download_sales_report(
                     stock_data[item_id]["last_90_days_dates"] = date_ranges
                     merged_count += 1
 
-            logger.info(f"DEBUG (download): Merged {merged_count} items with last_90_days_dates into stock_data")
+            logger.debug(f"DEBUG (download): Merged {merged_count} items with last_90_days_dates into stock_data")
 
         sales_report_items = []
         total_units = 0
@@ -2173,17 +2173,47 @@ async def get_data_metadata(
             {"date": {"$gte": start_date, "$lte": end_date}},
         )
 
+        # Get distinct dates for inventory
+        inventory_distinct_dates = await asyncio.to_thread(
+            lambda: list(stock_collection.distinct(
+                "date", {"date": {"$gte": start_datetime, "$lte": end_datetime}}
+            ))
+        )
+        inventory_dates_set = set(d.strftime("%Y-%m-%d") if isinstance(d, datetime) else d for d in inventory_distinct_dates)
+
+        # Get distinct dates for sales
+        sales_distinct_dates = await asyncio.to_thread(
+            lambda: list(invoices_collection.distinct(
+                "date", {"date": {"$gte": start_date, "$lte": end_date}}
+            ))
+        )
+        sales_dates_set = set(d if isinstance(d, str) else d.strftime("%Y-%m-%d") for d in sales_distinct_dates)
+
+        # Calculate all dates in the range
+        from datetime import timedelta
+        all_dates = set()
+        current_date = start_datetime
+        while current_date <= end_datetime:
+            all_dates.add(current_date.strftime("%Y-%m-%d"))
+            current_date += timedelta(days=1)
+
+        # Find missing dates
+        missing_inventory_dates = sorted(all_dates - inventory_dates_set)
+        missing_sales_dates = sorted(all_dates - sales_dates_set)
+
         # Return metadata for selected date range
         metadata = {
             "inventory_data": {
                 "first_inventory_date": start_date,
                 "last_inventory_date": end_date,
                 "total_stock_records": inventory_count,
+                "missing_dates": missing_inventory_dates,
             },
             "sales_data": {
                 "first_sales_date": start_date,
                 "last_sales_date": end_date,
                 "valid_invoices": invoice_count,
+                "missing_dates": missing_sales_dates,
             },
             "date_range": {
                 "start_date": start_date,

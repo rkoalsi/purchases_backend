@@ -1382,16 +1382,43 @@ async def sync_status(
                 {"date": {"$gte": start, "$lte": end}}
             )
 
+            # Get distinct dates for sales
+            sales_distinct_dates = list(db[sales_collection].distinct(
+                "date", {"date": {"$gte": start, "$lte": end}}
+            ))
+            sales_dates_set = set(d.strftime("%Y-%m-%d") if isinstance(d, datetime) else d for d in sales_distinct_dates)
+
+            # Get distinct dates for inventory
+            inventory_distinct_dates = list(db[inventory_collection].distinct(
+                "date", {"date": {"$gte": start, "$lte": end}}
+            ))
+            inventory_dates_set = set(d.strftime("%Y-%m-%d") if isinstance(d, datetime) else d for d in inventory_distinct_dates)
+
+            # Calculate all dates in the range
+            from datetime import timedelta
+            all_dates = set()
+            current_date = start.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_check = end.replace(hour=0, minute=0, second=0, microsecond=0)
+            while current_date <= end_check:
+                all_dates.add(current_date.strftime("%Y-%m-%d"))
+                current_date += timedelta(days=1)
+
+            # Find missing dates
+            missing_sales_dates = sorted(all_dates - sales_dates_set)
+            missing_inventory_dates = sorted(all_dates - inventory_dates_set)
+
             return {
                 "sales_data": {
                     "records_count": sales_count,
                     "first_sales_date": first_sales_date,
                     "last_sales_date": last_sales_date,
+                    "missing_dates": missing_sales_dates,
                 },
                 "inventory_data": {
                     "records_count": inventory_count,
                     "first_inventory_date": first_inventory_date,
                     "last_inventory_date": last_inventory_date,
+                    "missing_dates": missing_inventory_dates,
                 },
             }
 

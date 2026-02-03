@@ -154,7 +154,7 @@ async def fetch_last_n_days_in_stock_blinkit(
 
             # Debug logging for first few items
             if processed_count <= 3:
-                logger.info(f"DEBUG (Blinkit): SKU/City {sku_city_key} has {len(dates)} stock dates")
+                logger.debug(f"DEBUG (Blinkit): SKU/City {sku_city_key} has {len(dates)} stock dates")
 
             if dates:
                 # Format the dates into ranges
@@ -163,7 +163,7 @@ async def fetch_last_n_days_in_stock_blinkit(
 
                 # Debug log for first item
                 if processed_count == 1:
-                    logger.info(f"DEBUG (Blinkit): First item formatted ranges: {formatted_ranges[:100]}...")
+                    logger.debug(f"DEBUG (Blinkit): First item formatted ranges: {formatted_ranges[:100]}...")
             else:
                 stock_date_ranges[sku_city_key] = ""
 
@@ -172,7 +172,7 @@ async def fetch_last_n_days_in_stock_blinkit(
         # Debug: log sample keys
         if stock_date_ranges:
             sample_keys = list(stock_date_ranges.keys())[:3]
-            logger.info(f"DEBUG (Blinkit): Sample SKU/City pairs in result: {sample_keys}")
+            logger.debug(f"DEBUG (Blinkit): Sample SKU/City pairs in result: {sample_keys}")
 
         return stock_date_ranges
 
@@ -497,6 +497,31 @@ async def sync_status(start_date: str, end_date: str, db=Depends(get_database)):
             {"date": {"$gte": start, "$lte": end}}
         )
 
+        # Get distinct dates for sales (using order_date field for sales)
+        sales_distinct_dates = list(db[sales_collection].distinct(
+            "order_date", {"order_date": {"$gte": start, "$lte": end}}
+        ))
+        sales_dates_set = set(d.strftime("%Y-%m-%d") if isinstance(d, datetime) else d for d in sales_distinct_dates)
+
+        # Get distinct dates for inventory
+        inventory_distinct_dates = list(db[inventory_collection].distinct(
+            "date", {"date": {"$gte": start, "$lte": end}}
+        ))
+        inventory_dates_set = set(d.strftime("%Y-%m-%d") if isinstance(d, datetime) else d for d in inventory_distinct_dates)
+
+        # Calculate all dates in the range
+        from datetime import timedelta
+        all_dates = set()
+        current_date = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_check = end.replace(hour=0, minute=0, second=0, microsecond=0)
+        while current_date <= end_check:
+            all_dates.add(current_date.strftime("%Y-%m-%d"))
+            current_date += timedelta(days=1)
+
+        # Find missing dates
+        missing_sales_dates = sorted(all_dates - sales_dates_set)
+        missing_inventory_dates = sorted(all_dates - inventory_dates_set)
+
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
@@ -505,11 +530,13 @@ async def sync_status(start_date: str, end_date: str, db=Depends(get_database)):
                     "records_count": sales_count,
                     "first_sales_date": first_sales_date,
                     "last_sales_date": last_sales_date,
+                    "missing_dates": missing_sales_dates,
                 },
                 "inventory_data": {
                     "records_count": inventory_count,
                     "first_inventory_date": first_inventory_date,
                     "last_inventory_date": last_inventory_date,
+                    "missing_dates": missing_inventory_dates,
                 },
             },
         )
@@ -1643,10 +1670,10 @@ async def generate_report_by_date_range(
         if any_last_90_days and valid_sku_city_pairs:
             sku_city_list = list(valid_sku_city_pairs)
             logger.info(f"Fetching last 90 days in stock for {len(sku_city_list)} SKU/City pairs")
-            logger.info(f"DEBUG (Blinkit): Sample SKU/City pairs: {sku_city_list[:3]}")
+            logger.debug(f"DEBUG (Blinkit): Sample SKU/City pairs: {sku_city_list[:3]}")
 
             last_90_days_data = await fetch_last_n_days_in_stock_blinkit(database, overall_end_date, sku_city_list, 90)
-            logger.info(f"DEBUG (Blinkit): Received {len(last_90_days_data)} SKU/City pairs from fetch_last_n_days_in_stock_blinkit")
+            logger.debug(f"DEBUG (Blinkit): Received {len(last_90_days_data)} SKU/City pairs from fetch_last_n_days_in_stock_blinkit")
 
         # Helper function for best performing month
         def get_best_performing_month(sku_city_key):

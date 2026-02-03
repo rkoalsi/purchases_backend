@@ -25,20 +25,54 @@ INVENTORY_COLLECTION = "amazon_vendor_inventory"
 
 router = APIRouter()
 
-# VC API Configuration
-REFRESH_TOKEN = os.getenv("VC_REFRESH_TOKEN")
-GRANT_TYPE = os.getenv("VC_GRANT_TYPE", "refresh_token")
-CLIENT_ID = os.getenv("VC_CLIENT_ID")
-CLIENT_SECRET = os.getenv("VC_CLIENT_SECRET")
-LOGIN_URL = os.getenv("VC_LOGIN_URL", "https://api.amazon.com/auth/o2/token")
-MARKETPLACE_ID = os.getenv("VC_MARKETPLACE_ID", "A21TJRUUN4KGV")  # IN marketplace
-VC_API_BASE_URL = os.getenv(
-    "SP_API_BASE_URL", "https://sellingpartnerapi-na.amazon.com"
-)
+# VC API Configuration - stored in a dict for easy reloading
+_vc_config = {
+    "refresh_token": os.getenv("VC_REFRESH_TOKEN"),
+    "grant_type": os.getenv("VC_GRANT_TYPE", "refresh_token"),
+    "client_id": os.getenv("VC_CLIENT_ID"),
+    "client_secret": os.getenv("VC_CLIENT_SECRET"),
+    "login_url": os.getenv("VC_LOGIN_URL", "https://api.amazon.com/auth/o2/token"),
+    "marketplace_id": os.getenv("VC_MARKETPLACE_ID", "A21TJRUUN4KGV"),
+    "api_base_url": os.getenv("SP_API_BASE_URL", "https://sellingpartnerapi-na.amazon.com"),
+}
+
+# Legacy variable names for compatibility
+REFRESH_TOKEN = _vc_config["refresh_token"]
+GRANT_TYPE = _vc_config["grant_type"]
+CLIENT_ID = _vc_config["client_id"]
+CLIENT_SECRET = _vc_config["client_secret"]
+LOGIN_URL = _vc_config["login_url"]
+MARKETPLACE_ID = _vc_config["marketplace_id"]
+VC_API_BASE_URL = _vc_config["api_base_url"]
 
 # Global variable to store access token and expiry
 _vc_access_token = None
 _vc_token_expires_at = None
+
+
+def reload_vc_credentials():
+    """Reload VC credentials from .env file"""
+    global REFRESH_TOKEN, GRANT_TYPE, CLIENT_ID, CLIENT_SECRET, LOGIN_URL, MARKETPLACE_ID, VC_API_BASE_URL
+    global _vc_access_token, _vc_token_expires_at
+
+    load_dotenv(override=True)
+
+    REFRESH_TOKEN = os.getenv("VC_REFRESH_TOKEN")
+    GRANT_TYPE = os.getenv("VC_GRANT_TYPE", "refresh_token")
+    CLIENT_ID = os.getenv("VC_CLIENT_ID")
+    CLIENT_SECRET = os.getenv("VC_CLIENT_SECRET")
+    LOGIN_URL = os.getenv("VC_LOGIN_URL", "https://api.amazon.com/auth/o2/token")
+    MARKETPLACE_ID = os.getenv("VC_MARKETPLACE_ID", "A21TJRUUN4KGV")
+    VC_API_BASE_URL = os.getenv("SP_API_BASE_URL", "https://sellingpartnerapi-na.amazon.com")
+
+    # Clear cached token
+    _vc_access_token = None
+    _vc_token_expires_at = None
+
+    logger.info("🔄 VC credentials reloaded from .env")
+    logger.info(f"🔑 Client ID: {CLIENT_ID}")
+    logger.info(f"🔑 Client Secret (last 8): ...{CLIENT_SECRET[-8:] if CLIENT_SECRET else 'None'}")
+    logger.info(f"🔑 Refresh Token (last 8): ...{REFRESH_TOKEN[-8:] if REFRESH_TOKEN else 'None'}")
 
 
 def get_amazon_token() -> str:
@@ -59,7 +93,10 @@ def get_amazon_token() -> str:
         return _vc_access_token
 
     logger.info("🔄 Requesting new Amazon SP API token...")
-    
+    logger.info(f"🔑 Using Client ID: {CLIENT_ID}")
+    logger.info(f"🔑 Using Client Secret (last 8 chars): ...{CLIENT_SECRET[-8:] if CLIENT_SECRET else 'None'}")
+    logger.info(f"🔑 Using Refresh Token (last 8 chars): ...{REFRESH_TOKEN[-8:] if REFRESH_TOKEN else 'None'}")
+
     try:
         payload = {
             "grant_type": GRANT_TYPE,
@@ -121,10 +158,18 @@ def make_sp_api_request(
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"❌ API request failed: {e}")
+        # Log the full response body for debugging
+        error_body = ""
+        if hasattr(e, 'response') and e.response is not None:
+            error_body = e.response.text
+            logger.error(f"❌ API request failed: {e}")
+            logger.error(f"❌ Response body: {error_body}")
+            logger.error(f"❌ Response headers: {dict(e.response.headers)}")
+        else:
+            logger.error(f"❌ API request failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Amazon VC API request failed: {str(e)}",
+            detail=f"Amazon VC API request failed: {str(e)} - {error_body}",
         )
 
 
@@ -573,12 +618,34 @@ def background_sync_inventory(start_datetime: str, end_datetime: str, marketplac
 
 # API Endpoints (unchanged)
 
+@router.post("/auth/reload")
+async def reload_credentials():
+    """
+    Reload VC credentials from .env file without restarting server
+    """
+    logger.info("🔄 Reload credentials endpoint called")
+    reload_vc_credentials()
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "message": "Credentials reloaded successfully",
+            "client_id": CLIENT_ID,
+            "client_secret_suffix": f"...{CLIENT_SECRET[-8:]}" if CLIENT_SECRET else None,
+            "refresh_token_suffix": f"...{REFRESH_TOKEN[-8:]}" if REFRESH_TOKEN else None,
+        },
+    )
+
+
 @router.post("/auth/token")
 async def refresh_amazon_token():
     """
     Refresh Amazon SP API token
     """
-    logger.info("🔑 Token refresh endpoint called")
+    global _vc_access_token, _vc_token_expires_at
+    logger.info("🔑 Token refresh endpoint called - clearing cache")
+    # Force clear cached token to get fresh one
+    _vc_access_token = None
+    _vc_token_expires_at = None
     try:
         token = get_amazon_token()
         return JSONResponse(
