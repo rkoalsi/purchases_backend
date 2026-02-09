@@ -1011,8 +1011,24 @@ async def upload_inventory_data(
 ):
     """
     Optimized inventory data upload with city-level aggregation.
-    FIXED: Ensures SKU mapping is applied correctly before aggregation.
-    Supports both old and new inventory file formats.
+    Supports both OLD and NEW Blinkit inventory file formats.
+
+    Supported Formats:
+
+    1. OLD FORMAT (Legacy):
+       - Standard Excel file with columns: Item ID, Backend Outlet, Date, Qty
+       - Header row is the first row
+       - Date column already present
+
+    2. NEW FORMAT (Current - auto-detected):
+       - First row contains timestamp: "This sheet was generated at YYYY-MM-DD HH:MM:SS"
+       - Second row contains section headers (Product details, Warehouse details, etc.)
+       - Third row contains column headers
+       - Key columns: Item ID, Warehouse Facility Name (→ Backend Outlet),
+                      Total sellable (→ Qty), Item Name
+       - Date is automatically extracted from the timestamp
+
+    The function automatically detects which format is being used and processes accordingly.
     """
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(
@@ -1033,35 +1049,50 @@ async def upload_inventory_data(
 
             # New format detection: first cell contains timestamp
             if "This sheet was generated at" in first_cell:
-                logger.info("Detected NEW inventory format")
+                logger.info("Detected NEW inventory format (with timestamp in first cell)")
 
-                # Extract date from timestamp
+                # Extract date from timestamp using regex
                 match = re.search(r'(\d{4}-\d{2}-\d{2})', first_cell)
                 if match:
                     extracted_date = match.group(1)
+                    logger.info(f"Successfully extracted date from timestamp: {extracted_date}")
                 else:
-                    # Fallback to today's date
+                    # Fallback to today's date if extraction fails
                     extracted_date = datetime.now().strftime("%Y-%m-%d")
+                    logger.warning(f"Could not extract date from timestamp '{first_cell}', using today's date: {extracted_date}")
 
-                logger.info(f"Extracted date from new format: {extracted_date}")
-
-                # Read actual data (skip first 2 rows, row 2 is header)
+                # Read actual data (skip first 2 rows: row 0 = timestamp, row 1 = section headers, row 2 = column headers)
                 df = pd.read_excel(BytesIO(file_content), engine="openpyxl", skiprows=2)
+
+                logger.info(f"New format columns found: {list(df.columns)[:10]}...")
 
                 # Map new format columns to old format column names
                 if "Warehouse Facility Name" in df.columns:
                     df["Backend Outlet"] = df["Warehouse Facility Name"]
+                    logger.info("Mapped 'Warehouse Facility Name' → 'Backend Outlet'")
+                else:
+                    logger.warning("'Warehouse Facility Name' column not found in new format")
+
                 if "Total sellable" in df.columns:
                     df["Qty"] = df["Total sellable"]
+                    logger.info("Mapped 'Total sellable' → 'Qty'")
+                else:
+                    logger.warning("'Total sellable' column not found in new format")
+
+                # Also map Item Name if present
+                if "Item Name" in df.columns and "Item Name" not in df.columns:
+                    logger.info("Item Name column found in new format")
 
                 # Add Date column with extracted date
                 df["Date"] = extracted_date
+                logger.info(f"Added 'Date' column with value: {extracted_date}")
 
                 return df
             else:
-                logger.info("Detected OLD inventory format")
+                logger.info("Detected OLD inventory format (standard Excel format)")
                 # Old format: read normally
                 df = pd.read_excel(BytesIO(file_content), engine="openpyxl")
+                logger.info(f"Old format columns found: {list(df.columns)}")
                 return df
 
         with ThreadPoolExecutor() as executor:
