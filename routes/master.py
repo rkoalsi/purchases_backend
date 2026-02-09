@@ -115,13 +115,14 @@ class OptimizedMasterReportService:
 
             products_collection = self.database.get_collection("products")
 
-            # Single query to get all products
-            cursor = products_collection.find(
-                {"cf_sku_code": {"$in": list(valid_skus)}},
-                {"cf_sku_code": 1, "name": 1, "_id": 0},
-            )
+            # Single query to get all products - run in thread to avoid blocking event loop
+            def _fetch_products():
+                return list(products_collection.find(
+                    {"cf_sku_code": {"$in": list(valid_skus)}},
+                    {"cf_sku_code": 1, "name": 1, "_id": 0},
+                ))
 
-            products = list(cursor)
+            products = await asyncio.to_thread(_fetch_products)
 
             # Create mapping
             sku_to_name = {}
@@ -217,6 +218,7 @@ class OptimizedMasterReportService:
                         "warehouse": "Multiple",
                         "units_sold": self.safe_float(item.get("units_sold")),
                         "units_returned": self.safe_float(item.get("units_returned")),
+                        "credit_notes": self.safe_float(item.get("credit_notes")),
                         "total_amount": self.safe_float(item.get("total_amount")),
                         "closing_stock": self.safe_float(item.get("closing_stock")),
                         "days_in_stock": self.safe_int(item.get("total_days_in_stock")),
@@ -258,6 +260,7 @@ class OptimizedMasterReportService:
                 "warehouse": set(),
                 "units_sold": 0.0,
                 "units_returned": 0.0,
+                "credit_notes": 0.0,
                 "total_amount": 0.0,
                 "closing_stock": 0.0,
                 "sessions": 0,
@@ -266,6 +269,7 @@ class OptimizedMasterReportService:
                 "days_of_coverage": 0.0,
                 "additional_metrics": {},
                 "last_90_days_dates": "",
+                "amazon_data_source": "",  # Track specific Amazon platform (vendor_central, fba, etc.)
             }
         )
 
@@ -341,6 +345,11 @@ class OptimizedMasterReportService:
                     if isinstance(warehouses, list):
                         agg["warehouse"].update(warehouses)
 
+                    # Track specific Amazon data source (Vendor Central vs FBA)
+                    data_source = item.get("data_source", "")
+                    if data_source:
+                        agg["amazon_data_source"] = data_source
+
             except Exception as e:
                 logger.error(f"Error aggregating item from {source}: {e}")
                 continue
@@ -356,8 +365,21 @@ class OptimizedMasterReportService:
                     else "Unknown Warehouse"
                 )
 
+                # Determine specific source label for Amazon
+                item_source = source
+                if source == "amazon" and agg.get("amazon_data_source"):
+                    amazon_ds = agg["amazon_data_source"]
+                    if amazon_ds in ("vendor_central", "vendor_only"):
+                        item_source = "amazon_vendor_central"
+                    elif amazon_ds in ("fba", "fba_only", "fba+seller_flex"):
+                        item_source = "amazon_fba"
+                    elif amazon_ds == "seller_flex":
+                        item_source = "amazon_seller_flex"
+                    elif amazon_ds == "combined":
+                        item_source = "amazon_vc_fba"  # Item has data from both VC and FBA
+
                 normalized_item = {
-                    "source": source,
+                    "source": item_source,
                     "item_name": agg["item_name"],
                     "item_id": agg["item_id"],
                     "sku_code": agg["sku_code"],
@@ -399,7 +421,7 @@ class OptimizedMasterReportService:
         return normalized_data
 
     def combine_data_by_sku_optimized(
-        self, all_normalized_data: List[List[Dict]]
+        self, all_normalized_data: List[List[Dict]], period_days: int = 30, composite_products_map: Dict = None
     ) -> List[Dict]:
         """Optimized SKU combination using defaultdict and single pass, with composite product handling"""
         sku_data = defaultdict(
@@ -410,6 +432,7 @@ class OptimizedMasterReportService:
                 "combined_metrics": {
                     "total_units_sold": 0.0,
                     "total_units_returned": 0.0,
+                    "total_credit_notes": 0.0,
                     "total_amount": 0.0,
                     "total_closing_stock": 0.0,
                     "total_sessions": 0.0,
@@ -421,6 +444,7 @@ class OptimizedMasterReportService:
                     "blinkit": {
                         "units_sold": 0.0,
                         "units_returned": 0.0,
+                        "credit_notes": 0.0,
                         "closing_stock": 0.0,
                         "amount": 0.0,
                         "last_90_days_dates": "",
@@ -428,6 +452,7 @@ class OptimizedMasterReportService:
                     "amazon": {
                         "units_sold": 0.0,
                         "units_returned": 0.0,
+                        "credit_notes": 0.0,
                         "closing_stock": 0.0,
                         "amount": 0.0,
                         "last_90_days_dates": "",
@@ -435,6 +460,7 @@ class OptimizedMasterReportService:
                     "zoho": {
                         "units_sold": 0.0,
                         "units_returned": 0.0,
+                        "credit_notes": 0.0,
                         "closing_stock": 0.0,
                         "amount": 0.0,
                         "last_90_days_dates": "",
@@ -443,22 +469,8 @@ class OptimizedMasterReportService:
             }
         )
 
-        def get_composite_product_components(self, sku_code):
-            """Fetch composite product components from the collection"""
-            try:
-                # Assuming you have access to your MongoDB collection
-                # Replace 'composite_products' with your actual collection reference
-                composite_product = (
-                    get_database()
-                    .get_collection("composite_products")
-                    .find_one({"sku_code": sku_code})
-                )
-                if composite_product and "components" in composite_product:
-                    return composite_product["components"]
-                return None
-            except Exception as e:
-                print(f"Error fetching composite product for SKU {sku_code}: {e}")
-                return None
+        if composite_products_map is None:
+            composite_products_map = {}
 
         def process_item_data(self, item, sku_code, item_name, multiplier=1.0):
             """Process individual item data with optional quantity multiplier"""
@@ -469,7 +481,7 @@ class OptimizedMasterReportService:
                 sku_data[sku_code]["sku_code"] = sku_code
                 sku_data[sku_code]["item_name"] = item_name
 
-            # Add source
+            # Add source (with specific Amazon platform info)
             sku_data[sku_code]["sources"].add(source)
 
             # Update metrics efficiently with multiplier
@@ -479,6 +491,9 @@ class OptimizedMasterReportService:
             )
             metrics["total_units_returned"] += (
                 self.safe_float(item.get("units_returned")) * multiplier
+            )
+            metrics["total_credit_notes"] += (
+                self.safe_float(item.get("credit_notes")) * multiplier
             )
             metrics["total_amount"] += (
                 self.safe_float(item.get("total_amount")) * multiplier
@@ -493,14 +508,22 @@ class OptimizedMasterReportService:
                 item.get("days_in_stock")
             )  # Days don't multiply
 
+            # Map specific Amazon sources to "amazon" for source_breakdown
+            breakdown_source = source
+            if source.startswith("amazon_"):
+                breakdown_source = "amazon"
+
             # Update source breakdown with multiplier
-            if source in sku_data[sku_code]["source_breakdown"]:
-                breakdown = sku_data[sku_code]["source_breakdown"][source]
+            if breakdown_source in sku_data[sku_code]["source_breakdown"]:
+                breakdown = sku_data[sku_code]["source_breakdown"][breakdown_source]
                 breakdown["units_sold"] += (
                     self.safe_float(item.get("units_sold")) * multiplier
                 )
                 breakdown["units_returned"] += (
                     self.safe_float(item.get("units_returned")) * multiplier
+                )
+                breakdown["credit_notes"] += (
+                    self.safe_float(item.get("credit_notes")) * multiplier
                 )
                 breakdown["closing_stock"] += (
                     self.safe_float(item.get("closing_stock")) * multiplier
@@ -526,10 +549,8 @@ class OptimizedMasterReportService:
 
                 original_sku = item.get("sku_code", "Unknown SKU") or "Unknown SKU"
 
-                # Check if this SKU is a composite product
-                composite_components = get_composite_product_components(
-                    self, original_sku
-                )
+                # Check if this SKU is a composite product (using pre-loaded map)
+                composite_components = composite_products_map.get(original_sku)
 
                 if composite_components:
                     # This is a composite product - process each component
@@ -562,11 +583,10 @@ class OptimizedMasterReportService:
 
             # Calculate averages
             metrics = data["combined_metrics"]
-            total_units = metrics["total_units_sold"] + metrics["total_units_returned"]
-            total_days = metrics["total_days_in_stock"]
 
-            if total_days > 0:
-                metrics["avg_daily_run_rate"] = round(total_units / total_days, 2)
+            # DRR = total units sold / number of days in the period
+            if period_days > 0:
+                metrics["avg_daily_run_rate"] = round(metrics["total_units_sold"] / period_days, 2)
 
             if metrics["avg_daily_run_rate"] > 0:
                 metrics["avg_days_of_coverage"] = round(
@@ -639,7 +659,7 @@ async def get_master_report(
         try:
             results = await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
-                timeout=60.0,  # Reduced timeout since we're optimizing
+                timeout=180.0,  # Allow enough time for large date ranges
             )
         except asyncio.TimeoutError:
             raise HTTPException(
@@ -716,10 +736,39 @@ async def get_master_report(
                 logger.info(f"Normalized {len(result)} items")
 
         # Step 4: Combine data by SKU (CPU intensive, use thread)
+        # Calculate the number of days in the period for DRR calculation
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        period_days = (end_dt - start_dt).days + 1  # +1 to include both start and end dates
+
         if all_normalized_data:
             try:
+                # Batch-load all composite products in a single query before processing
+                composite_products_map = {}
+                try:
+                    composite_collection = db.get_collection("composite_products")
+                    all_skus = set()
+                    for source_data in all_normalized_data:
+                        if isinstance(source_data, list):
+                            for item in source_data:
+                                if isinstance(item, dict):
+                                    sku = item.get("sku_code", "")
+                                    if sku:
+                                        all_skus.add(sku)
+                    if all_skus:
+                        def _fetch_composites():
+                            result = {}
+                            for doc in composite_collection.find({"sku_code": {"$in": list(all_skus)}}):
+                                if doc.get("components"):
+                                    result[doc["sku_code"]] = doc["components"]
+                            return result
+                        composite_products_map = await asyncio.to_thread(_fetch_composites)
+                    logger.info(f"Batch loaded {len(composite_products_map)} composite products from {len(all_skus)} SKUs")
+                except Exception as e:
+                    logger.error(f"Error batch loading composite products: {e}")
+
                 combined_data = await asyncio.to_thread(
-                    report_service.combine_data_by_sku_optimized, all_normalized_data
+                    report_service.combine_data_by_sku_optimized, all_normalized_data, period_days, composite_products_map
                 )
                 logger.info(f"Combined data for {len(combined_data)} unique SKUs")
             except Exception as e:
@@ -733,6 +782,7 @@ async def get_master_report(
         summary_stats = {
             "total_units_sold": 0.0,
             "total_units_returned": 0.0,
+            "total_credit_notes": 0.0,
             "total_amount": 0.0,
             "total_closing_stock": 0.0,
             "avg_drr": 0.0,
@@ -744,6 +794,9 @@ async def get_master_report(
                 summary_stats["total_units_sold"] += metrics.get("total_units_sold", 0)
                 summary_stats["total_units_returned"] += metrics.get(
                     "total_units_returned", 0
+                )
+                summary_stats["total_credit_notes"] += metrics.get(
+                    "total_credit_notes", 0
                 )
                 summary_stats["total_amount"] += metrics.get("total_amount", 0)
                 summary_stats["total_closing_stock"] += metrics.get(
@@ -776,6 +829,12 @@ async def get_master_report(
                     "total_units_sold": round(summary_stats["total_units_sold"], 2),
                     "total_units_returned": round(
                         summary_stats["total_units_returned"], 2
+                    ),
+                    "total_credit_notes": round(
+                        summary_stats["total_credit_notes"], 2
+                    ),
+                    "total_net_units_sold": round(
+                        summary_stats["total_units_sold"] - summary_stats["total_credit_notes"], 2
                     ),
                     "total_amount": round(summary_stats["total_amount"], 2),
                     "total_closing_stock": round(
@@ -874,6 +933,14 @@ async def download_master_report(
                         "Total Units Returned": item.get("combined_metrics", {}).get(
                             "total_units_returned", 0
                         ),
+                        "Total Credit Notes": item.get("combined_metrics", {}).get(
+                            "total_credit_notes", 0
+                        ),
+                        "Total Net Units Sold": item.get("combined_metrics", {}).get(
+                            "total_units_sold", 0
+                        ) - item.get("combined_metrics", {}).get(
+                            "total_credit_notes", 0
+                        ),
                         "Total Amount": item.get("combined_metrics", {}).get(
                             "total_amount", 0
                         ),
@@ -909,6 +976,16 @@ async def download_master_report(
                         "Zoho Units Returned": item.get("source_breakdown", {})
                         .get("zoho", {})
                         .get("units_returned", 0),
+                        # Platform-wise Credit Notes
+                        "Blinkit Credit Notes": item.get("source_breakdown", {})
+                        .get("blinkit", {})
+                        .get("credit_notes", 0),
+                        "Amazon Credit Notes": item.get("source_breakdown", {})
+                        .get("amazon", {})
+                        .get("credit_notes", 0),
+                        "Zoho Credit Notes": item.get("source_breakdown", {})
+                        .get("zoho", {})
+                        .get("credit_notes", 0),
                         # Platform-wise Closing Stock
                         "Blinkit Closing Stock": item.get("source_breakdown", {})
                         .get("blinkit", {})
@@ -953,6 +1030,8 @@ async def download_master_report(
                 ["Total Unique SKUs", summary.get("total_unique_skus", 0)],
                 ["Total Units Sold", summary.get("total_units_sold", 0)],
                 ["Total Units Returned", summary.get("total_units_returned", 0)],
+                ["Total Credit Notes", summary.get("total_credit_notes", 0)],
+                ["Total Net Units Sold", summary.get("total_net_units_sold", 0)],
                 ["Total Amount", summary.get("total_amount", 0)],
                 ["Total Closing Stock", summary.get("total_closing_stock", 0)],
                 ["Average Daily Run Rate", summary.get("avg_drr", 0)],

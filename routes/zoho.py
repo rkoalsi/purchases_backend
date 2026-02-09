@@ -886,6 +886,7 @@ class SalesReportItem(BaseModel):
     sku_code: str
     units_sold: int
     units_returned: int
+    credit_notes: int = 0
     total_amount: float
     closing_stock: int
     total_days_in_stock: int
@@ -1708,6 +1709,7 @@ def process_batch_with_credit_notes(
                     item_name=item.get("item_name", ""),
                     sku_code=sku_code,
                     units_returned=credit_note_units,
+                    credit_notes=credit_note_units,
                     units_sold=units_sold,  # This is now net units (invoice - credit notes)
                     total_amount=round(amount, 2),  # This is now net amount
                     closing_stock=closing_stock,
@@ -1808,41 +1810,45 @@ async def get_sales_report_fast(
             f"Processing {len(stock_data)} stock items and {len(products_map)} products with credit notes"
         )
 
-        # Process results using the NEW batch processing function
-        sales_report_items = []
-        total_units = 0
-        total_returns = 0
-        total_amount = 0.0
-        total_closing_stock = 0
+        # Process results in a thread to avoid blocking the event loop
+        def _process_cursor_results(cursor, stock_data, products_map):
+            sales_report_items = []
+            total_units = 0
+            total_returns = 0
+            total_amount = 0.0
+            total_closing_stock = 0
 
-        # Process in batches for better memory management
-        batch = []
-        batch_size = 500  # Increased for better performance
+            batch = []
+            batch_size = 500
 
-        for item in result_cursor:
-            batch.append(item)
-            if len(batch) >= batch_size:
-                processed = process_batch_with_credit_notes(
-                    batch, stock_data, products_map
-                )
+            for item in cursor:
+                batch.append(item)
+                if len(batch) >= batch_size:
+                    processed = process_batch_with_credit_notes(
+                        batch, stock_data, products_map
+                    )
+                    sales_report_items.extend(processed["items"])
+                    total_units += processed["units"]
+                    total_amount += processed["amount"]
+                    total_returns += processed["returns"]
+                    total_closing_stock += processed["stock"]
+                    batch = []
+
+            # Process remaining items
+            if batch:
+                processed = process_batch_with_credit_notes(batch, stock_data, products_map)
                 sales_report_items.extend(processed["items"])
                 total_units += processed["units"]
                 total_amount += processed["amount"]
                 total_returns += processed["returns"]
                 total_closing_stock += processed["stock"]
-                batch = []
 
-        # Process remaining items
-        if batch:
-            processed = process_batch_with_credit_notes(batch, stock_data, products_map)
-            sales_report_items.extend(processed["items"])
-            total_units += processed["units"]
-            total_amount += processed["amount"]
-            total_returns += processed["returns"]
-            total_closing_stock += processed["stock"]
+            sales_report_items.sort(key=lambda x: x.item_name)
+            return sales_report_items, total_units, total_returns, total_amount, total_closing_stock
 
-        # Sort results (same as before)
-        sales_report_items.sort(key=lambda x: x.item_name)
+        sales_report_items, total_units, total_returns, total_amount, total_closing_stock = await asyncio.to_thread(
+            _process_cursor_results, result_cursor, stock_data, products_map
+        )
 
         execution_time = (datetime.now() - start_time).total_seconds()
         logger.info(

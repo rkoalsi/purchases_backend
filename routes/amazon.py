@@ -2044,7 +2044,7 @@ async def generate_vendor_central_data(start, end, database, any_last_90_days: b
                 "total_amount": {"$sum": "$amount"},
                 "total_returns": {"$sum": "$customer_returns"},
                 "last_day_closing_stock": {
-                    "$first": {"$ifNull": ["$inventory_data.closing_stock", 0]}
+                    "$last": {"$ifNull": ["$inventory_data.closing_stock", 0]}
                 },
                 "item_name": {"$last": "$item_info.item_name"},
                 "sku_code": {"$last": "$item_info.sku_code"},
