@@ -149,6 +149,43 @@ class OptimizedMasterReportService:
             logger.error(f"Error in batch loading product names: {e}")
             return {}
 
+    async def batch_load_product_rates(self, sku_codes: Set[str]) -> Dict[str, float]:
+        """Batch load rate from products collection for all SKUs"""
+        if not sku_codes:
+            return {}
+
+        try:
+            valid_skus = {sku for sku in sku_codes if sku and sku != "Unknown SKU"}
+            if not valid_skus:
+                return {}
+
+            products_collection = self.database.get_collection("products")
+
+            def _fetch_rates():
+                return list(products_collection.find(
+                    {"cf_sku_code": {"$in": list(valid_skus)}},
+                    {"cf_sku_code": 1, "rate": 1, "_id": 0},
+                ))
+
+            products = await asyncio.to_thread(_fetch_rates)
+
+            sku_to_rate = {}
+            for product in products:
+                sku_code = product.get("cf_sku_code")
+                rate = product.get("rate")
+                if sku_code and rate is not None:
+                    try:
+                        sku_to_rate[sku_code] = float(rate)
+                    except (ValueError, TypeError):
+                        pass
+
+            logger.info(f"Batch loaded rates for {len(sku_to_rate)} products")
+            return sku_to_rate
+
+        except Exception as e:
+            logger.error(f"Error batch loading product rates: {e}")
+            return {}
+
     def extract_all_sku_codes(self, all_reports: List[Dict[str, Any]]) -> Set[str]:
         """Extract all unique SKU codes from all reports"""
         sku_codes = set()
@@ -1077,15 +1114,26 @@ async def get_master_report(
             try:
                 combined_sku_codes = {item.get("sku_code", "") for item in combined_data if item.get("sku_code")}
 
-                # Fetch brand logistics, product brands, transit, and product logistics in parallel
+                # Fetch brand logistics, product brands, transit, product logistics, and rates in parallel
                 brand_logistics_task = report_service.get_brand_logistics()
                 product_brands_task = report_service.get_product_brands(combined_sku_codes)
                 transit_task = report_service.get_stock_in_transit()
                 logistics_task = report_service.get_product_logistics(combined_sku_codes)
+                rates_task = report_service.batch_load_product_rates(combined_sku_codes)
 
-                brand_logistics, product_brands, transit_data, logistics_data = await asyncio.gather(
-                    brand_logistics_task, product_brands_task, transit_task, logistics_task
+                brand_logistics, product_brands, transit_data, logistics_data, product_rates = await asyncio.gather(
+                    brand_logistics_task, product_brands_task, transit_task, logistics_task, rates_task
                 )
+
+                # Fill in total_amount for items where it's 0 (e.g. Blinkit-only) using rate * units_sold
+                for item in combined_data:
+                    metrics = item.get("combined_metrics", {})
+                    if metrics.get("total_amount", 0) == 0 and metrics.get("total_units_sold", 0) > 0:
+                        sku = item.get("sku_code", "")
+                        rate = product_rates.get(sku, 0)
+                        if rate > 0:
+                            calculated_amount = round(rate * metrics["total_units_sold"], 2)
+                            metrics["total_amount"] = calculated_amount
 
                 # Classify movement (Fast/Medium/Slow mover) using brand-specific settings
                 combined_data = report_service.classify_movement(combined_data, brand_logistics, product_brands)
