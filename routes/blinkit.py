@@ -571,6 +571,11 @@ async def process_orders_file(file_content: bytes, database, config: dict) -> di
 
         # Check if dataframe is empty
         if df.empty:
+            if config["order_type"] == "Return Orders":
+                return {
+                    "message": f"No return orders found in the file. 0 records processed.",
+                    "records_processed": 0,
+                }
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"The {config['order_type']} sheet appears to be empty or contains no data rows.",
@@ -1543,20 +1548,21 @@ async def generate_report_by_date_range(
                 ):
                     sku_city_warehouses_map[sku_city_key] = combined_warehouses
 
+        logger.info(f"Sales dates: {sorted(all_sales_dates)}")
+        logger.info(f"Inventory dates: {sorted(all_inventory_dates)}")
+
         common_dates = sorted(list(all_sales_dates.intersection(all_inventory_dates)))
         n_common_days = len(common_dates)
 
+        # Use union of all dates if no common dates exist, so report still shows data
+        all_dates = sorted(list(all_sales_dates.union(all_inventory_dates)))
         if n_common_days == 0:
-            return {
-                "message": f"Found data for {period_name}, but no common dates between sales and inventory data. No report generated.",
-                "data": [],
-                "period_info": {
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "period_name": period_name,
-                    "days_in_range": date_range_days,
-                },
-            }
+            logger.info(
+                f"No common dates between sales and inventory for {period_name}. "
+                f"Using all available dates ({len(all_dates)}) to generate report."
+            )
+            common_dates = all_dates
+            n_common_days = len(common_dates)
 
         logger.info(
             f"\nFound {n_common_days} common dates for calculation within {period_name}."
