@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Set
 import asyncio
 import pandas as pd
 import io
+import math
 from collections import defaultdict
 from ..database import get_database
 import logging
@@ -602,6 +603,300 @@ class OptimizedMasterReportService:
 
         return sorted(result, key=lambda x: x["sku_code"])
 
+    async def get_brand_logistics(self) -> Dict[str, Dict]:
+        """Load brand logistics settings (lead_time, safety_days per class) from brand_logistics collection"""
+        try:
+            collection = self.database.get_collection("brand_logistics")
+
+            def _fetch():
+                return list(collection.find({}, {"_id": 0}))
+
+            docs = await asyncio.to_thread(_fetch)
+
+            result = {}
+            for doc in docs:
+                brand = doc.get("brand", "")
+                if brand:
+                    result[brand.lower()] = {
+                        "lead_time": self.safe_float(doc.get("lead_time", 60)),
+                        "safety_days_fast": self.safe_float(doc.get("safety_days_fast", 40)),
+                        "safety_days_medium": self.safe_float(doc.get("safety_days_medium", 25)),
+                        "safety_days_slow": self.safe_float(doc.get("safety_days_slow", 15)),
+                    }
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching brand logistics: {e}")
+            return {}
+
+    async def get_product_brands(self, sku_codes: Set[str]) -> Dict[str, str]:
+        """Batch load brand info for products"""
+        if not sku_codes:
+            return {}
+
+        try:
+            products_collection = self.database.get_collection("products")
+
+            def _fetch():
+                return list(products_collection.find(
+                    {"cf_sku_code": {"$in": list(sku_codes)}},
+                    {"cf_sku_code": 1, "brand": 1, "_id": 0}
+                ))
+
+            products = await asyncio.to_thread(_fetch)
+            return {p.get("cf_sku_code"): p.get("brand", "") for p in products if p.get("cf_sku_code")}
+
+        except Exception as e:
+            logger.error(f"Error fetching product brands: {e}")
+            return {}
+
+    @staticmethod
+    def classify_movement(
+        combined_data: List[Dict],
+        brand_logistics: Dict[str, Dict],
+        product_brands: Dict[str, str],
+    ) -> List[Dict]:
+        """Classify each SKU as Fast/Medium/Slow mover based on volume and revenue percentiles.
+        Uses brand-specific safety_days and lead_time from brand_logistics collection."""
+        if not combined_data:
+            return combined_data
+
+        # Default settings when no brand config exists
+        default_settings = {
+            "lead_time": 60,
+            "safety_days_fast": 40,
+            "safety_days_medium": 25,
+            "safety_days_slow": 15,
+        }
+
+        # Extract units sold and amount for ranking
+        items_with_metrics = []
+        for item in combined_data:
+            metrics = item.get("combined_metrics", {})
+            items_with_metrics.append({
+                "units_sold": metrics.get("total_units_sold", 0),
+                "amount": metrics.get("total_amount", 0),
+            })
+
+        total_count = len(items_with_metrics)
+        if total_count == 0:
+            return combined_data
+
+        # Rank by volume (descending - highest sales gets rank 1)
+        volume_sorted = sorted(range(total_count), key=lambda i: items_with_metrics[i]["units_sold"], reverse=True)
+        volume_ranks = [0] * total_count
+        for rank, idx in enumerate(volume_sorted):
+            volume_ranks[idx] = (rank + 1) / total_count
+
+        # Rank by revenue (descending - highest revenue gets rank 1)
+        revenue_sorted = sorted(range(total_count), key=lambda i: items_with_metrics[i]["amount"], reverse=True)
+        revenue_ranks = [0] * total_count
+        for rank, idx in enumerate(revenue_sorted):
+            revenue_ranks[idx] = (rank + 1) / total_count
+
+        # Classify each item
+        for i, item in enumerate(combined_data):
+            vol_pct = volume_ranks[i]
+            rev_pct = revenue_ranks[i]
+
+            # Get brand-specific settings
+            sku = item.get("sku_code", "")
+            brand = product_brands.get(sku, "")
+            brand_settings = brand_logistics.get(brand.lower(), default_settings) if brand else default_settings
+
+            if vol_pct <= 0.2 or rev_pct <= 0.2:
+                mover_class = 1
+                movement = "Fast Mover"
+                safety_days = brand_settings.get("safety_days_fast", 40)
+            elif vol_pct <= 0.5 or rev_pct <= 0.5:
+                mover_class = 2
+                movement = "Medium Mover"
+                safety_days = brand_settings.get("safety_days_medium", 25)
+            else:
+                mover_class = 3
+                movement = "Slow Mover"
+                safety_days = brand_settings.get("safety_days_slow", 15)
+
+            item["movement"] = movement
+            item["mover_class"] = mover_class
+            item["safety_days"] = safety_days
+            item["lead_time"] = brand_settings.get("lead_time", 60)
+
+        return combined_data
+
+    async def get_stock_in_transit(self) -> Dict[str, Dict]:
+        """Get stock in transit from open purchase orders, grouped by SKU"""
+        try:
+            po_collection = self.database.get_collection("purchase_orders")
+
+            def _fetch_open_pos():
+                return list(po_collection.find(
+                    {"status": "open"},
+                    {"line_items": 1, "purchaseorder_number": 1, "_id": 0}
+                ))
+
+            open_pos = await asyncio.to_thread(_fetch_open_pos)
+
+            # Group transit quantities by SKU
+            sku_transit: Dict[str, List[float]] = defaultdict(list)
+
+            for po in open_pos:
+                line_items = po.get("line_items", [])
+                for li in line_items:
+                    # Extract SKU from custom fields
+                    sku_code = ""
+                    for cf in li.get("item_custom_fields", []):
+                        if cf.get("api_name") == "cf_sku_code":
+                            sku_code = cf.get("value", "")
+                            break
+
+                    if not sku_code:
+                        continue
+
+                    qty = self.safe_float(li.get("quantity", 0))
+                    qty_received = self.safe_float(li.get("quantity_received", 0))
+                    transit_qty = qty - qty_received
+
+                    if transit_qty > 0:
+                        sku_transit[sku_code].append(transit_qty)
+
+            # Build result with up to 3 transit entries per SKU
+            result = {}
+            for sku, quantities in sku_transit.items():
+                transit_1 = quantities[0] if len(quantities) > 0 else 0
+                transit_2 = quantities[1] if len(quantities) > 1 else 0
+                transit_3 = quantities[2] if len(quantities) > 2 else 0
+                result[sku] = {
+                    "transit_1": transit_1,
+                    "transit_2": transit_2,
+                    "transit_3": transit_3,
+                    "total": sum(quantities),
+                }
+
+            logger.info(f"Found stock in transit for {len(result)} SKUs from {len(open_pos)} open POs")
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching stock in transit: {e}")
+            return {}
+
+    async def get_product_logistics(self, sku_codes: Set[str]) -> Dict[str, Dict]:
+        """Batch load CBM and case_pack from products collection"""
+        if not sku_codes:
+            return {}
+
+        try:
+            products_collection = self.database.get_collection("products")
+
+            def _fetch_logistics():
+                return list(products_collection.find(
+                    {"cf_sku_code": {"$in": list(sku_codes)}},
+                    {"cf_sku_code": 1, "cbm": 1, "case_pack": 1, "_id": 0}
+                ))
+
+            products = await asyncio.to_thread(_fetch_logistics)
+
+            result = {}
+            for p in products:
+                sku = p.get("cf_sku_code")
+                if sku:
+                    result[sku] = {
+                        "cbm": self.safe_float(p.get("cbm")),
+                        "case_pack": self.safe_float(p.get("case_pack")),
+                    }
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching product logistics: {e}")
+            return {}
+
+    @staticmethod
+    def enrich_with_order_calculations(
+        combined_data: List[Dict],
+        transit_data: Dict[str, Dict],
+        logistics_data: Dict[str, Dict],
+    ) -> List[Dict]:
+        """Add order calculation columns to each item in combined_data"""
+        for item in combined_data:
+            sku = item.get("sku_code", "")
+            metrics = item.get("combined_metrics", {})
+            drr = metrics.get("avg_daily_run_rate", 0)
+            closing_stock = metrics.get("total_closing_stock", 0)
+
+            # Transit data
+            transit = transit_data.get(sku, {})
+            item["stock_in_transit_1"] = transit.get("transit_1", 0)
+            item["stock_in_transit_2"] = transit.get("transit_2", 0)
+            item["stock_in_transit_3"] = transit.get("transit_3", 0)
+            total_transit = transit.get("total", 0)
+            item["total_stock_in_transit"] = total_transit
+
+            # Days coverage
+            on_hand_days = metrics.get("avg_days_of_coverage", 0)
+            item["on_hand_days_coverage"] = round(on_hand_days, 2)
+
+            current_days_coverage = 0
+            if drr > 0:
+                current_days_coverage = round((closing_stock + total_transit) / drr, 2)
+            item["current_days_coverage"] = current_days_coverage
+
+            # Target days = lead_time + safety_days + review_days(10)
+            safety_days = item.get("safety_days", 15)
+            lead_time = item.get("lead_time", 60)
+            target_days = lead_time + safety_days + 10
+            item["target_days"] = target_days
+
+            # Excess or Order
+            if drr == 0:
+                item["excess_or_order"] = "NO MOVEMENT"
+            elif current_days_coverage < target_days:
+                item["excess_or_order"] = "ORDER"
+            else:
+                item["excess_or_order"] = "EXCESS"
+
+            # Order quantity
+            order_qty = max(0, (target_days - current_days_coverage) * drr)
+            item["order_qty"] = round(order_qty, 2)
+
+            # Logistics (CBM / Case Pack)
+            logistics = logistics_data.get(sku, {})
+            cbm = logistics.get("cbm", 0)
+            case_pack = logistics.get("case_pack", 0)
+            item["cbm"] = cbm
+            item["case_pack"] = case_pack
+
+            # Order qty rounded up to case pack
+            if case_pack > 0:
+                item["order_qty_rounded"] = math.ceil(order_qty / case_pack) * case_pack
+            else:
+                item["order_qty_rounded"] = round(order_qty, 0)
+
+            order_qty_rounded = item["order_qty_rounded"]
+
+            # Total CBM
+            if case_pack > 0 and cbm > 0:
+                item["total_cbm"] = round((order_qty_rounded / case_pack) * cbm, 4)
+            else:
+                item["total_cbm"] = 0
+
+            # Days current order will last
+            if drr > 0:
+                item["days_current_order_lasts"] = round(order_qty_rounded / drr, 2)
+            else:
+                item["days_current_order_lasts"] = 0
+
+            # Days total inventory will last
+            if drr > 0:
+                item["days_total_inventory_lasts"] = round(
+                    (closing_stock + total_transit + order_qty_rounded) / drr, 2
+                )
+            else:
+                item["days_total_inventory_lasts"] = 0
+
+        return combined_data
+
 
 @router.get("/master-report")
 async def get_master_report(
@@ -777,6 +1072,33 @@ async def get_master_report(
         else:
             combined_data = []
 
+        # Step 4b: Enrich with movement classification, transit stock, and order calculations
+        if combined_data:
+            try:
+                combined_sku_codes = {item.get("sku_code", "") for item in combined_data if item.get("sku_code")}
+
+                # Fetch brand logistics, product brands, transit, and product logistics in parallel
+                brand_logistics_task = report_service.get_brand_logistics()
+                product_brands_task = report_service.get_product_brands(combined_sku_codes)
+                transit_task = report_service.get_stock_in_transit()
+                logistics_task = report_service.get_product_logistics(combined_sku_codes)
+
+                brand_logistics, product_brands, transit_data, logistics_data = await asyncio.gather(
+                    brand_logistics_task, product_brands_task, transit_task, logistics_task
+                )
+
+                # Classify movement (Fast/Medium/Slow mover) using brand-specific settings
+                combined_data = report_service.classify_movement(combined_data, brand_logistics, product_brands)
+
+                # Enrich with order calculations
+                combined_data = report_service.enrich_with_order_calculations(
+                    combined_data, transit_data, logistics_data
+                )
+                logger.info(f"Enriched {len(combined_data)} items with movement and order calculations")
+            except Exception as e:
+                logger.error(f"Error enriching data: {e}")
+                errors.append(f"Enrichment error: {str(e)}")
+
         # Step 5: Calculate summary statistics
         total_skus = len(combined_data)
         summary_stats = {
@@ -933,14 +1255,6 @@ async def download_master_report(
                         "Total Units Returned": item.get("combined_metrics", {}).get(
                             "total_units_returned", 0
                         ),
-                        "Total Credit Notes": item.get("combined_metrics", {}).get(
-                            "total_credit_notes", 0
-                        ),
-                        "Total Net Units Sold": item.get("combined_metrics", {}).get(
-                            "total_units_sold", 0
-                        ) - item.get("combined_metrics", {}).get(
-                            "total_credit_notes", 0
-                        ),
                         "Total Amount": item.get("combined_metrics", {}).get(
                             "total_amount", 0
                         ),
@@ -976,16 +1290,6 @@ async def download_master_report(
                         "Zoho Units Returned": item.get("source_breakdown", {})
                         .get("zoho", {})
                         .get("units_returned", 0),
-                        # Platform-wise Credit Notes
-                        "Blinkit Credit Notes": item.get("source_breakdown", {})
-                        .get("blinkit", {})
-                        .get("credit_notes", 0),
-                        "Amazon Credit Notes": item.get("source_breakdown", {})
-                        .get("amazon", {})
-                        .get("credit_notes", 0),
-                        "Zoho Credit Notes": item.get("source_breakdown", {})
-                        .get("zoho", {})
-                        .get("credit_notes", 0),
                         # Platform-wise Closing Stock
                         "Blinkit Closing Stock": item.get("source_breakdown", {})
                         .get("blinkit", {})
@@ -1016,6 +1320,25 @@ async def download_master_report(
                         "Zoho Last 90 Days Dates": item.get("source_breakdown", {})
                         .get("zoho", {})
                         .get("last_90_days_dates", ""),
+                        # Movement & Order Calculation columns
+                        "Movement": item.get("movement", ""),
+                        "Safety Days": item.get("safety_days", 0),
+                        "Lead Time": item.get("lead_time", 0),
+                        "On-Hand Days Coverage": item.get("on_hand_days_coverage", 0),
+                        "Stock in Transit 1": item.get("stock_in_transit_1", 0),
+                        "Stock in Transit 2": item.get("stock_in_transit_2", 0),
+                        "Stock in Transit 3": item.get("stock_in_transit_3", 0),
+                        "Total Stock in Transit": item.get("total_stock_in_transit", 0),
+                        "Current Days Coverage": item.get("current_days_coverage", 0),
+                        "Target Days": item.get("target_days", 0),
+                        "Excess / Order": item.get("excess_or_order", ""),
+                        "Order Qty": item.get("order_qty", 0),
+                        "CBM": item.get("cbm", 0),
+                        "Case Pack": item.get("case_pack", 0),
+                        "Order Qty (Rounded)": item.get("order_qty_rounded", 0),
+                        "Total CBM": item.get("total_cbm", 0),
+                        "Days Current Order Lasts": item.get("days_current_order_lasts", 0),
+                        "Days Total Inventory Lasts": item.get("days_total_inventory_lasts", 0),
                     }
                 )
 
@@ -1030,8 +1353,6 @@ async def download_master_report(
                 ["Total Unique SKUs", summary.get("total_unique_skus", 0)],
                 ["Total Units Sold", summary.get("total_units_sold", 0)],
                 ["Total Units Returned", summary.get("total_units_returned", 0)],
-                ["Total Credit Notes", summary.get("total_credit_notes", 0)],
-                ["Total Net Units Sold", summary.get("total_net_units_sold", 0)],
                 ["Total Amount", summary.get("total_amount", 0)],
                 ["Total Closing Stock", summary.get("total_closing_stock", 0)],
                 ["Average Daily Run Rate", summary.get("avg_drr", 0)],
@@ -1075,3 +1396,251 @@ async def download_master_report(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate Excel report: {str(e)}",
         )
+
+
+@router.post("/import-product-logistics")
+async def import_product_logistics(
+    db=Depends(get_database),
+):
+    """
+    Import CBM and Case Pack data from PSR Sheet.xlsx Master sheet into products collection.
+    Maps BBCode (col B) to cf_sku_code and updates cbm (col BX) and case_pack (col BY).
+    """
+    try:
+        import openpyxl
+        import os
+
+        # Find PSR Sheet.xlsx in the backend directory
+        backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        psr_path = os.path.join(backend_dir, "PSR Sheet.xlsx")
+
+        if not os.path.exists(psr_path):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="PSR Sheet.xlsx not found in backend directory",
+            )
+
+        wb = openpyxl.load_workbook(psr_path, read_only=True)
+        ws = wb["Master"]
+
+        products_collection = db.get_collection("products")
+        updated_count = 0
+        skipped_count = 0
+
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            row = list(row)
+            if len(row) < 77:
+                continue
+
+            bbcode = row[1]  # Col B = BBCode (SKU)
+            cbm = row[75]    # Col BX = CBM
+            case_pack = row[76]  # Col BY = Case Pack
+
+            if not bbcode:
+                continue
+
+            try:
+                cbm_val = float(cbm) if cbm is not None else 0
+                case_pack_val = float(case_pack) if case_pack is not None else 0
+            except (ValueError, TypeError):
+                cbm_val = 0
+                case_pack_val = 0
+
+            result = products_collection.update_one(
+                {"cf_sku_code": str(bbcode).strip()},
+                {"$set": {"cbm": cbm_val, "case_pack": case_pack_val}},
+            )
+
+            if result.modified_count > 0 or result.matched_count > 0:
+                updated_count += 1
+            else:
+                skipped_count += 1
+
+        wb.close()
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": f"Imported CBM and Case Pack data",
+                "updated": updated_count,
+                "skipped": skipped_count,
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error importing product logistics: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to import product logistics: {str(e)}",
+        )
+
+
+# ─── Brand Logistics CRUD ───────────────────────────────────────────
+
+
+@router.get("/brand-logistics")
+async def get_brand_logistics(db=Depends(get_database)):
+    """Get all brand logistics settings"""
+    try:
+        collection = db.get_collection("brand_logistics")
+        docs = list(collection.find({}, {"_id": 0}))
+        return JSONResponse(status_code=200, content={"data": docs})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/brand-logistics")
+async def create_brand_logistics(
+    brand: str = Query(...),
+    lead_time: float = Query(60),
+    safety_days_fast: float = Query(40),
+    safety_days_medium: float = Query(25),
+    safety_days_slow: float = Query(15),
+    db=Depends(get_database),
+):
+    """Create or update brand logistics settings"""
+    try:
+        collection = db.get_collection("brand_logistics")
+        doc = {
+            "brand": brand.strip(),
+            "lead_time": lead_time,
+            "safety_days_fast": safety_days_fast,
+            "safety_days_medium": safety_days_medium,
+            "safety_days_slow": safety_days_slow,
+        }
+        collection.update_one(
+            {"brand": brand.strip()},
+            {"$set": doc},
+            upsert=True,
+        )
+        return JSONResponse(status_code=200, content={"message": f"Brand logistics saved for {brand}", "data": doc})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/brand-logistics")
+async def delete_brand_logistics(
+    brand: str = Query(...),
+    db=Depends(get_database),
+):
+    """Delete brand logistics settings"""
+    try:
+        collection = db.get_collection("brand_logistics")
+        result = collection.delete_one({"brand": brand.strip()})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail=f"Brand '{brand}' not found")
+        return JSONResponse(status_code=200, content={"message": f"Deleted logistics for {brand}"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Product Logistics (CBM / Case Pack) CRUD ──────────────────────
+
+
+@router.get("/product-logistics")
+async def get_product_logistics_list(
+    search: str = Query("", description="Search by SKU or product name"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db=Depends(get_database),
+):
+    """Get products with CBM and case_pack data, with pagination and search"""
+    try:
+        products_collection = db.get_collection("products")
+
+        # Always filter out products without a valid SKU code
+        base_filter = {"cf_sku_code": {"$exists": True, "$ne": ""}}
+
+        if search:
+            query = {
+                "$and": [
+                    base_filter,
+                    {
+                        "$or": [
+                            {"cf_sku_code": {"$regex": search, "$options": "i"}},
+                            {"name": {"$regex": search, "$options": "i"}},
+                        ]
+                    },
+                ]
+            }
+        else:
+            query = base_filter
+
+        total = products_collection.count_documents(query)
+        skip = (page - 1) * page_size
+
+        raw_products = list(
+            products_collection.find(
+                query,
+                {"cf_sku_code": 1, "name": 1, "brand": 1, "cbm": 1, "case_pack": 1, "_id": 0},
+            )
+            .skip(skip)
+            .limit(page_size)
+            .sort("cf_sku_code", 1)
+        )
+
+        # Ensure cbm and case_pack default to 0 when missing from DB
+        products = []
+        for p in raw_products:
+            products.append({
+                "cf_sku_code": p.get("cf_sku_code", ""),
+                "name": p.get("name", ""),
+                "brand": p.get("brand", ""),
+                "cbm": p.get("cbm", 0) or 0,
+                "case_pack": p.get("case_pack", 0) or 0,
+            })
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "data": products,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": math.ceil(total / page_size) if total > 0 else 1,
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/product-logistics")
+async def update_product_logistics(
+    sku_code: str = Query(...),
+    cbm: float = Query(None),
+    case_pack: float = Query(None),
+    db=Depends(get_database),
+):
+    """Update CBM and/or case_pack for a product"""
+    try:
+        products_collection = db.get_collection("products")
+
+        update_fields = {}
+        if cbm is not None:
+            update_fields["cbm"] = cbm
+        if case_pack is not None:
+            update_fields["case_pack"] = case_pack
+
+        if not update_fields:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        result = products_collection.update_one(
+            {"cf_sku_code": sku_code.strip()},
+            {"$set": update_fields},
+        )
+
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail=f"Product with SKU '{sku_code}' not found")
+
+        return JSONResponse(
+            status_code=200,
+            content={"message": f"Updated logistics for {sku_code}", "updated_fields": update_fields},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
