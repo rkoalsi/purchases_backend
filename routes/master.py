@@ -732,7 +732,7 @@ class OptimizedMasterReportService:
 
             def _fetch_open_pos():
                 return list(po_collection.find(
-                    {"status": "open"},
+                    {"status": "issued"},
                     {"line_items": 1, "purchaseorder_number": 1, "_id": 0}
                 ))
 
