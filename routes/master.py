@@ -31,7 +31,8 @@ class OptimizedMasterReportService:
             from .blinkit import generate_report_by_date_range
 
             report_data = await generate_report_by_date_range(
-                start_date=start_date, end_date=end_date, database=self.database, any_last_90_days=any_last_90_days
+                start_date=start_date, end_date=end_date, database=self.database,
+                any_last_90_days=any_last_90_days, skip_lifetime=True,
             )
 
             return {
@@ -149,8 +150,9 @@ class OptimizedMasterReportService:
             logger.error(f"Error in batch loading product names: {e}")
             return {}
 
-    async def batch_load_product_rates(self, sku_codes: Set[str]) -> Dict[str, float]:
-        """Batch load rate from products collection for all SKUs"""
+    async def batch_load_all_product_data(self, sku_codes: Set[str]) -> Dict[str, Dict]:
+        """Batch load all product data (name, rate, brand, cbm, case_pack) in a single query.
+        Returns a dict keyed by sku_code with all fields."""
         if not sku_codes:
             return {}
 
@@ -161,29 +163,32 @@ class OptimizedMasterReportService:
 
             products_collection = self.database.get_collection("products")
 
-            def _fetch_rates():
+            def _fetch_all():
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(valid_skus)}},
-                    {"cf_sku_code": 1, "rate": 1, "_id": 0},
+                    {"cf_sku_code": 1, "name": 1, "rate": 1, "brand": 1, "cbm": 1, "case_pack": 1, "_id": 0},
                 ))
 
-            products = await asyncio.to_thread(_fetch_rates)
+            products = await asyncio.to_thread(_fetch_all)
 
-            sku_to_rate = {}
+            result = {}
             for product in products:
                 sku_code = product.get("cf_sku_code")
-                rate = product.get("rate")
-                if sku_code and rate is not None:
-                    try:
-                        sku_to_rate[sku_code] = float(rate)
-                    except (ValueError, TypeError):
-                        pass
+                if not sku_code:
+                    continue
+                result[sku_code] = {
+                    "name": product.get("name"),
+                    "rate": product.get("rate"),
+                    "brand": product.get("brand", ""),
+                    "cbm": self.safe_float(product.get("cbm")),
+                    "case_pack": self.safe_float(product.get("case_pack")),
+                }
 
-            logger.info(f"Batch loaded rates for {len(sku_to_rate)} products")
-            return sku_to_rate
+            logger.info(f"Batch loaded all product data for {len(result)} products")
+            return result
 
         except Exception as e:
-            logger.error(f"Error batch loading product rates: {e}")
+            logger.error(f"Error batch loading all product data: {e}")
             return {}
 
     def extract_all_sku_codes(self, all_reports: List[Dict[str, Any]]) -> Set[str]:
@@ -935,19 +940,19 @@ class OptimizedMasterReportService:
         return combined_data
 
 
-@router.get("/master-report")
-async def get_master_report(
-    start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
-    end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
-    include_blinkit: bool = Query(True, description="Include Blinkit data"),
-    include_amazon: bool = Query(True, description="Include Amazon data"),
-    include_zoho: bool = Query(True, description="Include Zoho data"),
-    amazon_report_type: str = Query("all", description="Amazon report type"),
-    any_last_90_days: bool = Query(False, description="Include last 90 days in stock dates"),
-    db=Depends(get_database),
+async def _generate_master_report_data(
+    start_date: str,
+    end_date: str,
+    include_blinkit: bool,
+    include_amazon: bool,
+    include_zoho: bool,
+    amazon_report_type: str,
+    any_last_90_days: bool,
+    db,
 ):
     """
-    Optimized master report with batch processing and parallel execution
+    Internal function that generates full master report data (with raw individual_reports).
+    Used by both the API endpoint and the download endpoint.
     """
     try:
         # Validate dates
@@ -968,7 +973,7 @@ async def get_master_report(
         # Initialize service
         report_service = OptimizedMasterReportService(db)
 
-        # Step 1: Fetch all reports in parallel
+        # Step 1: Fetch all reports + composite products in parallel
         tasks = []
         if include_blinkit:
             tasks.append(report_service.get_blinkit_report(start_date, end_date, any_last_90_days))
@@ -987,10 +992,25 @@ async def get_master_report(
                 detail="At least one data source must be selected",
             )
 
-        # Execute all report fetches in parallel
+        # Fetch ALL composite products in parallel with reports (collection is small)
+        async def _fetch_all_composites():
+            try:
+                composite_collection = db.get_collection("composite_products")
+                def _query():
+                    result = {}
+                    for doc in composite_collection.find({}, {"sku_code": 1, "components": 1, "_id": 0}):
+                        if doc.get("components"):
+                            result[doc["sku_code"]] = doc["components"]
+                    return result
+                return await asyncio.to_thread(_query)
+            except Exception as e:
+                logger.error(f"Error loading composite products: {e}")
+                return {}
+
+        # Execute all report fetches + composites in parallel
         try:
-            results = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
+            all_results = await asyncio.wait_for(
+                asyncio.gather(*tasks, _fetch_all_composites(), return_exceptions=True),
                 timeout=180.0,  # Allow enough time for large date ranges
             )
         except asyncio.TimeoutError:
@@ -998,6 +1018,13 @@ async def get_master_report(
                 status_code=status.HTTP_408_REQUEST_TIMEOUT,
                 detail="Report generation timed out",
             )
+
+        # Last result is composite_products_map
+        results = all_results[:-1]
+        composite_products_map_raw = all_results[-1]
+        if isinstance(composite_products_map_raw, Exception):
+            logger.error(f"Composite products fetch failed: {composite_products_map_raw}")
+            composite_products_map_raw = {}
 
         # Process results
         individual_reports = {}
@@ -1024,12 +1051,25 @@ async def get_master_report(
                 detail="No successful reports generated",
             )
 
-        # Step 2: Extract all SKU codes and batch load product names
+        # Step 2: Extract all SKU codes and batch load all product data in one query
         all_sku_codes = report_service.extract_all_sku_codes(successful_reports)
         logger.info(f"Found {len(all_sku_codes)} unique SKU codes")
 
-        # Batch load product names
-        product_name_map = await report_service.batch_load_product_names(all_sku_codes)
+        # Single query to load all product data (name, rate, brand, cbm, case_pack)
+        all_product_data = await report_service.batch_load_all_product_data(all_sku_codes)
+
+        # Build product name map for normalization
+        product_name_map = {}
+        for sku, data in all_product_data.items():
+            name = data.get("name")
+            if name:
+                product_name_map[sku] = name
+            else:
+                product_name_map[sku] = "Unknown Item"
+        # Mark unknown SKUs
+        for sku in all_sku_codes:
+            if sku not in product_name_map:
+                product_name_map[sku] = "Unknown Item"
 
         # Step 3: Normalize all data in parallel
         normalization_tasks = []
@@ -1075,29 +1115,9 @@ async def get_master_report(
 
         if all_normalized_data:
             try:
-                # Batch-load all composite products in a single query before processing
-                composite_products_map = {}
-                try:
-                    composite_collection = db.get_collection("composite_products")
-                    all_skus = set()
-                    for source_data in all_normalized_data:
-                        if isinstance(source_data, list):
-                            for item in source_data:
-                                if isinstance(item, dict):
-                                    sku = item.get("sku_code", "")
-                                    if sku:
-                                        all_skus.add(sku)
-                    if all_skus:
-                        def _fetch_composites():
-                            result = {}
-                            for doc in composite_collection.find({"sku_code": {"$in": list(all_skus)}}):
-                                if doc.get("components"):
-                                    result[doc["sku_code"]] = doc["components"]
-                            return result
-                        composite_products_map = await asyncio.to_thread(_fetch_composites)
-                    logger.info(f"Batch loaded {len(composite_products_map)} composite products from {len(all_skus)} SKUs")
-                except Exception as e:
-                    logger.error(f"Error batch loading composite products: {e}")
+                # Use pre-fetched composite products map (loaded in parallel with reports)
+                composite_products_map = composite_products_map_raw
+                logger.info(f"Using {len(composite_products_map)} pre-loaded composite products")
 
                 combined_data = await asyncio.to_thread(
                     report_service.combine_data_by_sku_optimized, all_normalized_data, period_days, composite_products_map
@@ -1114,15 +1134,33 @@ async def get_master_report(
             try:
                 combined_sku_codes = {item.get("sku_code", "") for item in combined_data if item.get("sku_code")}
 
-                # Fetch brand logistics, product brands, transit, product logistics, and rates in parallel
-                brand_logistics_task = report_service.get_brand_logistics()
-                product_brands_task = report_service.get_product_brands(combined_sku_codes)
-                transit_task = report_service.get_stock_in_transit()
-                logistics_task = report_service.get_product_logistics(combined_sku_codes)
-                rates_task = report_service.batch_load_product_rates(combined_sku_codes)
+                # Load any additional SKUs that appeared after composite expansion
+                new_skus = combined_sku_codes - all_sku_codes
+                if new_skus:
+                    extra_product_data = await report_service.batch_load_all_product_data(new_skus)
+                    all_product_data.update(extra_product_data)
 
-                brand_logistics, product_brands, transit_data, logistics_data, product_rates = await asyncio.gather(
-                    brand_logistics_task, product_brands_task, transit_task, logistics_task, rates_task
+                # Build derived maps from the single product data query
+                product_rates = {}
+                product_brands = {}
+                logistics_data = {}
+                for sku, pdata in all_product_data.items():
+                    rate = pdata.get("rate")
+                    if rate is not None:
+                        try:
+                            product_rates[sku] = float(rate)
+                        except (ValueError, TypeError):
+                            pass
+                    product_brands[sku] = pdata.get("brand", "")
+                    logistics_data[sku] = {
+                        "cbm": pdata.get("cbm", 0),
+                        "case_pack": pdata.get("case_pack", 0),
+                    }
+
+                # Only brand_logistics and transit still need DB queries
+                brand_logistics, transit_data = await asyncio.gather(
+                    report_service.get_brand_logistics(),
+                    report_service.get_stock_in_transit(),
                 )
 
                 # Fill in total_amount for items where it's 0 (e.g. Blinkit-only) using rate * units_sold
@@ -1189,42 +1227,39 @@ async def get_master_report(
         execution_time = (datetime.now() - start_time).total_seconds()
         logger.info(f"Master report completed in {execution_time:.2f} seconds")
 
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={
-                "message": f"Optimized master report generated for {start_date} to {end_date}",
-                "date_range": {"start_date": start_date, "end_date": end_date},
-                "summary": {
-                    "total_unique_skus": total_skus,
-                    "total_units_sold": round(summary_stats["total_units_sold"], 2),
-                    "total_units_returned": round(
-                        summary_stats["total_units_returned"], 2
-                    ),
-                    "total_credit_notes": round(
-                        summary_stats["total_credit_notes"], 2
-                    ),
-                    "total_net_units_sold": round(
-                        summary_stats["total_units_sold"] - summary_stats["total_credit_notes"], 2
-                    ),
-                    "total_amount": round(summary_stats["total_amount"], 2),
-                    "total_closing_stock": round(
-                        summary_stats["total_closing_stock"], 2
-                    ),
-                    "avg_drr": summary_stats["avg_drr"],
-                    "sources_included": list(individual_reports.keys()),
-                    "source_record_counts": source_counts,
-                },
-                "individual_reports": individual_reports,
-                "combined_data": combined_data,
-                "errors": errors,
-                "meta": {
-                    "execution_time_seconds": round(execution_time, 2),
-                    "timestamp": datetime.now().isoformat(),
-                    "query_type": "optimized_master_report",
-                    "optimization_applied": True,
-                },
+        return {
+            "message": f"Optimized master report generated for {start_date} to {end_date}",
+            "date_range": {"start_date": start_date, "end_date": end_date},
+            "summary": {
+                "total_unique_skus": total_skus,
+                "total_units_sold": round(summary_stats["total_units_sold"], 2),
+                "total_units_returned": round(
+                    summary_stats["total_units_returned"], 2
+                ),
+                "total_credit_notes": round(
+                    summary_stats["total_credit_notes"], 2
+                ),
+                "total_net_units_sold": round(
+                    summary_stats["total_units_sold"] - summary_stats["total_credit_notes"], 2
+                ),
+                "total_amount": round(summary_stats["total_amount"], 2),
+                "total_closing_stock": round(
+                    summary_stats["total_closing_stock"], 2
+                ),
+                "avg_drr": summary_stats["avg_drr"],
+                "sources_included": list(individual_reports.keys()),
+                "source_record_counts": source_counts,
             },
-        )
+            "individual_reports": individual_reports,
+            "combined_data": combined_data,
+            "errors": errors,
+            "meta": {
+                "execution_time_seconds": round(execution_time, 2),
+                "timestamp": datetime.now().isoformat(),
+                "query_type": "optimized_master_report",
+                "optimization_applied": True,
+            },
+        }
 
     except HTTPException:
         raise
@@ -1235,6 +1270,39 @@ async def get_master_report(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate optimized master report: {str(e)}",
         )
+
+
+@router.get("/master-report")
+async def get_master_report(
+    start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
+    end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
+    include_blinkit: bool = Query(True, description="Include Blinkit data"),
+    include_amazon: bool = Query(True, description="Include Amazon data"),
+    include_zoho: bool = Query(True, description="Include Zoho data"),
+    amazon_report_type: str = Query("all", description="Amazon report type"),
+    any_last_90_days: bool = Query(False, description="Include last 90 days in stock dates"),
+    db=Depends(get_database),
+):
+    """
+    Optimized master report with batch processing and parallel execution
+    """
+    content = await _generate_master_report_data(
+        start_date, end_date, include_blinkit, include_amazon, include_zoho,
+        amazon_report_type, any_last_90_days, db,
+    )
+
+    # Strip raw data from individual_reports for the API response (keep metadata only)
+    content["individual_reports"] = {
+        source: {
+            "source": report.get("source", source),
+            "success": report.get("success", False),
+            "record_count": len(report.get("data", [])),
+            "error": report.get("error"),
+        }
+        for source, report in content["individual_reports"].items()
+    }
+
+    return JSONResponse(status_code=status.HTTP_200_OK, content=content)
 
 
 @router.get("/master-report/download")
@@ -1252,8 +1320,8 @@ async def download_master_report(
     Download master report as Excel file with multiple sheets.
     """
     try:
-        # Get the master report data
-        response = await get_master_report(
+        # Get the full master report data (with raw individual_reports for Excel sheets)
+        content = await _generate_master_report_data(
             start_date=start_date,
             end_date=end_date,
             include_blinkit=include_blinkit,
@@ -1263,14 +1331,6 @@ async def download_master_report(
             any_last_90_days=any_last_90_days,
             db=db,
         )
-
-        # Parse response content
-        if hasattr(response, "body"):
-            import json
-
-            content = json.loads(response.body)
-        else:
-            content = response
 
         combined_data = content.get("combined_data", [])
         individual_reports = content.get("individual_reports", {})

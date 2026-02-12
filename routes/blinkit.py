@@ -1316,6 +1316,7 @@ async def generate_report_by_date_range(
     start_date: str,  # Format: YYYY-MM-DD
     end_date: str,  # Format: YYYY-MM-DD
     any_last_90_days: bool = False,  # Include last 90 days in stock with date ranges
+    skip_lifetime: bool = False,  # Skip lifetime aggregation (master report doesn't need it)
     database=Depends(get_database),
 ):
     """
@@ -1360,27 +1361,41 @@ async def generate_report_by_date_range(
         inventory_collection = database.get_collection(INVENTORY_COLLECTION)
         returns_collection = database.get_collection(RETURN_COLLECTION)
 
+        # Pre-compute extended start date for comparison periods (7-day and 30-day lookbacks)
+        # Comparison periods go back at most ~59 days from end_date.
+        # Only extend past start_date if the comparison periods actually need earlier data.
+        comparison_earliest = overall_end_date - timedelta(days=59)
+        extended_sales_start = min(overall_start_date, comparison_earliest)
+
         logger.info(
             f"Querying sales, inventory, and returns data for {period_name} to generate dynamic report..."
         )
 
         # Run all four DB queries in parallel using threads
+        # Sales query covers extended period to include comparison data
         def _fetch_sales():
             return list(sales_collection.find(
-                {"order_date": {"$gte": overall_start_date, "$lte": overall_end_date}}
+                {"order_date": {"$gte": extended_sales_start, "$lte": overall_end_date}},
+                {"sku_code": 1, "city": 1, "order_date": 1, "quantity": 1, "item_name": 1, "item_id": 1, "_id": 0},
             ))
 
         def _fetch_returns():
-            return list(returns_collection.find({
-                "return_date": {
-                    "$gte": overall_start_date.replace(hour=0, minute=0, second=0, microsecond=0),
-                    "$lte": overall_end_date.replace(hour=0, minute=0, second=0, microsecond=0),
-                }
-            }))
+            return list(returns_collection.find(
+                {
+                    "return_date": {
+                        "$gte": overall_start_date.replace(hour=0, minute=0, second=0, microsecond=0),
+                        "$lte": overall_end_date.replace(hour=0, minute=0, second=0, microsecond=0),
+                    }
+                },
+                {"sku_code": 1, "city": 1, "return_date": 1, "quantity": 1, "item_name": 1, "item_id": 1, "_id": 0},
+            ))
+
+        # Lifetime aggregation (for "best performing month") - skip when called from master report
+        lifetime_lookback = overall_start_date - timedelta(days=730)
 
         def _fetch_lifetime_monthly():
             lifetime_agg_pipeline = [
-                {"$match": {"sku_code": {"$exists": True, "$ne": None}, "city": {"$exists": True, "$ne": None}, "order_date": {"$exists": True}}},
+                {"$match": {"sku_code": {"$exists": True, "$ne": None}, "city": {"$exists": True, "$ne": None}, "order_date": {"$gte": lifetime_lookback}}},
                 {"$project": {"sku_code": 1, "city": 1, "quantity": 1, "order_date": 1, "item_name": 1, "item_id": 1, "_id": 0}},
                 {"$group": {
                     "_id": {
@@ -1408,23 +1423,42 @@ async def generate_report_by_date_range(
             return result, item_info
 
         def _fetch_inventory():
-            return list(inventory_collection.find({
-                "date": {
-                    "$gte": overall_start_date.replace(hour=0, minute=0, second=0, microsecond=0),
-                    "$lte": overall_end_date.replace(hour=0, minute=0, second=0, microsecond=0),
-                }
-            }))
+            return list(inventory_collection.find(
+                {
+                    "date": {
+                        "$gte": overall_start_date.replace(hour=0, minute=0, second=0, microsecond=0),
+                        "$lte": overall_end_date.replace(hour=0, minute=0, second=0, microsecond=0),
+                    }
+                },
+                {"sku_code": 1, "city": 1, "date": 1, "warehouse_inventory": 1, "item_name": 1, "item_id": 1, "combined_warehouses": 1, "_id": 0},
+            ))
 
-        logger.info("Running sales, returns, lifetime aggregation, and inventory queries in parallel...")
-        sales_data, returns_data, (lifetime_monthly_sales, lifetime_item_info), inventory_data = await asyncio.gather(
-            asyncio.to_thread(_fetch_sales),
-            asyncio.to_thread(_fetch_returns),
-            asyncio.to_thread(_fetch_lifetime_monthly),
-            asyncio.to_thread(_fetch_inventory),
-        )
+        logger.info("Running sales, returns, %sinventory queries in parallel...",
+                     "" if skip_lifetime else "lifetime aggregation, and ")
+        _db_start = datetime.now()
+
+        if skip_lifetime:
+            # Master report path: skip expensive lifetime aggregation entirely
+            sales_data, returns_data, inventory_data = await asyncio.gather(
+                asyncio.to_thread(_fetch_sales),
+                asyncio.to_thread(_fetch_returns),
+                asyncio.to_thread(_fetch_inventory),
+            )
+            lifetime_monthly_sales = {}
+            lifetime_item_info = {}
+        else:
+            sales_data, returns_data, (lifetime_monthly_sales, lifetime_item_info), inventory_data = await asyncio.gather(
+                asyncio.to_thread(_fetch_sales),
+                asyncio.to_thread(_fetch_returns),
+                asyncio.to_thread(_fetch_lifetime_monthly),
+                asyncio.to_thread(_fetch_inventory),
+            )
+
+        _db_elapsed = (datetime.now() - _db_start).total_seconds()
         logger.info(
+            f"DB queries completed in {_db_elapsed:.2f}s. "
             f"Found {len(sales_data)} sales, {len(returns_data)} returns, {len(inventory_data)} inventory records. "
-            f"Aggregated lifetime monthly sales for {len(lifetime_monthly_sales)} SKU/city pairs."
+            f"Lifetime aggregation: {'skipped' if skip_lifetime else f'{len(lifetime_monthly_sales)} SKU/city pairs'}."
         )
 
         if not sales_data and not inventory_data and not returns_data:
@@ -1452,7 +1486,8 @@ async def generate_report_by_date_range(
 
         # lifetime_monthly_sales already populated by aggregation pipeline above
 
-        # Process current period sales data
+        # Process sales data (query covers extended period for comparisons)
+        # Only add to current_period_sales if within the original date range
         for record in sales_data:
             sku = record.get("sku_code")
             city = record.get("city")
@@ -1472,9 +1507,11 @@ async def generate_report_by_date_range(
             if sku not in sales_item_info:
                 sales_item_info[sku] = {"item_name": item_name, "item_id": item_id}
 
-            key = (sku, city, date_key_str)
-            current_period_sales[key] = current_period_sales.get(key, 0) + quantity
-            all_sales_dates.add(date_key_str)
+            # Only include in current period if within original date range
+            if overall_start_date <= order_date_dt <= overall_end_date:
+                key = (sku, city, date_key_str)
+                current_period_sales[key] = current_period_sales.get(key, 0) + quantity
+                all_sales_dates.add(date_key_str)
 
         # Process current period returns data
         logger.info("Processing returns data for the current period...")
@@ -1500,10 +1537,15 @@ async def generate_report_by_date_range(
             )
 
         # Process city-aggregated inventory data
+        # Also track most recent inventory per (sku, city) and which dates have inventory > 0
         inventory_map = {}
         inventory_item_info = {}
         all_inventory_dates = set()
         sku_city_warehouses_map = {}
+        most_recent_inventory_map = {}  # (sku, city) -> inventory qty (most recent date)
+        _most_recent_inv_date = {}  # (sku, city) -> date_key_str (to track recency)
+        # Set of (sku, city, date_str) that have inventory > 0 (for stock-day metrics)
+        inventory_positive_days = set()
 
         for record in inventory_data:
             sku = record.get("sku_code")
@@ -1547,6 +1589,16 @@ async def generate_report_by_date_range(
                     or existing_warehouses == "Unknown Warehouses"
                 ):
                     sku_city_warehouses_map[sku_city_key] = combined_warehouses
+
+            # Track most recent inventory per (sku, city) in single pass
+            prev_date = _most_recent_inv_date.get(sku_city_key)
+            if prev_date is None or date_key_str > prev_date:
+                _most_recent_inv_date[sku_city_key] = date_key_str
+                most_recent_inventory_map[sku_city_key] = inventory_qty
+
+            # Track days with positive inventory for stock-day metrics
+            if inventory_qty > 0:
+                inventory_positive_days.add(key)
 
         logger.info(f"Sales dates: {sorted(all_sales_dates)}")
         logger.info(f"Inventory dates: {sorted(all_inventory_dates)}")
@@ -1602,26 +1654,8 @@ async def generate_report_by_date_range(
 
             logger.info(f"Last common date in period: {last_common_date_str}")
 
-            extended_sales_fetch_start_date = previous_30_day_period_start
-            if prev_seven_days_period_start < extended_sales_fetch_start_date:
-                extended_sales_fetch_start_date = prev_seven_days_period_start
-
-            extended_sales_cursor = sales_collection.find(
-                {
-                    "order_date": {
-                        "$gte": extended_sales_fetch_start_date.replace(
-                            hour=0, minute=0, second=0, microsecond=0
-                        ),
-                        "$lte": last_common_date_dt,
-                    }
-                }
-            )
-            extended_sales_data = list(extended_sales_cursor)
-            logger.info(
-                f"Found {len(extended_sales_data)} sales records for comparison periods ending {last_common_date_str}."
-            )
-
-            for record in extended_sales_data:
+            # Reuse sales_data (already covers extended period) for comparison calculations
+            for record in sales_data:
                 sku = record.get("sku_code")
                 city = record.get("city")
                 order_date_dt = record.get("order_date")
@@ -1661,15 +1695,16 @@ async def generate_report_by_date_range(
                         previous_30_day_comparison_sales.get(key_pair, 0) + quantity
                     )
 
-        # Build valid SKU/City combinations
+        # Build valid SKU/City combinations (use set for O(1) date lookups)
+        common_dates_set = set(common_dates)
         valid_sku_city_pairs = set()
 
         for sku, city, date_s in current_period_sales.keys():
-            if date_s in common_dates:
+            if date_s in common_dates_set:
                 valid_sku_city_pairs.add((sku, city))
 
         for sku, city, date_s in inventory_map.keys():
-            if date_s in common_dates:
+            if date_s in common_dates_set:
                 valid_sku_city_pairs.add((sku, city))
 
         # Add SKU/City combinations from returns data
@@ -1679,6 +1714,29 @@ async def generate_report_by_date_range(
         logger.info(
             f"Calculating metrics for {len(valid_sku_city_pairs)} unique SKU/City combinations for period {period_name}..."
         )
+
+        # Pre-aggregate sales and inventory metrics by (sku, city) in single passes
+        # This replaces the O(SKUs × dates) inner loop per SKU/city
+        sku_city_total_sales = {}          # (sku, city) -> total sales on common dates
+        sku_city_sales_on_stock_days = {}  # (sku, city) -> sales only on days with inventory > 0
+        sku_city_days_with_inventory = {}  # (sku, city) -> count of days with inventory > 0
+
+        # Single pass over current_period_sales to aggregate by (sku, city)
+        for (sku, city, date_s), qty in current_period_sales.items():
+            if date_s not in common_dates_set:
+                continue
+            sc_key = (sku, city)
+            sku_city_total_sales[sc_key] = sku_city_total_sales.get(sc_key, 0) + qty
+            # Check if this date had positive inventory
+            if (sku, city, date_s) in inventory_positive_days:
+                sku_city_sales_on_stock_days[sc_key] = sku_city_sales_on_stock_days.get(sc_key, 0) + qty
+
+        # Single pass over inventory_map to count days with inventory > 0 on common dates
+        for (sku, city, date_s) in inventory_positive_days:
+            if date_s not in common_dates_set:
+                continue
+            sc_key = (sku, city)
+            sku_city_days_with_inventory[sc_key] = sku_city_days_with_inventory.get(sc_key, 0) + 1
 
         # Fetch last 90 days in stock if requested
         last_90_days_data = {}
@@ -1721,17 +1779,9 @@ async def generate_report_by_date_range(
 
         report_data = []
 
-        # Precompute most recent inventory per SKU/city (avoids O(n*m) reversed loop per item)
-        most_recent_inventory_map = {}
-        if common_dates:
-            for sku, city in valid_sku_city_pairs:
-                for date_str in reversed(common_dates):
-                    inv_info = inventory_map.get((sku, city, date_str))
-                    if inv_info:
-                        most_recent_inventory_map[(sku, city)] = inv_info["inventory"]
-                        break
+        # Process each SKU/City combination using pre-aggregated metrics (O(1) per SKU/city)
+        last_common_date_for_inv = common_dates[-1] if common_dates else None
 
-        # Process each SKU/City combination
         for sku, city in valid_sku_city_pairs:
             # Determine item info from available sources
             item_info = inventory_item_info.get(
@@ -1751,24 +1801,10 @@ async def generate_report_by_date_range(
                 sku_city_key, "Unknown Warehouses"
             )
 
-            total_sales_on_common_days = 0
-            total_sales_on_days_with_inventory = 0
-            days_with_inventory = 0
-
-            for date_str in common_dates:
-                sales_key = (sku, city, date_str)
-                inventory_key = (sku, city, date_str)
-
-                sales_qty = current_period_sales.get(sales_key, 0)
-                inventory_info_daily = inventory_map.get(inventory_key)
-                inventory_qty = (
-                    inventory_info_daily["inventory"] if inventory_info_daily else 0
-                )
-
-                total_sales_on_common_days += sales_qty
-                if inventory_qty > 0:
-                    total_sales_on_days_with_inventory += sales_qty
-                    days_with_inventory += 1
+            # Use pre-aggregated metrics instead of iterating common_dates
+            total_sales_on_common_days = sku_city_total_sales.get(sku_city_key, 0)
+            total_sales_on_days_with_inventory = sku_city_sales_on_stock_days.get(sku_city_key, 0)
+            days_with_inventory = sku_city_days_with_inventory.get(sku_city_key, 0)
 
             avg_daily_on_stock_days = (
                 total_sales_on_days_with_inventory / days_with_inventory
@@ -1786,15 +1822,13 @@ async def generate_report_by_date_range(
             avg_monthly_val_for_period = avg_daily_for_period * 30
 
             last_day_inventory = 0
-            if common_dates:
-                last_common_date = common_dates[-1]
-                inventory_at_lcd_key = (sku, city, last_common_date)
-                last_day_inventory_info = inventory_map.get(inventory_at_lcd_key)
-                if last_day_inventory_info:
-                    last_day_inventory = last_day_inventory_info["inventory"]
+            if last_common_date_for_inv:
+                inventory_at_lcd_info = inventory_map.get((sku, city, last_common_date_for_inv))
+                if inventory_at_lcd_info:
+                    last_day_inventory = inventory_at_lcd_info["inventory"]
                 else:
-                    # Use precomputed most recent inventory per SKU/city
-                    last_day_inventory = most_recent_inventory_map.get((sku, city), 0)
+                    # Use most recent inventory (built during inventory processing)
+                    last_day_inventory = most_recent_inventory_map.get(sku_city_key, 0)
 
             doc_calc = 0
             if avg_daily_on_stock_days > 0:
