@@ -52,7 +52,7 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
 
 
 @router.post("/login")
-async def login(data: User, database=Depends(get_database)):
+def login(data: User, database=Depends(get_database)):
     """Handles user login and returns a JWT on success."""
     email = str(data.email).strip()
     password = data.password

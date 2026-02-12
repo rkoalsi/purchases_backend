@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 @router.get("")
-async def get_users():
+def get_users():
     try:
         db = get_database()
         result = list(db["purchase_users"].find({}))
@@ -26,7 +26,7 @@ async def get_users():
 
 
 @router.get("/permissions")
-async def get_permissions():
+def get_permissions():
     try:
         db = get_database()
         result = list(db["purchase_permissions"].find({}))

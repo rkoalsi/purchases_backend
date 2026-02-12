@@ -16,6 +16,7 @@ import re
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 import logging
+import asyncio
 from .amazon_vc import router as amazon_vendor_router
 
 # --- Configuration ---
@@ -142,17 +143,19 @@ async def fetch_last_n_days_amazon_ledger(
             }
         ]
 
-        cursor = ledger_collection.aggregate(pipeline, allowDiskUse=True)
+        def _run_aggregation():
+            cursor = ledger_collection.aggregate(pipeline, allowDiskUse=True)
+            stock_date_ranges = {}
+            for doc in cursor:
+                asin = doc["_id"]
+                dates = doc.get("stock_dates", [])
+                if dates:
+                    stock_date_ranges[asin] = format_date_ranges(dates)
+                else:
+                    stock_date_ranges[asin] = ""
+            return stock_date_ranges
 
-        stock_date_ranges = {}
-        for doc in cursor:
-            asin = doc["_id"]
-            dates = doc.get("stock_dates", [])
-            if dates:
-                stock_date_ranges[asin] = format_date_ranges(dates)
-            else:
-                stock_date_ranges[asin] = ""
-
+        stock_date_ranges = await asyncio.to_thread(_run_aggregation)
         logger.info(f"Fetched last {n_days} days (Amazon Ledger): {len(stock_date_ranges)} ASINs with data")
         return stock_date_ranges
 
@@ -212,17 +215,19 @@ async def fetch_last_n_days_vendor_inventory(
             }
         ]
 
-        cursor = inventory_collection.aggregate(pipeline, allowDiskUse=True)
+        def _run_aggregation():
+            cursor = inventory_collection.aggregate(pipeline, allowDiskUse=True)
+            stock_date_ranges = {}
+            for doc in cursor:
+                asin = doc["_id"]
+                dates = doc.get("stock_dates", [])
+                if dates:
+                    stock_date_ranges[asin] = format_date_ranges(dates)
+                else:
+                    stock_date_ranges[asin] = ""
+            return stock_date_ranges
 
-        stock_date_ranges = {}
-        for doc in cursor:
-            asin = doc["_id"]
-            dates = doc.get("stock_dates", [])
-            if dates:
-                stock_date_ranges[asin] = format_date_ranges(dates)
-            else:
-                stock_date_ranges[asin] = ""
-
+        stock_date_ranges = await asyncio.to_thread(_run_aggregation)
         logger.info(f"Fetched last {n_days} days (Vendor): {len(stock_date_ranges)} ASINs with data")
         return stock_date_ranges
 
@@ -1177,7 +1182,7 @@ def get_amazon_sc_returns_data(
 
 
 @router.post("/auth/token")
-async def refresh_amazon_token():
+def refresh_amazon_token():
     """
     Refresh Amazon SP API token
     """
@@ -1703,7 +1708,7 @@ async def sync_monthly_returns_data(
 
 
 @router.get("/sales-traffic/{asin}")
-async def get_asin_sales_data(
+def get_asin_sales_data(
     asin: str,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -1742,7 +1747,7 @@ async def get_asin_sales_data(
 
 
 @router.get("/ledger/summary")
-async def get_ledger_summary(
+def get_ledger_summary(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     transaction_type: Optional[str] = None,
@@ -1789,7 +1794,7 @@ async def get_ledger_summary(
 
 
 @router.get("/get_amazon_sku_mapping")
-async def get_sku_mapping(database=Depends(get_database)):
+def get_sku_mapping(database=Depends(get_database)):
     try:
         sku_collection = database.get_collection(SKU_COLLECTION)
         sku_documents = serialize_mongo_document(
@@ -1894,7 +1899,7 @@ async def upload_sku_mapping(
 
 
 @router.post("/create_single_item")
-async def create_single_item(body: dict):
+def create_single_item(body: dict):
     try:
         item_name = body.get("item_name")
         item_id = body.get("item_id")
@@ -1923,7 +1928,7 @@ async def create_single_item(body: dict):
 
 
 @router.delete("/delete_item/{item_id}")
-async def delete_item(item_id: str):
+def delete_item(item_id: str):
     try:
         db = get_database()
         result = db[SKU_COLLECTION].delete_one({"_id": ObjectId(item_id)})
@@ -2143,7 +2148,11 @@ async def generate_vendor_central_data(start, end, database, any_last_90_days: b
     ]
 
     collection = database.get_collection("amazon_vendor_sales")
-    cursor = list(collection.aggregate(vendor_pipeline))
+
+    def _run_vendor_aggregation():
+        return list(collection.aggregate(vendor_pipeline))
+
+    cursor = await asyncio.to_thread(_run_vendor_aggregation)
     result = serialize_mongo_document(cursor)
 
     # Fetch last 90 days in stock if requested
@@ -2433,7 +2442,11 @@ async def generate_amazon_data(start, end, database, report_type, any_last_90_da
     )
 
     collection = database.get_collection(SALES_COLLECTION)
-    cursor = list(collection.aggregate(base_pipeline))
+
+    def _run_fba_aggregation():
+        return list(collection.aggregate(base_pipeline))
+
+    cursor = await asyncio.to_thread(_run_fba_aggregation)
     result = serialize_mongo_document(cursor)
 
     # Fetch last 90 days in stock if requested
@@ -2848,7 +2861,7 @@ def format_column_name(column_name):
     return replacements.get(formatted, formatted)
 
 @router.post("/sync/settlements")
-async def sync_settlement_reports(
+def sync_settlement_reports(
     days_back: Optional[int] = 7,
     db=Depends(get_database),
 ):
@@ -3071,7 +3084,7 @@ async def sync_settlement_reports(
 
 
 @router.get("/settlements/pivot")
-async def get_settlements_pivot(
+def get_settlements_pivot(
     start_date: Optional[str] = Query(
         None, description="Start date in YYYY-MM-DD format"
     ),
@@ -3252,7 +3265,7 @@ async def get_settlements_pivot(
 
 
 @router.get("/settlements/pivot/columns")
-async def get_pivot_columns(db=Depends(get_database)):
+def get_pivot_columns(db=Depends(get_database)):
     """
     Get list of all unique amount_description values (column names in pivot table).
 
@@ -3281,7 +3294,7 @@ async def get_pivot_columns(db=Depends(get_database)):
 
 
 @router.get("/settlements/summary")
-async def get_settlements_summary(
+def get_settlements_summary(
     start_date: Optional[str] = Query(
         None, description="Start date in YYYY-MM-DD format"
     ),

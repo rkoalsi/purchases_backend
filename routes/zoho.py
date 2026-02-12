@@ -83,7 +83,7 @@ async def get_excluded_customers():
 
 
 @router.get("/products")
-async def get_products(
+def get_products(
     page: int = Query(1, ge=1, description="Page number (starts from 1)"),
     limit: int = Query(
         10, ge=1, le=100, description="Number of items per page (max 100)"
@@ -227,7 +227,7 @@ async def get_products(
 
 
 @router.get("/products/summary")
-async def get_products_summary():
+def get_products_summary():
     """
     Get a summary of products including total count, active/inactive counts, and categories.
 
@@ -287,7 +287,7 @@ async def get_products_summary():
 
 
 @router.get("/sales")
-async def get_sales(
+def get_sales(
     page: int = Query(1, ge=1, description="Page number (starts from 1)"),
     limit: int = Query(
         10, ge=1, le=100, description="Number of items per page (max 100)"
@@ -771,7 +771,7 @@ def create_excel_file(data: List[dict]) -> io.BytesIO:
 
 
 @router.post("/generate-invoice-report")
-async def generate_invoice_report(
+def generate_invoice_report(
     request: ReportRequest, background_tasks: BackgroundTasks, db=Depends(get_database)
 ):
     try:
@@ -837,7 +837,7 @@ async def generate_invoice_report(
 
 
 @router.get("/brands")
-async def get_available_brands(db=Depends(get_database)):
+def get_available_brands(db=Depends(get_database)):
     """
     Get list of available brands.
     Adjust this based on your actual data structure.
@@ -1028,39 +1028,36 @@ async def fetch_last_n_days_in_stock(
             }
         ]
 
-        cursor = stock_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000)
+        def _run_aggregation():
+            cursor = stock_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000)
+            stock_date_ranges = {}
+            processed_count = 0
+            for doc in cursor:
+                processed_count += 1
+                item_id = doc["_id"]
+                dates = doc.get("stock_dates", [])
 
-        # Convert to dictionary with formatted date ranges
-        stock_date_ranges = {}
-        processed_count = 0
-        for doc in cursor:
-            processed_count += 1
-            item_id = doc["_id"]
-            dates = doc.get("stock_dates", [])
+                if processed_count <= 3:
+                    logger.debug(f"DEBUG: Item {item_id} has {len(dates)} stock dates")
 
-            # Debug logging for first few items
-            if processed_count <= 3:
-                logger.debug(f"DEBUG: Item {item_id} has {len(dates)} stock dates")
+                if dates:
+                    formatted_ranges = format_date_ranges(dates)
+                    stock_date_ranges[item_id] = formatted_ranges
 
-            if dates:
-                # Format the dates into ranges
-                formatted_ranges = format_date_ranges(dates)
-                stock_date_ranges[item_id] = formatted_ranges
+                    if processed_count == 1:
+                        logger.debug(f"DEBUG: First item formatted ranges: {formatted_ranges[:100]}...")
+                else:
+                    stock_date_ranges[item_id] = ""
 
-                # Debug log for first item
-                if processed_count == 1:
-                    logger.debug(f"DEBUG: First item formatted ranges: {formatted_ranges[:100]}...")
-            else:
-                stock_date_ranges[item_id] = ""
+            logger.info(f"Fetched last {n_days} days in stock: processed {processed_count} items, returned {len(stock_date_ranges)} items with data")
 
-        logger.info(f"Fetched last {n_days} days in stock: processed {processed_count} items, returned {len(stock_date_ranges)} items with data")
+            if stock_date_ranges:
+                sample_keys = list(stock_date_ranges.keys())[:3]
+                logger.debug(f"DEBUG: Sample item IDs in result: {sample_keys}")
 
-        # Debug: log sample item IDs
-        if stock_date_ranges:
-            sample_keys = list(stock_date_ranges.keys())[:3]
-            logger.debug(f"DEBUG: Sample item IDs in result: {sample_keys}")
+            return stock_date_ranges
 
-        return stock_date_ranges
+        return await asyncio.to_thread(_run_aggregation)
 
     except Exception as e:
         logger.error(f"Error fetching last N days in stock: {e}", exc_info=True)
@@ -1148,18 +1145,20 @@ async def fetch_stock_data_for_items(
             },
         ]
 
-        # Execute with optimized settings
-        cursor = stock_collection.aggregate(
-            pipeline, allowDiskUse=True, batchSize=10000
-        )
+        # Execute with optimized settings - run in thread to avoid blocking event loop
+        def _run_aggregation():
+            cursor = stock_collection.aggregate(
+                pipeline, allowDiskUse=True, batchSize=10000
+            )
+            result = {}
+            for doc in cursor:
+                result[doc["_id"]] = {
+                    "closing_stock": doc.get("closing_stock", 0),
+                    "total_days_in_stock": doc.get("total_days_in_stock", 0),
+                }
+            return result
 
-        # Convert to dictionary
-        stock_data = {}
-        for doc in cursor:
-            stock_data[doc["_id"]] = {
-                "closing_stock": doc.get("closing_stock", 0),
-                "total_days_in_stock": doc.get("total_days_in_stock", 0),
-            }
+        stock_data = await asyncio.to_thread(_run_aggregation)
 
         # If requested, also fetch last 90 days in stock with date ranges
         if fetch_last_90_days:
@@ -1271,20 +1270,22 @@ async def fetch_stock_data_optimized(
             },
         ]
 
-        # Use cursor with optimized settings
-        cursor = stock_collection.aggregate(
-            pipeline,
-            allowDiskUse=True,
-            batchSize=10000,  # Larger batch for better throughput
-        )
+        # Use cursor with optimized settings - run in thread to avoid blocking event loop
+        def _run_aggregation():
+            cursor = stock_collection.aggregate(
+                pipeline,
+                allowDiskUse=True,
+                batchSize=10000,
+            )
+            stock_data = {}
+            for doc in cursor:
+                stock_data[doc["_id"]] = {
+                    "closing_stock": doc.get("closing_stock", 0),
+                    "total_days_in_stock": doc.get("total_days_in_stock", 0),
+                }
+            return stock_data
 
-        # Convert to dictionary efficiently
-        stock_data = {}
-        for doc in cursor:
-            stock_data[doc["_id"]] = {
-                "closing_stock": doc.get("closing_stock", 0),
-                "total_days_in_stock": doc.get("total_days_in_stock", 0),
-            }
+        stock_data = await asyncio.to_thread(_run_aggregation)
 
         logger.info(
             f"Fetched {len(stock_data)} stock records with zoho_item_id for date range {start_datetime.date()} to {end_datetime.date()}"
@@ -1303,30 +1304,28 @@ async def fetch_all_products_indexed(db) -> Dict:
     try:
         products_collection = db["products"]
 
-        # Simple projection to get only what we need
-        cursor = products_collection.find(
-            {
-                "$and": [
-                    {"name": {"$ne": ""}},  # Not empty string
-                    {
-                        "name": {"$ne": "amazon"}
-                    },  # Not exactly "amazon" (case sensitive)
-                ]
-            },
-            {
-                "item_id": 1,
-                "cf_sku_code": 1,
-                "name": 1,
-                "_id": 0,
-            },  # Include name for debugging
-            batch_size=5000,
-        )
+        def _fetch():
+            cursor = products_collection.find(
+                {
+                    "$and": [
+                        {"name": {"$ne": ""}},
+                        {"name": {"$ne": "amazon"}},
+                    ]
+                },
+                {
+                    "item_id": 1,
+                    "cf_sku_code": 1,
+                    "name": 1,
+                    "_id": 0,
+                },
+                batch_size=5000,
+            )
+            products_map = {}
+            for product in cursor:
+                products_map[product.get("item_id")] = product.get("cf_sku_code", "")
+            return products_map
 
-        # Create indexed map
-        products_map = {}
-        for product in cursor:
-            products_map[product.get("item_id")] = product.get("cf_sku_code", "")
-
+        products_map = await asyncio.to_thread(_fetch)
         logger.info(f"Indexed {len(products_map)} products")
         return products_map
 
@@ -1418,13 +1417,15 @@ async def get_cached_report(cache_key: str, db) -> Optional[Dict]:
     try:
         cache_collection = db.get_collection("report_cache")
 
-        # Find cached report
-        cached = cache_collection.find_one(
-            {
-                "_id": cache_key,
-                "created_at": {"$gte": datetime.now() - timedelta(hours=1)},
-            }
-        )
+        def _fetch():
+            return cache_collection.find_one(
+                {
+                    "_id": cache_key,
+                    "created_at": {"$gte": datetime.now() - timedelta(hours=1)},
+                }
+            )
+
+        cached = await asyncio.to_thread(_fetch)
 
         if cached:
             return cached.get("data")
@@ -1442,11 +1443,14 @@ async def cache_report(cache_key: str, data: Dict, db):
     try:
         cache_collection = db.get_collection("report_cache")
 
-        cache_collection.replace_one(
-            {"_id": cache_key},
-            {"_id": cache_key, "data": data, "created_at": datetime.now()},
-            upsert=True,
-        )
+        def _write():
+            cache_collection.replace_one(
+                {"_id": cache_key},
+                {"_id": cache_key, "data": data, "created_at": datetime.now()},
+                upsert=True,
+            )
+
+        await asyncio.to_thread(_write)
 
         logger.info(f"Report cached with key: {cache_key}")
 
@@ -1777,15 +1781,8 @@ async def get_sales_report_fast(
             start_date, end_date, excluded_customers
         )
 
-        # Execute main aggregation
+        # Get parallel task results while pipeline is prepared
         logger.info("Executing aggregation pipeline with credit notes integration...")
-        result_cursor = invoices_collection.aggregate(
-            pipeline,
-            allowDiskUse=True,
-            batchSize=1000,
-        )
-
-        # Get parallel task results
         stock_data, products_map = await asyncio.gather(stock_task, products_task)
 
         # If any_last_90_days is requested, fetch the last 90 days in stock for all items
@@ -1811,7 +1808,12 @@ async def get_sales_report_fast(
         )
 
         # Process results in a thread to avoid blocking the event loop
-        def _process_cursor_results(cursor, stock_data, products_map):
+        def _process_cursor_results(collection, pipeline, stock_data, products_map):
+            cursor = collection.aggregate(
+                pipeline,
+                allowDiskUse=True,
+                batchSize=1000,
+            )
             sales_report_items = []
             total_units = 0
             total_returns = 0
@@ -1847,7 +1849,7 @@ async def get_sales_report_fast(
             return sales_report_items, total_units, total_returns, total_amount, total_closing_stock
 
         sales_report_items, total_units, total_returns, total_amount, total_closing_stock = await asyncio.to_thread(
-            _process_cursor_results, result_cursor, stock_data, products_map
+            _process_cursor_results, invoices_collection, pipeline, stock_data, products_map
         )
 
         execution_time = (datetime.now() - start_time).total_seconds()
@@ -1952,13 +1954,6 @@ async def download_sales_report(
             start_date, end_date, excluded_customers
         )
 
-        # Execute aggregation
-        result_cursor = invoices_collection.aggregate(
-            pipeline,
-            allowDiskUse=True,
-            batchSize=1000,
-        )
-
         # Process exactly the same way as the main API
         stock_data, products_map = await asyncio.gather(stock_task, products_task)
 
@@ -1980,37 +1975,49 @@ async def download_sales_report(
 
             logger.debug(f"DEBUG (download): Merged {merged_count} items with last_90_days_dates into stock_data")
 
-        sales_report_items = []
-        total_units = 0
-        total_returns = 0
-        total_amount = 0.0
-        total_closing_stock = 0
+        # Run cursor creation + iteration in thread to avoid blocking
+        def _process_download_cursor(collection, pipeline, stock_data, products_map):
+            result_cursor = collection.aggregate(
+                pipeline,
+                allowDiskUse=True,
+                batchSize=1000,
+            )
+            sales_report_items = []
+            total_units = 0
+            total_returns = 0
+            total_amount = 0.0
+            total_closing_stock = 0
 
-        batch = []
-        batch_size = 500  # Increased for better performance
+            batch = []
+            batch_size = 500
 
-        for item in result_cursor:
-            batch.append(item)
-            if len(batch) >= batch_size:
-                processed = process_batch_with_credit_notes(
-                    batch, stock_data, products_map
-                )
+            for item in result_cursor:
+                batch.append(item)
+                if len(batch) >= batch_size:
+                    processed = process_batch_with_credit_notes(
+                        batch, stock_data, products_map
+                    )
+                    sales_report_items.extend(processed["items"])
+                    total_units += processed["units"]
+                    total_returns += processed["returns"]
+                    total_amount += processed["amount"]
+                    total_closing_stock += processed["stock"]
+                    batch = []
+
+            if batch:
+                processed = process_batch_with_credit_notes(batch, stock_data, products_map)
                 sales_report_items.extend(processed["items"])
                 total_units += processed["units"]
                 total_returns += processed["returns"]
                 total_amount += processed["amount"]
                 total_closing_stock += processed["stock"]
-                batch = []
 
-        if batch:
-            processed = process_batch_with_credit_notes(batch, stock_data, products_map)
-            sales_report_items.extend(processed["items"])
-            total_units += processed["units"]
-            total_returns += processed["returns"]
-            total_amount += processed["amount"]
-            total_closing_stock += processed["stock"]
+            sales_report_items.sort(key=lambda x: x.item_name)
+            return sales_report_items, total_units, total_returns, total_amount, total_closing_stock
 
-        sales_report_items.sort(key=lambda x: x.item_name)
+        sales_report_items, total_units, total_returns, total_amount, total_closing_stock = await asyncio.to_thread(
+            _process_download_cursor, invoices_collection, pipeline, stock_data, products_map
+        )
 
         execution_time = (datetime.now() - start_time).total_seconds()
         logger.info(
@@ -2483,7 +2490,7 @@ async def get_data_metadata_cached(
 
 
 @router.get("/estimates-vs-invoices")
-async def get_estimates_vs_invoices(
+def get_estimates_vs_invoices(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
     db=Depends(get_database),

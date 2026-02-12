@@ -1507,7 +1507,7 @@ async def download_master_report(
 
 
 @router.post("/import-product-logistics")
-async def import_product_logistics(
+def import_product_logistics(
     db=Depends(get_database),
 ):
     """
@@ -1589,7 +1589,7 @@ async def import_product_logistics(
 
 
 @router.get("/brand-logistics")
-async def get_brand_logistics(db=Depends(get_database)):
+def get_brand_logistics(db=Depends(get_database)):
     """Get all brand logistics settings"""
     try:
         collection = db.get_collection("brand_logistics")
@@ -1600,7 +1600,7 @@ async def get_brand_logistics(db=Depends(get_database)):
 
 
 @router.post("/brand-logistics")
-async def create_brand_logistics(
+def create_brand_logistics(
     brand: str = Query(...),
     lead_time: float = Query(60),
     safety_days_fast: float = Query(40),
@@ -1629,7 +1629,7 @@ async def create_brand_logistics(
 
 
 @router.delete("/brand-logistics")
-async def delete_brand_logistics(
+def delete_brand_logistics(
     brand: str = Query(...),
     db=Depends(get_database),
 ):
@@ -1650,7 +1650,7 @@ async def delete_brand_logistics(
 
 
 @router.get("/product-logistics")
-async def get_product_logistics_list(
+def get_product_logistics_list(
     search: str = Query("", description="Search by SKU or product name"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
@@ -1717,7 +1717,7 @@ async def get_product_logistics_list(
 
 
 @router.put("/product-logistics")
-async def update_product_logistics(
+def update_product_logistics(
     sku_code: str = Query(...),
     cbm: float = Query(None),
     case_pack: float = Query(None),

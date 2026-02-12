@@ -25,7 +25,7 @@ router = APIRouter()
 
 
 @router.get("/", response_model=dict)
-async def get_workflows():
+def get_workflows():
     try:
         db = get_database()
         workflows = list(db.workflows.find({}))
@@ -41,7 +41,7 @@ async def get_workflows():
 
 
 @router.post("/", response_model=dict)
-async def create_workflow(data: WorkflowCreate):  # ✅ Use WorkflowCreate, not Workflow
+def create_workflow(data: WorkflowCreate):
     try:
         db = get_database()
         workflow_dict = data.model_dump()
@@ -66,7 +66,7 @@ async def create_workflow(data: WorkflowCreate):  # ✅ Use WorkflowCreate, not 
 
 
 @router.delete("/", response_model=dict)
-async def delete_workflow(id: str):
+def delete_workflow(id: str):
     try:
         db = get_database()
         workflow = db.workflows.delete_one({"_id": ObjectId(id)})

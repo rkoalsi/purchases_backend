@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 @router.get("/get_all_products")
-async def get_all_products(database=Depends(get_database)):
+def get_all_products(database=Depends(get_database)):
     """
     Retrieves all documents from the Products collection.
     """

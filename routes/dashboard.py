@@ -163,13 +163,14 @@ class MultiSourceDashboardService:
 
             products_collection = self.database.get_collection("products")
 
-            # Single query to get all products
-            cursor = products_collection.find(
-                {"cf_sku_code": {"$in": list(valid_skus)}},
-                {"cf_sku_code": 1, "name": 1, "_id": 0},
-            )
+            # Single query to get all products - run in thread to avoid blocking event loop
+            def _fetch_products():
+                return list(products_collection.find(
+                    {"cf_sku_code": {"$in": list(valid_skus)}},
+                    {"cf_sku_code": 1, "name": 1, "_id": 0},
+                ))
 
-            products = list(cursor)
+            products = await asyncio.to_thread(_fetch_products)
 
             # Create mapping
             sku_to_name = {}

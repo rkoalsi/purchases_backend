@@ -142,39 +142,36 @@ async def fetch_last_n_days_in_stock_blinkit(
             }
         ]
 
-        cursor = inventory_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000)
+        def _run_aggregation():
+            cursor = inventory_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000)
+            stock_date_ranges = {}
+            processed_count = 0
+            for doc in cursor:
+                processed_count += 1
+                sku_city_key = (doc["_id"]["sku_code"], doc["_id"]["city"])
+                dates = doc.get("stock_dates", [])
 
-        # Convert to dictionary with formatted date ranges
-        stock_date_ranges = {}
-        processed_count = 0
-        for doc in cursor:
-            processed_count += 1
-            sku_city_key = (doc["_id"]["sku_code"], doc["_id"]["city"])
-            dates = doc.get("stock_dates", [])
+                if processed_count <= 3:
+                    logger.debug(f"DEBUG (Blinkit): SKU/City {sku_city_key} has {len(dates)} stock dates")
 
-            # Debug logging for first few items
-            if processed_count <= 3:
-                logger.debug(f"DEBUG (Blinkit): SKU/City {sku_city_key} has {len(dates)} stock dates")
+                if dates:
+                    formatted_ranges = format_date_ranges(dates)
+                    stock_date_ranges[sku_city_key] = formatted_ranges
 
-            if dates:
-                # Format the dates into ranges
-                formatted_ranges = format_date_ranges(dates)
-                stock_date_ranges[sku_city_key] = formatted_ranges
+                    if processed_count == 1:
+                        logger.debug(f"DEBUG (Blinkit): First item formatted ranges: {formatted_ranges[:100]}...")
+                else:
+                    stock_date_ranges[sku_city_key] = ""
 
-                # Debug log for first item
-                if processed_count == 1:
-                    logger.debug(f"DEBUG (Blinkit): First item formatted ranges: {formatted_ranges[:100]}...")
-            else:
-                stock_date_ranges[sku_city_key] = ""
+            logger.info(f"Fetched last {n_days} days in stock (Blinkit): processed {processed_count} SKU/City pairs, returned {len(stock_date_ranges)} pairs with data")
 
-        logger.info(f"Fetched last {n_days} days in stock (Blinkit): processed {processed_count} SKU/City pairs, returned {len(stock_date_ranges)} pairs with data")
+            if stock_date_ranges:
+                sample_keys = list(stock_date_ranges.keys())[:3]
+                logger.debug(f"DEBUG (Blinkit): Sample SKU/City pairs in result: {sample_keys}")
 
-        # Debug: log sample keys
-        if stock_date_ranges:
-            sample_keys = list(stock_date_ranges.keys())[:3]
-            logger.debug(f"DEBUG (Blinkit): Sample SKU/City pairs in result: {sample_keys}")
+            return stock_date_ranges
 
-        return stock_date_ranges
+        return await asyncio.to_thread(_run_aggregation)
 
     except Exception as e:
         logger.error(f"Error fetching last N days in stock (Blinkit): {e}", exc_info=True)
@@ -190,13 +187,14 @@ class SKUCache:
     async def get_sku_mapping(self, sku_collection):
         # Cache for 5 minutes to avoid repeated DB calls
         if self._cache is None or (datetime.now() - self._last_updated).seconds > 300:
-
-            self._cache = {
-                doc["item_id"]: doc
-                for doc in sku_collection.find(
-                    {}, {"item_id": 1, "sku_code": 1, "item_name": 1}
-                )
-            }
+            def _fetch():
+                return {
+                    doc["item_id"]: doc
+                    for doc in sku_collection.find(
+                        {}, {"item_id": 1, "sku_code": 1, "item_name": 1}
+                    )
+                }
+            self._cache = await asyncio.to_thread(_fetch)
             self._last_updated = datetime.now()
         return self._cache
 
@@ -283,7 +281,7 @@ def get_total_days_in_month(year: int, month: int) -> int:
 
 
 @router.get("/get_blinkit_sku_mapping")
-async def get_sku_mapping(database=Depends(get_database)):
+def get_sku_mapping(database=Depends(get_database)):
     """
     Retrieves all documents from the SKU mapping collection.
     """
@@ -390,7 +388,7 @@ async def upload_sku_mapping(
 
 
 @router.post("/create_single_item")
-async def create_single_item(body: dict):
+def create_single_item(body: dict):
     try:
         item_name = body.get("item_name")
         item_id = body.get("item_id")
@@ -419,7 +417,7 @@ async def create_single_item(body: dict):
 
 
 @router.get("/status")
-async def sync_status(start_date: str, end_date: str, db=Depends(get_database)):
+def sync_status(start_date: str, end_date: str, db=Depends(get_database)):
     try:
         # Parse date range
         start = datetime.strptime(start_date, "%Y-%m-%d").replace(
@@ -2141,7 +2139,7 @@ async def get_report_data_by_date_range(
 
 
 @router.delete("/delete_item/{item_id}")
-async def delete_item(item_id: str):
+def delete_item(item_id: str):
     try:
         db = get_database()
         result = db[SKU_COLLECTION].delete_one({"_id": ObjectId(item_id)})
