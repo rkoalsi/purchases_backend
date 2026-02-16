@@ -23,62 +23,14 @@ class OptimizedMasterReportService:
         self.database = database
         self._product_name_cache = {}
 
-    async def get_blinkit_report(
-        self, start_date: str, end_date: str, any_last_90_days: bool = False
-    ) -> Dict[str, Any]:
-        """Get Blinkit report data"""
-        try:
-            from .blinkit import generate_report_by_date_range
-
-            report_data = await generate_report_by_date_range(
-                start_date=start_date, end_date=end_date, database=self.database,
-                any_last_90_days=any_last_90_days, skip_lifetime=True,
-            )
-
-            return {
-                "source": "blinkit",
-                "data": report_data.get("data", []) if report_data else [],
-                "success": True,
-                "error": None,
-            }
-
-        except Exception as e:
-            logger.error(f"Error fetching Blinkit report: {e}")
-            return {"source": "blinkit", "data": [], "success": False, "error": str(e)}
-
-    async def get_amazon_report(
-        self, start_date: str, end_date: str, report_type: str = "all", any_last_90_days: bool = False
-    ) -> Dict[str, Any]:
-        """Get Amazon report data"""
-        try:
-            from .amazon import generate_report_by_date_range
-
-            report_data = await generate_report_by_date_range(
-                start_date=start_date,
-                end_date=end_date,
-                database=self.database,
-                report_type=report_type,
-                any_last_90_days=any_last_90_days,
-            )
-
-            return {
-                "source": "amazon",
-                "data": report_data if isinstance(report_data, list) else [],
-                "success": True,
-                "error": None,
-            }
-
-        except Exception as e:
-            logger.error(f"Error fetching Amazon report: {e}")
-            return {"source": "amazon", "data": [], "success": False, "error": str(e)}
-
-    async def get_zoho_report(self, start_date: str, end_date: str, any_last_90_days: bool = False) -> Dict[str, Any]:
+    async def get_zoho_report(self, start_date: str, end_date: str) -> Dict[str, Any]:
         """Get Zoho report data"""
         try:
             from .zoho import get_sales_report_fast
 
             response = await get_sales_report_fast(
-                start_date=start_date, end_date=end_date, db=self.database, any_last_90_days=any_last_90_days
+                start_date=start_date, end_date=end_date, db=self.database,
+                exclude_customers=False,
             )
 
             report_data = []
@@ -102,6 +54,64 @@ class OptimizedMasterReportService:
         except Exception as e:
             logger.error(f"Error fetching Zoho report: {e}")
             return {"source": "zoho", "data": [], "success": False, "error": str(e)}
+
+    async def fetch_fba_closing_stock(self, end_date: str) -> Dict[str, float]:
+        """Fetch FBA closing stock from amazon_ledger, mapped by SKU code.
+        Returns dict of {sku_code: closing_stock}."""
+        try:
+            end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
+            ledger_collection = self.database["amazon_ledger"]
+            sku_mapping_collection = self.database["amazon_sku_mapping"]
+
+            def _fetch():
+                # Get latest ending_warehouse_balance per ASIN from ledger
+                pipeline = [
+                    {
+                        "$match": {
+                            "date": {"$lte": end_datetime},
+                            "disposition": "SELLABLE",
+                        }
+                    },
+                    {"$sort": {"asin": 1, "date": -1}},
+                    {
+                        "$group": {
+                            "_id": "$asin",
+                            "closing_stock": {"$first": "$ending_warehouse_balance"},
+                        }
+                    },
+                ]
+                asin_stock = {}
+                for doc in ledger_collection.aggregate(pipeline):
+                    asin = doc["_id"]
+                    stock = doc.get("closing_stock", 0) or 0
+                    if stock > 0:
+                        asin_stock[asin] = float(stock)
+
+                if not asin_stock:
+                    return {}
+
+                # Map ASINs to SKU codes
+                sku_docs = list(sku_mapping_collection.find(
+                    {"item_id": {"$in": list(asin_stock.keys())}},
+                    {"item_id": 1, "sku_code": 1, "_id": 0},
+                ))
+
+                sku_stock = {}
+                for doc in sku_docs:
+                    asin = doc.get("item_id")
+                    sku = doc.get("sku_code")
+                    if asin and sku and asin in asin_stock:
+                        sku_stock[sku] = sku_stock.get(sku, 0) + asin_stock[asin]
+
+                return sku_stock
+
+            result = await asyncio.to_thread(_fetch)
+            logger.info(f"Fetched FBA closing stock for {len(result)} SKUs")
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching FBA closing stock: {e}")
+            return {}
 
     async def batch_load_product_names(self, sku_codes: Set[str]) -> Dict[str, str]:
         """Batch load all product names in a single database query"""
@@ -280,10 +290,11 @@ class OptimizedMasterReportService:
                             2,
                         )
 
-                    # Only add items with sales or returns
+                    # Add items with sales, returns, or closing stock
                     if (
                         normalized_item["units_sold"] > 0
                         or normalized_item["units_returned"] > 0
+                        or normalized_item["closing_stock"] > 0
                     ):
                         normalized_data.append(normalized_item)
 
@@ -448,10 +459,11 @@ class OptimizedMasterReportService:
                         2,
                     )
 
-                # Only add items with sales or returns
+                # Add items with sales, returns, or closing stock
                 if (
                     normalized_item["units_sold"] > 0
                     or normalized_item["units_returned"] > 0
+                    or normalized_item["closing_stock"] > 0
                 ):
                     normalized_data.append(normalized_item)
 
@@ -464,7 +476,8 @@ class OptimizedMasterReportService:
         return normalized_data
 
     def combine_data_by_sku_optimized(
-        self, all_normalized_data: List[List[Dict]], period_days: int = 30, composite_products_map: Dict = None
+        self, all_normalized_data: List[List[Dict]], period_days: int = 30,
+        composite_products_map: Dict = None, fba_stock_by_sku: Dict = None
     ) -> List[Dict]:
         """Optimized SKU combination using defaultdict and single pass, with composite product handling"""
         sku_data = defaultdict(
@@ -484,36 +497,22 @@ class OptimizedMasterReportService:
                     "avg_days_of_coverage": 0.0,
                 },
                 "source_breakdown": {
-                    "blinkit": {
-                        "units_sold": 0.0,
-                        "units_returned": 0.0,
-                        "credit_notes": 0.0,
-                        "closing_stock": 0.0,
-                        "amount": 0.0,
-                        "last_90_days_dates": "",
-                    },
-                    "amazon": {
-                        "units_sold": 0.0,
-                        "units_returned": 0.0,
-                        "credit_notes": 0.0,
-                        "closing_stock": 0.0,
-                        "amount": 0.0,
-                        "last_90_days_dates": "",
-                    },
                     "zoho": {
                         "units_sold": 0.0,
                         "units_returned": 0.0,
                         "credit_notes": 0.0,
                         "closing_stock": 0.0,
                         "amount": 0.0,
-                        "last_90_days_dates": "",
                     },
                 },
+                "in_stock": False,
             }
         )
 
         if composite_products_map is None:
             composite_products_map = {}
+        if fba_stock_by_sku is None:
+            fba_stock_by_sku = {}
 
         def process_item_data(self, item, sku_code, item_name, multiplier=1.0):
             """Process individual item data with optional quantity multiplier"""
@@ -551,10 +550,8 @@ class OptimizedMasterReportService:
                 item.get("days_in_stock")
             )  # Days don't multiply
 
-            # Map specific Amazon sources to "amazon" for source_breakdown
+            # Map source to breakdown key
             breakdown_source = source
-            if source.startswith("amazon_"):
-                breakdown_source = "amazon"
 
             # Update source breakdown with multiplier
             if breakdown_source in sku_data[sku_code]["source_breakdown"]:
@@ -574,12 +571,6 @@ class OptimizedMasterReportService:
                 breakdown["amount"] += (
                     self.safe_float(item.get("total_amount")) * multiplier
                 )
-                # Capture last_90_days_dates for this source
-                # Always capture if present, even if empty (to show N/A in frontend)
-                if "last_90_days_dates" in item:
-                    # Only update if we have data or if current is empty
-                    if item.get("last_90_days_dates") or not breakdown["last_90_days_dates"]:
-                        breakdown["last_90_days_dates"] = item.get("last_90_days_dates", "")
 
         # Single pass through all data
         for source_data in all_normalized_data:
@@ -627,14 +618,29 @@ class OptimizedMasterReportService:
             # Calculate averages
             metrics = data["combined_metrics"]
 
-            # DRR = total units sold / number of days in the period
+            # DRR based on Zoho sales only
+            zoho_breakdown = data["source_breakdown"]["zoho"]
+            zoho_units = zoho_breakdown["units_sold"]
+            zoho_stock = zoho_breakdown["closing_stock"]
+            fba_stock = fba_stock_by_sku.get(sku, 0)
+
             if period_days > 0:
-                metrics["avg_daily_run_rate"] = round(metrics["total_units_sold"] / period_days, 2)
+                metrics["avg_daily_run_rate"] = round(zoho_units / period_days, 2)
+
+            # Closing stock = Pupscribe WH (Zoho) + FBA stock (amazon_ledger)
+            metrics["total_closing_stock"] = round(zoho_stock + fba_stock, 2)
+
+            # Store FBA stock in combined_metrics for visibility
+            metrics["fba_closing_stock"] = round(fba_stock, 2)
+            metrics["pupscribe_wh_stock"] = round(zoho_stock, 2)
 
             if metrics["avg_daily_run_rate"] > 0:
                 metrics["avg_days_of_coverage"] = round(
                     metrics["total_closing_stock"] / metrics["avg_daily_run_rate"], 2
                 )
+
+            # in_stock flag: True if Pupscribe WH or FBA has stock
+            data["in_stock"] = zoho_stock > 0 or fba_stock > 0
 
             # Round all metrics
             for key, value in metrics.items():
@@ -943,11 +949,7 @@ class OptimizedMasterReportService:
 async def _generate_master_report_data(
     start_date: str,
     end_date: str,
-    include_blinkit: bool,
-    include_amazon: bool,
     include_zoho: bool,
-    amazon_report_type: str,
-    any_last_90_days: bool,
     db,
 ):
     """
@@ -973,18 +975,10 @@ async def _generate_master_report_data(
         # Initialize service
         report_service = OptimizedMasterReportService(db)
 
-        # Step 1: Fetch all reports + composite products in parallel
+        # Step 1: Fetch Zoho report + composite products in parallel
         tasks = []
-        if include_blinkit:
-            tasks.append(report_service.get_blinkit_report(start_date, end_date, any_last_90_days))
-        if include_amazon:
-            tasks.append(
-                report_service.get_amazon_report(
-                    start_date, end_date, amazon_report_type, any_last_90_days
-                )
-            )
         if include_zoho:
-            tasks.append(report_service.get_zoho_report(start_date, end_date, any_last_90_days))
+            tasks.append(report_service.get_zoho_report(start_date, end_date))
 
         if not tasks:
             raise HTTPException(
@@ -1007,10 +1001,15 @@ async def _generate_master_report_data(
                 logger.error(f"Error loading composite products: {e}")
                 return {}
 
-        # Execute all report fetches + composites in parallel
+        # Execute all report fetches + composites + FBA stock in parallel
         try:
             all_results = await asyncio.wait_for(
-                asyncio.gather(*tasks, _fetch_all_composites(), return_exceptions=True),
+                asyncio.gather(
+                    *tasks,
+                    _fetch_all_composites(),
+                    report_service.fetch_fba_closing_stock(end_date),
+                    return_exceptions=True,
+                ),
                 timeout=180.0,  # Allow enough time for large date ranges
             )
         except asyncio.TimeoutError:
@@ -1019,12 +1018,16 @@ async def _generate_master_report_data(
                 detail="Report generation timed out",
             )
 
-        # Last result is composite_products_map
-        results = all_results[:-1]
-        composite_products_map_raw = all_results[-1]
+        # Last two results are composite_products_map and fba_stock
+        results = all_results[:-2]
+        composite_products_map_raw = all_results[-2]
+        fba_stock_by_sku = all_results[-1]
         if isinstance(composite_products_map_raw, Exception):
             logger.error(f"Composite products fetch failed: {composite_products_map_raw}")
             composite_products_map_raw = {}
+        if isinstance(fba_stock_by_sku, Exception):
+            logger.error(f"FBA stock fetch failed: {fba_stock_by_sku}")
+            fba_stock_by_sku = {}
 
         # Process results
         individual_reports = {}
@@ -1120,7 +1123,8 @@ async def _generate_master_report_data(
                 logger.info(f"Using {len(composite_products_map)} pre-loaded composite products")
 
                 combined_data = await asyncio.to_thread(
-                    report_service.combine_data_by_sku_optimized, all_normalized_data, period_days, composite_products_map
+                    report_service.combine_data_by_sku_optimized, all_normalized_data, period_days,
+                    composite_products_map, fba_stock_by_sku
                 )
                 logger.info(f"Combined data for {len(combined_data)} unique SKUs")
             except Exception as e:
@@ -1276,19 +1280,14 @@ async def _generate_master_report_data(
 async def get_master_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
-    include_blinkit: bool = Query(True, description="Include Blinkit data"),
-    include_amazon: bool = Query(True, description="Include Amazon data"),
     include_zoho: bool = Query(True, description="Include Zoho data"),
-    amazon_report_type: str = Query("all", description="Amazon report type"),
-    any_last_90_days: bool = Query(False, description="Include last 90 days in stock dates"),
     db=Depends(get_database),
 ):
     """
     Optimized master report with batch processing and parallel execution
     """
     content = await _generate_master_report_data(
-        start_date, end_date, include_blinkit, include_amazon, include_zoho,
-        amazon_report_type, any_last_90_days, db,
+        start_date, end_date, include_zoho, db,
     )
 
     # Strip raw data from individual_reports for the API response (keep metadata only)
@@ -1309,11 +1308,7 @@ async def get_master_report(
 async def download_master_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
-    include_blinkit: bool = Query(True, description="Include Blinkit data"),
-    include_amazon: bool = Query(True, description="Include Amazon data"),
     include_zoho: bool = Query(True, description="Include Zoho data"),
-    amazon_report_type: str = Query("all", description="Amazon report type"),
-    any_last_90_days: bool = Query(False, description="Include last 90 days in stock dates"),
     db=Depends(get_database),
 ):
     """
@@ -1324,11 +1319,7 @@ async def download_master_report(
         content = await _generate_master_report_data(
             start_date=start_date,
             end_date=end_date,
-            include_blinkit=include_blinkit,
-            include_amazon=include_amazon,
             include_zoho=include_zoho,
-            amazon_report_type=amazon_report_type,
-            any_last_90_days=any_last_90_days,
             db=db,
         )
 
@@ -1378,56 +1369,29 @@ async def download_master_report(
                         "Avg Days of Coverage": item.get("combined_metrics", {}).get(
                             "avg_days_of_coverage", 0
                         ),
-                        # Platform-wise Units Sold
-                        "Blinkit Units Sold": item.get("source_breakdown", {})
-                        .get("blinkit", {})
-                        .get("units_sold", 0),
-                        "Amazon Units Sold": item.get("source_breakdown", {})
-                        .get("amazon", {})
-                        .get("units_sold", 0),
+                        # Zoho breakdown
                         "Zoho Units Sold": item.get("source_breakdown", {})
                         .get("zoho", {})
                         .get("units_sold", 0),
-                        # Platform-wise Units Returned
-                        "Blinkit Units Returned": item.get("source_breakdown", {})
-                        .get("blinkit", {})
-                        .get("units_returned", 0),
-                        "Amazon Units Returned": item.get("source_breakdown", {})
-                        .get("amazon", {})
-                        .get("units_returned", 0),
                         "Zoho Units Returned": item.get("source_breakdown", {})
                         .get("zoho", {})
                         .get("units_returned", 0),
-                        # Platform-wise Closing Stock
-                        "Blinkit Closing Stock": item.get("source_breakdown", {})
-                        .get("blinkit", {})
-                        .get("closing_stock", 0),
-                        "Amazon Closing Stock": item.get("source_breakdown", {})
-                        .get("amazon", {})
-                        .get("closing_stock", 0),
+                        "Zoho Credit Notes": item.get("source_breakdown", {})
+                        .get("zoho", {})
+                        .get("credit_notes", 0),
                         "Zoho Closing Stock": item.get("source_breakdown", {})
                         .get("zoho", {})
                         .get("closing_stock", 0),
-                        # Platform-wise Amount
-                        "Blinkit Amount": item.get("source_breakdown", {})
-                        .get("blinkit", {})
-                        .get("amount", 0),
-                        "Amazon Amount": item.get("source_breakdown", {})
-                        .get("amazon", {})
-                        .get("amount", 0),
                         "Zoho Amount": item.get("source_breakdown", {})
                         .get("zoho", {})
                         .get("amount", 0),
-                        # Last 90 Days Dates
-                        "Blinkit Last 90 Days Dates": item.get("source_breakdown", {})
-                        .get("blinkit", {})
-                        .get("last_90_days_dates", ""),
-                        "Amazon Last 90 Days Dates": item.get("source_breakdown", {})
-                        .get("amazon", {})
-                        .get("last_90_days_dates", ""),
-                        "Zoho Last 90 Days Dates": item.get("source_breakdown", {})
-                        .get("zoho", {})
-                        .get("last_90_days_dates", ""),
+                        "Pupscribe WH Stock": item.get("combined_metrics", {}).get(
+                            "pupscribe_wh_stock", 0
+                        ),
+                        "FBA Stock": item.get("combined_metrics", {}).get(
+                            "fba_closing_stock", 0
+                        ),
+                        "In Stock": "Yes" if item.get("in_stock", False) else "No",
                         # Movement & Order Calculation columns
                         "Movement": item.get("movement", ""),
                         "Safety Days": item.get("safety_days", 0),

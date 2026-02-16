@@ -57,14 +57,14 @@ PURCHASE_ORDER_COLLECTION = "purchase_orders"
 
 # Standardized excluded customers list - used across multiple endpoints
 EXCLUDED_CUSTOMERS_LIST = [
-    "(amzb2b) Pupscribe Enterprises Pvt Ltd",
-    "Pupscribe Enterprises Private Limited",
-    "(OSAMP) Office samples",
-    "(PUPEV) PUPSCRIBE EVENTS",
-    "(SSAM) Sales samples",
-    "(RS) Retail samples",
-    "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
-    "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd",
+    # "Pupscribe Enterprises Private Limited",
+    # "(OSAMP) Office samples",
+    # "(PUPEV) PUPSCRIBE EVENTS",
+    # "(SSAM) Sales samples",
+    # "(RS) Retail samples",
+    # "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
+    # "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
 ]
 
 router = APIRouter()
@@ -616,7 +616,7 @@ def query_invoices_for_item_names(
                         ]
                     },
                     "status": {"$nin": ["draft", "void"]},
-                    "customer_name": {"$nin": EXCLUDED_CUSTOMERS_LIST},
+                    # "customer_name": {"$nin": EXCLUDED_CUSTOMERS_LIST},
                     # Much simpler - just match item names directly
                     "line_items": {"$elemMatch": {"name": {"$in": item_names}}},
                 }
@@ -1361,7 +1361,7 @@ def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Di
 
             items.append(
                 SalesReportItem(
-                    item_name=item.get("item_name", ""),
+                    item_name=item.get("item_name") or "",
                     sku_code=sku_code,
                     units_sold=units_sold,
                     total_amount=round(amount, 2),
@@ -1383,25 +1383,25 @@ def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Di
 def get_excluded_customer_list() -> str:
     patterns = [
         # "(EC)",
-        "(NA)",
-        "(amzb2b)",
-        "(amz2b2)",
-        "(PUPEV)",
-        "(RS)",
-        "(MKT)",
-        "(SPUR)",
-        "(SSAM)",
-        "(OSAM)",
-        "(OSAMP)",
-        "(DON)",
-        "(Jiomart b2c)",
-        "Blinkit",
-        "KIRANAKART",
-        "Mr. Tikoti Laxman",
-        "Rushil Kalsi",
-        "ETRADE",
-        "Pupscribe",
-        "Flipkart",
+        # "(NA)",
+        # "(amzb2b)",
+        # "(amz2b2)",
+        # "(PUPEV)",
+        # "(RS)",
+        # "(MKT)",
+        # "(SPUR)",
+        # "(SSAM)",
+        # "(OSAM)",
+        # "(OSAMP)",
+        # "(DON)",
+        # "(Jiomart b2c)",
+        # "Blinkit",
+        # "KIRANAKART",
+        # "Mr. Tikoti Laxman",
+        # "Rushil Kalsi",
+        # "ETRADE",
+        # "Pupscribe",
+        # "Flipkart",
     ]
 
     escaped_patterns = [re.escape(pattern) for pattern in patterns]
@@ -1459,29 +1459,44 @@ async def cache_report(cache_key: str, data: Dict, db):
 
 
 def build_optimized_pipeline_with_credit_notes_and_composites(
-    start_date: str, end_date: str, excluded_customers: str
+    start_date: str, end_date: str, excluded_customers: str = None
 ) -> List[Dict]:
     """
     Build an optimized aggregation pipeline that incorporates both invoices and credit notes,
     and handles composite products by breaking them down into individual components.
     Credit notes logic remains exactly the same - only composite products are expanded.
+
+    When excluded_customers is None or empty, no customer filtering is applied.
     """
+    # Build invoice match conditions
+    invoice_match_conditions = [
+        {"date": {"$gte": start_date, "$lte": end_date}},
+        {"status": {"$nin": ["draft", "void"]}},
+        {"invoice_number": {"$regex": "INV/", "$options": "i"}},
+    ]
+
+    # Build credit note match conditions
+    credit_note_match_conditions = [
+        {"date": {"$gte": start_date, "$lte": end_date}},
+    ]
+
+    # Only add customer exclusion filter if excluded_customers is provided
+    if excluded_customers:
+        customer_filter = {
+            "customer_name": {
+                "$not": {
+                    "$regex": excluded_customers,
+                    "$options": "i",
+                }
+            }
+        }
+        invoice_match_conditions.append(customer_filter)
+        credit_note_match_conditions.append(customer_filter)
+
     return [
         {
             "$match": {
-                "$and": [
-                    {"date": {"$gte": start_date, "$lte": end_date}},
-                    {"status": {"$nin": ["draft", "void"]}},
-                    {
-                        "customer_name": {
-                            "$not": {
-                                "$regex": excluded_customers,
-                                "$options": "i",
-                            }
-                        }
-                    },
-                    {"invoice_number": {"$regex": "INV/", "$options": "i"}},
-                ]
+                "$and": invoice_match_conditions
             }
         },
         {"$addFields": {"doc_type": "invoice"}},
@@ -1491,17 +1506,7 @@ def build_optimized_pipeline_with_credit_notes_and_composites(
                 "pipeline": [
                     {
                         "$match": {
-                            "$and": [
-                                {"date": {"$gte": start_date, "$lte": end_date}},
-                                {
-                                    "customer_name": {
-                                        "$not": {
-                                            "$regex": excluded_customers,
-                                            "$options": "i",
-                                        }
-                                    }
-                                },
-                            ]
+                            "$and": credit_note_match_conditions
                         }
                     },
                     {"$addFields": {"doc_type": "credit_note"}},
@@ -1710,7 +1715,7 @@ def process_batch_with_credit_notes(
 
             items.append(
                 SalesReportItem(
-                    item_name=item.get("item_name", ""),
+                    item_name=item.get("item_name") or "",
                     sku_code=sku_code,
                     units_returned=credit_note_units,
                     credit_notes=credit_note_units,
@@ -1737,6 +1742,7 @@ async def get_sales_report_fast(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
     any_last_90_days: bool = Query(False, description="Include last 90 days in stock with date ranges"),
+    exclude_customers: bool = True,
     db=Depends(get_database),
 ):
     """
@@ -1771,7 +1777,7 @@ async def get_sales_report_fast(
         products_task = asyncio.create_task(fetch_all_products_indexed(db))
 
         # OPTIMIZATION 2: Use efficient customer filtering
-        excluded_customers = get_excluded_customer_list()
+        excluded_customers = get_excluded_customer_list() if exclude_customers else None
 
         # OPTIMIZATION 3: Use the NEW pipeline that includes credit notes
         invoices_collection = db[INVOICES_COLLECTION]
