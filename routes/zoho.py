@@ -1218,55 +1218,305 @@ async def fetch_stock_data_for_items(
         return {}
 
 
-async def fetch_zoho_lookback_sales(
+async def fetch_stock_data_for_items_batch(
     db,
-    start_date: str,
-    end_date: str,
-    target_item_ids: list,
-) -> Dict[str, int]:
+    periods: list,
+    item_ids: list,
+) -> Dict[int, Dict]:
     """
-    Fetch Zoho sales (units_sold) for specific item_ids in a date range.
-    Uses the same pipeline as build_optimized_pipeline_with_credit_notes_and_composites
-    but with an item_id filter before the $group stage to only aggregate target items.
+    Fetch stock data (days_in_stock) for ALL lookback periods in a SINGLE aggregation.
+    Groups by (item_id, period_index) using $switch on date buckets.
+
+    Args:
+        periods: List of (start_dt, end_dt) tuples
+        item_ids: List of zoho_item_ids
 
     Returns:
-        Dict mapping item_id (str) to units_sold (int)
+        Dict[period_index, Dict[item_id, {"total_days_in_stock": int}]]
     """
+    if not periods or not item_ids:
+        return {}
+
     try:
-        invoices_collection = db[INVOICES_COLLECTION]
+        stock_collection = db["zoho_warehouse_stock"]
 
-        # Build the full pipeline with composite expansion
-        pipeline = build_optimized_pipeline_with_credit_notes_and_composites(
-            start_date, end_date, excluded_customers=None
-        )
+        overall_start = min(p[0] for p in periods)
+        overall_end = max(p[1] for p in periods)
 
-        # Insert item_id filter before the $group stage (after $replaceRoot)
-        # This ensures composite expansion happens first, then we filter to only target items
-        target_ids_set = [str(iid) for iid in target_item_ids]
-        filtered_pipeline = []
-        for stage in pipeline:
-            if "$group" in stage:
-                filtered_pipeline.append({"$match": {"item_id": {"$in": target_ids_set}}})
-            filtered_pipeline.append(stage)
+        # Build period_index switch branches using datetime comparison
+        period_branches = []
+        for i, (p_start, p_end) in enumerate(periods):
+            period_branches.append({
+                "case": {"$and": [{"$gte": ["$date", p_start]}, {"$lte": ["$date", p_end]}]},
+                "then": i,
+            })
+
+        pipeline = [
+            {
+                "$match": {
+                    "zoho_item_id": {"$in": item_ids},
+                    "date": {"$gte": overall_start, "$lte": overall_end},
+                }
+            },
+            {
+                "$project": {
+                    "zoho_item_id": 1,
+                    "date": 1,
+                    "pupscribe_stock": {
+                        "$ifNull": [
+                            "$warehouses.Pupscribe Enterprises Private Limited",
+                            0,
+                        ]
+                    },
+                }
+            },
+            # Assign period_index
+            {
+                "$addFields": {
+                    "period_index": {
+                        "$switch": {
+                            "branches": period_branches,
+                            "default": -1,
+                        }
+                    }
+                }
+            },
+            {"$match": {"period_index": {"$gte": 0}}},
+            # Group by (item_id, period_index) — count days with stock > 0
+            {
+                "$group": {
+                    "_id": {"item_id": "$zoho_item_id", "period": "$period_index"},
+                    "total_days_in_stock": {
+                        "$sum": {
+                            "$cond": [{"$gt": ["$pupscribe_stock", 0]}, 1, 0]
+                        }
+                    },
+                }
+            },
+        ]
 
         def _run():
-            cursor = invoices_collection.aggregate(
-                filtered_pipeline, allowDiskUse=True, batchSize=5000
+            cursor = stock_collection.aggregate(
+                pipeline, allowDiskUse=True, batchSize=10000
             )
             results = {}
             for doc in cursor:
-                item_id = str(doc["_id"])
-                results[item_id] = doc.get("total_units_sold", 0)
+                period_idx = doc["_id"]["period"]
+                item_id = doc["_id"]["item_id"]
+                if period_idx not in results:
+                    results[period_idx] = {}
+                results[period_idx][item_id] = {
+                    "total_days_in_stock": doc.get("total_days_in_stock", 0),
+                }
+            return results
+
+        stock_data = await asyncio.to_thread(_run)
+        logger.info(
+            f"Lookback stock batch: fetched data for {len(stock_data)} periods, "
+            f"{len(item_ids)} items"
+        )
+        return stock_data
+
+    except Exception as e:
+        logger.error(f"Error fetching stock data batch: {e}")
+        return {}
+
+
+async def fetch_zoho_lookback_sales_batch(
+    db,
+    periods: list,
+    target_item_ids: list,
+) -> Dict[int, Dict[str, int]]:
+    """
+    Fetch Zoho sales for ALL lookback periods in a SINGLE aggregation.
+    Covers the full date range (earliest period start → most recent period end),
+    then uses $switch to bucket each document into its period index.
+
+    Args:
+        periods: List of (start_dt, end_dt) tuples, one per lookback period
+        target_item_ids: List of item_ids to filter for
+
+    Returns:
+        Dict[period_index, Dict[item_id_str, units_sold]]
+    """
+    if not periods or not target_item_ids:
+        return {}
+
+    try:
+        invoices_collection = db[INVOICES_COLLECTION]
+
+        # Full date range spanning all periods
+        overall_start = min(p[0] for p in periods)
+        overall_end = max(p[1] for p in periods)
+        overall_start_str = overall_start.strftime("%Y-%m-%d")
+        overall_end_str = overall_end.strftime("%Y-%m-%d")
+
+        target_ids_set = [str(iid) for iid in target_item_ids]
+
+        # Build custom pipeline that carries doc_date through composite expansion
+        # so we can bucket results by period_index
+        cn_start = datetime.strptime(overall_start_str, "%Y-%m-%d")
+        cn_end = datetime.strptime(overall_end_str, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+
+        invoice_match = {
+            "$match": {
+                "$and": [
+                    {"date": {"$gte": overall_start_str, "$lte": overall_end_str}},
+                    {"status": {"$nin": ["draft", "void"]}},
+                ]
+            }
+        }
+
+        credit_note_match_conditions = [
+            {
+                "$or": [
+                    {"date": {"$gte": overall_start_str, "$lte": overall_end_str}},
+                    {"date": {"$gte": cn_start, "$lte": cn_end}},
+                ]
+            },
+            {"customer_name": {"$nin": TRANSFER_ORDER_CUSTOMERS}},
+        ]
+
+        # Build period_index switch branches
+        period_branches = []
+        for i, (p_start, p_end) in enumerate(periods):
+            ps = p_start.strftime("%Y-%m-%d")
+            pe = p_end.strftime("%Y-%m-%d")
+            period_branches.append({
+                "case": {"$and": [{"$gte": ["$doc_date", ps]}, {"$lte": ["$doc_date", pe]}]},
+                "then": i,
+            })
+
+        custom_pipeline = [
+            invoice_match,
+            {"$addFields": {"doc_type": "invoice", "doc_date": "$date"}},
+            {
+                "$unionWith": {
+                    "coll": "credit_notes",
+                    "pipeline": [
+                        {"$match": {"$and": credit_note_match_conditions}},
+                        {
+                            "$addFields": {
+                                "doc_type": "credit_note",
+                                # credit_notes may store date as ISODate or string
+                                "doc_date": {
+                                    "$cond": {
+                                        "if": {"$eq": [{"$type": "$date"}, "string"]},
+                                        "then": "$date",
+                                        "else": {"$dateToString": {"format": "%Y-%m-%d", "date": "$date"}},
+                                    }
+                                },
+                            }
+                        },
+                    ],
+                }
+            },
+            {"$unwind": "$line_items"},
+            {
+                "$lookup": {
+                    "from": "composite_products",
+                    "localField": "line_items.item_id",
+                    "foreignField": "composite_item_id",
+                    "as": "composite_match",
+                }
+            },
+            {
+                "$addFields": {
+                    "composite_info": {"$arrayElemAt": ["$composite_match", 0]},
+                }
+            },
+            {
+                "$project": {
+                    "doc_date": 1,
+                    "items_to_process": {
+                        "$cond": [
+                            {"$gt": [{"$size": "$composite_match"}, 0]},
+                            {
+                                "$map": {
+                                    "input": "$composite_info.components",
+                                    "as": "component",
+                                    "in": {
+                                        "doc_type": "$doc_type",
+                                        "doc_date": "$doc_date",
+                                        "item_id": "$$component.item_id",
+                                        "quantity": {
+                                            "$multiply": [
+                                                "$line_items.quantity",
+                                                "$$component.quantity",
+                                            ]
+                                        },
+                                    },
+                                }
+                            },
+                            [
+                                {
+                                    "doc_type": "$doc_type",
+                                    "doc_date": "$doc_date",
+                                    "item_id": "$line_items.item_id",
+                                    "quantity": "$line_items.quantity",
+                                }
+                            ],
+                        ]
+                    },
+                }
+            },
+            {"$unwind": "$items_to_process"},
+            {"$replaceRoot": {"newRoot": "$items_to_process"}},
+            # Filter to target items
+            {"$match": {"item_id": {"$in": target_ids_set}}},
+            # Assign period_index
+            {
+                "$addFields": {
+                    "period_index": {
+                        "$switch": {
+                            "branches": period_branches,
+                            "default": -1,
+                        }
+                    }
+                }
+            },
+            {"$match": {"period_index": {"$gte": 0}}},
+            # Group by (item_id, period_index)
+            {
+                "$group": {
+                    "_id": {"item_id": "$item_id", "period": "$period_index"},
+                    "total_units_sold": {
+                        "$sum": {
+                            "$cond": [
+                                {"$eq": ["$doc_type", "invoice"]},
+                                "$quantity",
+                                0,
+                            ]
+                        }
+                    },
+                }
+            },
+        ]
+
+        def _run():
+            cursor = invoices_collection.aggregate(
+                custom_pipeline, allowDiskUse=True, batchSize=5000
+            )
+            results = {}
+            for doc in cursor:
+                period_idx = doc["_id"]["period"]
+                item_id = str(doc["_id"]["item_id"])
+                if period_idx not in results:
+                    results[period_idx] = {}
+                results[period_idx][item_id] = doc.get("total_units_sold", 0)
             return results
 
         sales_data = await asyncio.to_thread(_run)
         logger.info(
-            f"Lookback sales: fetched {len(sales_data)} items for {start_date} to {end_date}"
+            f"Lookback sales batch: fetched data for {len(sales_data)} periods, "
+            f"{overall_start_str} to {overall_end_str}"
         )
         return sales_data
 
     except Exception as e:
-        logger.error(f"Error fetching lookback sales: {e}")
+        logger.error(f"Error fetching lookback sales batch: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return {}
 
 

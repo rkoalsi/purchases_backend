@@ -832,100 +832,85 @@ class OptimizedMasterReportService:
         self,
         skus_needing_lookback: Dict[str, str],
         start_date: str,
-        end_date: str,
         period_days: int,
     ) -> Dict[str, Dict]:
         """
         Look back at previous periods to find representative DRR for items with < 60 days in stock.
-
-        Args:
-            skus_needing_lookback: Dict[sku_code, item_id] for SKUs that need lookback
-            start_date: Original period start date (YYYY-MM-DD)
-            end_date: Original period end date (YYYY-MM-DD)
-            period_days: Number of days in the period
-
-        Returns:
-            Dict[sku_code, {"drr": float, "lookback_period": str, "days_in_stock": int, "found": bool}]
+        Uses TWO batch aggregations (stock + sales) covering all 6 periods at once,
+        instead of 12 separate queries.
         """
-        from .zoho import fetch_stock_data_for_items, fetch_zoho_lookback_sales
+        from .zoho import fetch_stock_data_for_items_batch, fetch_zoho_lookback_sales_batch
 
         if not skus_needing_lookback:
             return {}
 
-        remaining_skus = set(skus_needing_lookback.keys())
-        results = {}
-
+        all_item_ids = list(set(skus_needing_lookback.values()))
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
+        # Pre-compute all 6 lookback period date ranges
         max_lookbacks = 6
+        periods = []
+        cur_start = start_dt
+        for _ in range(max_lookbacks):
+            p_end = cur_start - timedelta(days=1)
+            p_start = p_end - timedelta(days=period_days - 1)
+            periods.append((p_start, p_end))
+            cur_start = p_start
+
+        logger.info(
+            f"DRR lookback: 2 batch queries covering {max_lookbacks} periods for "
+            f"{len(skus_needing_lookback)} SKUs"
+        )
+
+        # TWO queries total: one for stock, one for sales — both cover all 6 periods
+        stock_by_period, sales_by_period = await asyncio.gather(
+            fetch_stock_data_for_items_batch(self.database, periods, all_item_ids),
+            fetch_zoho_lookback_sales_batch(self.database, periods, all_item_ids),
+        )
+
+        # Process results in priority order (period 0 = most recent lookback first)
+        results = {}
+        resolved_skus = set()
+
         for i in range(max_lookbacks):
-            if not remaining_skus:
-                break
+            stock_data = stock_by_period.get(i, {})
+            sales_data = sales_by_period.get(i, {})
+            p_start, p_end = periods[i]
+            p_start_str = p_start.strftime("%Y-%m-%d")
+            p_end_str = p_end.strftime("%Y-%m-%d")
 
-            # Shift dates back by period_days
-            end_dt = start_dt - timedelta(days=1)
-            start_dt = end_dt - timedelta(days=period_days - 1)
+            for sku, item_id in skus_needing_lookback.items():
+                if sku in resolved_skus:
+                    continue
 
-            prev_start = start_dt.strftime("%Y-%m-%d")
-            prev_end = end_dt.strftime("%Y-%m-%d")
-
-            logger.info(
-                f"DRR lookback iteration {i+1}: {prev_start} to {prev_end}, "
-                f"{len(remaining_skus)} SKUs remaining"
-            )
-
-            # Get item_ids for remaining SKUs
-            remaining_item_ids = [
-                skus_needing_lookback[sku] for sku in remaining_skus
-            ]
-
-            # Fetch stock data and sales data in parallel
-            stock_data, sales_data = await asyncio.gather(
-                fetch_stock_data_for_items(
-                    self.database, start_dt, end_dt, remaining_item_ids
-                ),
-                fetch_zoho_lookback_sales(
-                    self.database, prev_start, prev_end, remaining_item_ids
-                ),
-            )
-
-            # Check which SKUs now have >= 60 days in stock
-            satisfied_skus = set()
-            for sku in list(remaining_skus):
-                item_id = skus_needing_lookback[sku]
                 stock_info = stock_data.get(item_id, {})
                 days_in_stock = stock_info.get("total_days_in_stock", 0)
 
                 if days_in_stock >= 60:
-                    # Get sales for this item
                     units_sold = sales_data.get(str(item_id), 0)
-                    # DRR = units_sold / days_in_stock (not period_days)
-                    # This gives the true daily run rate based on actual days the item had stock
                     drr = round(units_sold / days_in_stock, 2) if days_in_stock > 0 else 0
-
                     results[sku] = {
                         "drr": drr,
-                        "lookback_period": f"{prev_start} to {prev_end}",
+                        "lookback_period": f"{p_start_str} to {p_end_str}",
                         "days_in_stock": days_in_stock,
                         "found": True,
                     }
-                    satisfied_skus.add(sku)
+                    resolved_skus.add(sku)
 
-            remaining_skus -= satisfied_skus
             logger.info(
-                f"DRR lookback iteration {i+1}: {len(satisfied_skus)} SKUs satisfied, "
-                f"{len(remaining_skus)} remaining"
+                f"DRR lookback period {i+1} ({p_start_str} to {p_end_str}): "
+                f"{len(resolved_skus)} total resolved"
             )
 
         # Mark remaining SKUs as not found
-        for sku in remaining_skus:
-            results[sku] = {
-                "drr": 0,
-                "lookback_period": "",
-                "days_in_stock": 0,
-                "found": False,
-            }
+        for sku in skus_needing_lookback:
+            if sku not in resolved_skus:
+                results[sku] = {
+                    "drr": 0,
+                    "lookback_period": "",
+                    "days_in_stock": 0,
+                    "found": False,
+                }
 
         return results
 
@@ -1370,29 +1355,48 @@ async def _generate_master_report_data(
         else:
             combined_data = []
 
-        # Step 4a: DRR lookback for items with < 60 days in stock
+        # Step 4a+4b: DRR lookback + enrichment data fetched in parallel
         if combined_data:
+            # Identify SKUs needing lookback
+            skus_needing_lookback_list = []
+            for item in combined_data:
+                days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
+                sku = item.get("sku_code", "")
+                if days < 60 and sku:
+                    skus_needing_lookback_list.append(sku)
+
+            combined_sku_codes = {item.get("sku_code", "") for item in combined_data if item.get("sku_code")}
+            new_skus = combined_sku_codes - all_sku_codes
+
+            # Fire off ALL independent DB queries in parallel:
+            # 1. sku_to_item_id (for lookback)
+            # 2. brand_logistics (for enrichment)
+            # 3. transit_data (for enrichment)
+            # 4. extra_product_data (if new SKUs from composite expansion)
+            parallel_tasks = [
+                report_service.get_brand_logistics(),
+                report_service.get_stock_in_transit(),
+            ]
+            if skus_needing_lookback_list:
+                parallel_tasks.append(report_service.fetch_sku_to_item_id_map(set(skus_needing_lookback_list)))
+            if new_skus:
+                parallel_tasks.append(report_service.batch_load_all_product_data(new_skus))
+
+            parallel_results = await asyncio.gather(*parallel_tasks, return_exceptions=True)
+
+            brand_logistics = parallel_results[0] if not isinstance(parallel_results[0], Exception) else {}
+            transit_data = parallel_results[1] if not isinstance(parallel_results[1], Exception) else {}
+            idx = 2
+            sku_to_item_id = {}
+            if skus_needing_lookback_list:
+                sku_to_item_id = parallel_results[idx] if not isinstance(parallel_results[idx], Exception) else {}
+                idx += 1
+            if new_skus and idx < len(parallel_results) and not isinstance(parallel_results[idx], Exception):
+                all_product_data.update(parallel_results[idx])
+
+            # DRR lookback (needs sku_to_item_id from above)
             try:
-                # Identify SKUs with < 60 days in stock (need DRR lookback)
-                skus_needing_lookback_list = []
-                for item in combined_data:
-                    days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
-                    sku = item.get("sku_code", "")
-                    if days < 60 and sku:
-                        skus_needing_lookback_list.append(sku)
-
-                if skus_needing_lookback_list:
-                    logger.info(
-                        f"DRR lookback needed for {len(skus_needing_lookback_list)} SKUs "
-                        f"with < 60 days in stock"
-                    )
-
-                    # Get sku → item_id mapping for lookback queries
-                    sku_to_item_id = await report_service.fetch_sku_to_item_id_map(
-                        set(skus_needing_lookback_list)
-                    )
-
-                    # Filter to only SKUs we found item_ids for
+                if skus_needing_lookback_list and sku_to_item_id:
                     skus_with_ids = {
                         sku: sku_to_item_id[sku]
                         for sku in skus_needing_lookback_list
@@ -1400,8 +1404,12 @@ async def _generate_master_report_data(
                     }
 
                     if skus_with_ids:
+                        logger.info(
+                            f"DRR lookback needed for {len(skus_with_ids)} SKUs "
+                            f"with < 60 days in stock"
+                        )
                         lookback_results = await report_service.fetch_previous_period_drr(
-                            skus_with_ids, start_date, end_date, period_days
+                            skus_with_ids, start_date, period_days
                         )
 
                         # Apply lookback results to combined_data
@@ -1418,7 +1426,6 @@ async def _generate_master_report_data(
                                 lb = lookback_results[sku]
                                 if lb["found"]:
                                     metrics["avg_daily_run_rate"] = lb["drr"]
-                                    # Recalculate days of coverage with new DRR
                                     if lb["drr"] > 0:
                                         metrics["avg_days_of_coverage"] = round(
                                             metrics.get("total_closing_stock", 0) / lb["drr"], 2
@@ -1431,7 +1438,6 @@ async def _generate_master_report_data(
                                     item["drr_lookback_period"] = ""
                                     item["highlight"] = "red"
                             else:
-                                # No item_id found for this SKU
                                 item["drr_source"] = "current_period"
                                 item["drr_lookback_period"] = ""
                                 item["highlight"] = None
@@ -1442,41 +1448,34 @@ async def _generate_master_report_data(
                             f"{sum(1 for r in lookback_results.values() if not r['found'])} not found"
                         )
                     else:
-                        # Set default drr_source for all items
                         for item in combined_data:
                             days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
                             item["drr_source"] = "current_period" if days >= 60 else "insufficient_stock"
                             item["drr_lookback_period"] = ""
                             item["highlight"] = "red" if days < 60 else None
-                else:
-                    # All items have >= 60 days in stock
+                elif not skus_needing_lookback_list:
                     for item in combined_data:
                         item["drr_source"] = "current_period"
                         item["drr_lookback_period"] = ""
                         item["highlight"] = None
+                else:
+                    for item in combined_data:
+                        days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
+                        item["drr_source"] = "current_period" if days >= 60 else "insufficient_stock"
+                        item["drr_lookback_period"] = ""
+                        item["highlight"] = "red" if days < 60 else None
 
             except Exception as e:
                 logger.error(f"DRR lookback error: {e}")
                 logger.error(traceback.format_exc())
                 errors.append(f"DRR lookback error: {str(e)}")
-                # Set defaults on error
                 for item in combined_data:
                     item.setdefault("drr_source", "current_period")
                     item.setdefault("drr_lookback_period", "")
                     item.setdefault("highlight", None)
 
-        # Step 4b: Enrich with movement classification, transit stock, and order calculations
-        if combined_data:
+            # Enrichment (uses brand_logistics + transit_data fetched in parallel above)
             try:
-                combined_sku_codes = {item.get("sku_code", "") for item in combined_data if item.get("sku_code")}
-
-                # Load any additional SKUs that appeared after composite expansion
-                new_skus = combined_sku_codes - all_sku_codes
-                if new_skus:
-                    extra_product_data = await report_service.batch_load_all_product_data(new_skus)
-                    all_product_data.update(extra_product_data)
-
-                # Build derived maps from the single product data query
                 product_rates = {}
                 product_brands = {}
                 logistics_data = {}
@@ -1493,7 +1492,6 @@ async def _generate_master_report_data(
                         "case_pack": pdata.get("case_pack", 0),
                     }
 
-                # Filter by brand if specified
                 if brand:
                     combined_data = [
                         item for item in combined_data
@@ -1501,26 +1499,15 @@ async def _generate_master_report_data(
                     ]
                     logger.info(f"Filtered to {len(combined_data)} items for brand '{brand}'")
 
-                # Only brand_logistics and transit still need DB queries
-                brand_logistics, transit_data = await asyncio.gather(
-                    report_service.get_brand_logistics(),
-                    report_service.get_stock_in_transit(),
-                )
-
-                # Fill in total_amount for items where it's 0 (e.g. Blinkit-only) using rate * units_sold
                 for item in combined_data:
                     metrics = item.get("combined_metrics", {})
                     if metrics.get("total_amount", 0) == 0 and metrics.get("total_units_sold", 0) > 0:
                         sku = item.get("sku_code", "")
                         rate = product_rates.get(sku, 0)
                         if rate > 0:
-                            calculated_amount = round(rate * metrics["total_units_sold"], 2)
-                            metrics["total_amount"] = calculated_amount
+                            metrics["total_amount"] = round(rate * metrics["total_units_sold"], 2)
 
-                # Classify movement (Fast/Medium/Slow mover) using brand-specific settings
                 combined_data = report_service.classify_movement(combined_data, brand_logistics, product_brands)
-
-                # Enrich with order calculations
                 combined_data = report_service.enrich_with_order_calculations(
                     combined_data, transit_data, logistics_data
                 )
