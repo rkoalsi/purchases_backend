@@ -736,7 +736,8 @@ class OptimizedMasterReportService:
             # Transfer orders and total sales
             transfer_qty = transfer_orders_by_sku.get(sku, 0)
             metrics["transfer_orders"] = round(transfer_qty, 2)
-            metrics["total_sales"] = round(metrics["total_units_sold"] - transfer_qty, 2)
+            credit_notes = metrics.get("total_credit_notes", 0)
+            metrics["total_sales"] = round(metrics["total_units_sold"] - transfer_qty - credit_notes, 2)
 
             if metrics["avg_daily_run_rate"] > 0:
                 metrics["avg_days_of_coverage"] = round(
@@ -1688,7 +1689,6 @@ async def download_master_report(
                     {
                         "SKU Code": item.get("sku_code", ""),
                         "Item Name": item.get("item_name", ""),
-                        "Sources": ", ".join(item.get("sources", [])),
                         "Total Units Sold": item.get("combined_metrics", {}).get(
                             "total_units_sold", 0
                         ),
