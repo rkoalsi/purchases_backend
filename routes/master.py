@@ -1357,13 +1357,14 @@ async def _generate_master_report_data(
 
         # Step 4a+4b: DRR lookback + enrichment data fetched in parallel
         if combined_data:
-            # Identify SKUs needing lookback
+            # Only do lookback and highlighting for date ranges >= 90 days
             skus_needing_lookback_list = []
-            for item in combined_data:
-                days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
-                sku = item.get("sku_code", "")
-                if days < 60 and sku:
-                    skus_needing_lookback_list.append(sku)
+            if period_days >= 90:
+                for item in combined_data:
+                    days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
+                    sku = item.get("sku_code", "")
+                    if days < 60 and sku:
+                        skus_needing_lookback_list.append(sku)
 
             combined_sku_codes = {item.get("sku_code", "") for item in combined_data if item.get("sku_code")}
             new_skus = combined_sku_codes - all_sku_codes
