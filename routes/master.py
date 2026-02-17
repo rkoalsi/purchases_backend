@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, status, Depends, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Set
 import asyncio
@@ -1802,15 +1802,19 @@ async def download_master_report(
                         logger.error(f"Error creating sheet for {source}: {e}")
 
         excel_buffer.seek(0)
+        file_bytes = excel_buffer.read()
 
         # Generate filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"master_report_{start_date}_to_{end_date}_{timestamp}.xlsx"
 
-        return StreamingResponse(
-            excel_buffer,
+        return Response(
+            content=file_bytes,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={filename}"},
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Length": str(len(file_bytes)),
+            },
         )
 
     except Exception as e:
