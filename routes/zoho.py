@@ -29,6 +29,7 @@ class ReportRequest(BaseModel):
     end_date: str
     brand: str
     exclude_customers: bool
+    min_quantity: float = None
 
     @validator("start_date", "end_date")
     def validate_date_format(cls, v):
@@ -57,14 +58,25 @@ PURCHASE_ORDER_COLLECTION = "purchase_orders"
 
 # Standardized excluded customers list - used across multiple endpoints
 EXCLUDED_CUSTOMERS_LIST = [
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd",
-    # "Pupscribe Enterprises Private Limited",
-    # "(OSAMP) Office samples",
-    # "(PUPEV) PUPSCRIBE EVENTS",
-    # "(SSAM) Sales samples",
-    # "(RS) Retail samples",
-    # "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (KA)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (MH)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (TL)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (TN)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (WB)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (HY)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (DL)",
+    # "Pupscribe Enterprises Private Limited (Blinkit Maharashtra)",
     # "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
+    # "Pupscribe Enterprises Private Limited (Blinkit Telangana)",
+    # "Pupscribe Enterprises Private Limited (Blinkit Tamil Nadu)",
+    # "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
+    # "Pupscribe Enterprises Private Limited (Blinkit West Bengal)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (UP)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (GJ)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (KL)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (AD)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (GA)",
+    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (PB)",
 ]
 
 router = APIRouter()
@@ -78,7 +90,7 @@ async def get_excluded_customers():
     """
     return {
         "excluded_customers": EXCLUDED_CUSTOMERS_LIST,
-        "count": len(EXCLUDED_CUSTOMERS_LIST)
+        "count": len(EXCLUDED_CUSTOMERS_LIST),
     }
 
 
@@ -777,7 +789,7 @@ def generate_invoice_report(
     try:
         start_time = datetime.now()
         logger.info(
-            f"Starting report generation for brand: {request.brand}, date range: {request.start_date} to {request.end_date}"
+            f"Starting report generation for brand: {request.brand}, date range: {request.start_date} to {request.end_date}, min_quantity: {request.min_quantity}"
         )
 
         # Parse dates
@@ -807,6 +819,22 @@ def generate_invoice_report(
             raise HTTPException(
                 status_code=404, detail="No invoices found for the specified criteria"
             )
+
+        # Filter by min_quantity: keep only rows where quantity >= threshold
+        if request.min_quantity is not None and request.min_quantity > 0:
+            before_count = len(invoice_data)
+            invoice_data = [
+                row for row in invoice_data
+                if float(row.get("Quantity", 0)) >= request.min_quantity
+            ]
+            logger.info(f"Min quantity filter ({request.min_quantity}): {before_count} -> {len(invoice_data)} rows")
+
+            if not invoice_data:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No line items found with quantity >= {request.min_quantity}",
+                )
+
         # STEP 3: Create Excel file (parallel processing for large datasets)
         excel_start = datetime.now()
         excel_file = create_excel_file(invoice_data)
@@ -941,7 +969,9 @@ def format_date_ranges(dates: List[datetime]) -> str:
             if start_date == end_date:
                 ranges.append(start_date.strftime("%d %b %Y"))
             else:
-                ranges.append(f"{start_date.strftime('%d %b %Y')} - {end_date.strftime('%d %b %Y')}")
+                ranges.append(
+                    f"{start_date.strftime('%d %b %Y')} - {end_date.strftime('%d %b %Y')}"
+                )
             # Start new range
             start_date = current_date
             end_date = current_date
@@ -950,7 +980,9 @@ def format_date_ranges(dates: List[datetime]) -> str:
     if start_date == end_date:
         ranges.append(start_date.strftime("%d %b %Y"))
     else:
-        ranges.append(f"{start_date.strftime('%d %b %Y')} - {end_date.strftime('%d %b %Y')}")
+        ranges.append(
+            f"{start_date.strftime('%d %b %Y')} - {end_date.strftime('%d %b %Y')}"
+        )
 
     return ", ".join(ranges)
 
@@ -978,14 +1010,19 @@ async def fetch_last_n_days_in_stock(
         # Look back maximum 1 year to find the last 90 days in stock
         lookback_limit = end_datetime - timedelta(days=365)
 
-        logger.info(f"Fetching last {n_days} days in stock for {len(item_ids)} items from {lookback_limit.date()} to {end_datetime.date()}")
+        logger.info(
+            f"Fetching last {n_days} days in stock for {len(item_ids)} items from {lookback_limit.date()} to {end_datetime.date()}"
+        )
 
         # Aggregate to get the last N days where stock > 0 for each item
         pipeline = [
             {
                 "$match": {
                     "zoho_item_id": {"$in": item_ids},
-                    "date": {"$gte": lookback_limit, "$lte": end_datetime},  # Only last 1 year
+                    "date": {
+                        "$gte": lookback_limit,
+                        "$lte": end_datetime,
+                    },  # Only last 1 year
                 }
             },
             {
@@ -1001,35 +1038,24 @@ async def fetch_last_n_days_in_stock(
                 }
             },
             # Filter only days with stock > 0
-            {
-                "$match": {
-                    "pupscribe_stock": {"$gt": 0}
-                }
-            },
+            {"$match": {"pupscribe_stock": {"$gt": 0}}},
             # Sort by item and date descending (most recent first)
             {"$sort": {"zoho_item_id": 1, "date": -1}},
             # Group by item and collect last N dates
-            {
-                "$group": {
-                    "_id": "$zoho_item_id",
-                    "stock_dates": {
-                        "$push": "$date"
-                    }
-                }
-            },
+            {"$group": {"_id": "$zoho_item_id", "stock_dates": {"$push": "$date"}}},
             # Limit to last N days
             {
                 "$project": {
                     "_id": 1,
-                    "stock_dates": {
-                        "$slice": ["$stock_dates", n_days]
-                    }
+                    "stock_dates": {"$slice": ["$stock_dates", n_days]},
                 }
-            }
+            },
         ]
 
         def _run_aggregation():
-            cursor = stock_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000)
+            cursor = stock_collection.aggregate(
+                pipeline, allowDiskUse=True, batchSize=10000
+            )
             stock_date_ranges = {}
             processed_count = 0
             for doc in cursor:
@@ -1045,11 +1071,15 @@ async def fetch_last_n_days_in_stock(
                     stock_date_ranges[item_id] = formatted_ranges
 
                     if processed_count == 1:
-                        logger.debug(f"DEBUG: First item formatted ranges: {formatted_ranges[:100]}...")
+                        logger.debug(
+                            f"DEBUG: First item formatted ranges: {formatted_ranges[:100]}..."
+                        )
                 else:
                     stock_date_ranges[item_id] = ""
 
-            logger.info(f"Fetched last {n_days} days in stock: processed {processed_count} items, returned {len(stock_date_ranges)} items with data")
+            logger.info(
+                f"Fetched last {n_days} days in stock: processed {processed_count} items, returned {len(stock_date_ranges)} items with data"
+            )
 
             if stock_date_ranges:
                 sample_keys = list(stock_date_ranges.keys())[:3]
@@ -1065,7 +1095,11 @@ async def fetch_last_n_days_in_stock(
 
 
 async def fetch_stock_data_for_items(
-    db, start_datetime: datetime, end_datetime: datetime, item_ids: list, fetch_last_90_days: bool = False
+    db,
+    start_datetime: datetime,
+    end_datetime: datetime,
+    item_ids: list,
+    fetch_last_90_days: bool = False,
 ) -> Dict:
     """
     Fetch stock data ONLY for specific items (not all items in database).
@@ -1162,7 +1196,9 @@ async def fetch_stock_data_for_items(
 
         # If requested, also fetch last 90 days in stock with date ranges
         if fetch_last_90_days:
-            last_90_days_data = await fetch_last_n_days_in_stock(db, end_datetime, item_ids, 90)
+            last_90_days_data = await fetch_last_n_days_in_stock(
+                db, end_datetime, item_ids, 90
+            )
             # Merge the last 90 days data into stock_data
             for item_id, date_ranges in last_90_days_data.items():
                 if item_id in stock_data:
@@ -1179,6 +1215,58 @@ async def fetch_stock_data_for_items(
 
     except Exception as e:
         logger.error(f"Error fetching stock data for items: {e}")
+        return {}
+
+
+async def fetch_zoho_lookback_sales(
+    db,
+    start_date: str,
+    end_date: str,
+    target_item_ids: list,
+) -> Dict[str, int]:
+    """
+    Fetch Zoho sales (units_sold) for specific item_ids in a date range.
+    Uses the same pipeline as build_optimized_pipeline_with_credit_notes_and_composites
+    but with an item_id filter before the $group stage to only aggregate target items.
+
+    Returns:
+        Dict mapping item_id (str) to units_sold (int)
+    """
+    try:
+        invoices_collection = db[INVOICES_COLLECTION]
+
+        # Build the full pipeline with composite expansion
+        pipeline = build_optimized_pipeline_with_credit_notes_and_composites(
+            start_date, end_date, excluded_customers=None
+        )
+
+        # Insert item_id filter before the $group stage (after $replaceRoot)
+        # This ensures composite expansion happens first, then we filter to only target items
+        target_ids_set = [str(iid) for iid in target_item_ids]
+        filtered_pipeline = []
+        for stage in pipeline:
+            if "$group" in stage:
+                filtered_pipeline.append({"$match": {"item_id": {"$in": target_ids_set}}})
+            filtered_pipeline.append(stage)
+
+        def _run():
+            cursor = invoices_collection.aggregate(
+                filtered_pipeline, allowDiskUse=True, batchSize=5000
+            )
+            results = {}
+            for doc in cursor:
+                item_id = str(doc["_id"])
+                results[item_id] = doc.get("total_units_sold", 0)
+            return results
+
+        sales_data = await asyncio.to_thread(_run)
+        logger.info(
+            f"Lookback sales: fetched {len(sales_data)} items for {start_date} to {end_date}"
+        )
+        return sales_data
+
+    except Exception as e:
+        logger.error(f"Error fetching lookback sales: {e}")
         return {}
 
 
@@ -1458,26 +1546,62 @@ async def cache_report(cache_key: str, data: Dict, db):
         logger.warning(f"Failed to cache report: {e}")
 
 
+TRANSFER_ORDER_CUSTOMERS = [
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (KA)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (MH)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (TL)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (TN)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (WB)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (HY)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (DL)",
+    "Pupscribe Enterprises Private Limited (Blinkit Maharashtra)",
+    "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
+    "Pupscribe Enterprises Private Limited (Blinkit Telangana)",
+    "Pupscribe Enterprises Private Limited (Blinkit Tamil Nadu)",
+    "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
+    "Pupscribe Enterprises Private Limited (Blinkit West Bengal)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (UP)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (GJ)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (KL)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (AD)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (GA)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd (PB)",
+]
+
+
 def build_optimized_pipeline_with_credit_notes_and_composites(
     start_date: str, end_date: str, excluded_customers: str = None
 ) -> List[Dict]:
     """
     Build an optimized aggregation pipeline that incorporates both invoices and credit notes,
     and handles composite products by breaking them down into individual components.
-    Credit notes logic remains exactly the same - only composite products are expanded.
+    Credit notes are matched using ISODate format (datetime objects) since credit_notes
+    collection stores dates as ISODate, while invoices store dates as strings.
+    Transfer order customers are excluded from credit notes.
 
     When excluded_customers is None or empty, no customer filtering is applied.
     """
+    # credit_notes stores date as ISODate, invoices as string
+    cn_start = datetime.strptime(start_date, "%Y-%m-%d")
+    cn_end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+
     # Build invoice match conditions
     invoice_match_conditions = [
         {"date": {"$gte": start_date, "$lte": end_date}},
         {"status": {"$nin": ["draft", "void"]}},
-        {"invoice_number": {"$regex": "INV/", "$options": "i"}},
+        # {"invoice_number": {"$regex": "INV/", "$options": "i"}},
     ]
 
-    # Build credit note match conditions
+    # Build credit note match conditions (use ISODate for credit_notes collection)
     credit_note_match_conditions = [
-        {"date": {"$gte": start_date, "$lte": end_date}},
+        {
+            "$or": [
+                {"date": {"$gte": start_date, "$lte": end_date}},
+                {"date": {"$gte": cn_start, "$lte": cn_end}},
+            ]
+        },
+        # Exclude transfer order customers from credit notes (returns)
+        {"customer_name": {"$nin": TRANSFER_ORDER_CUSTOMERS}},
     ]
 
     # Only add customer exclusion filter if excluded_customers is provided
@@ -1494,21 +1618,13 @@ def build_optimized_pipeline_with_credit_notes_and_composites(
         credit_note_match_conditions.append(customer_filter)
 
     return [
-        {
-            "$match": {
-                "$and": invoice_match_conditions
-            }
-        },
+        {"$match": {"$and": invoice_match_conditions}},
         {"$addFields": {"doc_type": "invoice"}},
         {
             "$unionWith": {
                 "coll": "credit_notes",
                 "pipeline": [
-                    {
-                        "$match": {
-                            "$and": credit_note_match_conditions
-                        }
-                    },
+                    {"$match": {"$and": credit_note_match_conditions}},
                     {"$addFields": {"doc_type": "credit_note"}},
                 ],
             }
@@ -1517,14 +1633,19 @@ def build_optimized_pipeline_with_credit_notes_and_composites(
         {
             "$lookup": {
                 "from": "composite_products",
-                "localField": "line_items.name",
-                "foreignField": "name",
+                "localField": "line_items.item_id",
+                "foreignField": "composite_item_id",
                 "as": "composite_match",
             }
         },
         {
             "$addFields": {
-                "is_composite": {"$gt": [{"$size": "$composite_match"}, 0]},
+                "is_composite": {
+                    "$or": [
+                        {"$gt": [{"$size": "$composite_match"}, 0]},
+                        {"$eq": ["$line_items.is_combo_product", True]},
+                    ]
+                },
                 "composite_info": {"$arrayElemAt": ["$composite_match", 0]},
             }
         },
@@ -1532,8 +1653,8 @@ def build_optimized_pipeline_with_credit_notes_and_composites(
             "$project": {
                 "items_to_process": {
                     "$cond": [
-                        # If it's a composite item
-                        "$is_composite",
+                        # If it's a composite item with components found
+                        {"$gt": [{"$size": "$composite_match"}, 0]},
                         # Then: create array of component items
                         {
                             "$map": {
@@ -1543,13 +1664,13 @@ def build_optimized_pipeline_with_credit_notes_and_composites(
                                     "doc_type": "$doc_type",
                                     "invoice_number": "$invoice_number",
                                     "creditnote_number": "$creditnote_number",
-                                    "item_id": "$component.item_id",
-                                    "item_name": "$component.name",
+                                    "item_id": "$$component.item_id",
+                                    "item_name": "$$component.name",
                                     # Multiply original quantity by component quantity
                                     "quantity": {
                                         "$multiply": [
                                             "$line_items.quantity",
-                                            "$component.quantity",
+                                            "$$component.quantity",
                                         ]
                                     },
                                     # Distribute amount proportionally
@@ -1697,7 +1818,9 @@ def process_batch_with_credit_notes(
         stock_info = stock_data.get(item_id, {})
         closing_stock = stock_info.get("closing_stock", 0)
         days_in_stock = stock_info.get("total_days_in_stock", 0)
-        last_90_days_dates = stock_info.get("last_90_days_dates", "")  # Get the new field
+        last_90_days_dates = stock_info.get(
+            "last_90_days_dates", ""
+        )  # Get the new field
         drr = round(units_sold / days_in_stock, 2) if days_in_stock > 0 else 0
 
         # Only accumulate totals for items with names (same filtering as before)
@@ -1741,7 +1864,9 @@ def process_batch_with_credit_notes(
 async def get_sales_report_fast(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
-    any_last_90_days: bool = Query(False, description="Include last 90 days in stock with date ranges"),
+    any_last_90_days: bool = Query(
+        False, description="Include last 90 days in stock with date ranges"
+    ),
     exclude_customers: bool = True,
     db=Depends(get_database),
 ):
@@ -1797,8 +1922,12 @@ async def get_sales_report_fast(
             logger.info(f"Fetching last 90 days in stock for {len(item_ids)} items")
             logger.debug(f"DEBUG: Sample stock_data keys: {item_ids[:3]}")
 
-            last_90_days_data = await fetch_last_n_days_in_stock(db, end_datetime, item_ids, 90)
-            logger.debug(f"DEBUG: Received {len(last_90_days_data)} items from fetch_last_n_days_in_stock")
+            last_90_days_data = await fetch_last_n_days_in_stock(
+                db, end_datetime, item_ids, 90
+            )
+            logger.debug(
+                f"DEBUG: Received {len(last_90_days_data)} items from fetch_last_n_days_in_stock"
+            )
 
             # Merge into stock_data
             merged_count = 0
@@ -1807,7 +1936,9 @@ async def get_sales_report_fast(
                     stock_data[item_id]["last_90_days_dates"] = date_ranges
                     merged_count += 1
 
-            logger.debug(f"DEBUG: Merged {merged_count} items with last_90_days_dates into stock_data")
+            logger.debug(
+                f"DEBUG: Merged {merged_count} items with last_90_days_dates into stock_data"
+            )
 
         logger.info(
             f"Processing {len(stock_data)} stock items and {len(products_map)} products with credit notes"
@@ -1844,7 +1975,9 @@ async def get_sales_report_fast(
 
             # Process remaining items
             if batch:
-                processed = process_batch_with_credit_notes(batch, stock_data, products_map)
+                processed = process_batch_with_credit_notes(
+                    batch, stock_data, products_map
+                )
                 sales_report_items.extend(processed["items"])
                 total_units += processed["units"]
                 total_amount += processed["amount"]
@@ -1852,10 +1985,26 @@ async def get_sales_report_fast(
                 total_closing_stock += processed["stock"]
 
             sales_report_items.sort(key=lambda x: x.item_name)
-            return sales_report_items, total_units, total_returns, total_amount, total_closing_stock
+            return (
+                sales_report_items,
+                total_units,
+                total_returns,
+                total_amount,
+                total_closing_stock,
+            )
 
-        sales_report_items, total_units, total_returns, total_amount, total_closing_stock = await asyncio.to_thread(
-            _process_cursor_results, invoices_collection, pipeline, stock_data, products_map
+        (
+            sales_report_items,
+            total_units,
+            total_returns,
+            total_amount,
+            total_closing_stock,
+        ) = await asyncio.to_thread(
+            _process_cursor_results,
+            invoices_collection,
+            pipeline,
+            stock_data,
+            products_map,
         )
 
         execution_time = (datetime.now() - start_time).total_seconds()
@@ -1919,7 +2068,9 @@ async def get_sales_report_fast(
 async def download_sales_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
-    any_last_90_days: bool = Query(False, description="Include last 90 days in stock with date ranges"),
+    any_last_90_days: bool = Query(
+        False, description="Include last 90 days in stock with date ranges"
+    ),
     db=Depends(get_database),
 ):
     """
@@ -1966,11 +2117,17 @@ async def download_sales_report(
         # If any_last_90_days is requested, fetch the last 90 days in stock for all items
         if any_last_90_days and stock_data:
             item_ids = list(stock_data.keys())
-            logger.info(f"Fetching last 90 days in stock for download: {len(item_ids)} items")
+            logger.info(
+                f"Fetching last 90 days in stock for download: {len(item_ids)} items"
+            )
             logger.debug(f"DEBUG (download): Sample stock_data keys: {item_ids[:3]}")
 
-            last_90_days_data = await fetch_last_n_days_in_stock(db, end_datetime, item_ids, 90)
-            logger.debug(f"DEBUG (download): Received {len(last_90_days_data)} items from fetch_last_n_days_in_stock")
+            last_90_days_data = await fetch_last_n_days_in_stock(
+                db, end_datetime, item_ids, 90
+            )
+            logger.debug(
+                f"DEBUG (download): Received {len(last_90_days_data)} items from fetch_last_n_days_in_stock"
+            )
 
             # Merge into stock_data
             merged_count = 0
@@ -1979,7 +2136,9 @@ async def download_sales_report(
                     stock_data[item_id]["last_90_days_dates"] = date_ranges
                     merged_count += 1
 
-            logger.debug(f"DEBUG (download): Merged {merged_count} items with last_90_days_dates into stock_data")
+            logger.debug(
+                f"DEBUG (download): Merged {merged_count} items with last_90_days_dates into stock_data"
+            )
 
         # Run cursor creation + iteration in thread to avoid blocking
         def _process_download_cursor(collection, pipeline, stock_data, products_map):
@@ -2011,7 +2170,9 @@ async def download_sales_report(
                     batch = []
 
             if batch:
-                processed = process_batch_with_credit_notes(batch, stock_data, products_map)
+                processed = process_batch_with_credit_notes(
+                    batch, stock_data, products_map
+                )
                 sales_report_items.extend(processed["items"])
                 total_units += processed["units"]
                 total_returns += processed["returns"]
@@ -2019,10 +2180,26 @@ async def download_sales_report(
                 total_closing_stock += processed["stock"]
 
             sales_report_items.sort(key=lambda x: x.item_name)
-            return sales_report_items, total_units, total_returns, total_amount, total_closing_stock
+            return (
+                sales_report_items,
+                total_units,
+                total_returns,
+                total_amount,
+                total_closing_stock,
+            )
 
-        sales_report_items, total_units, total_returns, total_amount, total_closing_stock = await asyncio.to_thread(
-            _process_download_cursor, invoices_collection, pipeline, stock_data, products_map
+        (
+            sales_report_items,
+            total_units,
+            total_returns,
+            total_amount,
+            total_closing_stock,
+        ) = await asyncio.to_thread(
+            _process_download_cursor,
+            invoices_collection,
+            pipeline,
+            stock_data,
+            products_map,
         )
 
         execution_time = (datetime.now() - start_time).total_seconds()
@@ -2194,22 +2371,33 @@ async def get_data_metadata(
 
         # Get distinct dates for inventory
         inventory_distinct_dates = await asyncio.to_thread(
-            lambda: list(stock_collection.distinct(
-                "date", {"date": {"$gte": start_datetime, "$lte": end_datetime}}
-            ))
+            lambda: list(
+                stock_collection.distinct(
+                    "date", {"date": {"$gte": start_datetime, "$lte": end_datetime}}
+                )
+            )
         )
-        inventory_dates_set = set(d.strftime("%Y-%m-%d") if isinstance(d, datetime) else d for d in inventory_distinct_dates)
+        inventory_dates_set = set(
+            d.strftime("%Y-%m-%d") if isinstance(d, datetime) else d
+            for d in inventory_distinct_dates
+        )
 
         # Get distinct dates for sales
         sales_distinct_dates = await asyncio.to_thread(
-            lambda: list(invoices_collection.distinct(
-                "date", {"date": {"$gte": start_date, "$lte": end_date}}
-            ))
+            lambda: list(
+                invoices_collection.distinct(
+                    "date", {"date": {"$gte": start_date, "$lte": end_date}}
+                )
+            )
         )
-        sales_dates_set = set(d if isinstance(d, str) else d.strftime("%Y-%m-%d") for d in sales_distinct_dates)
+        sales_dates_set = set(
+            d if isinstance(d, str) else d.strftime("%Y-%m-%d")
+            for d in sales_distinct_dates
+        )
 
         # Calculate all dates in the range
         from datetime import timedelta
+
         all_dates = set()
         current_date = start_datetime
         while current_date <= end_datetime:
@@ -2577,19 +2765,24 @@ def get_estimates_vs_invoices(
                 "$replaceRoot": {"newRoot": "$latest"}
             },  # Replace root with the latest document
             {"$unwind": "$line_items"},  # Unwind line items to process each one
-            # Lookup composite products by name
+            # Lookup composite products by item_id
             {
                 "$lookup": {
                     "from": "composite_products",
-                    "localField": "line_items.name",
-                    "foreignField": "name",
+                    "localField": "line_items.item_id",
+                    "foreignField": "composite_item_id",
                     "as": "composite_match",
                 }
             },
             # Check if item is composite
             {
                 "$addFields": {
-                    "is_composite": {"$gt": [{"$size": "$composite_match"}, 0]},
+                    "is_composite": {
+                        "$or": [
+                            {"$gt": [{"$size": "$composite_match"}, 0]},
+                            {"$eq": ["$line_items.is_combo_product", True]},
+                        ]
+                    },
                     "composite_info": {"$arrayElemAt": ["$composite_match", 0]},
                 }
             },
@@ -2598,8 +2791,8 @@ def get_estimates_vs_invoices(
                 "$project": {
                     "items_to_process": {
                         "$cond": [
-                            # If it's a composite item
-                            "$is_composite",
+                            # If it's a composite item with components found
+                            {"$gt": [{"$size": "$composite_match"}, 0]},
                             # Then: create array of component items
                             {
                                 "$map": {
@@ -2637,7 +2830,11 @@ def get_estimates_vs_invoices(
             {"$unwind": "$items_to_process"},
             {"$replaceRoot": {"newRoot": "$items_to_process"}},
         ]
-        estimates = list(estimates_collection.aggregate(estimates_pipeline, allowDiskUse=True, batchSize=1000))
+        estimates = list(
+            estimates_collection.aggregate(
+                estimates_pipeline, allowDiskUse=True, batchSize=1000
+            )
+        )
 
         logger.info(f"Fetching invoices from {start_date} to {end_date}")
 
@@ -2655,19 +2852,24 @@ def get_estimates_vs_invoices(
                 "$replaceRoot": {"newRoot": "$latest"}
             },  # Replace root with the latest document
             {"$unwind": "$line_items"},  # Unwind line items to process each one
-            # Lookup composite products by name
+            # Lookup composite products by item_id
             {
                 "$lookup": {
                     "from": "composite_products",
-                    "localField": "line_items.name",
-                    "foreignField": "name",
+                    "localField": "line_items.item_id",
+                    "foreignField": "composite_item_id",
                     "as": "composite_match",
                 }
             },
             # Check if item is composite
             {
                 "$addFields": {
-                    "is_composite": {"$gt": [{"$size": "$composite_match"}, 0]},
+                    "is_composite": {
+                        "$or": [
+                            {"$gt": [{"$size": "$composite_match"}, 0]},
+                            {"$eq": ["$line_items.is_combo_product", True]},
+                        ]
+                    },
                     "composite_info": {"$arrayElemAt": ["$composite_match", 0]},
                 }
             },
@@ -2676,8 +2878,8 @@ def get_estimates_vs_invoices(
                 "$project": {
                     "items_to_process": {
                         "$cond": [
-                            # If it's a composite item
-                            "$is_composite",
+                            # If it's a composite item with components found
+                            {"$gt": [{"$size": "$composite_match"}, 0]},
                             # Then: create array of component items
                             {
                                 "$map": {
@@ -2715,7 +2917,11 @@ def get_estimates_vs_invoices(
             {"$unwind": "$items_to_process"},
             {"$replaceRoot": {"newRoot": "$items_to_process"}},
         ]
-        invoices = list(invoices_collection.aggregate(invoices_pipeline, allowDiskUse=True, batchSize=1000))
+        invoices = list(
+            invoices_collection.aggregate(
+                invoices_pipeline, allowDiskUse=True, batchSize=1000
+            )
+        )
 
         logger.info(
             f"Found {len(estimates)} line items from estimates and {len(invoices)} line items from invoices (composite items expanded)"
@@ -2897,7 +3103,7 @@ def get_estimates_vs_invoices(
             )
         )
 
-        result.sort(key=lambda x:(x["item_name"]))
+        result.sort(key=lambda x: (x["item_name"]))
         return {
             "data": result,
             "meta": {

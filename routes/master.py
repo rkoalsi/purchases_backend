@@ -1,10 +1,11 @@
 from fastapi import APIRouter, HTTPException, status, Depends, Query
 from fastapi.responses import JSONResponse, StreamingResponse
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Set
 import asyncio
 import pandas as pd
 import io
+import json
 import math
 from collections import defaultdict
 from ..database import get_database
@@ -54,6 +55,154 @@ class OptimizedMasterReportService:
         except Exception as e:
             logger.error(f"Error fetching Zoho report: {e}")
             return {"source": "zoho", "data": [], "success": False, "error": str(e)}
+
+    TRANSFER_ORDER_CUSTOMERS = [
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (KA)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (MH)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (TL)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (TN)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (WB)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (HY)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (DL)",
+        "Pupscribe Enterprises Private Limited (Blinkit Maharashtra)",
+        "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
+        "Pupscribe Enterprises Private Limited (Blinkit Telangana)",
+        "Pupscribe Enterprises Private Limited (Blinkit Tamil Nadu)",
+        "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
+        "Pupscribe Enterprises Private Limited (Blinkit West Bengal)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (UP)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (GJ)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (KL)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (AD)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (GA)",
+        "(amzb2b) Pupscribe Enterprises Pvt Ltd (PB)",
+    ]
+
+    async def fetch_transfer_orders(self, start_date: str, end_date: str) -> Dict[str, float]:
+        """Fetch transfer order quantities from invoices for specific customer names.
+        Returns dict of {sku_code: total_quantity}."""
+        try:
+            invoices_collection = self.database["invoices"]
+            composite_collection = self.database.get_collection("composite_products")
+            products_collection = self.database.get_collection("products")
+
+            def _fetch():
+                # credit_notes stores date as ISODate, invoices as string
+                from datetime import datetime
+                cn_start = datetime.strptime(start_date, "%Y-%m-%d")
+                cn_end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+
+                pipeline = [
+                    {
+                        "$match": {
+                            "$or": [
+                                {"date": {"$gte": start_date, "$lte": end_date}},
+                                {"date": {"$gte": cn_start, "$lte": cn_end}},
+                            ],
+                            "status": {"$nin": ["void"]},
+                            "customer_name": {"$in": self.TRANSFER_ORDER_CUSTOMERS},
+                        }
+                    },
+                    {"$addFields": {"doc_type": "invoice"}},
+                    {
+                        "$unionWith": {
+                            "coll": "credit_notes",
+                            "pipeline": [
+                                {
+                                    "$match": {
+                                        "$or": [
+                                            {"date": {"$gte": start_date, "$lte": end_date}},
+                                            {"date": {"$gte": cn_start, "$lte": cn_end}},
+                                        ],
+                                        "customer_name": {"$in": self.TRANSFER_ORDER_CUSTOMERS},
+                                    }
+                                },
+                                {"$addFields": {"doc_type": "credit_note"}},
+                            ],
+                        }
+                    },
+                    {"$unwind": "$line_items"},
+                    {
+                        "$group": {
+                            "_id": "$line_items.item_id",
+                            "total_quantity": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$eq": ["$doc_type", "credit_note"]},
+                                        {"$multiply": ["$line_items.quantity", -1]},
+                                        "$line_items.quantity",
+                                    ]
+                                }
+                            },
+                        }
+                    },
+                ]
+                # Keep original item_id types (could be int or str in MongoDB)
+                item_quantities = {}
+                for doc in invoices_collection.aggregate(pipeline):
+                    item_id = doc["_id"]
+                    qty = doc.get("total_quantity", 0) or 0
+                    if item_id and qty != 0:
+                        item_quantities[item_id] = float(qty)
+
+                if not item_quantities:
+                    return {}
+
+                # Load composite products map (keyed by composite_item_id)
+                composites = {}
+                for doc in composite_collection.find({}, {"composite_item_id": 1, "components": 1, "_id": 0}):
+                    cid = doc.get("composite_item_id")
+                    if cid and doc.get("components"):
+                        composites[cid] = doc["components"]
+                        composites[str(cid)] = doc["components"]
+
+                # Map item_id → sku_code using products collection
+                # Query with both original types and string versions to handle type mismatches
+                raw_ids = list(item_quantities.keys())
+                str_ids = [str(i) for i in raw_ids]
+                all_query_ids = list(set(raw_ids + str_ids))
+                item_id_to_sku = {}
+                for doc in products_collection.find(
+                    {"item_id": {"$in": all_query_ids}},
+                    {"item_id": 1, "cf_sku_code": 1, "_id": 0},
+                ):
+                    iid = doc.get("item_id")
+                    sku = doc.get("cf_sku_code", "")
+                    if iid and sku:
+                        # Store both original and string key so lookup always works
+                        item_id_to_sku[iid] = sku
+                        item_id_to_sku[str(iid)] = sku
+
+                logger.info(f"Transfer orders: {len(item_quantities)} item_ids, mapped {len(item_id_to_sku)//2} to SKUs")
+
+                # Build sku → quantity, expanding composites
+                sku_quantities: Dict[str, float] = {}
+                for item_id, qty in item_quantities.items():
+                    # Check if composite FIRST (composite items won't be in products collection)
+                    components = composites.get(item_id) or composites.get(str(item_id))
+                    if components:
+                        for comp in components:
+                            comp_sku = comp.get("sku_code", "")
+                            comp_qty = float(comp.get("quantity", 1))
+                            if comp_sku:
+                                sku_quantities[comp_sku] = sku_quantities.get(comp_sku, 0) + (qty * comp_qty)
+                        continue
+
+                    # Regular product — need SKU mapping
+                    sku = item_id_to_sku.get(item_id) or item_id_to_sku.get(str(item_id), "")
+                    if not sku:
+                        continue
+                    sku_quantities[sku] = sku_quantities.get(sku, 0) + qty
+
+                return sku_quantities
+
+            result = await asyncio.to_thread(_fetch)
+            logger.info(f"Fetched transfer orders for {len(result)} SKUs")
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching transfer orders: {e}")
+            return {}
 
     async def fetch_fba_closing_stock(self, end_date: str) -> Dict[str, float]:
         """Fetch FBA closing stock from amazon_ledger, mapped by SKU code.
@@ -477,7 +626,8 @@ class OptimizedMasterReportService:
 
     def combine_data_by_sku_optimized(
         self, all_normalized_data: List[List[Dict]], period_days: int = 30,
-        composite_products_map: Dict = None, fba_stock_by_sku: Dict = None
+        composite_products_map: Dict = None, fba_stock_by_sku: Dict = None,
+        transfer_orders_by_sku: Dict = None
     ) -> List[Dict]:
         """Optimized SKU combination using defaultdict and single pass, with composite product handling"""
         sku_data = defaultdict(
@@ -491,20 +641,13 @@ class OptimizedMasterReportService:
                     "total_credit_notes": 0.0,
                     "total_amount": 0.0,
                     "total_closing_stock": 0.0,
-                    "total_sessions": 0.0,
                     "total_days_in_stock": 0.0,
                     "avg_daily_run_rate": 0.0,
                     "avg_days_of_coverage": 0.0,
                 },
-                "source_breakdown": {
-                    "zoho": {
-                        "units_sold": 0.0,
-                        "units_returned": 0.0,
-                        "credit_notes": 0.0,
-                        "closing_stock": 0.0,
-                        "amount": 0.0,
-                    },
-                },
+                # Internal only: track Zoho units/stock for DRR calc
+                "_zoho_units_sold": 0.0,
+                "_zoho_closing_stock": 0.0,
                 "in_stock": False,
             }
         )
@@ -513,64 +656,34 @@ class OptimizedMasterReportService:
             composite_products_map = {}
         if fba_stock_by_sku is None:
             fba_stock_by_sku = {}
+        if transfer_orders_by_sku is None:
+            transfer_orders_by_sku = {}
 
         def process_item_data(self, item, sku_code, item_name, multiplier=1.0):
             """Process individual item data with optional quantity multiplier"""
             source = item.get("source", "unknown")
+            entry = sku_data[sku_code]
 
             # Initialize if first time seeing this SKU
-            if sku_data[sku_code]["sku_code"] == "":
-                sku_data[sku_code]["sku_code"] = sku_code
-                sku_data[sku_code]["item_name"] = item_name
+            if entry["sku_code"] == "":
+                entry["sku_code"] = sku_code
+                entry["item_name"] = item_name
 
-            # Add source (with specific Amazon platform info)
-            sku_data[sku_code]["sources"].add(source)
+            entry["sources"].add(source)
 
-            # Update metrics efficiently with multiplier
-            metrics = sku_data[sku_code]["combined_metrics"]
-            metrics["total_units_sold"] += (
-                self.safe_float(item.get("units_sold")) * multiplier
-            )
-            metrics["total_units_returned"] += (
-                self.safe_float(item.get("units_returned")) * multiplier
-            )
-            metrics["total_credit_notes"] += (
-                self.safe_float(item.get("credit_notes")) * multiplier
-            )
-            metrics["total_amount"] += (
-                self.safe_float(item.get("total_amount")) * multiplier
-            )
-            metrics["total_closing_stock"] += (
-                self.safe_float(item.get("closing_stock")) * multiplier
-            )
-            metrics["total_sessions"] += self.safe_float(
-                item.get("sessions")
-            )  # Sessions don't multiply
-            metrics["total_days_in_stock"] += self.safe_float(
-                item.get("days_in_stock")
-            )  # Days don't multiply
+            # Update metrics with multiplier
+            metrics = entry["combined_metrics"]
+            metrics["total_units_sold"] += self.safe_float(item.get("units_sold")) * multiplier
+            metrics["total_units_returned"] += self.safe_float(item.get("units_returned")) * multiplier
+            metrics["total_credit_notes"] += self.safe_float(item.get("credit_notes")) * multiplier
+            metrics["total_amount"] += self.safe_float(item.get("total_amount")) * multiplier
+            metrics["total_closing_stock"] += self.safe_float(item.get("closing_stock")) * multiplier
+            metrics["total_days_in_stock"] += self.safe_float(item.get("days_in_stock"))
 
-            # Map source to breakdown key
-            breakdown_source = source
-
-            # Update source breakdown with multiplier
-            if breakdown_source in sku_data[sku_code]["source_breakdown"]:
-                breakdown = sku_data[sku_code]["source_breakdown"][breakdown_source]
-                breakdown["units_sold"] += (
-                    self.safe_float(item.get("units_sold")) * multiplier
-                )
-                breakdown["units_returned"] += (
-                    self.safe_float(item.get("units_returned")) * multiplier
-                )
-                breakdown["credit_notes"] += (
-                    self.safe_float(item.get("credit_notes")) * multiplier
-                )
-                breakdown["closing_stock"] += (
-                    self.safe_float(item.get("closing_stock")) * multiplier
-                )
-                breakdown["amount"] += (
-                    self.safe_float(item.get("total_amount")) * multiplier
-                )
+            # Track Zoho units/stock for DRR calculation
+            if source == "zoho":
+                entry["_zoho_units_sold"] += self.safe_float(item.get("units_sold")) * multiplier
+                entry["_zoho_closing_stock"] += self.safe_float(item.get("closing_stock")) * multiplier
 
         # Single pass through all data
         for source_data in all_normalized_data:
@@ -582,67 +695,57 @@ class OptimizedMasterReportService:
                     continue
 
                 original_sku = item.get("sku_code", "Unknown SKU") or "Unknown SKU"
+                item_id = str(item.get("item_id", ""))
 
-                # Check if this SKU is a composite product (using pre-loaded map)
-                composite_components = composite_products_map.get(original_sku)
+                # Check if this is a composite product
+                composite_components = composite_products_map.get(item_id)
 
                 if composite_components:
-                    # This is a composite product - process each component
                     for component in composite_components:
-                        
-                        component_sku = component.get(
-                            "sku_code", "Unknown Component SKU"
-                        )
-                        component_name = component.get("name", "Unknown Component")
-                        component_quantity = float(component.get("quantity", 1))
-
-                        # Process the component with multiplied quantities
                         process_item_data(
-                            self,
-                            item,
-                            component_sku,
-                            component_name,
-                            component_quantity,
+                            self, item,
+                            component.get("sku_code", "Unknown Component SKU"),
+                            component.get("name", "Unknown Component"),
+                            float(component.get("quantity", 1)),
                         )
                 else:
-                    # Regular product - process normally
-                    item_name = item.get("item_name", "Unknown Item")
-                    process_item_data(self, item, original_sku, item_name)
+                    process_item_data(self, item, original_sku, item.get("item_name", "Unknown Item"))
 
         # Calculate averages in a single pass
         result = []
         for sku, data in sku_data.items():
-            # Convert sources set to list
             data["sources"] = list(data["sources"])
-
-            # Calculate averages
             metrics = data["combined_metrics"]
 
-            # DRR based on Zoho sales only
-            zoho_breakdown = data["source_breakdown"]["zoho"]
-            zoho_units = zoho_breakdown["units_sold"]
-            zoho_stock = zoho_breakdown["closing_stock"]
+            # DRR based on Zoho sales / days in stock
+            zoho_units = data.pop("_zoho_units_sold")
+            zoho_stock = data.pop("_zoho_closing_stock")
             fba_stock = fba_stock_by_sku.get(sku, 0)
 
-            if period_days > 0:
+            days_in_stock = metrics.get("total_days_in_stock", 0)
+            if days_in_stock > 0:
+                metrics["avg_daily_run_rate"] = round(zoho_units / days_in_stock, 2)
+            elif period_days > 0:
                 metrics["avg_daily_run_rate"] = round(zoho_units / period_days, 2)
 
-            # Closing stock = Pupscribe WH (Zoho) + FBA stock (amazon_ledger)
+            # Closing stock = Pupscribe WH (Zoho) + FBA stock
             metrics["total_closing_stock"] = round(zoho_stock + fba_stock, 2)
-
-            # Store FBA stock in combined_metrics for visibility
             metrics["fba_closing_stock"] = round(fba_stock, 2)
             metrics["pupscribe_wh_stock"] = round(zoho_stock, 2)
+
+            # Transfer orders and total sales
+            transfer_qty = transfer_orders_by_sku.get(sku, 0)
+            metrics["transfer_orders"] = round(transfer_qty, 2)
+            metrics["total_sales"] = round(metrics["total_units_sold"] - transfer_qty, 2)
 
             if metrics["avg_daily_run_rate"] > 0:
                 metrics["avg_days_of_coverage"] = round(
                     metrics["total_closing_stock"] / metrics["avg_daily_run_rate"], 2
                 )
 
-            # in_stock flag: True if Pupscribe WH or FBA has stock
             data["in_stock"] = zoho_stock > 0 or fba_stock > 0
 
-            # Round all metrics
+            # Round all float metrics
             for key, value in metrics.items():
                 if isinstance(value, float):
                     metrics[key] = round(value, 2)
@@ -698,6 +801,133 @@ class OptimizedMasterReportService:
         except Exception as e:
             logger.error(f"Error fetching product brands: {e}")
             return {}
+
+    async def fetch_sku_to_item_id_map(self, sku_codes: Set[str]) -> Dict[str, str]:
+        """Build reverse mapping: sku_code → zoho item_id from products collection"""
+        if not sku_codes:
+            return {}
+
+        try:
+            products_collection = self.database.get_collection("products")
+
+            def _fetch():
+                docs = products_collection.find(
+                    {"cf_sku_code": {"$in": list(sku_codes)}},
+                    {"item_id": 1, "cf_sku_code": 1, "_id": 0}
+                )
+                result = {}
+                for doc in docs:
+                    sku = doc.get("cf_sku_code", "")
+                    iid = doc.get("item_id")
+                    if sku and iid:
+                        result[sku] = iid
+                return result
+
+            return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            logger.error(f"Error fetching sku to item_id map: {e}")
+            return {}
+
+    async def fetch_previous_period_drr(
+        self,
+        skus_needing_lookback: Dict[str, str],
+        start_date: str,
+        end_date: str,
+        period_days: int,
+    ) -> Dict[str, Dict]:
+        """
+        Look back at previous periods to find representative DRR for items with < 60 days in stock.
+
+        Args:
+            skus_needing_lookback: Dict[sku_code, item_id] for SKUs that need lookback
+            start_date: Original period start date (YYYY-MM-DD)
+            end_date: Original period end date (YYYY-MM-DD)
+            period_days: Number of days in the period
+
+        Returns:
+            Dict[sku_code, {"drr": float, "lookback_period": str, "days_in_stock": int, "found": bool}]
+        """
+        from .zoho import fetch_stock_data_for_items, fetch_zoho_lookback_sales
+
+        if not skus_needing_lookback:
+            return {}
+
+        remaining_skus = set(skus_needing_lookback.keys())
+        results = {}
+
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+        max_lookbacks = 6
+        for i in range(max_lookbacks):
+            if not remaining_skus:
+                break
+
+            # Shift dates back by period_days
+            end_dt = start_dt - timedelta(days=1)
+            start_dt = end_dt - timedelta(days=period_days - 1)
+
+            prev_start = start_dt.strftime("%Y-%m-%d")
+            prev_end = end_dt.strftime("%Y-%m-%d")
+
+            logger.info(
+                f"DRR lookback iteration {i+1}: {prev_start} to {prev_end}, "
+                f"{len(remaining_skus)} SKUs remaining"
+            )
+
+            # Get item_ids for remaining SKUs
+            remaining_item_ids = [
+                skus_needing_lookback[sku] for sku in remaining_skus
+            ]
+
+            # Fetch stock data and sales data in parallel
+            stock_data, sales_data = await asyncio.gather(
+                fetch_stock_data_for_items(
+                    self.database, start_dt, end_dt, remaining_item_ids
+                ),
+                fetch_zoho_lookback_sales(
+                    self.database, prev_start, prev_end, remaining_item_ids
+                ),
+            )
+
+            # Check which SKUs now have >= 60 days in stock
+            satisfied_skus = set()
+            for sku in list(remaining_skus):
+                item_id = skus_needing_lookback[sku]
+                stock_info = stock_data.get(item_id, {})
+                days_in_stock = stock_info.get("total_days_in_stock", 0)
+
+                if days_in_stock >= 60:
+                    # Get sales for this item
+                    units_sold = sales_data.get(str(item_id), 0)
+                    # DRR = units_sold / days_in_stock (not period_days)
+                    # This gives the true daily run rate based on actual days the item had stock
+                    drr = round(units_sold / days_in_stock, 2) if days_in_stock > 0 else 0
+
+                    results[sku] = {
+                        "drr": drr,
+                        "lookback_period": f"{prev_start} to {prev_end}",
+                        "days_in_stock": days_in_stock,
+                        "found": True,
+                    }
+                    satisfied_skus.add(sku)
+
+            remaining_skus -= satisfied_skus
+            logger.info(
+                f"DRR lookback iteration {i+1}: {len(satisfied_skus)} SKUs satisfied, "
+                f"{len(remaining_skus)} remaining"
+            )
+
+        # Mark remaining SKUs as not found
+        for sku in remaining_skus:
+            results[sku] = {
+                "drr": 0,
+                "lookback_period": "",
+                "days_in_stock": 0,
+                "found": False,
+            }
+
+        return results
 
     @staticmethod
     def classify_movement(
@@ -951,6 +1181,7 @@ async def _generate_master_report_data(
     end_date: str,
     include_zoho: bool,
     db,
+    brand: str = None,
 ):
     """
     Internal function that generates full master report data (with raw individual_reports).
@@ -992,22 +1223,24 @@ async def _generate_master_report_data(
                 composite_collection = db.get_collection("composite_products")
                 def _query():
                     result = {}
-                    for doc in composite_collection.find({}, {"sku_code": 1, "components": 1, "_id": 0}):
-                        if doc.get("components"):
-                            result[doc["sku_code"]] = doc["components"]
+                    for doc in composite_collection.find({}, {"composite_item_id": 1, "components": 1, "_id": 0}):
+                        cid = doc.get("composite_item_id")
+                        if cid and doc.get("components"):
+                            result[str(cid)] = doc["components"]
                     return result
                 return await asyncio.to_thread(_query)
             except Exception as e:
                 logger.error(f"Error loading composite products: {e}")
                 return {}
 
-        # Execute all report fetches + composites + FBA stock in parallel
+        # Execute all report fetches + composites + FBA stock + transfer orders in parallel
         try:
             all_results = await asyncio.wait_for(
                 asyncio.gather(
                     *tasks,
                     _fetch_all_composites(),
                     report_service.fetch_fba_closing_stock(end_date),
+                    report_service.fetch_transfer_orders(start_date, end_date),
                     return_exceptions=True,
                 ),
                 timeout=180.0,  # Allow enough time for large date ranges
@@ -1018,16 +1251,20 @@ async def _generate_master_report_data(
                 detail="Report generation timed out",
             )
 
-        # Last two results are composite_products_map and fba_stock
-        results = all_results[:-2]
-        composite_products_map_raw = all_results[-2]
-        fba_stock_by_sku = all_results[-1]
+        # Last three results are composite_products_map, fba_stock, and transfer_orders
+        results = all_results[:-3]
+        composite_products_map_raw = all_results[-3]
+        fba_stock_by_sku = all_results[-2]
+        transfer_orders_by_sku = all_results[-1]
         if isinstance(composite_products_map_raw, Exception):
             logger.error(f"Composite products fetch failed: {composite_products_map_raw}")
             composite_products_map_raw = {}
         if isinstance(fba_stock_by_sku, Exception):
             logger.error(f"FBA stock fetch failed: {fba_stock_by_sku}")
             fba_stock_by_sku = {}
+        if isinstance(transfer_orders_by_sku, Exception):
+            logger.error(f"Transfer orders fetch failed: {transfer_orders_by_sku}")
+            transfer_orders_by_sku = {}
 
         # Process results
         individual_reports = {}
@@ -1124,7 +1361,7 @@ async def _generate_master_report_data(
 
                 combined_data = await asyncio.to_thread(
                     report_service.combine_data_by_sku_optimized, all_normalized_data, period_days,
-                    composite_products_map, fba_stock_by_sku
+                    composite_products_map, fba_stock_by_sku, transfer_orders_by_sku
                 )
                 logger.info(f"Combined data for {len(combined_data)} unique SKUs")
             except Exception as e:
@@ -1132,6 +1369,101 @@ async def _generate_master_report_data(
                 combined_data = []
         else:
             combined_data = []
+
+        # Step 4a: DRR lookback for items with < 60 days in stock
+        if combined_data:
+            try:
+                # Identify SKUs with < 60 days in stock (need DRR lookback)
+                skus_needing_lookback_list = []
+                for item in combined_data:
+                    days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
+                    sku = item.get("sku_code", "")
+                    if days < 60 and sku:
+                        skus_needing_lookback_list.append(sku)
+
+                if skus_needing_lookback_list:
+                    logger.info(
+                        f"DRR lookback needed for {len(skus_needing_lookback_list)} SKUs "
+                        f"with < 60 days in stock"
+                    )
+
+                    # Get sku → item_id mapping for lookback queries
+                    sku_to_item_id = await report_service.fetch_sku_to_item_id_map(
+                        set(skus_needing_lookback_list)
+                    )
+
+                    # Filter to only SKUs we found item_ids for
+                    skus_with_ids = {
+                        sku: sku_to_item_id[sku]
+                        for sku in skus_needing_lookback_list
+                        if sku in sku_to_item_id
+                    }
+
+                    if skus_with_ids:
+                        lookback_results = await report_service.fetch_previous_period_drr(
+                            skus_with_ids, start_date, end_date, period_days
+                        )
+
+                        # Apply lookback results to combined_data
+                        for item in combined_data:
+                            sku = item.get("sku_code", "")
+                            days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
+                            metrics = item.get("combined_metrics", {})
+
+                            if days >= 60:
+                                item["drr_source"] = "current_period"
+                                item["drr_lookback_period"] = ""
+                                item["highlight"] = None
+                            elif sku in lookback_results:
+                                lb = lookback_results[sku]
+                                if lb["found"]:
+                                    metrics["avg_daily_run_rate"] = lb["drr"]
+                                    # Recalculate days of coverage with new DRR
+                                    if lb["drr"] > 0:
+                                        metrics["avg_days_of_coverage"] = round(
+                                            metrics.get("total_closing_stock", 0) / lb["drr"], 2
+                                        )
+                                    item["drr_source"] = "previous_period"
+                                    item["drr_lookback_period"] = lb["lookback_period"]
+                                    item["highlight"] = "yellow"
+                                else:
+                                    item["drr_source"] = "insufficient_stock"
+                                    item["drr_lookback_period"] = ""
+                                    item["highlight"] = "red"
+                            else:
+                                # No item_id found for this SKU
+                                item["drr_source"] = "current_period"
+                                item["drr_lookback_period"] = ""
+                                item["highlight"] = None
+
+                        logger.info(
+                            f"DRR lookback complete: "
+                            f"{sum(1 for r in lookback_results.values() if r['found'])} found, "
+                            f"{sum(1 for r in lookback_results.values() if not r['found'])} not found"
+                        )
+                    else:
+                        # Set default drr_source for all items
+                        for item in combined_data:
+                            days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
+                            item["drr_source"] = "current_period" if days >= 60 else "insufficient_stock"
+                            item["drr_lookback_period"] = ""
+                            item["highlight"] = "red" if days < 60 else None
+                else:
+                    # All items have >= 60 days in stock
+                    for item in combined_data:
+                        item["drr_source"] = "current_period"
+                        item["drr_lookback_period"] = ""
+                        item["highlight"] = None
+
+            except Exception as e:
+                logger.error(f"DRR lookback error: {e}")
+                logger.error(traceback.format_exc())
+                errors.append(f"DRR lookback error: {str(e)}")
+                # Set defaults on error
+                for item in combined_data:
+                    item.setdefault("drr_source", "current_period")
+                    item.setdefault("drr_lookback_period", "")
+                    item.setdefault("highlight", None)
 
         # Step 4b: Enrich with movement classification, transit stock, and order calculations
         if combined_data:
@@ -1160,6 +1492,14 @@ async def _generate_master_report_data(
                         "cbm": pdata.get("cbm", 0),
                         "case_pack": pdata.get("case_pack", 0),
                     }
+
+                # Filter by brand if specified
+                if brand:
+                    combined_data = [
+                        item for item in combined_data
+                        if product_brands.get(item.get("sku_code", ""), "").lower() == brand.lower()
+                    ]
+                    logger.info(f"Filtered to {len(combined_data)} items for brand '{brand}'")
 
                 # Only brand_logistics and transit still need DB queries
                 brand_logistics, transit_data = await asyncio.gather(
@@ -1198,6 +1538,8 @@ async def _generate_master_report_data(
             "total_amount": 0.0,
             "total_closing_stock": 0.0,
             "avg_drr": 0.0,
+            "total_transfer_orders": 0.0,
+            "total_total_sales": 0.0,
         }
 
         if combined_data:
@@ -1215,6 +1557,8 @@ async def _generate_master_report_data(
                     "total_closing_stock", 0
                 )
                 summary_stats["avg_drr"] += metrics.get("avg_daily_run_rate", 0)
+                summary_stats["total_transfer_orders"] += metrics.get("transfer_orders", 0)
+                summary_stats["total_total_sales"] += metrics.get("total_sales", 0)
 
             if total_skus > 0:
                 summary_stats["avg_drr"] = round(
@@ -1251,6 +1595,12 @@ async def _generate_master_report_data(
                     summary_stats["total_closing_stock"], 2
                 ),
                 "avg_drr": summary_stats["avg_drr"],
+                "total_transfer_orders": round(
+                    summary_stats["total_transfer_orders"], 2
+                ),
+                "total_total_sales": round(
+                    summary_stats["total_total_sales"], 2
+                ),
                 "sources_included": list(individual_reports.keys()),
                 "source_record_counts": source_counts,
             },
@@ -1281,13 +1631,14 @@ async def get_master_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
     include_zoho: bool = Query(True, description="Include Zoho data"),
+    brand: str = Query(None, description="Filter by brand name"),
     db=Depends(get_database),
 ):
     """
     Optimized master report with batch processing and parallel execution
     """
     content = await _generate_master_report_data(
-        start_date, end_date, include_zoho, db,
+        start_date, end_date, include_zoho, db, brand=brand,
     )
 
     # Strip raw data from individual_reports for the API response (keep metadata only)
@@ -1309,6 +1660,7 @@ async def download_master_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
     include_zoho: bool = Query(True, description="Include Zoho data"),
+    brand: str = Query(None, description="Filter by brand name"),
     db=Depends(get_database),
 ):
     """
@@ -1321,6 +1673,7 @@ async def download_master_report(
             end_date=end_date,
             include_zoho=include_zoho,
             db=db,
+            brand=brand,
         )
 
         combined_data = content.get("combined_data", [])
@@ -1363,28 +1716,17 @@ async def download_master_report(
                         "Total Sessions": item.get("combined_metrics", {}).get(
                             "total_sessions", 0
                         ),
+                        "Days in Stock": item.get("combined_metrics", {}).get(
+                            "total_days_in_stock", 0
+                        ),
                         "Avg Daily Run Rate": item.get("combined_metrics", {}).get(
                             "avg_daily_run_rate", 0
                         ),
+                        "DRR Source": item.get("drr_source", "current_period"),
+                        "DRR Lookback Period": item.get("drr_lookback_period", ""),
                         "Avg Days of Coverage": item.get("combined_metrics", {}).get(
                             "avg_days_of_coverage", 0
                         ),
-                        # Zoho breakdown
-                        "Zoho Units Sold": item.get("source_breakdown", {})
-                        .get("zoho", {})
-                        .get("units_sold", 0),
-                        "Zoho Units Returned": item.get("source_breakdown", {})
-                        .get("zoho", {})
-                        .get("units_returned", 0),
-                        "Zoho Credit Notes": item.get("source_breakdown", {})
-                        .get("zoho", {})
-                        .get("credit_notes", 0),
-                        "Zoho Closing Stock": item.get("source_breakdown", {})
-                        .get("zoho", {})
-                        .get("closing_stock", 0),
-                        "Zoho Amount": item.get("source_breakdown", {})
-                        .get("zoho", {})
-                        .get("amount", 0),
                         "Pupscribe WH Stock": item.get("combined_metrics", {}).get(
                             "pupscribe_wh_stock", 0
                         ),
@@ -1392,6 +1734,12 @@ async def download_master_report(
                             "fba_closing_stock", 0
                         ),
                         "In Stock": "Yes" if item.get("in_stock", False) else "No",
+                        "Transfer Orders": item.get("combined_metrics", {}).get(
+                            "transfer_orders", 0
+                        ),
+                        "Total Sales": item.get("combined_metrics", {}).get(
+                            "total_sales", 0
+                        ),
                         # Movement & Order Calculation columns
                         "Movement": item.get("movement", ""),
                         "Safety Days": item.get("safety_days", 0),
@@ -1417,6 +1765,23 @@ async def download_master_report(
             if combined_df_data:
                 combined_df = pd.DataFrame(combined_df_data)
                 combined_df.to_excel(writer, sheet_name="Combined Summary", index=False)
+
+                # Apply row highlighting based on DRR source
+                from openpyxl.styles import PatternFill
+                yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+                red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
+
+                ws = writer.sheets["Combined Summary"]
+                drr_source_col_idx = list(combined_df.columns).index("DRR Source") + 1  # 1-based
+
+                for row_idx in range(2, len(combined_df_data) + 2):  # Skip header row
+                    drr_source_val = ws.cell(row=row_idx, column=drr_source_col_idx).value
+                    if drr_source_val == "previous_period":
+                        for col_idx in range(1, len(combined_df.columns) + 1):
+                            ws.cell(row=row_idx, column=col_idx).fill = yellow_fill
+                    elif drr_source_val == "insufficient_stock":
+                        for col_idx in range(1, len(combined_df.columns) + 1):
+                            ws.cell(row=row_idx, column=col_idx).fill = red_fill
 
             # Sheet 2: Summary Statistics
             summary_data = [
@@ -1468,6 +1833,22 @@ async def download_master_report(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate Excel report: {str(e)}",
         )
+
+
+@router.get("/brands")
+def get_available_brands(db=Depends(get_database)):
+    """Get list of available brands from products collection"""
+    try:
+        products_collection = db.get_collection("products")
+        brands = products_collection.find({"status": "active"}).distinct("brand")
+        return {
+            "brands": [
+                {"value": brand, "label": brand.title()} for brand in brands if brand
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error getting brands: {e}")
+        raise HTTPException(status_code=500, detail="Error retrieving brands")
 
 
 @router.post("/import-product-logistics")
