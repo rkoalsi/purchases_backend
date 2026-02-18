@@ -326,7 +326,7 @@ class OptimizedMasterReportService:
             def _fetch_all():
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(valid_skus)}},
-                    {"cf_sku_code": 1, "name": 1, "rate": 1, "brand": 1, "cbm": 1, "case_pack": 1, "_id": 0},
+                    {"cf_sku_code": 1, "name": 1, "rate": 1, "brand": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1, "_id": 0},
                 ))
 
             products = await asyncio.to_thread(_fetch_all)
@@ -342,6 +342,7 @@ class OptimizedMasterReportService:
                     "brand": product.get("brand", ""),
                     "cbm": self.safe_float(product.get("cbm")),
                     "case_pack": self.safe_float(product.get("case_pack")),
+                    "purchase_status": product.get("purchase_status", ""),
                 }
 
             logger.info(f"Batch loaded all product data for {len(result)} products")
@@ -1057,7 +1058,7 @@ class OptimizedMasterReportService:
             def _fetch_logistics():
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(sku_codes)}},
-                    {"cf_sku_code": 1, "cbm": 1, "case_pack": 1, "_id": 0}
+                    {"cf_sku_code": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1, "_id": 0}
                 ))
 
             products = await asyncio.to_thread(_fetch_logistics)
@@ -1069,6 +1070,7 @@ class OptimizedMasterReportService:
                     result[sku] = {
                         "cbm": self.safe_float(p.get("cbm")),
                         "case_pack": self.safe_float(p.get("case_pack")),
+                        "purchase_status": p.get("purchase_status", ""),
                     }
 
             return result
@@ -1125,12 +1127,13 @@ class OptimizedMasterReportService:
             order_qty = max(0, (target_days - current_days_coverage) * drr)
             item["order_qty"] = round(order_qty, 2)
 
-            # Logistics (CBM / Case Pack)
+            # Logistics (CBM / Case Pack / Purchase Status)
             logistics = logistics_data.get(sku, {})
             cbm = logistics.get("cbm", 0)
             case_pack = logistics.get("case_pack", 0)
             item["cbm"] = cbm
             item["case_pack"] = case_pack
+            item["purchase_status"] = logistics.get("purchase_status", "")
 
             # Order qty rounded up to case pack
             if case_pack > 0:
@@ -1493,6 +1496,7 @@ async def _generate_master_report_data(
                     logistics_data[sku] = {
                         "cbm": pdata.get("cbm", 0),
                         "case_pack": pdata.get("case_pack", 0),
+                        "purchase_status": pdata.get("purchase_status", ""),
                     }
 
                 if brand:
@@ -1688,6 +1692,7 @@ async def download_master_report(
 
                 combined_df_data.append(
                     {
+                        "Purchase Status": item.get("purchase_status", ""),
                         "SKU Code": item.get("sku_code", ""),
                         "Item Name": item.get("item_name", ""),
                         "Total Units Sold": item.get("combined_metrics", {}).get(
@@ -1849,52 +1854,71 @@ def import_product_logistics(
     db=Depends(get_database),
 ):
     """
-    Import CBM and Case Pack data from PSR Sheet.xlsx Master sheet into products collection.
-    Maps BBCode (col B) to cf_sku_code and updates cbm (col BX) and case_pack (col BY).
+    Import Item Status (col A), CBM (col BX), and Case Pack (col BY) from the PSR Google Sheet
+    Master tab. Maps BBCode (col B) to cf_sku_code and saves purchase_status, cbm, case_pack.
     """
+    import os
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    def _map_status(raw: str) -> str:
+        s = raw.strip().lower()
+        if s == "active":
+            return "active"
+        elif s == "discontinued":
+            return "inactive"
+        elif "until stock" in s:
+            return "discontinued until stock lasts"
+        return ""
+
     try:
-        import openpyxl
-        import os
-
-        # Find PSR Sheet.xlsx in the backend directory
         backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        psr_path = os.path.join(backend_dir, "PSR Sheet.xlsx")
+        creds_path = os.path.join(backend_dir, "creds.json")
 
-        if not os.path.exists(psr_path):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="PSR Sheet.xlsx not found in backend directory",
-            )
+        scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+        credentials = Credentials.from_service_account_file(creds_path, scopes=scopes)
+        gc = gspread.authorize(credentials)
 
-        wb = openpyxl.load_workbook(psr_path, read_only=True)
-        ws = wb["Master"]
+        sh = gc.open_by_key("1xjPO-M8MScP4gLVI04QCdz1594DIkXh2_odAxtKlMWY")
+        ws = sh.worksheet("Master")
+
+        # Fetch all rows at once (col A=status, B=BBCode, BX=col76=CBM, BY=col77=case_pack)
+        all_rows = ws.get_all_values()
 
         products_collection = db.get_collection("products")
         updated_count = 0
         skipped_count = 0
 
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            row = list(row)
-            if len(row) < 77:
+        for row in all_rows[1:]:  # skip header
+            if len(row) < 2:
                 continue
 
-            bbcode = row[1]  # Col B = BBCode (SKU)
-            cbm = row[75]    # Col BX = CBM
-            case_pack = row[76]  # Col BY = Case Pack
-
+            bbcode = row[1].strip() if len(row) > 1 else ""
             if not bbcode:
                 continue
 
+            raw_status = row[0].strip() if len(row) > 0 else ""
+            cbm_raw = row[75] if len(row) > 75 else ""
+            case_pack_raw = row[76] if len(row) > 76 else ""
+
             try:
-                cbm_val = float(cbm) if cbm is not None else 0
-                case_pack_val = float(case_pack) if case_pack is not None else 0
+                cbm_val = float(cbm_raw) if cbm_raw else 0
             except (ValueError, TypeError):
                 cbm_val = 0
+
+            try:
+                case_pack_val = float(case_pack_raw) if case_pack_raw else 0
+            except (ValueError, TypeError):
                 case_pack_val = 0
 
+            update_doc: dict = {"cbm": cbm_val, "case_pack": case_pack_val}
+            mapped_status = _map_status(raw_status)
+            if mapped_status:
+                update_doc["purchase_status"] = mapped_status
+
             result = products_collection.update_one(
-                {"cf_sku_code": str(bbcode).strip()},
-                {"$set": {"cbm": cbm_val, "case_pack": case_pack_val}},
+                {"cf_sku_code": bbcode},
+                {"$set": update_doc},
             )
 
             if result.modified_count > 0 or result.matched_count > 0:
@@ -1902,12 +1926,10 @@ def import_product_logistics(
             else:
                 skipped_count += 1
 
-        wb.close()
-
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
-                "message": f"Imported CBM and Case Pack data",
+                "message": "Imported status, CBM and Case Pack from PSR Sheet",
                 "updated": updated_count,
                 "skipped": skipped_count,
             },
@@ -2022,7 +2044,7 @@ def get_product_logistics_list(
         raw_products = list(
             products_collection.find(
                 query,
-                {"cf_sku_code": 1, "name": 1, "brand": 1, "cbm": 1, "case_pack": 1, "_id": 0},
+                {"cf_sku_code": 1, "name": 1, "brand": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1, "_id": 0},
             )
             .skip(skip)
             .limit(page_size)
@@ -2038,6 +2060,7 @@ def get_product_logistics_list(
                 "brand": p.get("brand", ""),
                 "cbm": p.get("cbm", 0) or 0,
                 "case_pack": p.get("case_pack", 0) or 0,
+                "purchase_status": p.get("purchase_status", ""),
             })
 
         return JSONResponse(
@@ -2059,9 +2082,10 @@ def update_product_logistics(
     sku_code: str = Query(...),
     cbm: float = Query(None),
     case_pack: float = Query(None),
+    purchase_status: str = Query(None),
     db=Depends(get_database),
 ):
-    """Update CBM and/or case_pack for a product"""
+    """Update CBM, case_pack, and/or purchase_status for a product"""
     try:
         products_collection = db.get_collection("products")
 
@@ -2070,6 +2094,8 @@ def update_product_logistics(
             update_fields["cbm"] = cbm
         if case_pack is not None:
             update_fields["case_pack"] = case_pack
+        if purchase_status is not None:
+            update_fields["purchase_status"] = purchase_status
 
         if not update_fields:
             raise HTTPException(status_code=400, detail="No fields to update")
