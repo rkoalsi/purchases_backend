@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, status, Depends, Query
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Set
 import asyncio
@@ -2013,16 +2013,22 @@ def delete_brand_logistics(
 @router.get("/product-logistics")
 def get_product_logistics_list(
     search: str = Query("", description="Search by SKU or product name"),
+    brand: str = Query("", description="Filter by brand"),
+    status: str = Query("", description="Filter by purchase status"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db=Depends(get_database),
 ):
-    """Get products with CBM and case_pack data, with pagination and search"""
+    """Get products with CBM and case_pack data, with pagination, search and brand filter"""
     try:
         products_collection = db.get_collection("products")
 
         # Always filter out products without a valid SKU code
         base_filter = {"cf_sku_code": {"$exists": True, "$ne": ""}}
+        if brand:
+            base_filter["brand"] = brand
+        if status:
+            base_filter["purchase_status"] = status
 
         if search:
             query = {
@@ -2078,6 +2084,81 @@ def get_product_logistics_list(
                 "page_size": page_size,
                 "total_pages": math.ceil(total / page_size) if total > 0 else 1,
             },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/product-logistics/download")
+def download_product_logistics(
+    search: str = Query("", description="Search by SKU or product name"),
+    brand: str = Query("", description="Filter by brand"),
+    status: str = Query("", description="Filter by purchase status"),
+    db=Depends(get_database),
+):
+    """Download all product logistics as an XLSX file"""
+    try:
+        products_collection = db.get_collection("products")
+
+        base_filter = {"cf_sku_code": {"$exists": True, "$ne": ""}}
+        if brand:
+            base_filter["brand"] = brand
+        if status:
+            base_filter["purchase_status"] = status
+
+        if search:
+            query = {
+                "$and": [
+                    base_filter,
+                    {
+                        "$or": [
+                            {"cf_sku_code": {"$regex": search, "$options": "i"}},
+                            {"name": {"$regex": search, "$options": "i"}},
+                        ]
+                    },
+                ]
+            }
+        else:
+            query = base_filter
+
+        raw_products = list(
+            products_collection.find(
+                query,
+                {"item_id": 1, "cf_sku_code": 1, "name": 1, "brand": 1, "cbm": 1, "case_pack": 1,
+                 "purchase_status": 1, "stock_in_transit_1": 1, "stock_in_transit_2": 1,
+                 "stock_in_transit_3": 1, "_id": 0},
+            ).sort("cf_sku_code", 1)
+        )
+
+        rows = []
+        for p in raw_products:
+            rows.append({
+                "SKU Code": p.get("cf_sku_code", ""),
+                "Product Name": p.get("name", ""),
+                "Brand": p.get("brand", ""),
+                "Status": p.get("purchase_status", ""),
+                "CBM": p.get("cbm", 0) or 0,
+                "Case Pack": p.get("case_pack", 0) or 0,
+                "Stock in Transit 1": p.get("stock_in_transit_1", 0) or 0,
+                "Stock in Transit 2": p.get("stock_in_transit_2", 0) or 0,
+                "Stock in Transit 3": p.get("stock_in_transit_3", 0) or 0,
+            })
+
+        df = pd.DataFrame(rows)
+        # Keep SKU Code as string so Excel doesn't convert to scientific notation
+        df["SKU Code"] = df["SKU Code"].astype(str)
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Product Logistics", index=False)
+            ws = writer.sheets["Product Logistics"]
+            for cell in ws["A"][1:]:  # column A = SKU Code, skip header
+                cell.number_format = "@"
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=product_logistics.xlsx"},
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
