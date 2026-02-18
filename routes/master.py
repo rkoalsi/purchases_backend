@@ -219,6 +219,7 @@ class OptimizedMasterReportService:
                         "$match": {
                             "date": {"$lte": end_datetime},
                             "disposition": "SELLABLE",
+                            "location": {"$ne": "VKSX"},
                         }
                     },
                     {"$sort": {"asin": 1, "date": -1}},
