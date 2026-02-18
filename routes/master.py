@@ -326,7 +326,9 @@ class OptimizedMasterReportService:
             def _fetch_all():
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(valid_skus)}},
-                    {"cf_sku_code": 1, "name": 1, "rate": 1, "brand": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1, "_id": 0},
+                    {"cf_sku_code": 1, "name": 1, "rate": 1, "brand": 1, "cbm": 1, "case_pack": 1,
+                     "purchase_status": 1, "stock_in_transit_1": 1, "stock_in_transit_2": 1,
+                     "stock_in_transit_3": 1, "_id": 0},
                 ))
 
             products = await asyncio.to_thread(_fetch_all)
@@ -343,6 +345,9 @@ class OptimizedMasterReportService:
                     "cbm": self.safe_float(product.get("cbm")),
                     "case_pack": self.safe_float(product.get("case_pack")),
                     "purchase_status": product.get("purchase_status", ""),
+                    "stock_in_transit_1": self.safe_float(product.get("stock_in_transit_1")),
+                    "stock_in_transit_2": self.safe_float(product.get("stock_in_transit_2")),
+                    "stock_in_transit_3": self.safe_float(product.get("stock_in_transit_3")),
                 }
 
             logger.info(f"Batch loaded all product data for {len(result)} products")
@@ -896,6 +901,7 @@ class OptimizedMasterReportService:
                         "drr": drr,
                         "lookback_period": f"{p_start_str} to {p_end_str}",
                         "days_in_stock": days_in_stock,
+                        "units_sold": units_sold,
                         "found": True,
                     }
                     resolved_skus.add(sku)
@@ -923,12 +929,12 @@ class OptimizedMasterReportService:
         brand_logistics: Dict[str, Dict],
         product_brands: Dict[str, str],
     ) -> List[Dict]:
-        """Classify each SKU as Fast/Medium/Slow mover based on volume and revenue percentiles.
-        Uses brand-specific safety_days and lead_time from brand_logistics collection."""
+        """Classify each SKU as Fast/Medium/Slow mover based on volume and revenue percentiles
+        computed within each brand group. Products are only ranked against other products of
+        the same brand, so brand size does not skew classifications."""
         if not combined_data:
             return combined_data
 
-        # Default settings when no brand config exists
         default_settings = {
             "lead_time": 60,
             "safety_days_fast": 40,
@@ -936,58 +942,59 @@ class OptimizedMasterReportService:
             "safety_days_slow": 15,
         }
 
-        # Extract units sold and amount for ranking
-        items_with_metrics = []
-        for item in combined_data:
-            metrics = item.get("combined_metrics", {})
-            items_with_metrics.append({
-                "units_sold": metrics.get("total_units_sold", 0),
-                "amount": metrics.get("total_amount", 0),
-            })
-
-        total_count = len(items_with_metrics)
-        if total_count == 0:
-            return combined_data
-
-        # Rank by volume (descending - highest sales gets rank 1)
-        volume_sorted = sorted(range(total_count), key=lambda i: items_with_metrics[i]["units_sold"], reverse=True)
-        volume_ranks = [0] * total_count
-        for rank, idx in enumerate(volume_sorted):
-            volume_ranks[idx] = (rank + 1) / total_count
-
-        # Rank by revenue (descending - highest revenue gets rank 1)
-        revenue_sorted = sorted(range(total_count), key=lambda i: items_with_metrics[i]["amount"], reverse=True)
-        revenue_ranks = [0] * total_count
-        for rank, idx in enumerate(revenue_sorted):
-            revenue_ranks[idx] = (rank + 1) / total_count
-
-        # Classify each item
+        # Group item indices by brand
+        brand_groups: Dict[str, List[int]] = defaultdict(list)
         for i, item in enumerate(combined_data):
-            vol_pct = volume_ranks[i]
-            rev_pct = revenue_ranks[i]
-
-            # Get brand-specific settings
             sku = item.get("sku_code", "")
-            brand = product_brands.get(sku, "")
-            brand_settings = brand_logistics.get(brand.lower(), default_settings) if brand else default_settings
+            brand = product_brands.get(sku, "") or ""
+            brand_groups[brand.lower()].append(i)
 
-            if vol_pct <= 0.2 or rev_pct <= 0.2:
-                mover_class = 1
-                movement = "Fast Mover"
-                safety_days = brand_settings.get("safety_days_fast", 40)
-            elif vol_pct <= 0.5 or rev_pct <= 0.5:
-                mover_class = 2
-                movement = "Medium Mover"
-                safety_days = brand_settings.get("safety_days_medium", 25)
-            else:
-                mover_class = 3
-                movement = "Slow Mover"
-                safety_days = brand_settings.get("safety_days_slow", 15)
+        # Rank and classify within each brand group independently
+        for brand_key, indices in brand_groups.items():
+            brand_settings = brand_logistics.get(brand_key, default_settings)
+            group_size = len(indices)
 
-            item["movement"] = movement
-            item["mover_class"] = mover_class
-            item["safety_days"] = safety_days
-            item["lead_time"] = brand_settings.get("lead_time", 60)
+            # Extract metrics for this brand's items only
+            group_metrics = [
+                {
+                    "units_sold": combined_data[i].get("combined_metrics", {}).get("total_units_sold", 0),
+                    "amount": combined_data[i].get("combined_metrics", {}).get("total_amount", 0),
+                }
+                for i in indices
+            ]
+
+            # Rank by volume within the brand (highest → rank 1)
+            vol_order = sorted(range(group_size), key=lambda j: group_metrics[j]["units_sold"], reverse=True)
+            vol_pct = [0.0] * group_size
+            for rank, j in enumerate(vol_order):
+                vol_pct[j] = (rank + 1) / group_size
+
+            # Rank by revenue within the brand (highest → rank 1)
+            rev_order = sorted(range(group_size), key=lambda j: group_metrics[j]["amount"], reverse=True)
+            rev_pct = [0.0] * group_size
+            for rank, j in enumerate(rev_order):
+                rev_pct[j] = (rank + 1) / group_size
+
+            # Classify each item in this brand group
+            for j, global_idx in enumerate(indices):
+                item = combined_data[global_idx]
+                if vol_pct[j] <= 0.2 or rev_pct[j] <= 0.2:
+                    mover_class = 1
+                    movement = "Fast Mover"
+                    safety_days = brand_settings.get("safety_days_fast", 40)
+                elif vol_pct[j] <= 0.5 or rev_pct[j] <= 0.5:
+                    mover_class = 2
+                    movement = "Medium Mover"
+                    safety_days = brand_settings.get("safety_days_medium", 25)
+                else:
+                    mover_class = 3
+                    movement = "Slow Mover"
+                    safety_days = brand_settings.get("safety_days_slow", 15)
+
+                item["movement"] = movement
+                item["mover_class"] = mover_class
+                item["safety_days"] = safety_days
+                item["lead_time"] = brand_settings.get("lead_time", 60)
 
         return combined_data
 
@@ -1058,7 +1065,8 @@ class OptimizedMasterReportService:
             def _fetch_logistics():
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(sku_codes)}},
-                    {"cf_sku_code": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1, "_id": 0}
+                    {"cf_sku_code": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1,
+                     "stock_in_transit_1": 1, "stock_in_transit_2": 1, "stock_in_transit_3": 1, "_id": 0}
                 ))
 
             products = await asyncio.to_thread(_fetch_logistics)
@@ -1071,6 +1079,9 @@ class OptimizedMasterReportService:
                         "cbm": self.safe_float(p.get("cbm")),
                         "case_pack": self.safe_float(p.get("case_pack")),
                         "purchase_status": p.get("purchase_status", ""),
+                        "stock_in_transit_1": self.safe_float(p.get("stock_in_transit_1")),
+                        "stock_in_transit_2": self.safe_float(p.get("stock_in_transit_2")),
+                        "stock_in_transit_3": self.safe_float(p.get("stock_in_transit_3")),
                     }
 
             return result
@@ -1092,12 +1103,16 @@ class OptimizedMasterReportService:
             drr = metrics.get("avg_daily_run_rate", 0)
             closing_stock = metrics.get("total_closing_stock", 0)
 
-            # Transit data
+            # Transit data: prefer product-stored values, fallback to PO-derived
+            logistics = logistics_data.get(sku, {})
             transit = transit_data.get(sku, {})
-            item["stock_in_transit_1"] = transit.get("transit_1", 0)
-            item["stock_in_transit_2"] = transit.get("transit_2", 0)
-            item["stock_in_transit_3"] = transit.get("transit_3", 0)
-            total_transit = transit.get("total", 0)
+            sit_1 = logistics.get("stock_in_transit_1") or transit.get("transit_1", 0)
+            sit_2 = logistics.get("stock_in_transit_2") or transit.get("transit_2", 0)
+            sit_3 = logistics.get("stock_in_transit_3") or transit.get("transit_3", 0)
+            item["stock_in_transit_1"] = sit_1
+            item["stock_in_transit_2"] = sit_2
+            item["stock_in_transit_3"] = sit_3
+            total_transit = sit_1 + sit_2 + sit_3
             item["total_stock_in_transit"] = total_transit
 
             # Days coverage
@@ -1128,16 +1143,15 @@ class OptimizedMasterReportService:
             item["order_qty"] = round(order_qty, 2)
 
             # Logistics (CBM / Case Pack / Purchase Status)
-            logistics = logistics_data.get(sku, {})
             cbm = logistics.get("cbm", 0)
             case_pack = logistics.get("case_pack", 0)
             item["cbm"] = cbm
             item["case_pack"] = case_pack
             item["purchase_status"] = logistics.get("purchase_status", "")
 
-            # Order qty rounded up to case pack
+            # Order qty rounded down to case pack
             if case_pack > 0:
-                item["order_qty_rounded"] = math.ceil(order_qty / case_pack) * case_pack
+                item["order_qty_rounded"] = math.floor(order_qty / case_pack) * case_pack
             else:
                 item["order_qty_rounded"] = round(order_qty, 0)
 
@@ -1155,13 +1169,10 @@ class OptimizedMasterReportService:
             else:
                 item["days_current_order_lasts"] = 0
 
-            # Days total inventory will last
-            if drr > 0:
-                item["days_total_inventory_lasts"] = round(
-                    (closing_stock + total_transit + order_qty_rounded) / drr, 2
-                )
-            else:
-                item["days_total_inventory_lasts"] = 0
+            # Days total inventory will last = current coverage + days order lasts
+            item["days_total_inventory_lasts"] = round(
+                current_days_coverage + item["days_current_order_lasts"], 2
+            )
 
         return combined_data
 
@@ -1438,10 +1449,14 @@ async def _generate_master_report_data(
                                         )
                                     item["drr_source"] = "previous_period"
                                     item["drr_lookback_period"] = lb["lookback_period"]
+                                    item["drr_lookback_days_in_stock"] = lb["days_in_stock"]
+                                    item["drr_lookback_sales"] = lb["units_sold"]
                                     item["highlight"] = "yellow"
                                 else:
                                     item["drr_source"] = "insufficient_stock"
                                     item["drr_lookback_period"] = ""
+                                    item["drr_lookback_days_in_stock"] = 0
+                                    item["drr_lookback_sales"] = 0
                                     item["highlight"] = "red"
                             else:
                                 item["drr_source"] = "current_period"
@@ -1497,6 +1512,9 @@ async def _generate_master_report_data(
                         "cbm": pdata.get("cbm", 0),
                         "case_pack": pdata.get("case_pack", 0),
                         "purchase_status": pdata.get("purchase_status", ""),
+                        "stock_in_transit_1": pdata.get("stock_in_transit_1", 0) or 0,
+                        "stock_in_transit_2": pdata.get("stock_in_transit_2", 0) or 0,
+                        "stock_in_transit_3": pdata.get("stock_in_transit_3", 0) or 0,
                     }
 
                 if brand:
@@ -1718,6 +1736,8 @@ async def download_master_report(
                         ),
                         "DRR Source": item.get("drr_source", "current_period"),
                         "DRR Lookback Period": item.get("drr_lookback_period", ""),
+                        "Lookback Days in Stock": item.get("drr_lookback_days_in_stock", 0),
+                        "Lookback Sales": item.get("drr_lookback_sales", 0),
                         "Avg Days of Coverage": item.get("combined_metrics", {}).get(
                             "avg_days_of_coverage", 0
                         ),
@@ -1854,8 +1874,10 @@ def import_product_logistics(
     db=Depends(get_database),
 ):
     """
-    Import Item Status (col A), CBM (col BX), and Case Pack (col BY) from the PSR Google Sheet
-    Master tab. Maps BBCode (col B) to cf_sku_code and saves purchase_status, cbm, case_pack.
+    Import Item Status (col A), Stock in Transit 1 (col BU), Stock in Transit 2 (col BV),
+    CBM (col BX), and Case Pack (col BY) from the PSR Google Sheet Master tab.
+    Maps BBCode (col B) to cf_sku_code. purchase_status, cbm, case_pack, and transit values
+    are applied to ALL products sharing the same sku_code via update_many.
     """
     import os
     import gspread
@@ -1898,25 +1920,28 @@ def import_product_logistics(
                 continue
 
             raw_status = row[0].strip() if len(row) > 0 else ""
-            cbm_raw = row[75] if len(row) > 75 else ""
-            case_pack_raw = row[76] if len(row) > 76 else ""
+            sit1_raw = row[72] if len(row) > 72 else ""   # BU
+            sit2_raw = row[73] if len(row) > 73 else ""   # BV
+            cbm_raw = row[75] if len(row) > 75 else ""    # BX
+            case_pack_raw = row[76] if len(row) > 76 else ""  # BY
 
-            try:
-                cbm_val = float(cbm_raw) if cbm_raw else 0
-            except (ValueError, TypeError):
-                cbm_val = 0
+            def _to_float(val: str) -> float:
+                try:
+                    return float(val) if val else 0
+                except (ValueError, TypeError):
+                    return 0
 
-            try:
-                case_pack_val = float(case_pack_raw) if case_pack_raw else 0
-            except (ValueError, TypeError):
-                case_pack_val = 0
-
-            update_doc: dict = {"cbm": cbm_val, "case_pack": case_pack_val}
+            update_doc: dict = {
+                "cbm": _to_float(cbm_raw),
+                "case_pack": _to_float(case_pack_raw),
+                "stock_in_transit_1": _to_float(sit1_raw),
+                "stock_in_transit_2": _to_float(sit2_raw),
+            }
             mapped_status = _map_status(raw_status)
             if mapped_status:
                 update_doc["purchase_status"] = mapped_status
 
-            result = products_collection.update_one(
+            result = products_collection.update_many(
                 {"cf_sku_code": bbcode},
                 {"$set": update_doc},
             )
@@ -1929,7 +1954,7 @@ def import_product_logistics(
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
-                "message": "Imported status, CBM and Case Pack from PSR Sheet",
+                "message": "Imported status, CBM, Case Pack and Stock in Transit from PSR Sheet",
                 "updated": updated_count,
                 "skipped": skipped_count,
             },
@@ -2044,23 +2069,28 @@ def get_product_logistics_list(
         raw_products = list(
             products_collection.find(
                 query,
-                {"cf_sku_code": 1, "name": 1, "brand": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1, "_id": 0},
+                {"item_id": 1, "cf_sku_code": 1, "name": 1, "brand": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1,
+                 "stock_in_transit_1": 1, "stock_in_transit_2": 1, "stock_in_transit_3": 1, "_id": 0},
             )
             .skip(skip)
             .limit(page_size)
             .sort("cf_sku_code", 1)
         )
 
-        # Ensure cbm and case_pack default to 0 when missing from DB
+        # Ensure numeric fields default to 0 when missing from DB
         products = []
         for p in raw_products:
             products.append({
+                "item_id": str(p.get("item_id", "")),
                 "cf_sku_code": p.get("cf_sku_code", ""),
                 "name": p.get("name", ""),
                 "brand": p.get("brand", ""),
                 "cbm": p.get("cbm", 0) or 0,
                 "case_pack": p.get("case_pack", 0) or 0,
                 "purchase_status": p.get("purchase_status", ""),
+                "stock_in_transit_1": p.get("stock_in_transit_1", 0) or 0,
+                "stock_in_transit_2": p.get("stock_in_transit_2", 0) or 0,
+                "stock_in_transit_3": p.get("stock_in_transit_3", 0) or 0,
             })
 
         return JSONResponse(
@@ -2079,38 +2109,59 @@ def get_product_logistics_list(
 
 @router.put("/product-logistics")
 def update_product_logistics(
-    sku_code: str = Query(...),
+    item_id: str = Query(...),
+    sku_code: str = Query(None),
     cbm: float = Query(None),
     case_pack: float = Query(None),
     purchase_status: str = Query(None),
+    stock_in_transit_1: float = Query(None),
+    stock_in_transit_2: float = Query(None),
+    stock_in_transit_3: float = Query(None),
     db=Depends(get_database),
 ):
-    """Update CBM, case_pack, and/or purchase_status for a product"""
+    """Update product logistics fields. purchase_status is applied to all products sharing
+    the same sku_code; all other fields update only the specific item by item_id."""
     try:
         products_collection = db.get_collection("products")
 
-        update_fields = {}
+        # Fields that apply only to the specific item (by item_id)
+        item_fields: Dict[str, Any] = {}
         if cbm is not None:
-            update_fields["cbm"] = cbm
+            item_fields["cbm"] = cbm
         if case_pack is not None:
-            update_fields["case_pack"] = case_pack
-        if purchase_status is not None:
-            update_fields["purchase_status"] = purchase_status
+            item_fields["case_pack"] = case_pack
+        if stock_in_transit_1 is not None:
+            item_fields["stock_in_transit_1"] = stock_in_transit_1
+        if stock_in_transit_2 is not None:
+            item_fields["stock_in_transit_2"] = stock_in_transit_2
+        if stock_in_transit_3 is not None:
+            item_fields["stock_in_transit_3"] = stock_in_transit_3
 
-        if not update_fields:
+        if not item_fields and purchase_status is None:
             raise HTTPException(status_code=400, detail="No fields to update")
 
-        result = products_collection.update_one(
-            {"cf_sku_code": sku_code.strip()},
-            {"$set": update_fields},
-        )
+        matched = 0
 
-        if result.matched_count == 0:
-            raise HTTPException(status_code=404, detail=f"Product with SKU '{sku_code}' not found")
+        # Update item-specific fields by item_id
+        if item_fields:
+            iid: Any = int(item_id) if item_id.isdigit() else item_id
+            result = products_collection.update_one({"item_id": iid}, {"$set": item_fields})
+            if result.matched_count == 0:
+                result = products_collection.update_one({"item_id": item_id}, {"$set": item_fields})
+            matched = max(matched, result.matched_count)
+
+        # Update purchase_status across ALL products with the same sku_code
+        if purchase_status is not None:
+            sku_filter = {"cf_sku_code": sku_code.strip()} if sku_code else {"item_id": (int(item_id) if item_id.isdigit() else item_id)}
+            result = products_collection.update_many(sku_filter, {"$set": {"purchase_status": purchase_status}})
+            matched = max(matched, result.matched_count)
+
+        if matched == 0:
+            raise HTTPException(status_code=404, detail=f"Product with item_id '{item_id}' not found")
 
         return JSONResponse(
             status_code=200,
-            content={"message": f"Updated logistics for {sku_code}", "updated_fields": update_fields},
+            content={"message": f"Updated logistics for item {item_id}"},
         )
     except HTTPException:
         raise
