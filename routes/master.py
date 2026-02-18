@@ -1708,53 +1708,29 @@ async def download_master_report(
                 if not isinstance(item, dict):
                     continue
 
+                metrics = item.get("combined_metrics", {})
                 combined_df_data.append(
                     {
                         "Purchase Status": item.get("purchase_status", ""),
                         "SKU Code": item.get("sku_code", ""),
                         "Item Name": item.get("item_name", ""),
-                        "Total Units Sold": item.get("combined_metrics", {}).get(
-                            "total_units_sold", 0
-                        ),
-                        "Total Units Returned": item.get("combined_metrics", {}).get(
-                            "total_units_returned", 0
-                        ),
-                        "Total Amount": item.get("combined_metrics", {}).get(
-                            "total_amount", 0
-                        ),
-                        "Total Closing Stock": item.get("combined_metrics", {}).get(
-                            "total_closing_stock", 0
-                        ),
-                        "Total Sessions": item.get("combined_metrics", {}).get(
-                            "total_sessions", 0
-                        ),
-                        "Days in Stock": item.get("combined_metrics", {}).get(
-                            "total_days_in_stock", 0
-                        ),
-                        "Avg Daily Run Rate": item.get("combined_metrics", {}).get(
-                            "avg_daily_run_rate", 0
-                        ),
-                        "DRR Source": item.get("drr_source", "current_period"),
-                        "DRR Lookback Period": item.get("drr_lookback_period", ""),
+                        "Total Amount": metrics.get("total_amount", 0),
+                        "Total Units Sold": metrics.get("total_units_sold", 0),
+                        "Total Units Returned": metrics.get("total_units_returned", 0),
+                        "Net Total Sales": metrics.get("total_sales", 0),
+                        "Days in Stock": metrics.get("total_days_in_stock", 0),
                         "Lookback Days in Stock": item.get("drr_lookback_days_in_stock", 0),
                         "Lookback Sales": item.get("drr_lookback_sales", 0),
-                        "Avg Days of Coverage": item.get("combined_metrics", {}).get(
-                            "avg_days_of_coverage", 0
-                        ),
-                        "Pupscribe WH Stock": item.get("combined_metrics", {}).get(
-                            "pupscribe_wh_stock", 0
-                        ),
-                        "FBA Stock": item.get("combined_metrics", {}).get(
-                            "fba_closing_stock", 0
-                        ),
+                        "Avg Daily Run Rate": metrics.get("avg_daily_run_rate", 0),
+                        "DRR Source": item.get("drr_source", "current_period"),
+                        "DRR Lookback Period": item.get("drr_lookback_period", ""),
+                        "Total Closing Stock": metrics.get("total_closing_stock", 0),
+                        "Avg Days of Coverage": metrics.get("avg_days_of_coverage", 0),
+                        "Pupscribe WH Stock": metrics.get("pupscribe_wh_stock", 0),
+                        "FBA Stock": metrics.get("fba_closing_stock", 0),
                         "In Stock": "Yes" if item.get("in_stock", False) else "No",
-                        "Transfer Orders": item.get("combined_metrics", {}).get(
-                            "transfer_orders", 0
-                        ),
-                        "Total Sales": item.get("combined_metrics", {}).get(
-                            "total_sales", 0
-                        ),
-                        # Movement & Order Calculation columns
+                        "Transfer Orders": metrics.get("transfer_orders", 0),
+                        "Total Sales": metrics.get("total_sales", 0),
                         "Movement": item.get("movement", ""),
                         "Safety Days": item.get("safety_days", 0),
                         "Lead Time": item.get("lead_time", 0),
