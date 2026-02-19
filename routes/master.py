@@ -1105,6 +1105,7 @@ class OptimizedMasterReportService:
 
             # Transit data: prefer product-stored values, fallback to PO-derived
             logistics = logistics_data.get(sku, {})
+            purchase_status = logistics.get("purchase_status", "")
             transit = transit_data.get(sku, {})
             sit_1 = logistics.get("stock_in_transit_1") or transit.get("transit_1", 0)
             sit_2 = logistics.get("stock_in_transit_2") or transit.get("transit_2", 0)
@@ -1138,16 +1139,25 @@ class OptimizedMasterReportService:
             else:
                 item["excess_or_order"] = "EXCESS"
 
-            # Order quantity
-            order_qty = max(0, (target_days - current_days_coverage) * drr)
-            item["order_qty"] = round(order_qty, 2)
-
             # Logistics (CBM / Case Pack / Purchase Status)
             cbm = logistics.get("cbm", 0)
             case_pack = logistics.get("case_pack", 0)
             item["cbm"] = cbm
             item["case_pack"] = case_pack
-            item["purchase_status"] = logistics.get("purchase_status", "")
+            item["purchase_status"] = purchase_status
+
+            # Skip order quantity calculations for inactive / discontinued items
+            if purchase_status in ("inactive", "discontinued until stock lasts"):
+                item["order_qty"] = 0
+                item["order_qty_rounded"] = 0
+                item["total_cbm"] = 0
+                item["days_current_order_lasts"] = 0
+                item["days_total_inventory_lasts"] = round(current_days_coverage, 2)
+                continue
+
+            # Order quantity
+            order_qty = max(0, (target_days - current_days_coverage) * drr)
+            item["order_qty"] = round(order_qty, 2)
 
             # Order qty rounded down to case pack
             if case_pack > 0:
