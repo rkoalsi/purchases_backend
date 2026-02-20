@@ -10,6 +10,7 @@ from .routes.zoho import router as zoho_router
 from .routes.master import router as master_router
 from .routes.util import router as util_router
 from .routes.workflow import router as workflow_router
+from .routes.missed_sales import router as missed_sales_router
 from .database import connect_db, close_db
 from contextlib import asynccontextmanager
 from .helpers.scheduler import scheduler, api_scheduler, setup_scheduler
@@ -83,3 +84,4 @@ app.include_router(master_router, prefix="/master", tags=["master"])
 app.include_router(util_router, prefix="/util", tags=["util"])
 app.include_router(dashboard_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(workflow_router, prefix="/workflows", tags=["workflow"])
+app.include_router(missed_sales_router, prefix="/missed_sales", tags=["missed_sales"])
