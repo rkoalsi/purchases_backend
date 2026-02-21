@@ -1537,96 +1537,118 @@ async def fetch_stock_data_optimized(
     try:
         stock_collection = db["zoho_warehouse_stock"]
 
-        # PERFORMANCE: Limit lookback to 2 years for closing stock
-        lookback_limit = start_datetime - timedelta(days=730)
+        # Split into two focused parallel queries instead of one monolithic scan:
+        #
+        # Q1 — days_in_stock: only the exact report period (e.g. 3 months).
+        #      No sort needed, just a $sum. Scans ~period_days × n_items docs.
+        #
+        # Q2 — closing_stock: 90-day lookback from end_date to find the most
+        #      recent stock per item. 90 days is sufficient because Zoho stock
+        #      is synced daily; any item with no record in 90 days has 0 stock.
+        #      Scans ~(period_days + 90) × n_items docs — far fewer than the
+        #      former 2-year (730-day) window which scanned ~1.8M docs.
+        #
+        # Running both in separate threads lets MongoDB serve them concurrently.
+
+        closing_lookback = end_datetime - timedelta(days=90)
 
         logger.info(
-            f"Fetching stock data from {lookback_limit.date()} to {end_datetime.date()}"
+            f"Fetching stock data: days [{start_datetime.date()}–{end_datetime.date()}], "
+            f"closing [{closing_lookback.date()}–{end_datetime.date()}] (parallel)"
         )
 
-        # Highly optimized pipeline using $sum instead of $push to avoid building arrays
-        pipeline = [
-            # OPTIMIZATION 1: Filter with 2-year lookback limit
-            {
-                "$match": {
-                    "date": {
-                        "$gte": lookback_limit,  # 2 years lookback
-                        "$lte": end_datetime,
-                    },
-                    "zoho_item_id": {"$exists": True, "$ne": None},
-                }
-            },
-            # OPTIMIZATION 2: Project only needed fields and compute pupscribe_stock early
-            {
-                "$project": {
-                    "zoho_item_id": 1,
-                    "date": 1,
-                    "pupscribe_stock": {
-                        "$ifNull": [
-                            "$warehouses.Pupscribe Enterprises Private Limited",
-                            0,
-                        ]
-                    },
-                }
-            },
-            # OPTIMIZATION 3: Sort by item and date descending (latest first)
-            {"$sort": {"zoho_item_id": 1, "date": -1}},
-            # OPTIMIZATION 4: Group and use $sum for days calculation (no arrays!)
-            {
-                "$group": {
-                    "_id": "$zoho_item_id",
-                    "closing_stock": {
-                        "$first": "$pupscribe_stock"
-                    },  # Most recent stock
-                    "latest_date": {"$first": "$date"},
-                    # Count days in stock using $sum instead of $push
-                    "total_days_in_stock": {
-                        "$sum": {
-                            "$cond": {
-                                "if": {
-                                    "$and": [
-                                        {"$gte": ["$date", start_datetime]},
-                                        {"$lte": ["$date", end_datetime]},
-                                        {"$gt": ["$pupscribe_stock", 0]},
-                                    ]
-                                },
-                                "then": 1,
-                                "else": 0,
-                            }
-                        }
-                    },
-                }
-            },
-            # OPTIMIZATION 5: Final projection
-            {
-                "$project": {
-                    "_id": 1,
-                    "closing_stock": 1,
-                    "total_days_in_stock": 1,
-                    "latest_date": 1,
-                }
-            },
-        ]
+        def _fetch_days_in_stock():
+            """Count days with inventory within the report period only."""
+            pipeline = [
+                {
+                    "$match": {
+                        "date": {"$gte": start_datetime, "$lte": end_datetime},
+                        "zoho_item_id": {"$ne": None},
+                    }
+                },
+                {
+                    "$project": {
+                        "zoho_item_id": 1,
+                        "pupscribe_stock": {
+                            "$ifNull": [
+                                "$warehouses.Pupscribe Enterprises Private Limited",
+                                0,
+                            ]
+                        },
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$zoho_item_id",
+                        "total_days_in_stock": {
+                            "$sum": {"$cond": [{"$gt": ["$pupscribe_stock", 0]}, 1, 0]}
+                        },
+                    }
+                },
+            ]
+            result = {}
+            for doc in stock_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000):
+                result[doc["_id"]] = doc.get("total_days_in_stock", 0)
+            return result
 
-        # Use cursor with optimized settings - run in thread to avoid blocking event loop
-        def _run_aggregation():
-            cursor = stock_collection.aggregate(
-                pipeline,
-                allowDiskUse=True,
-                batchSize=10000,
-            )
-            stock_data = {}
-            for doc in cursor:
-                stock_data[doc["_id"]] = {
-                    "closing_stock": doc.get("closing_stock", 0),
-                    "total_days_in_stock": doc.get("total_days_in_stock", 0),
+        def _fetch_closing_stock():
+            """Get the most recent stock per item as of end_date (90-day lookback)."""
+            pipeline = [
+                {
+                    "$match": {
+                        "date": {"$gte": closing_lookback, "$lte": end_datetime},
+                        "zoho_item_id": {"$ne": None},
+                    }
+                },
+                # Sort BEFORE $project — allows MongoDB to use compound index
+                # {zoho_item_id: 1, date: -1} without an in-memory sort.
+                {"$sort": {"zoho_item_id": 1, "date": -1}},
+                {
+                    "$project": {
+                        "zoho_item_id": 1,
+                        "date": 1,
+                        "pupscribe_stock": {
+                            "$ifNull": [
+                                "$warehouses.Pupscribe Enterprises Private Limited",
+                                0,
+                            ]
+                        },
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$zoho_item_id",
+                        "closing_stock": {"$first": "$pupscribe_stock"},
+                        "latest_date": {"$first": "$date"},
+                    }
+                },
+            ]
+            result = {}
+            for doc in stock_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000):
+                result[doc["_id"]] = {
+                    "closing_stock": doc.get("closing_stock", 0) or 0,
+                    "latest_date": doc.get("latest_date"),
                 }
-            return stock_data
+            return result
 
-        stock_data = await asyncio.to_thread(_run_aggregation)
+        # Run both aggregations in parallel — each gets its own thread + connection
+        days_data, closing_data = await asyncio.gather(
+            asyncio.to_thread(_fetch_days_in_stock),
+            asyncio.to_thread(_fetch_closing_stock),
+        )
+
+        # Merge: union of all item_ids seen in either query
+        all_item_ids = set(days_data.keys()) | set(closing_data.keys())
+        stock_data = {}
+        for item_id in all_item_ids:
+            stock_data[item_id] = {
+                "closing_stock": closing_data.get(item_id, {}).get("closing_stock", 0),
+                "total_days_in_stock": days_data.get(item_id, 0),
+            }
 
         logger.info(
-            f"Fetched {len(stock_data)} stock records with zoho_item_id for date range {start_datetime.date()} to {end_datetime.date()}"
+            f"Fetched {len(stock_data)} stock records for date range "
+            f"{start_datetime.date()} to {end_datetime.date()}"
         )
         return stock_data
 
@@ -2145,28 +2167,45 @@ async def get_sales_report_fast(
         )
         start_time = datetime.now()
 
-        # OPTIMIZATION 1: Run stock and products fetching in parallel with 2-year lookback
+        # Use efficient customer filtering
+        excluded_customers = get_excluded_customer_list() if exclude_customers else None
+
+        # Build the pipeline (pure Python — instant)
+        invoices_collection = db[INVOICES_COLLECTION]
+        pipeline = build_optimized_pipeline_with_credit_notes_and_composites(
+            start_date, end_date, excluded_customers
+        )
+
+        # Run all three heavy fetches in parallel:
+        #   - Invoice aggregation (heavy: $unionWith + $unwind + $lookup + $group)
+        #   - Stock data aggregation (heavy: 4-5M records)
+        #   - Products map (moderate)
+        # Previously the invoice pipeline only started AFTER stock+products finished,
+        # wasting the time they overlapped.
+        def _fetch_raw_invoice_docs():
+            """Run the invoice/credit-note aggregation and return all results as a list.
+            The final $group reduces output to one doc per item_id (~hundreds to low thousands),
+            so list() is safe here."""
+            cursor = invoices_collection.aggregate(
+                pipeline,
+                allowDiskUse=True,
+                batchSize=5000,
+            )
+            return list(cursor)
+
+        invoice_task = asyncio.create_task(asyncio.to_thread(_fetch_raw_invoice_docs))
         stock_task = asyncio.create_task(
             fetch_stock_data_optimized(db, start_datetime, end_datetime)
         )
         products_task = asyncio.create_task(fetch_all_products_indexed(db))
 
-        # OPTIMIZATION 2: Use efficient customer filtering
-        excluded_customers = get_excluded_customer_list() if exclude_customers else None
-
-        # OPTIMIZATION 3: Use the NEW pipeline that includes credit notes
-        invoices_collection = db[INVOICES_COLLECTION]
-
-        # Build the NEW pipeline with credit notes integration
-        pipeline = build_optimized_pipeline_with_credit_notes_and_composites(
-            start_date, end_date, excluded_customers
+        logger.info("Executing invoice aggregation, stock fetch, and products fetch in parallel...")
+        raw_invoice_docs, stock_data, products_map = await asyncio.gather(
+            invoice_task, stock_task, products_task
         )
 
-        # Get parallel task results while pipeline is prepared
-        logger.info("Executing aggregation pipeline with credit notes integration...")
-        stock_data, products_map = await asyncio.gather(stock_task, products_task)
-
-        # If any_last_90_days is requested, fetch the last 90 days in stock for all items
+        # If any_last_90_days is requested, fetch the last 90 days in stock for all items.
+        # This is sequential (needs stock_data keys first) but rarely used.
         if any_last_90_days and stock_data:
             item_ids = list(stock_data.keys())
             logger.info(f"Fetching last 90 days in stock for {len(item_ids)} items")
@@ -2179,7 +2218,6 @@ async def get_sales_report_fast(
                 f"DEBUG: Received {len(last_90_days_data)} items from fetch_last_n_days_in_stock"
             )
 
-            # Merge into stock_data
             merged_count = 0
             for item_id, date_ranges in last_90_days_data.items():
                 if item_id in stock_data:
@@ -2191,56 +2229,23 @@ async def get_sales_report_fast(
             )
 
         logger.info(
-            f"Processing {len(stock_data)} stock items and {len(products_map)} products with credit notes"
+            f"Processing {len(raw_invoice_docs)} invoice docs, "
+            f"{len(stock_data)} stock items, {len(products_map)} products"
         )
 
-        # Process results in a thread to avoid blocking the event loop
-        def _process_cursor_results(collection, pipeline, stock_data, products_map):
-            cursor = collection.aggregate(
-                pipeline,
-                allowDiskUse=True,
-                batchSize=1000,
+        # Process all buffered results in a thread (CPU-bound, fast — data already fetched)
+        def _process_all_results():
+            processed = process_batch_with_credit_notes(
+                raw_invoice_docs, stock_data, products_map
             )
-            sales_report_items = []
-            total_units = 0
-            total_returns = 0
-            total_amount = 0.0
-            total_closing_stock = 0
-
-            batch = []
-            batch_size = 500
-
-            for item in cursor:
-                batch.append(item)
-                if len(batch) >= batch_size:
-                    processed = process_batch_with_credit_notes(
-                        batch, stock_data, products_map
-                    )
-                    sales_report_items.extend(processed["items"])
-                    total_units += processed["units"]
-                    total_amount += processed["amount"]
-                    total_returns += processed["returns"]
-                    total_closing_stock += processed["stock"]
-                    batch = []
-
-            # Process remaining items
-            if batch:
-                processed = process_batch_with_credit_notes(
-                    batch, stock_data, products_map
-                )
-                sales_report_items.extend(processed["items"])
-                total_units += processed["units"]
-                total_amount += processed["amount"]
-                total_returns += processed["returns"]
-                total_closing_stock += processed["stock"]
-
-            sales_report_items.sort(key=lambda x: x.item_name)
+            items = processed["items"]
+            items.sort(key=lambda x: x.item_name)
             return (
-                sales_report_items,
-                total_units,
-                total_returns,
-                total_amount,
-                total_closing_stock,
+                items,
+                processed["units"],
+                processed["returns"],
+                processed["amount"],
+                processed["stock"],
             )
 
         (
@@ -2249,13 +2254,7 @@ async def get_sales_report_fast(
             total_returns,
             total_amount,
             total_closing_stock,
-        ) = await asyncio.to_thread(
-            _process_cursor_results,
-            invoices_collection,
-            pipeline,
-            stock_data,
-            products_map,
-        )
+        ) = await asyncio.to_thread(_process_all_results)
 
         execution_time = (datetime.now() - start_time).total_seconds()
         logger.info(

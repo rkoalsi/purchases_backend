@@ -32,6 +32,7 @@ class OptimizedMasterReportService:
             response = await get_sales_report_fast(
                 start_date=start_date, end_date=end_date, db=self.database,
                 exclude_customers=False,
+                any_last_90_days=False,  # Explicit False avoids the Query() default being truthy
             )
 
             report_data = []
@@ -214,9 +215,11 @@ class OptimizedMasterReportService:
             products_collection = self.database["products"]
 
             def _fetch():
-                # Step 1: cheaply find the latest date (O(1) with a date index)
+                # Step 1: cheaply find the latest date (O(1) with a date index).
+                # No filter so MongoDB can use a plain date index without touching
+                # the document body to check zoho_item_id existence.
                 latest_doc = stock_collection.find_one(
-                    {"zoho_item_id": {"$exists": True, "$ne": None}},
+                    {},
                     sort=[("date", -1)],
                     projection={"date": 1},
                 )
@@ -224,9 +227,11 @@ class OptimizedMasterReportService:
                     return {"by_sku": {}, "latest_date": None}
                 latest_date = latest_doc["date"]
 
-                # Step 2: aggregate only that one date's records
+                # Step 2: aggregate only that one date's records.
+                # Use $ne: None (excludes null/missing) instead of $exists+$ne — same
+                # semantics but friendlier to index use.
                 pipeline = [
-                    {"$match": {"date": latest_date, "zoho_item_id": {"$exists": True, "$ne": None}}},
+                    {"$match": {"date": latest_date, "zoho_item_id": {"$ne": None}}},
                     {
                         "$group": {
                             "_id": "$zoho_item_id",
@@ -242,7 +247,7 @@ class OptimizedMasterReportService:
                     },
                 ]
                 by_item_id: Dict[str, float] = {}
-                for doc in stock_collection.aggregate(pipeline):
+                for doc in stock_collection.aggregate(pipeline, allowDiskUse=True):
                     item_id = doc["_id"]
                     stock = float(doc.get("stock", 0) or 0)
                     by_item_id[str(item_id)] = stock
@@ -1411,6 +1416,14 @@ async def _generate_master_report_data(
         # Initialize service
         report_service = OptimizedMasterReportService(db)
 
+        # Kick off latest-stock fetches immediately as background tasks.
+        # These scan 4-5M records (zoho_warehouse_stock) and are completely independent
+        # of the report date range — running them in the background hides their latency
+        # behind all the other processing (Zoho report, DRR lookback, enrichment, etc.).
+        # Note: create_task needs a coroutine, so we create one task per coroutine.
+        _zoho_stock_task = asyncio.create_task(report_service.fetch_latest_zoho_wh_stock())
+        _fba_stock_task = asyncio.create_task(report_service.fetch_latest_fba_stock())
+
         # Step 1: Fetch Zoho report + composite products in parallel
         tasks = []
         if include_zoho:
@@ -1757,15 +1770,12 @@ async def _generate_master_report_data(
                 logger.error(f"Error enriching data: {e}")
                 errors.append(f"Enrichment error: {str(e)}")
 
-            # Fetch latest current stock in parallel — runs after main enrichment so it
-            # cannot block or timeout the core report path
+            # Await the latest-stock task that was started at the very beginning of this
+            # function.  By now it has been running concurrently with all report processing,
+            # so it should be close to (or already) complete.
             try:
                 lz_res, lf_res = await asyncio.wait_for(
-                    asyncio.gather(
-                        report_service.fetch_latest_zoho_wh_stock(),
-                        report_service.fetch_latest_fba_stock(),
-                        return_exceptions=True,
-                    ),
+                    asyncio.gather(_zoho_stock_task, _fba_stock_task, return_exceptions=True),
                     timeout=45.0,
                 )
                 if not isinstance(lz_res, Exception):
@@ -1780,6 +1790,8 @@ async def _generate_master_report_data(
                     logger.error(f"Latest FBA stock fetch failed: {lf_res}")
             except asyncio.TimeoutError:
                 logger.warning("Latest stock fetch timed out — latest stock columns will be empty")
+                _zoho_stock_task.cancel()
+                _fba_stock_task.cancel()
 
             # Attach latest current stock to each item
             for item in combined_data:
@@ -1789,6 +1801,14 @@ async def _generate_master_report_data(
                 item["latest_zoho_stock"] = lz
                 item["latest_fba_stock"] = lf
                 item["latest_total_stock"] = round(lz + lf, 2)
+
+        # If combined_data was empty the if-block above was skipped and the background
+        # tasks were never awaited — cancel them to avoid dangling tasks.
+        if not combined_data:
+            if not _zoho_stock_task.done():
+                _zoho_stock_task.cancel()
+            if not _fba_stock_task.done():
+                _fba_stock_task.cancel()
 
         # Step 5: Calculate summary statistics
         total_skus = len(combined_data)
