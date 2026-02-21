@@ -204,6 +204,182 @@ class OptimizedMasterReportService:
             logger.error(f"Error fetching transfer orders: {e}")
             return {}
 
+    async def fetch_latest_zoho_wh_stock(self) -> Dict:
+        """Fetch the most recent Pupscribe WH stock per SKU from zoho_warehouse_stock.
+        Uses a 2-step approach: find_one(sort date desc) to get the latest date cheaply,
+        then query only that date's records — avoids sorting the whole collection.
+        Returns {"by_sku": {sku_code: qty}, "latest_date": "YYYY-MM-DD" | None}."""
+        try:
+            stock_collection = self.database["zoho_warehouse_stock"]
+            products_collection = self.database["products"]
+
+            def _fetch():
+                # Step 1: cheaply find the latest date (O(1) with a date index)
+                latest_doc = stock_collection.find_one(
+                    {"zoho_item_id": {"$exists": True, "$ne": None}},
+                    sort=[("date", -1)],
+                    projection={"date": 1},
+                )
+                if not latest_doc:
+                    return {"by_sku": {}, "latest_date": None}
+                latest_date = latest_doc["date"]
+
+                # Step 2: aggregate only that one date's records
+                pipeline = [
+                    {"$match": {"date": latest_date, "zoho_item_id": {"$exists": True, "$ne": None}}},
+                    {
+                        "$group": {
+                            "_id": "$zoho_item_id",
+                            "stock": {
+                                "$first": {
+                                    "$ifNull": [
+                                        "$warehouses.Pupscribe Enterprises Private Limited",
+                                        0,
+                                    ]
+                                }
+                            },
+                        }
+                    },
+                ]
+                by_item_id: Dict[str, float] = {}
+                for doc in stock_collection.aggregate(pipeline):
+                    item_id = doc["_id"]
+                    stock = float(doc.get("stock", 0) or 0)
+                    by_item_id[str(item_id)] = stock
+
+                if not by_item_id:
+                    return {"by_sku": {}, "latest_date": latest_date.strftime("%Y-%m-%d")}
+
+                # Step 3: map zoho_item_id → cf_sku_code via products
+                by_sku: Dict[str, float] = {}
+                for doc in products_collection.find(
+                    {"item_id": {"$in": list(by_item_id.keys())}},
+                    {"item_id": 1, "cf_sku_code": 1, "_id": 0},
+                ):
+                    iid = str(doc.get("item_id", ""))
+                    sku = doc.get("cf_sku_code", "")
+                    if iid and sku:
+                        by_sku[sku] = by_sku.get(sku, 0) + by_item_id.get(iid, 0)
+
+                return {"by_sku": by_sku, "latest_date": latest_date.strftime("%Y-%m-%d")}
+
+            result = await asyncio.to_thread(_fetch)
+            logger.info(
+                f"Fetched latest Zoho WH stock for {len(result.get('by_sku', {}))} SKUs, "
+                f"date: {result.get('latest_date')}"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching latest Zoho WH stock: {e}")
+            return {"by_sku": {}, "latest_date": None}
+
+    async def fetch_latest_fba_stock(self) -> Dict:
+        """Fetch the most recent FBA stock per SKU from amazon_ledger.
+        Uses a 2-step approach: find_one(sort date desc) to get the latest date cheaply,
+        then run the standard closing-stock pipeline bounded to that date.
+        Returns {"by_sku": {sku_code: qty}, "latest_date": "YYYY-MM-DD" | None}."""
+        try:
+            ledger_collection = self.database["amazon_ledger"]
+            sku_mapping_collection = self.database["amazon_sku_mapping"]
+
+            def _fetch():
+                # Step 1: cheaply find the latest date (O(1) with a date index)
+                latest_doc = ledger_collection.find_one(
+                    {"disposition": "SELLABLE", "location": {"$ne": "VKSX"}},
+                    sort=[("date", -1)],
+                    projection={"date": 1},
+                )
+                if not latest_doc:
+                    return {"by_sku": {}, "latest_date": None}
+                latest_date = latest_doc["date"]
+
+                # Step 2: same pipeline as fetch_fba_closing_stock but bounded to latest_date
+                pipeline = [
+                    {
+                        "$match": {
+                            "date": {"$lte": latest_date},
+                            "disposition": "SELLABLE",
+                            "location": {"$ne": "VKSX"},
+                        }
+                    },
+                    {"$sort": {"asin": 1, "date": -1}},
+                    {
+                        "$group": {
+                            "_id": "$asin",
+                            "closing_stock": {"$first": "$ending_warehouse_balance"},
+                        }
+                    },
+                ]
+                asin_stock: Dict[str, float] = {}
+                for doc in ledger_collection.aggregate(pipeline):
+                    asin = doc["_id"]
+                    stock = float(doc.get("closing_stock", 0) or 0)
+                    if stock > 0:
+                        asin_stock[asin] = stock
+
+                date_str = latest_date.strftime("%Y-%m-%d")
+                if not asin_stock:
+                    return {"by_sku": {}, "latest_date": date_str}
+
+                sku_docs = list(sku_mapping_collection.find(
+                    {"item_id": {"$in": list(asin_stock.keys())}},
+                    {"item_id": 1, "sku_code": 1, "_id": 0},
+                ))
+                by_sku: Dict[str, float] = {}
+                for doc in sku_docs:
+                    asin = doc.get("item_id")
+                    sku = doc.get("sku_code")
+                    if asin and sku and asin in asin_stock:
+                        by_sku[sku] = by_sku.get(sku, 0) + asin_stock[asin]
+
+                return {"by_sku": by_sku, "latest_date": date_str}
+
+            result = await asyncio.to_thread(_fetch)
+            logger.info(
+                f"Fetched latest FBA stock for {len(result.get('by_sku', {}))} SKUs, "
+                f"date: {result.get('latest_date')}"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching latest FBA stock: {e}")
+            return {"by_sku": {}, "latest_date": None}
+
+    async def fetch_missed_sales(self, start_date: str, end_date: str) -> Dict[str, float]:
+        """Fetch total missed_sales_quantity from missed_sales collection grouped by item_code (= cf_sku_code).
+        Returns dict of {sku_code: total_missed_sales_quantity}."""
+        try:
+            collection = self.database.get_collection("missed_sales")
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+
+            def _fetch():
+                pipeline = [
+                    {"$match": {"date": {"$gte": start_dt, "$lte": end_dt}}},
+                    {
+                        "$group": {
+                            "_id": "$item_code",
+                            "total_missed_sales": {"$sum": "$missed_sales_quantity"},
+                        }
+                    },
+                ]
+                result = {}
+                for doc in collection.aggregate(pipeline):
+                    item_code = doc["_id"]
+                    qty = doc.get("total_missed_sales", 0) or 0
+                    if item_code and qty > 0:
+                        result[item_code] = float(qty)
+                return result
+
+            result = await asyncio.to_thread(_fetch)
+            logger.info(f"Fetched missed sales for {len(result)} SKUs")
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching missed sales: {e}")
+            return {}
+
     async def fetch_fba_closing_stock(self, end_date: str) -> Dict[str, float]:
         """Fetch FBA closing stock from amazon_ledger, mapped by SKU code.
         Returns dict of {sku_code: closing_stock}."""
@@ -1095,8 +1271,13 @@ class OptimizedMasterReportService:
         combined_data: List[Dict],
         transit_data: Dict[str, Dict],
         logistics_data: Dict[str, Dict],
+        missed_sales_by_sku: Dict[str, float] = None,
+        period_days: int = 30,
     ) -> List[Dict]:
         """Add order calculation columns to each item in combined_data"""
+        if missed_sales_by_sku is None:
+            missed_sales_by_sku = {}
+
         for item in combined_data:
             sku = item.get("sku_code", "")
             metrics = item.get("combined_metrics", {})
@@ -1129,6 +1310,15 @@ class OptimizedMasterReportService:
             safety_days = item.get("safety_days", 15)
             lead_time = item.get("lead_time", 60)
             target_days = lead_time + safety_days + 10
+
+            # Missed Sales columns (inserted between Current Days Coverage and Target Days)
+            missed_sales = missed_sales_by_sku.get(sku, 0)
+            item["missed_sales"] = missed_sales
+            missed_sales_drr = round(missed_sales / period_days, 4) if period_days > 0 else 0.0
+            item["missed_sales_drr"] = missed_sales_drr
+            extra_qty = round(missed_sales_drr * lead_time, 2)
+            item["extra_qty"] = extra_qty
+
             item["target_days"] = target_days
 
             # Excess or Order
@@ -1150,6 +1340,7 @@ class OptimizedMasterReportService:
             if purchase_status in ("inactive", "discontinued until stock lasts"):
                 item["order_qty"] = 0
                 item["order_qty_rounded"] = 0
+                item["order_qty_plus_extra_qty"] = round(extra_qty, 2)
                 item["total_cbm"] = 0
                 item["days_current_order_lasts"] = 0
                 item["days_total_inventory_lasts"] = round(current_days_coverage, 2)
@@ -1158,6 +1349,9 @@ class OptimizedMasterReportService:
             # Order quantity
             order_qty = max(0, (target_days - current_days_coverage) * drr)
             item["order_qty"] = round(order_qty, 2)
+
+            # Order Qty + Extra Qty
+            item["order_qty_plus_extra_qty"] = round(order_qty + extra_qty, 2)
 
             # Order qty rounded down to case pack
             if case_pack > 0:
@@ -1244,7 +1438,7 @@ async def _generate_master_report_data(
                 logger.error(f"Error loading composite products: {e}")
                 return {}
 
-        # Execute all report fetches + composites + FBA stock + transfer orders in parallel
+        # Execute core report fetches in parallel (Zoho + composites + period-specific data)
         try:
             all_results = await asyncio.wait_for(
                 asyncio.gather(
@@ -1252,9 +1446,10 @@ async def _generate_master_report_data(
                     _fetch_all_composites(),
                     report_service.fetch_fba_closing_stock(end_date),
                     report_service.fetch_transfer_orders(start_date, end_date),
+                    report_service.fetch_missed_sales(start_date, end_date),
                     return_exceptions=True,
                 ),
-                timeout=180.0,  # Allow enough time for large date ranges
+                timeout=180.0,
             )
         except asyncio.TimeoutError:
             raise HTTPException(
@@ -1262,11 +1457,13 @@ async def _generate_master_report_data(
                 detail="Report generation timed out",
             )
 
-        # Last three results are composite_products_map, fba_stock, and transfer_orders
-        results = all_results[:-3]
-        composite_products_map_raw = all_results[-3]
-        fba_stock_by_sku = all_results[-2]
-        transfer_orders_by_sku = all_results[-1]
+        # Last four suffix results: composite, fba_stock, transfer_orders, missed_sales
+        results = all_results[:-4]
+        composite_products_map_raw = all_results[-4]
+        fba_stock_by_sku = all_results[-3]
+        transfer_orders_by_sku = all_results[-2]
+        missed_sales_by_sku = all_results[-1]
+
         if isinstance(composite_products_map_raw, Exception):
             logger.error(f"Composite products fetch failed: {composite_products_map_raw}")
             composite_products_map_raw = {}
@@ -1276,6 +1473,15 @@ async def _generate_master_report_data(
         if isinstance(transfer_orders_by_sku, Exception):
             logger.error(f"Transfer orders fetch failed: {transfer_orders_by_sku}")
             transfer_orders_by_sku = {}
+        if isinstance(missed_sales_by_sku, Exception):
+            logger.error(f"Missed sales fetch failed: {missed_sales_by_sku}")
+            missed_sales_by_sku = {}
+
+        # Placeholders — filled after enrichment in a separate parallel step
+        latest_zoho_by_sku: Dict[str, float] = {}
+        latest_fba_by_sku: Dict[str, float] = {}
+        latest_zoho_date: str = ""
+        latest_fba_date: str = ""
 
         # Process results
         individual_reports = {}
@@ -1544,12 +1750,45 @@ async def _generate_master_report_data(
 
                 combined_data = report_service.classify_movement(combined_data, brand_logistics, product_brands)
                 combined_data = report_service.enrich_with_order_calculations(
-                    combined_data, transit_data, logistics_data
+                    combined_data, transit_data, logistics_data, missed_sales_by_sku, period_days
                 )
                 logger.info(f"Enriched {len(combined_data)} items with movement and order calculations")
             except Exception as e:
                 logger.error(f"Error enriching data: {e}")
                 errors.append(f"Enrichment error: {str(e)}")
+
+            # Fetch latest current stock in parallel — runs after main enrichment so it
+            # cannot block or timeout the core report path
+            try:
+                lz_res, lf_res = await asyncio.wait_for(
+                    asyncio.gather(
+                        report_service.fetch_latest_zoho_wh_stock(),
+                        report_service.fetch_latest_fba_stock(),
+                        return_exceptions=True,
+                    ),
+                    timeout=45.0,
+                )
+                if not isinstance(lz_res, Exception):
+                    latest_zoho_by_sku = lz_res.get("by_sku", {})
+                    latest_zoho_date = lz_res.get("latest_date") or ""
+                else:
+                    logger.error(f"Latest Zoho WH stock fetch failed: {lz_res}")
+                if not isinstance(lf_res, Exception):
+                    latest_fba_by_sku = lf_res.get("by_sku", {})
+                    latest_fba_date = lf_res.get("latest_date") or ""
+                else:
+                    logger.error(f"Latest FBA stock fetch failed: {lf_res}")
+            except asyncio.TimeoutError:
+                logger.warning("Latest stock fetch timed out — latest stock columns will be empty")
+
+            # Attach latest current stock to each item
+            for item in combined_data:
+                sku = item.get("sku_code", "")
+                lz = round(latest_zoho_by_sku.get(sku, 0), 2)
+                lf = round(latest_fba_by_sku.get(sku, 0), 2)
+                item["latest_zoho_stock"] = lz
+                item["latest_fba_stock"] = lf
+                item["latest_total_stock"] = round(lz + lf, 2)
 
         # Step 5: Calculate summary statistics
         total_skus = len(combined_data)
@@ -1629,6 +1868,10 @@ async def _generate_master_report_data(
             "individual_reports": individual_reports,
             "combined_data": combined_data,
             "errors": errors,
+            "latest_stock_dates": {
+                "zoho": latest_zoho_date,
+                "fba": latest_fba_date,
+            },
             "meta": {
                 "execution_time_seconds": round(execution_time, 2),
                 "timestamp": datetime.now().isoformat(),
@@ -1699,8 +1942,6 @@ async def download_master_report(
         )
 
         combined_data = content.get("combined_data", [])
-        individual_reports = content.get("individual_reports", {})
-        summary = content.get("summary", {})
 
         if not combined_data:
             raise HTTPException(
@@ -1708,11 +1949,37 @@ async def download_master_report(
                 detail="No data found to download",
             )
 
-        # Create Excel file with multiple sheets
+        # Build a readable date-range sheet name (Excel max 31 chars) and stock column labels
+        try:
+            _sd = datetime.strptime(start_date, "%Y-%m-%d")
+            _ed = datetime.strptime(end_date, "%Y-%m-%d")
+            if _sd.year == _ed.year:
+                _sheet_name = f"{_sd.strftime('%d %b')} - {_ed.strftime('%d %b %Y')}"
+            else:
+                _sheet_name = f"{_sd.strftime('%d %b %Y')} - {_ed.strftime('%d %b %Y')}"
+            _sheet_name = _sheet_name[:31]
+            _end_date_label = _ed.strftime("%d %b %Y")
+        except Exception:
+            _sheet_name = "Master Sheet"
+            _end_date_label = end_date
+
+        # Latest stock column labels from the actual latest dates in the DB
+        latest_stock_dates = content.get("latest_stock_dates", {})
+        def _fmt_date(d: str) -> str:
+            try:
+                return datetime.strptime(d, "%Y-%m-%d").strftime("%d %b %Y")
+            except Exception:
+                return d or "Latest"
+        _latest_zoho_label = _fmt_date(latest_stock_dates.get("zoho", ""))
+        _latest_fba_label = _fmt_date(latest_stock_dates.get("fba", ""))
+        # For total, use the more recent of the two
+        _latest_total_label = _latest_fba_label if latest_stock_dates.get("fba", "") >= latest_stock_dates.get("zoho", "") else _latest_zoho_label
+
+        # Create Excel file
         excel_buffer = io.BytesIO()
 
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            # Sheet 1: Combined Summary
+            # Master Sheet
             combined_df_data = []
             for item in combined_data:
                 if not isinstance(item, dict):
@@ -1734,10 +2001,13 @@ async def download_master_report(
                         "Avg Daily Run Rate": metrics.get("avg_daily_run_rate", 0),
                         "DRR Source": item.get("drr_source", "current_period"),
                         "DRR Lookback Period": item.get("drr_lookback_period", ""),
-                        "Total Closing Stock": metrics.get("total_closing_stock", 0),
+                        f"Total Stock ({_end_date_label})": metrics.get("total_closing_stock", 0),
                         "Avg Days of Coverage": metrics.get("avg_days_of_coverage", 0),
-                        "Pupscribe WH Stock": metrics.get("pupscribe_wh_stock", 0),
-                        "FBA Stock": metrics.get("fba_closing_stock", 0),
+                        f"Pupscribe WH Stock ({_end_date_label})": metrics.get("pupscribe_wh_stock", 0),
+                        f"FBA Stock ({_end_date_label})": metrics.get("fba_closing_stock", 0),
+                        f"Total Stock ({_latest_total_label})": item.get("latest_total_stock", 0),
+                        f"Pupscribe WH Stock ({_latest_zoho_label})": item.get("latest_zoho_stock", 0),
+                        f"FBA Stock ({_latest_fba_label})": item.get("latest_fba_stock", 0),
                         "In Stock": "Yes" if item.get("in_stock", False) else "No",
                         "Transfer Orders": metrics.get("transfer_orders", 0),
                         "Total Sales": metrics.get("total_sales", 0),
@@ -1750,8 +2020,12 @@ async def download_master_report(
                         "Stock in Transit 3": item.get("stock_in_transit_3", 0),
                         "Total Stock in Transit": item.get("total_stock_in_transit", 0),
                         "Current Days Coverage": item.get("current_days_coverage", 0),
+                        "Missed Sales": item.get("missed_sales", 0),
+                        "Missed Sales DRR": item.get("missed_sales_drr", 0),
+                        "Extra Qty": item.get("extra_qty", 0),
                         "Target Days": item.get("target_days", 0),
                         "Excess / Order": item.get("excess_or_order", ""),
+                        "Order Qty + Extra Qty": item.get("order_qty_plus_extra_qty", 0),
                         "Order Qty": item.get("order_qty", 0),
                         "CBM": item.get("cbm", 0),
                         "Case Pack": item.get("case_pack", 0),
@@ -1764,14 +2038,14 @@ async def download_master_report(
 
             if combined_df_data:
                 combined_df = pd.DataFrame(combined_df_data)
-                combined_df.to_excel(writer, sheet_name="Combined Summary", index=False)
+                combined_df.to_excel(writer, sheet_name=_sheet_name, index=False)
 
                 # Apply row highlighting based on DRR source
                 from openpyxl.styles import PatternFill
                 yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
                 red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
 
-                ws = writer.sheets["Combined Summary"]
+                ws = writer.sheets[_sheet_name]
                 drr_source_col_idx = list(combined_df.columns).index("DRR Source") + 1  # 1-based
 
                 for row_idx in range(2, len(combined_df_data) + 2):  # Skip header row
@@ -1782,37 +2056,6 @@ async def download_master_report(
                     elif drr_source_val == "insufficient_stock":
                         for col_idx in range(1, len(combined_df.columns) + 1):
                             ws.cell(row=row_idx, column=col_idx).fill = red_fill
-
-            # Sheet 2: Summary Statistics
-            summary_data = [
-                ["Metric", "Value"],
-                ["Report Period", f"{start_date} to {end_date}"],
-                ["Total Unique SKUs", summary.get("total_unique_skus", 0)],
-                ["Total Units Sold", summary.get("total_units_sold", 0)],
-                ["Total Units Returned", summary.get("total_units_returned", 0)],
-                ["Total Amount", summary.get("total_amount", 0)],
-                ["Total Closing Stock", summary.get("total_closing_stock", 0)],
-                ["Average Daily Run Rate", summary.get("avg_drr", 0)],
-                ["Sources Included", ", ".join(summary.get("sources_included", []))],
-                ["", ""],
-                ["Source Record Counts", ""],
-            ]
-
-            for source, count in summary.get("source_record_counts", {}).items():
-                summary_data.append([f"{source.title()} Records", count])
-
-            summary_df = pd.DataFrame(summary_data[1:], columns=summary_data[0])
-            summary_df.to_excel(writer, sheet_name="Summary", index=False)
-
-            # Individual source sheets
-            for source, report_data in individual_reports.items():
-                if report_data.get("success") and report_data.get("data"):
-                    try:
-                        source_df = pd.DataFrame(report_data["data"])
-                        sheet_name = f"{source.title()} Data"
-                        source_df.to_excel(writer, sheet_name=sheet_name, index=False)
-                    except Exception as e:
-                        logger.error(f"Error creating sheet for {source}: {e}")
 
         excel_buffer.seek(0)
         file_bytes = excel_buffer.read()
