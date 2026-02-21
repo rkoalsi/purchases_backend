@@ -1176,6 +1176,7 @@ class OptimizedMasterReportService:
                 item["mover_class"] = mover_class
                 item["safety_days"] = safety_days
                 item["lead_time"] = brand_settings.get("lead_time", 60)
+                item["brand"] = product_brands.get(item.get("sku_code", ""), "") or ""
 
         return combined_data
 
