@@ -1803,6 +1803,73 @@ async def _generate_master_report_data(
                 item["latest_fba_stock"] = lf
                 item["latest_total_stock"] = round(lz + lf, 2)
 
+            # Recalculate days-coverage columns and all downstream order calculations
+            # using latest DB stock instead of end-of-period closing stock.
+            for item in combined_data:
+                metrics = item.get("combined_metrics", {})
+                drr = metrics.get("avg_daily_run_rate", 0)
+                latest_stock = item.get("latest_total_stock", 0)
+                total_transit = item.get("total_stock_in_transit", 0)
+                purchase_status = item.get("purchase_status", "")
+
+                # Avg Days of Coverage and On-Hand Days Coverage
+                if drr > 0:
+                    avg_doc = round(latest_stock / drr, 2)
+                else:
+                    avg_doc = 0.0
+                metrics["avg_days_of_coverage"] = avg_doc
+                item["on_hand_days_coverage"] = avg_doc
+
+                # Current Days Coverage
+                if drr > 0:
+                    current_days_coverage = round((latest_stock + total_transit) / drr, 2)
+                else:
+                    current_days_coverage = 0.0
+                item["current_days_coverage"] = current_days_coverage
+
+                # Refresh Excess / Order flag
+                target_days = item.get("target_days", 0)
+                if drr == 0:
+                    item["excess_or_order"] = "NO MOVEMENT"
+                elif current_days_coverage < target_days:
+                    item["excess_or_order"] = "ORDER"
+                else:
+                    item["excess_or_order"] = "EXCESS"
+
+                # Inactive / discontinued: only days_total_inventory_lasts needs updating
+                if purchase_status in ("inactive", "discontinued until stock lasts"):
+                    item["days_total_inventory_lasts"] = round(current_days_coverage, 2)
+                    continue
+
+                # Order quantity
+                extra_qty = item.get("extra_qty", 0)
+                order_qty = max(0, (target_days - current_days_coverage) * drr)
+                item["order_qty"] = round(order_qty, 2)
+                item["order_qty_plus_extra_qty"] = round(order_qty + extra_qty, 2)
+
+                case_pack = item.get("case_pack", 0)
+                if case_pack > 0:
+                    item["order_qty_rounded"] = math.floor(order_qty / case_pack) * case_pack
+                else:
+                    item["order_qty_rounded"] = round(order_qty, 0)
+
+                order_qty_rounded = item["order_qty_rounded"]
+
+                cbm = item.get("cbm", 0)
+                if case_pack > 0 and cbm > 0:
+                    item["total_cbm"] = round((order_qty_rounded / case_pack) * cbm, 4)
+                else:
+                    item["total_cbm"] = 0
+
+                if drr > 0:
+                    item["days_current_order_lasts"] = round(order_qty_rounded / drr, 2)
+                else:
+                    item["days_current_order_lasts"] = 0
+
+                item["days_total_inventory_lasts"] = round(
+                    current_days_coverage + item["days_current_order_lasts"], 2
+                )
+
         # If combined_data was empty the if-block above was skipped and the background
         # tasks were never awaited — cancel them to avoid dangling tasks.
         if not combined_data:
