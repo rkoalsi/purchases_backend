@@ -507,20 +507,30 @@ class OptimizedMasterReportService:
             def _fetch_all():
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(valid_skus)}},
-                    {"cf_sku_code": 1, "name": 1, "rate": 1, "brand": 1, "cbm": 1, "case_pack": 1,
+                    {"cf_sku_code": 1, "item_id": 1, "name": 1, "rate": 1, "brand": 1, "cbm": 1, "case_pack": 1,
                      "purchase_status": 1, "stock_in_transit_1": 1, "stock_in_transit_2": 1,
-                     "stock_in_transit_3": 1, "_id": 0},
+                     "stock_in_transit_3": 1, "created_at": 1, "_id": 0},
                 ))
 
             products = await asyncio.to_thread(_fetch_all)
+
+            three_months_ago = datetime.utcnow() - timedelta(days=90)
 
             result = {}
             for product in products:
                 sku_code = product.get("cf_sku_code")
                 if not sku_code:
                     continue
+                created_at = product.get("created_at")
+                if isinstance(created_at, str):
+                    try:
+                        created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except (ValueError, AttributeError):
+                        created_at = None
+                is_new = isinstance(created_at, datetime) and created_at >= three_months_ago
                 result[sku_code] = {
                     "name": product.get("name"),
+                    "item_id": product.get("item_id"),
                     "rate": product.get("rate"),
                     "brand": product.get("brand", ""),
                     "cbm": self.safe_float(product.get("cbm")),
@@ -529,6 +539,7 @@ class OptimizedMasterReportService:
                     "stock_in_transit_1": self.safe_float(product.get("stock_in_transit_1")),
                     "stock_in_transit_2": self.safe_float(product.get("stock_in_transit_2")),
                     "stock_in_transit_3": self.safe_float(product.get("stock_in_transit_3")),
+                    "is_new": is_new,
                 }
 
             logger.info(f"Batch loaded all product data for {len(result)} products")
@@ -1104,6 +1115,49 @@ class OptimizedMasterReportService:
 
         return results
 
+    async def fetch_past_90d_drr(
+        self,
+        sku_to_item_id: Dict[str, str],
+        start_date: str,
+    ) -> Dict[str, float]:
+        """
+        Fetch Zoho-based DRR for the 90-day window immediately before start_date.
+        Used to compute the growth rate column.
+        Returns dict of sku_code -> past_drr (0.0 when no history found).
+        """
+        from .zoho import fetch_stock_data_for_items_batch, fetch_zoho_lookback_sales_batch
+
+        if not sku_to_item_id:
+            return {}
+
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            past_end = start_dt - timedelta(days=1)
+            past_start = past_end - timedelta(days=89)  # 90 days inclusive
+            periods = [(past_start, past_end)]
+            all_item_ids = list(set(sku_to_item_id.values()))
+
+            stock_by_period, sales_by_period = await asyncio.gather(
+                fetch_stock_data_for_items_batch(self.database, periods, all_item_ids),
+                fetch_zoho_lookback_sales_batch(self.database, periods, all_item_ids),
+            )
+
+            stock_data = stock_by_period.get(0, {})
+            sales_data = sales_by_period.get(0, {})
+
+            result: Dict[str, float] = {}
+            for sku, item_id in sku_to_item_id.items():
+                stock_info = stock_data.get(item_id, {})
+                days_in_stock = stock_info.get("total_days_in_stock", 0)
+                units_sold = sales_data.get(str(item_id), 0)
+                result[sku] = round(units_sold / days_in_stock, 4) if days_in_stock > 0 else 0.0
+
+            logger.info(f"Fetched past 90d DRR for {len(result)} SKUs")
+            return result
+        except Exception as e:
+            logger.error(f"Error fetching past 90d DRR: {e}")
+            return {}
+
     @staticmethod
     def classify_movement(
         combined_data: List[Dict],
@@ -1335,12 +1389,13 @@ class OptimizedMasterReportService:
             else:
                 item["excess_or_order"] = "EXCESS"
 
-            # Logistics (CBM / Case Pack / Purchase Status)
+            # Logistics (CBM / Case Pack / Purchase Status / Is New)
             cbm = logistics.get("cbm", 0)
             case_pack = logistics.get("case_pack", 0)
             item["cbm"] = cbm
             item["case_pack"] = case_pack
             item["purchase_status"] = purchase_status
+            item["is_new"] = logistics.get("is_new", False)
 
             # Skip order quantity calculations for inactive / discontinued items
             if purchase_status in ("inactive", "discontinued until stock lasts"):
@@ -1641,6 +1696,18 @@ async def _generate_master_report_data(
             if new_skus and idx < len(parallel_results) and not isinstance(parallel_results[idx], Exception):
                 all_product_data.update(parallel_results[idx])
 
+            # Start past-90d DRR fetch as a background task so it runs concurrently
+            # with the DRR lookback below. all_product_data is now fully populated.
+            _full_sku_to_item_id = {
+                sku: pdata["item_id"]
+                for sku, pdata in all_product_data.items()
+                if pdata.get("item_id")
+            }
+            _past_drr_task = (
+                asyncio.create_task(report_service.fetch_past_90d_drr(_full_sku_to_item_id, start_date))
+                if _full_sku_to_item_id else None
+            )
+
             # DRR lookback (needs sku_to_item_id from above)
             try:
                 if skus_needing_lookback_list and sku_to_item_id:
@@ -1745,6 +1812,7 @@ async def _generate_master_report_data(
                         "stock_in_transit_1": pdata.get("stock_in_transit_1", 0) or 0,
                         "stock_in_transit_2": pdata.get("stock_in_transit_2", 0) or 0,
                         "stock_in_transit_3": pdata.get("stock_in_transit_3", 0) or 0,
+                        "is_new": pdata.get("is_new", False),
                     }
 
                 if brand:
@@ -1869,6 +1937,28 @@ async def _generate_master_report_data(
                 item["days_total_inventory_lasts"] = round(
                     current_days_coverage + item["days_current_order_lasts"], 2
                 )
+
+            # Await past 90d DRR and compute return_pct + growth_rate for every item
+            past_drr_by_sku: Dict[str, float] = {}
+            if _past_drr_task is not None:
+                try:
+                    past_drr_by_sku = await asyncio.wait_for(_past_drr_task, timeout=30.0)
+                except Exception as e:
+                    logger.warning(f"Past 90d DRR fetch failed or timed out: {e}")
+                    _past_drr_task.cancel()
+
+            for item in combined_data:
+                metrics = item.get("combined_metrics", {})
+                total_sold = metrics.get("total_units_sold", 0)
+                total_returned = metrics.get("total_units_returned", 0)
+                item["return_pct"] = round((total_returned / total_sold) * 100, 2) if total_sold > 0 else 0.0
+
+                current_drr = metrics.get("avg_daily_run_rate", 0)
+                past_drr = past_drr_by_sku.get(item.get("sku_code", ""), 0)
+                if past_drr and past_drr > 0:
+                    item["growth_rate"] = round(((current_drr - past_drr) / past_drr) * 100, 2)
+                else:
+                    item["growth_rate"] = None
 
         # If combined_data was empty the if-block above was skipped and the background
         # tasks were never awaited — cancel them to avoid dangling tasks.
@@ -2077,16 +2167,19 @@ async def download_master_report(
                 combined_df_data.append(
                     {
                         "Purchase Status": item.get("purchase_status", ""),
+                        "Is New": "Yes" if item.get("is_new", False) else "No",
                         "SKU Code": item.get("sku_code", ""),
                         "Item Name": item.get("item_name", ""),
                         "Total Amount": metrics.get("total_amount", 0),
                         "Total Units Sold": metrics.get("total_units_sold", 0),
                         "Total Units Returned": metrics.get("total_units_returned", 0),
                         "Net Total Sales": metrics.get("total_sales", 0),
+                        "Return %": item.get("return_pct", 0),
                         "Days in Stock": metrics.get("total_days_in_stock", 0),
                         "Lookback Days in Stock": item.get("drr_lookback_days_in_stock", 0),
                         "Lookback Sales": item.get("drr_lookback_sales", 0),
                         "Avg Daily Run Rate": metrics.get("avg_daily_run_rate", 0),
+                        "Growth Rate (%)": item.get("growth_rate"),
                         "DRR Source": item.get("drr_source", "current_period"),
                         "DRR Lookback Period": item.get("drr_lookback_period", ""),
                         f"Total Stock ({_end_date_label})": metrics.get("total_closing_stock", 0),
