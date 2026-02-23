@@ -1835,7 +1835,7 @@ async def upload_sku_mapping(
     try:
         file_content = await file.read()
         df = pd.read_excel(
-            BytesIO(file_content), sheet_name="E-trade Inventory Tracker"
+            BytesIO(file_content), sheet_name="Sheet2"
         )
 
         # Validate required columns
@@ -1914,7 +1914,7 @@ def create_single_item(body: dict):
             )
         else:
             db[SKU_COLLECTION].insert_one(
-                {"item_name": item_name, "item_id": int(item_id), "sku_code": sku_code}
+                {"item_name": item_name, "item_id": str(item_id), "sku_code": sku_code}
             )
             return "Item Created"
     except HTTPException as e:

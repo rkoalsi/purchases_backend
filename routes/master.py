@@ -303,16 +303,15 @@ class OptimizedMasterReportService:
                 pipeline = [
                     {
                         "$match": {
-                            "date": {"$lte": latest_date},
+                            "date": {"$eq": latest_date},
                             "disposition": "SELLABLE",
                             "location": {"$ne": "VKSX"},
                         }
                     },
-                    {"$sort": {"asin": 1, "date": -1}},
                     {
                         "$group": {
                             "_id": "$asin",
-                            "closing_stock": {"$first": "$ending_warehouse_balance"},
+                            "closing_stock": {"$sum": "$ending_warehouse_balance"},
                         }
                     },
                 ]
@@ -394,20 +393,36 @@ class OptimizedMasterReportService:
             sku_mapping_collection = self.database["amazon_sku_mapping"]
 
             def _fetch():
+                # Find the latest date in the ledger that is <= end_date.
+                # The ledger is typically ingested with a 1-day lag, so an exact
+                # match on end_date would return nothing if that date hasn't been
+                # uploaded yet.
+                latest_doc = ledger_collection.find_one(
+                    {
+                        "date": {"$lte": end_datetime},
+                        "disposition": "SELLABLE",
+                        "location": {"$ne": "VKSX"},
+                    },
+                    sort=[("date", -1)],
+                    projection={"date": 1},
+                )
+                if not latest_doc:
+                    return {}
+                effective_date = latest_doc["date"]
+
                 # Get latest ending_warehouse_balance per ASIN from ledger
                 pipeline = [
                     {
                         "$match": {
-                            "date": {"$lte": end_datetime},
+                            "date": {"$eq": effective_date},
                             "disposition": "SELLABLE",
                             "location": {"$ne": "VKSX"},
                         }
                     },
-                    {"$sort": {"asin": 1, "date": -1}},
                     {
                         "$group": {
                             "_id": "$asin",
-                            "closing_stock": {"$first": "$ending_warehouse_balance"},
+                            "closing_stock": {"$sum": "$ending_warehouse_balance"},
                         }
                     },
                 ]
@@ -437,7 +452,7 @@ class OptimizedMasterReportService:
                 return sku_stock
 
             result = await asyncio.to_thread(_fetch)
-            logger.info(f"Fetched FBA closing stock for {len(result)} SKUs")
+            logger.info(f"Fetched FBA closing stock for {len(result)} SKUs (end_date={end_date})")
             return result
 
         except Exception as e:
@@ -918,14 +933,15 @@ class OptimizedMasterReportService:
 
             # DRR based on Zoho sales / days in stock
             zoho_units = data.pop("_zoho_units_sold")
+            credit_notes = metrics.get("total_credit_notes", 0)
             zoho_stock = data.pop("_zoho_closing_stock")
             fba_stock = fba_stock_by_sku.get(sku, 0)
 
             days_in_stock = metrics.get("total_days_in_stock", 0)
             if days_in_stock > 0:
-                metrics["avg_daily_run_rate"] = round(zoho_units / days_in_stock, 2)
+                metrics["avg_daily_run_rate"] = round(round(metrics["total_units_sold"] - credit_notes, 2) / days_in_stock, 2)
             elif period_days > 0:
-                metrics["avg_daily_run_rate"] = round(zoho_units / period_days, 2)
+                metrics["avg_daily_run_rate"] = round(round(metrics["total_units_sold"] - credit_notes, 2) / period_days, 2)
 
             # Closing stock = Pupscribe WH (Zoho) + FBA stock
             metrics["total_closing_stock"] = round(zoho_stock + fba_stock, 2)
@@ -935,7 +951,6 @@ class OptimizedMasterReportService:
             # Transfer orders and total sales
             transfer_qty = transfer_orders_by_sku.get(sku, 0)
             metrics["transfer_orders"] = round(transfer_qty, 2)
-            credit_notes = metrics.get("total_credit_notes", 0)
             metrics["total_sales"] = round(metrics["total_units_sold"] - credit_notes, 2)
 
             if metrics["avg_daily_run_rate"] > 0:
@@ -1861,6 +1876,61 @@ async def _generate_master_report_data(
                 logger.warning("Latest stock fetch timed out — latest stock columns will be empty")
                 _zoho_stock_task.cancel()
                 _fba_stock_task.cancel()
+
+            # Inject stub rows for SKUs that have FBA stock but zero sales in this period.
+            # These ASINs exist in amazon_sku_mapping but never appeared in any sales report,
+            # so combine_data_by_sku_optimized never created an entry for them.
+            if latest_fba_by_sku:
+                existing_skus = {item.get("sku_code") for item in combined_data if item.get("sku_code")}
+                fba_only_skus = {sku for sku in latest_fba_by_sku if sku not in existing_skus}
+                if fba_only_skus:
+                    fba_only_product_data = await report_service.batch_load_all_product_data(fba_only_skus)
+                    for sku in sorted(fba_only_skus):
+                        pdata = fba_only_product_data.get(sku, {})
+                        # Respect brand filter if active
+                        if brand and pdata.get("brand", "").lower() != brand.lower():
+                            continue
+                        name = pdata.get("name") or "Unknown Item"
+                        fba_end_stock = round(fba_stock_by_sku.get(sku, 0), 2)
+                        stub = {
+                            "sku_code": sku,
+                            "item_name": name,
+                            "sources": [],
+                            "combined_metrics": {
+                                "total_units_sold": 0.0,
+                                "total_units_returned": 0.0,
+                                "total_credit_notes": 0.0,
+                                "total_amount": 0.0,
+                                "total_closing_stock": fba_end_stock,
+                                "total_days_in_stock": 0.0,
+                                "avg_daily_run_rate": 0.0,
+                                "avg_days_of_coverage": 0.0,
+                                "fba_closing_stock": fba_end_stock,
+                                "pupscribe_wh_stock": 0.0,
+                                "transfer_orders": 0.0,
+                                "total_sales": 0.0,
+                            },
+                            "in_stock": True,
+                            "total_stock_in_transit": 0,
+                            "stock_in_transit_1": 0,
+                            "stock_in_transit_2": 0,
+                            "stock_in_transit_3": 0,
+                            "on_hand_days_coverage": 0.0,
+                            "current_days_coverage": 0.0,
+                            "target_days": 70,
+                            "cbm": pdata.get("cbm", 0) or 0,
+                            "case_pack": pdata.get("case_pack", 0) or 0,
+                            "purchase_status": pdata.get("purchase_status", ""),
+                            "is_new": pdata.get("is_new", False),
+                            "missed_sales": 0,
+                            "missed_sales_drr": 0.0,
+                            "extra_qty": 0.0,
+                            "drr_source": "current_period",
+                            "drr_lookback_period": "",
+                            "highlight": None,
+                        }
+                        combined_data.append(stub)
+                    logger.info(f"Injected {len(fba_only_skus)} FBA-only stub items into combined_data")
 
             # Attach latest current stock to each item
             for item in combined_data:
