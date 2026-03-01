@@ -1415,8 +1415,8 @@ class OptimizedMasterReportService:
             # Skip order quantity calculations for inactive / discontinued items
             if purchase_status in ("inactive", "discontinued until stock lasts"):
                 item["order_qty"] = 0
-                item["order_qty_rounded"] = 0
                 item["order_qty_plus_extra_qty"] = round(extra_qty, 2)
+                item["order_qty_plus_extra_qty_rounded"] = 0
                 item["total_cbm"] = 0
                 item["days_current_order_lasts"] = 0
                 item["days_total_inventory_lasts"] = round(current_days_coverage, 2)
@@ -1429,13 +1429,14 @@ class OptimizedMasterReportService:
             # Order Qty + Extra Qty
             item["order_qty_plus_extra_qty"] = round(order_qty + extra_qty, 2)
 
-            # Order qty rounded down to case pack
+            # Order Qty + Extra Qty rounded down to case pack
+            order_qty_plus_extra_qty = item["order_qty_plus_extra_qty"]
             if case_pack > 0:
-                item["order_qty_rounded"] = math.floor(order_qty / case_pack) * case_pack
+                item["order_qty_plus_extra_qty_rounded"] = math.floor(order_qty_plus_extra_qty / case_pack) * case_pack
             else:
-                item["order_qty_rounded"] = round(order_qty, 0)
+                item["order_qty_plus_extra_qty_rounded"] = round(order_qty_plus_extra_qty, 0)
 
-            order_qty_rounded = item["order_qty_rounded"]
+            order_qty_rounded = item["order_qty_plus_extra_qty_rounded"]
 
             # Total CBM
             if case_pack > 0 and cbm > 0:
@@ -1986,12 +1987,13 @@ async def _generate_master_report_data(
                 item["order_qty_plus_extra_qty"] = round(order_qty + extra_qty, 2)
 
                 case_pack = item.get("case_pack", 0)
+                order_qty_plus_extra_qty = item["order_qty_plus_extra_qty"]
                 if case_pack > 0:
-                    item["order_qty_rounded"] = math.floor(order_qty / case_pack) * case_pack
+                    item["order_qty_plus_extra_qty_rounded"] = math.floor(order_qty_plus_extra_qty / case_pack) * case_pack
                 else:
-                    item["order_qty_rounded"] = round(order_qty, 0)
+                    item["order_qty_plus_extra_qty_rounded"] = round(order_qty_plus_extra_qty, 0)
 
-                order_qty_rounded = item["order_qty_rounded"]
+                order_qty_rounded = item["order_qty_plus_extra_qty_rounded"]
 
                 cbm = item.get("cbm", 0)
                 if case_pack > 0 and cbm > 0:
@@ -2275,11 +2277,11 @@ async def download_master_report(
                         "Extra Qty": item.get("extra_qty", 0),
                         "Target Days": item.get("target_days", 0),
                         "Excess / Order": item.get("excess_or_order", ""),
-                        "Order Qty + Extra Qty": item.get("order_qty_plus_extra_qty", 0),
                         "Order Qty": item.get("order_qty", 0),
+                        "Order Qty + Extra Qty": item.get("order_qty_plus_extra_qty", 0),
                         "CBM": item.get("cbm", 0),
                         "Case Pack": item.get("case_pack", 0),
-                        "Order Qty (Rounded)": item.get("order_qty_rounded", 0),
+                        "Order Qty + Extra Qty (Rounded)": item.get("order_qty_plus_extra_qty_rounded", 0),
                         "Total CBM": item.get("total_cbm", 0),
                         "Days Current Order Lasts": item.get("days_current_order_lasts", 0),
                         "Days Total Inventory Lasts": item.get("days_total_inventory_lasts", 0),
