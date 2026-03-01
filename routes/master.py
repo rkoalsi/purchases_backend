@@ -951,7 +951,7 @@ class OptimizedMasterReportService:
             # Transfer orders and total sales
             transfer_qty = transfer_orders_by_sku.get(sku, 0)
             metrics["transfer_orders"] = round(transfer_qty, 2)
-            metrics["total_sales"] = round(metrics["total_units_sold"] - credit_notes, 2)
+            metrics["total_sales"] = round(metrics["total_units_sold"] - credit_notes - transfer_qty, 2)
 
             if metrics["avg_daily_run_rate"] > 0:
                 metrics["avg_days_of_coverage"] = round(
@@ -2096,17 +2096,17 @@ async def _generate_master_report_data(
                 "total_credit_notes": round(
                     summary_stats["total_credit_notes"], 2
                 ),
+                "total_transfer_orders": round(
+                    summary_stats["total_transfer_orders"], 2
+                ),
                 "total_net_units_sold": round(
-                    summary_stats["total_units_sold"] - summary_stats["total_credit_notes"], 2
+                    summary_stats["total_units_sold"] - summary_stats["total_credit_notes"] - summary_stats["total_transfer_orders"], 2
                 ),
                 "total_amount": round(summary_stats["total_amount"], 2),
                 "total_closing_stock": round(
                     summary_stats["total_closing_stock"], 2
                 ),
                 "avg_drr": summary_stats["avg_drr"],
-                "total_transfer_orders": round(
-                    summary_stats["total_transfer_orders"], 2
-                ),
                 "total_total_sales": round(
                     summary_stats["total_total_sales"], 2
                 ),
@@ -2243,6 +2243,7 @@ async def download_master_report(
                         "Total Amount": metrics.get("total_amount", 0),
                         "Total Units Sold": metrics.get("total_units_sold", 0),
                         "Total Units Returned": metrics.get("total_units_returned", 0),
+                        "Transfer Orders": metrics.get("transfer_orders", 0),
                         "Net Total Sales": metrics.get("total_sales", 0),
                         "Return %": item.get("return_pct", 0),
                         "Days in Stock": metrics.get("total_days_in_stock", 0),
@@ -2260,7 +2261,6 @@ async def download_master_report(
                         f"FBA Stock ({_latest_fba_label})": item.get("latest_fba_stock", 0),
                         "Avg Days of Coverage": metrics.get("avg_days_of_coverage", 0),
                         "In Stock": "Yes" if item.get("in_stock", False) else "No",
-                        "Transfer Orders": metrics.get("transfer_orders", 0),
                         "Movement": item.get("movement", ""),
                         "Safety Days": item.get("safety_days", 0),
                         "Lead Time": item.get("lead_time", 0),
