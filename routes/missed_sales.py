@@ -187,7 +187,8 @@ async def get_missed_sales(
     start_date: str = Query(None),
     end_date: str = Query(None),
 ):
-    """Get missed sales records with optional date range filter."""
+    """Get missed sales records with optional date range filter.
+    Composite SKUs are expanded into their component SKUs automatically."""
     try:
         db = get_database()
         collection = db[MISSED_SALES_COLLECTION]
@@ -207,7 +208,42 @@ async def get_missed_sales(
             return list(collection.find(query, {"_id": 0}).sort("date", 1))
 
         records = await asyncio.to_thread(_fetch)
-        serialized = serialize_mongo_document(records)
+
+        # Batch-load composite products for any item_codes that match a composite sku_code
+        item_codes = {r.get("item_code") for r in records if r.get("item_code")}
+        composite_map: dict = {}
+        if item_codes:
+            def _fetch_composites():
+                result = {}
+                for doc in db["composite_products"].find(
+                    {"sku_code": {"$in": list(item_codes)}},
+                    {"sku_code": 1, "components": 1, "_id": 0},
+                ):
+                    sku = doc.get("sku_code")
+                    if sku and doc.get("components"):
+                        result[sku] = doc["components"]
+                return result
+            composite_map = await asyncio.to_thread(_fetch_composites)
+
+        # Expand composite records into individual component records
+        expanded = []
+        for record in records:
+            item_code = record.get("item_code")
+            components = composite_map.get(item_code) if item_code else None
+            if components:
+                base_qty = record.get("missed_sales_quantity", 0)
+                for comp in components:
+                    comp_record = dict(record)
+                    comp_record["item_code"] = comp.get("sku_code", item_code)
+                    comp_record["item_name"] = comp.get("name", record.get("item_name"))
+                    comp_record["missed_sales_quantity"] = round(
+                        base_qty * float(comp.get("quantity", 1)), 4
+                    )
+                    expanded.append(comp_record)
+            else:
+                expanded.append(record)
+
+        serialized = serialize_mongo_document(expanded)
 
         return JSONResponse(
             content={

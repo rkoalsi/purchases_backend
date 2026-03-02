@@ -352,9 +352,11 @@ class OptimizedMasterReportService:
 
     async def fetch_missed_sales(self, start_date: str, end_date: str) -> Dict[str, float]:
         """Fetch total missed_sales_quantity from missed_sales collection grouped by item_code (= cf_sku_code).
+        Composite SKUs are expanded into their component SKUs before summing.
         Returns dict of {sku_code: total_missed_sales_quantity}."""
         try:
             collection = self.database.get_collection("missed_sales")
+            composite_collection = self.database.get_collection("composite_products")
             start_dt = datetime.strptime(start_date, "%Y-%m-%d")
             end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
 
@@ -376,8 +378,38 @@ class OptimizedMasterReportService:
                         result[item_code] = float(qty)
                 return result
 
-            result = await asyncio.to_thread(_fetch)
-            logger.info(f"Fetched missed sales for {len(result)} SKUs")
+            def _fetch_composites(sku_codes):
+                composite_map = {}
+                for doc in composite_collection.find(
+                    {"sku_code": {"$in": sku_codes}},
+                    {"sku_code": 1, "components": 1, "_id": 0},
+                ):
+                    sku = doc.get("sku_code")
+                    if sku and doc.get("components"):
+                        composite_map[sku] = doc["components"]
+                return composite_map
+
+            raw = await asyncio.to_thread(_fetch)
+
+            if not raw:
+                return {}
+
+            composite_map = await asyncio.to_thread(_fetch_composites, list(raw.keys()))
+
+            # Expand composite SKUs into their components
+            result: Dict[str, float] = {}
+            for sku, total_qty in raw.items():
+                components = composite_map.get(sku)
+                if components:
+                    for comp in components:
+                        comp_sku = comp.get("sku_code")
+                        if comp_sku:
+                            comp_qty = total_qty * float(comp.get("quantity", 1))
+                            result[comp_sku] = result.get(comp_sku, 0) + comp_qty
+                else:
+                    result[sku] = result.get(sku, 0) + total_qty
+
+            logger.info(f"Fetched missed sales for {len(result)} SKUs (after composite expansion)")
             return result
 
         except Exception as e:
