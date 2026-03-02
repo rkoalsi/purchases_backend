@@ -1178,10 +1178,13 @@ class OptimizedMasterReportService:
         combined_data: List[Dict],
         brand_logistics: Dict[str, Dict],
         product_brands: Dict[str, str],
+        logistics_data: Dict[str, Dict] = None,
     ) -> List[Dict]:
         """Classify each SKU as Fast/Medium/Slow mover based on volume and revenue percentiles
         computed within each brand group. Products are only ranked against other products of
-        the same brand, so brand size does not skew classifications."""
+        the same brand, so brand size does not skew classifications.
+        Only active products (purchase_status == 'active') participate in percentile ranking;
+        inactive/discontinued products are always classified as Slow Mover."""
         if not combined_data:
             return combined_data
 
@@ -1202,7 +1205,6 @@ class OptimizedMasterReportService:
         # Rank and classify within each brand group independently
         for brand_key, indices in brand_groups.items():
             brand_settings = brand_logistics.get(brand_key, default_settings)
-            group_size = len(indices)
 
             # Extract metrics for this brand's items only
             group_metrics = [
@@ -1213,17 +1215,27 @@ class OptimizedMasterReportService:
                 for i in indices
             ]
 
-            # Rank by volume within the brand (highest → rank 1)
-            vol_order = sorted(range(group_size), key=lambda j: group_metrics[j]["units_sold"], reverse=True)
-            vol_pct = [0.0] * group_size
-            for rank, j in enumerate(vol_order):
-                vol_pct[j] = (rank + 1) / group_size
+            # Only rank active products (purchase_status == "active") against each other
+            _logistics = logistics_data or {}
+            active_indices = [
+                j for j in range(len(indices))
+                if _logistics.get(combined_data[indices[j]].get("sku_code", ""), {}).get("purchase_status", "active") == "active"
+            ]
+            active_size = len(active_indices)
 
-            # Rank by revenue within the brand (highest → rank 1)
-            rev_order = sorted(range(group_size), key=lambda j: group_metrics[j]["amount"], reverse=True)
-            rev_pct = [0.0] * group_size
-            for rank, j in enumerate(rev_order):
-                rev_pct[j] = (rank + 1) / group_size
+            vol_pct = [1.0] * len(indices)  # inactive default → Slow Mover
+            rev_pct = [1.0] * len(indices)
+
+            if active_size > 0:
+                # Rank by volume within active products (highest → rank 1)
+                vol_order = sorted(active_indices, key=lambda j: group_metrics[j]["units_sold"], reverse=True)
+                for rank, j in enumerate(vol_order):
+                    vol_pct[j] = (rank + 1) / active_size
+
+                # Rank by revenue within active products (highest → rank 1)
+                rev_order = sorted(active_indices, key=lambda j: group_metrics[j]["amount"], reverse=True)
+                for rank, j in enumerate(rev_order):
+                    rev_pct[j] = (rank + 1) / active_size
 
             # Classify each item in this brand group
             for j, global_idx in enumerate(indices):
@@ -1932,7 +1944,7 @@ async def _generate_master_report_data(
             # FBA-only stubs — have been added.  Running here ensures every product is
             # ranked within its own brand group rather than across all brands.
             try:
-                combined_data = report_service.classify_movement(combined_data, brand_logistics, product_brands)
+                combined_data = report_service.classify_movement(combined_data, brand_logistics, product_brands, logistics_data)
                 combined_data = report_service.enrich_with_order_calculations(
                     combined_data, transit_data, logistics_data, missed_sales_by_sku, period_days
                 )
