@@ -1809,10 +1809,11 @@ async def _generate_master_report_data(
                     item.setdefault("highlight", None)
 
             # Enrichment (uses brand_logistics + transit_data fetched in parallel above)
+            # Initialise here so they are always defined even if the try-block below fails.
+            product_rates = {}
+            product_brands = {}
+            logistics_data = {}
             try:
-                product_rates = {}
-                product_brands = {}
-                logistics_data = {}
                 for sku, pdata in all_product_data.items():
                     rate = pdata.get("rate")
                     if rate is not None:
@@ -1846,11 +1847,6 @@ async def _generate_master_report_data(
                         if rate > 0:
                             metrics["total_amount"] = round(rate * metrics["total_units_sold"], 2)
 
-                combined_data = report_service.classify_movement(combined_data, brand_logistics, product_brands)
-                combined_data = report_service.enrich_with_order_calculations(
-                    combined_data, transit_data, logistics_data, missed_sales_by_sku, period_days
-                )
-                logger.info(f"Enriched {len(combined_data)} items with movement and order calculations")
             except Exception as e:
                 logger.error(f"Error enriching data: {e}")
                 errors.append(f"Enrichment error: {str(e)}")
@@ -1889,10 +1885,23 @@ async def _generate_master_report_data(
                     for sku in sorted(fba_only_skus):
                         pdata = fba_only_product_data.get(sku, {})
                         # Respect brand filter if active
-                        if brand and pdata.get("brand", "").lower() != brand.lower():
+                        stub_brand = pdata.get("brand", "") or ""
+                        if brand and stub_brand.lower() != brand.lower():
                             continue
                         name = pdata.get("name") or "Unknown Item"
                         fba_end_stock = round(fba_stock_by_sku.get(sku, 0), 2)
+                        # Register stub in product_brands so classify_movement can group it correctly,
+                        # and in logistics_data so enrich_with_order_calculations picks up its metadata.
+                        product_brands[sku] = stub_brand
+                        logistics_data[sku] = {
+                            "cbm": pdata.get("cbm", 0) or 0,
+                            "case_pack": pdata.get("case_pack", 0) or 0,
+                            "purchase_status": pdata.get("purchase_status", ""),
+                            "stock_in_transit_1": 0,
+                            "stock_in_transit_2": 0,
+                            "stock_in_transit_3": 0,
+                            "is_new": pdata.get("is_new", False),
+                        }
                         stub = {
                             "sku_code": sku,
                             "item_name": name,
@@ -1912,26 +1921,25 @@ async def _generate_master_report_data(
                                 "total_sales": 0.0,
                             },
                             "in_stock": True,
-                            "total_stock_in_transit": 0,
-                            "stock_in_transit_1": 0,
-                            "stock_in_transit_2": 0,
-                            "stock_in_transit_3": 0,
-                            "on_hand_days_coverage": 0.0,
-                            "current_days_coverage": 0.0,
-                            "target_days": 70,
-                            "cbm": pdata.get("cbm", 0) or 0,
-                            "case_pack": pdata.get("case_pack", 0) or 0,
-                            "purchase_status": pdata.get("purchase_status", ""),
-                            "is_new": pdata.get("is_new", False),
-                            "missed_sales": 0,
-                            "missed_sales_drr": 0.0,
-                            "extra_qty": 0.0,
                             "drr_source": "current_period",
                             "drr_lookback_period": "",
                             "highlight": None,
                         }
                         combined_data.append(stub)
                     logger.info(f"Injected {len(fba_only_skus)} FBA-only stub items into combined_data")
+
+            # Classify movement and compute order metrics now that all items — including
+            # FBA-only stubs — have been added.  Running here ensures every product is
+            # ranked within its own brand group rather than across all brands.
+            try:
+                combined_data = report_service.classify_movement(combined_data, brand_logistics, product_brands)
+                combined_data = report_service.enrich_with_order_calculations(
+                    combined_data, transit_data, logistics_data, missed_sales_by_sku, period_days
+                )
+                logger.info(f"Enriched {len(combined_data)} items with movement and order calculations")
+            except Exception as e:
+                logger.error(f"Error in movement classification and order calculations: {e}")
+                errors.append(f"Movement/order enrichment error: {str(e)}")
 
             # Attach latest current stock to each item
             for item in combined_data:
