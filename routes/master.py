@@ -2453,8 +2453,8 @@ def import_product_logistics(
                 continue
 
             raw_status = row[0].strip() if len(row) > 0 else ""
-            sit1_raw = row[72] if len(row) > 72 else ""   # BU
-            sit2_raw = row[73] if len(row) > 73 else ""   # BV
+            sit1_raw = row[73] if len(row) > 73 else ""   # BV
+            sit2_raw = row[74] if len(row) > 74 else ""   # BW
             cbm_raw = row[76] if len(row) > 76 else ""    # BY
             case_pack_raw = row[77] if len(row) > 77 else ""  # BZ
 
