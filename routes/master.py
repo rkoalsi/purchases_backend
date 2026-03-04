@@ -1239,13 +1239,22 @@ class OptimizedMasterReportService:
             brand_settings = brand_logistics.get(brand_key, default_settings)
 
             # Extract metrics for this brand's items only
-            group_metrics = [
-                {
-                    "units_sold": combined_data[i].get("combined_metrics", {}).get("total_units_sold", 0),
-                    "amount": combined_data[i].get("combined_metrics", {}).get("total_amount", 0),
-                }
-                for i in indices
-            ]
+            # If an item was in stock < 60 days, use MAX(current sales, lookback sales)
+            # so stockouts don't suppress the movement ranking
+            group_metrics = []
+            for i in indices:
+                item_metrics = combined_data[i].get("combined_metrics", {})
+                days_in_stock = item_metrics.get("total_days_in_stock", 0)
+                sales_90 = item_metrics.get("total_units_sold", 0)
+                if days_in_stock >= 60:
+                    movement_units = sales_90
+                else:
+                    lookback_sales = combined_data[i].get("drr_lookback_sales", 0) or 0
+                    movement_units = max(sales_90, lookback_sales)
+                group_metrics.append({
+                    "units_sold": movement_units,
+                    "amount": item_metrics.get("total_amount", 0),
+                })
 
             # Only rank active products (purchase_status == "active") against each other
             _logistics = logistics_data or {}
@@ -1433,7 +1442,11 @@ class OptimizedMasterReportService:
             # Missed Sales columns (inserted between Current Days Coverage and Target Days)
             missed_sales = missed_sales_by_sku.get(sku, 0)
             item["missed_sales"] = missed_sales
-            missed_sales_drr = round(missed_sales / period_days, 4) if period_days > 0 else 0.0
+            missed_sales_drr_raw = missed_sales / period_days if period_days > 0 else 0.0
+            # Cap at 50% of true DRR to prevent over-ordering from missed sales spikes
+            if drr > 0:
+                missed_sales_drr_raw = min(missed_sales_drr_raw, 0.5 * drr)
+            missed_sales_drr = round(missed_sales_drr_raw, 4)
             item["missed_sales_drr"] = missed_sales_drr
             extra_qty = round(missed_sales_drr * lead_time, 2)
             item["extra_qty"] = extra_qty
