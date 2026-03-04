@@ -2386,6 +2386,494 @@ async def download_master_report(
         )
 
 
+def _classify_sku_stock(current_days_coverage: float, lead_time: float, drr: float) -> str:
+    """Classify a SKU's stock health.
+    Reorder Risk → Healthy → Heavy → Overstock → Dead (5 categories).
+    """
+    if drr == 0:
+        return "dead"
+    if current_days_coverage > 3 * lead_time:
+        return "dead"
+    if current_days_coverage > 2 * lead_time:
+        return "overstock"
+    if current_days_coverage > 1.5 * lead_time:
+        return "heavy"
+    if current_days_coverage >= lead_time:
+        return "healthy"
+    return "reorder_risk"
+
+
+def _aggregate_brand_kpi(
+    brand: str,
+    items: list,
+    brand_logistics_map: Dict,
+    rate_map: Dict[str, float],
+    period_days: int,
+) -> Dict:
+    """Aggregate all KPI metrics for a single brand."""
+    bl = brand_logistics_map.get(brand.lower(), {})
+    lead_time = bl.get("lead_time", 60)
+    safety_days_medium = bl.get("safety_days_medium", 25)
+    target_days = lead_time + safety_days_medium + 10
+
+    units_sold = sum(i.get("combined_metrics", {}).get("total_units_sold", 0) for i in items)
+    units_returned = sum(i.get("combined_metrics", {}).get("total_units_returned", 0) for i in items)
+    credit_notes = sum(i.get("combined_metrics", {}).get("total_credit_notes", 0) for i in items)
+    transfer_orders = sum(i.get("combined_metrics", {}).get("transfer_orders", 0) for i in items)
+    net_sales = sum(i.get("combined_metrics", {}).get("total_sales", 0) for i in items)
+    revenue = sum(i.get("combined_metrics", {}).get("total_amount", 0) for i in items)
+    latest_net_stock = sum(i.get("latest_total_stock", 0) for i in items)
+    latest_zoho = sum(i.get("latest_zoho_stock", 0) for i in items)
+    latest_fba = sum(i.get("latest_fba_stock", 0) for i in items)
+    stock_in_transit = sum(i.get("total_stock_in_transit", 0) for i in items)
+    total_cbm = sum(i.get("total_cbm", 0) for i in items)
+
+    # Inventory value and missed sales (need rate per SKU)
+    net_inv_value = sum(
+        i.get("latest_total_stock", 0) * rate_map.get(i.get("sku_code", ""), 0)
+        for i in items
+    )
+    missed_sales_units = sum(i.get("missed_sales", 0) for i in items)
+    missed_sales_daily_units = round(missed_sales_units / period_days, 2) if period_days > 0 else 0.0
+    missed_sales_value_total = sum(
+        i.get("missed_sales", 0) * rate_map.get(i.get("sku_code", ""), 0)
+        for i in items
+    )
+    missed_sales_daily_value = round(missed_sales_value_total / period_days, 2) if period_days > 0 else 0.0
+
+    # Return %
+    return_pct = round(units_returned / units_sold * 100, 2) if units_sold > 0 else 0.0
+
+    # Weighted-average growth rate (weight = per-SKU DRR)
+    drr_w_sum = 0.0
+    drr_w_total = 0.0
+    for i in items:
+        item_drr = i.get("combined_metrics", {}).get("avg_daily_run_rate", 0)
+        item_gr = i.get("growth_rate")
+        if item_gr is not None and item_drr > 0:
+            drr_w_sum += item_gr * item_drr
+            drr_w_total += item_drr
+    growth_rate = round(drr_w_sum / drr_w_total, 2) if drr_w_total > 0 else None
+
+    # Brand-level DRR and days cover
+    drr = round(net_sales / period_days, 4) if period_days > 0 else 0.0
+    days_cover = round(latest_net_stock / drr, 2) if drr > 0 else 0.0
+    current_days_coverage = round((latest_net_stock + stock_in_transit) / drr, 2) if drr > 0 else 0.0
+
+    # Weighted-average days cover (weight = per-SKU latest stock, exclude dead SKUs)
+    stock_w_total = 0.0
+    weighted_doc_sum = 0.0
+    for i in items:
+        item_drr = i.get("combined_metrics", {}).get("avg_daily_run_rate", 0)
+        item_stock = i.get("latest_total_stock", 0)
+        item_doc = i.get("current_days_coverage", 0)
+        if item_drr > 0 and item_stock > 0:
+            weighted_doc_sum += item_stock * item_doc
+            stock_w_total += item_stock
+    weighted_avg_days_cover = round(weighted_doc_sum / stock_w_total, 2) if stock_w_total > 0 else 0.0
+
+    # Alert level based on aggregate days cover
+    if drr == 0:
+        alert_level = 3  # no movement
+    elif days_cover < lead_time:
+        alert_level = 2  # red – critical
+    elif days_cover < target_days:
+        alert_level = 1  # yellow – caution
+    else:
+        alert_level = 0  # green – healthy
+
+    # Stock classification per SKU
+    classes = [
+        _classify_sku_stock(
+            i.get("current_days_coverage", 0),
+            lead_time,
+            i.get("combined_metrics", {}).get("avg_daily_run_rate", 0),
+        )
+        for i in items
+    ]
+    total_skus = len(items)
+    class_counts = {
+        "reorder_risk": sum(1 for c in classes if c == "reorder_risk"),
+        "healthy": sum(1 for c in classes if c == "healthy"),
+        "heavy": sum(1 for c in classes if c == "heavy"),
+        "overstock": sum(1 for c in classes if c == "overstock"),
+        "dead": sum(1 for c in classes if c == "dead"),
+    }
+    class_pct = {k: round(v / total_skus * 100, 1) if total_skus > 0 else 0.0 for k, v in class_counts.items()}
+
+    # Per-SKU list for lowest/highest 10 (exclude dead/no-movement SKUs from both lists)
+    sku_detail = sorted(
+        [
+            {
+                "sku_code": i.get("sku_code", ""),
+                "item_name": i.get("item_name", ""),
+                "drr": round(i.get("combined_metrics", {}).get("avg_daily_run_rate", 0), 4),
+                "net_stock": round(i.get("latest_total_stock", 0), 2),
+                "days_cover": round(i.get("current_days_coverage", 0), 1),
+                "excess_or_order": i.get("excess_or_order", ""),
+                "movement": i.get("movement", ""),
+                "stock_class": _classify_sku_stock(
+                    i.get("current_days_coverage", 0),
+                    lead_time,
+                    i.get("combined_metrics", {}).get("avg_daily_run_rate", 0),
+                ),
+            }
+            for i in items
+            if i.get("combined_metrics", {}).get("avg_daily_run_rate", 0) > 0
+        ],
+        key=lambda x: x["days_cover"],
+    )
+    sku_lowest_10 = sku_detail[:10]
+    sku_highest_10 = list(reversed(sku_detail[-10:]))
+
+    return {
+        "brand": brand,
+        "sku_count": total_skus,
+        "units_sold": round(units_sold, 2),
+        "units_returned": round(units_returned, 2),
+        "credit_notes": round(credit_notes, 2),
+        "transfer_orders": round(transfer_orders, 2),
+        "net_sales": round(net_sales, 2),
+        "revenue": round(revenue, 2),
+        "return_pct": return_pct,
+        "growth_rate": growth_rate,
+        "drr": drr,
+        "latest_net_stock": round(latest_net_stock, 2),
+        "latest_zoho_stock": round(latest_zoho, 2),
+        "latest_fba_stock": round(latest_fba, 2),
+        "net_sellable_inventory_value": round(net_inv_value, 2),
+        "stock_in_transit": round(stock_in_transit, 2),
+        "total_cbm": round(total_cbm, 4),
+        "days_cover": days_cover,
+        "current_days_coverage": current_days_coverage,
+        "weighted_avg_days_cover": weighted_avg_days_cover,
+        "lead_time": lead_time,
+        "safety_days": safety_days_medium,
+        "target_days": target_days,
+        "alert_level": alert_level,
+        "order_count": sum(1 for i in items if i.get("excess_or_order") == "ORDER"),
+        "excess_count": sum(1 for i in items if i.get("excess_or_order") == "EXCESS"),
+        "no_movement_count": sum(1 for i in items if i.get("excess_or_order") == "NO MOVEMENT"),
+        "fast_mover_count": sum(1 for i in items if i.get("movement") == "Fast Mover"),
+        "medium_mover_count": sum(1 for i in items if i.get("movement") == "Medium Mover"),
+        "slow_mover_count": sum(1 for i in items if i.get("movement") == "Slow Mover"),
+        "missed_sales_units": round(missed_sales_units, 2),
+        "missed_sales_daily_units": missed_sales_daily_units,
+        "missed_sales_value_total": round(missed_sales_value_total, 2),
+        "missed_sales_daily_value": missed_sales_daily_value,
+        "stock_classification": {"counts": class_counts, "pct": class_pct},
+        "sku_lowest_10": sku_lowest_10,
+        "sku_highest_10": sku_highest_10,
+    }
+
+
+@router.get("/dashboard-kpi")
+async def get_dashboard_kpi(db=Depends(get_database)):
+    """
+    Stock Cover KPI Dashboard – last 90 days, aggregated by brand.
+
+    Includes: net sales, DRR, net stock, days cover (aggregate + weighted avg),
+    return %, growth %, missed sales (units+value/day), total CBM, net inventory value,
+    stock classification per SKU (Reorder Risk / Healthy / Heavy / Overstock / Dead),
+    and the 10 lowest / 10 highest days-cover SKUs per brand.
+    """
+    try:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=89)).strftime("%Y-%m-%d")
+        period_days = 90
+
+        service = OptimizedMasterReportService(db)
+
+        content, brand_logistics_map = await asyncio.gather(
+            _generate_master_report_data(start_date, end_date, True, db),
+            service.get_brand_logistics(),
+        )
+
+        combined_data = content.get("combined_data", [])
+
+        # Batch-load product rates (for inventory value + missed-sales value)
+        all_skus = {i.get("sku_code") for i in combined_data if i.get("sku_code")}
+        product_data_map = await service.batch_load_all_product_data(all_skus) if all_skus else {}
+        rate_map: Dict[str, float] = {
+            sku: float(pdata.get("rate") or 0) for sku, pdata in product_data_map.items()
+        }
+
+        # Group by brand
+        brand_groups: Dict[str, list] = defaultdict(list)
+        for item in combined_data:
+            brand = (item.get("brand") or "Unknown").strip() or "Unknown"
+            brand_groups[brand].append(item)
+
+        brands_kpi = [
+            _aggregate_brand_kpi(brand, items, brand_logistics_map, rate_map, period_days)
+            for brand, items in brand_groups.items()
+        ]
+
+        # Sort: most critical first, then alphabetical
+        brands_kpi.sort(key=lambda x: (-x["alert_level"], x["brand"]))
+
+        # Global totals
+        total_net_sales = sum(b["net_sales"] for b in brands_kpi)
+        total_net_stock = sum(b["latest_net_stock"] for b in brands_kpi)
+        total_units_sold = sum(b["units_sold"] for b in brands_kpi)
+        total_units_returned = sum(b["units_returned"] for b in brands_kpi)
+        total_drr = round(total_net_sales / period_days, 4) if period_days > 0 else 0.0
+        total_days_cover = round(total_net_stock / total_drr, 2) if total_drr > 0 else 0.0
+        total_transit = sum(b["stock_in_transit"] for b in brands_kpi)
+        total_current_coverage = round((total_net_stock + total_transit) / total_drr, 2) if total_drr > 0 else 0.0
+
+        # Global weighted avg days cover (weight = brand net stock, exclude dead brands)
+        global_stock_w = sum(b["latest_net_stock"] for b in brands_kpi if b["drr"] > 0)
+        global_weighted_doc = sum(
+            b["latest_net_stock"] * b["weighted_avg_days_cover"]
+            for b in brands_kpi if b["drr"] > 0 and b["latest_net_stock"] > 0
+        )
+        global_weighted_avg_doc = round(global_weighted_doc / global_stock_w, 2) if global_stock_w > 0 else 0.0
+
+        # Global stock classification counts
+        global_class_counts: Dict[str, int] = {"reorder_risk": 0, "healthy": 0, "heavy": 0, "overstock": 0, "dead": 0}
+        for b in brands_kpi:
+            for k, v in b["stock_classification"]["counts"].items():
+                global_class_counts[k] = global_class_counts.get(k, 0) + v
+        total_global_skus = sum(global_class_counts.values())
+        global_class_pct = {
+            k: round(v / total_global_skus * 100, 1) if total_global_skus > 0 else 0.0
+            for k, v in global_class_counts.items()
+        }
+
+        return JSONResponse(status_code=200, content={
+            "period": {"start_date": start_date, "end_date": end_date, "days": period_days},
+            "brands": brands_kpi,
+            "totals": {
+                "brand_count": len(brands_kpi),
+                "sku_count": sum(b["sku_count"] for b in brands_kpi),
+                "units_sold": round(total_units_sold, 2),
+                "units_returned": round(total_units_returned, 2),
+                "credit_notes": round(sum(b["credit_notes"] for b in brands_kpi), 2),
+                "transfer_orders": round(sum(b["transfer_orders"] for b in brands_kpi), 2),
+                "net_sales": round(total_net_sales, 2),
+                "revenue": round(sum(b["revenue"] for b in brands_kpi), 2),
+                "return_pct": round(total_units_returned / total_units_sold * 100, 2) if total_units_sold > 0 else 0.0,
+                "drr": total_drr,
+                "latest_net_stock": round(total_net_stock, 2),
+                "latest_zoho_stock": round(sum(b["latest_zoho_stock"] for b in brands_kpi), 2),
+                "latest_fba_stock": round(sum(b["latest_fba_stock"] for b in brands_kpi), 2),
+                "net_sellable_inventory_value": round(sum(b["net_sellable_inventory_value"] for b in brands_kpi), 2),
+                "stock_in_transit": round(total_transit, 2),
+                "total_cbm": round(sum(b["total_cbm"] for b in brands_kpi), 4),
+                "days_cover": total_days_cover,
+                "current_days_coverage": total_current_coverage,
+                "weighted_avg_days_cover": global_weighted_avg_doc,
+                "missed_sales_units": round(sum(b["missed_sales_units"] for b in brands_kpi), 2),
+                "missed_sales_daily_units": round(sum(b["missed_sales_daily_units"] for b in brands_kpi), 2),
+                "missed_sales_value_total": round(sum(b["missed_sales_value_total"] for b in brands_kpi), 2),
+                "missed_sales_daily_value": round(sum(b["missed_sales_daily_value"] for b in brands_kpi), 2),
+            },
+            "global_stock_classification": {
+                "counts": global_class_counts,
+                "pct": global_class_pct,
+            },
+            "latest_stock_dates": content.get("latest_stock_dates", {}),
+            "meta": content.get("meta", {}),
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating dashboard KPI: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to generate dashboard KPI: {str(e)}")
+
+
+@router.get("/dashboard-kpi/download")
+async def download_dashboard_kpi(
+    breakdown: str = Query("brand", description="'brand' for brand-level or 'product' for SKU-level"),
+    db=Depends(get_database),
+):
+    """Download Stock Cover KPI as Excel. breakdown=brand or breakdown=product."""
+    try:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=89)).strftime("%Y-%m-%d")
+        period_days = 90
+
+        service = OptimizedMasterReportService(db)
+        content, brand_logistics_map = await asyncio.gather(
+            _generate_master_report_data(start_date, end_date, True, db),
+            service.get_brand_logistics(),
+        )
+
+        combined_data = content.get("combined_data", [])
+        latest_stock_dates = content.get("latest_stock_dates", {})
+
+        # Batch-load rates for inventory / missed-sales value columns
+        all_skus = {i.get("sku_code") for i in combined_data if i.get("sku_code")}
+        product_data_map = await service.batch_load_all_product_data(all_skus) if all_skus else {}
+        rate_map: Dict[str, float] = {
+            sku: float(pdata.get("rate") or 0) for sku, pdata in product_data_map.items()
+        }
+
+        def _fmt_date(d: str) -> str:
+            try:
+                return datetime.strptime(d, "%Y-%m-%d").strftime("%d %b %Y")
+            except Exception:
+                return d or "Latest"
+
+        _latest_zoho_label = _fmt_date(latest_stock_dates.get("zoho", ""))
+        _latest_fba_label = _fmt_date(latest_stock_dates.get("fba", ""))
+
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+            if breakdown == "product":
+                rows = []
+                for item in combined_data:
+                    m = item.get("combined_metrics", {})
+                    sku = item.get("sku_code", "")
+                    rate = rate_map.get(sku, 0)
+                    lead_time_item = item.get("lead_time", 60)
+                    item_drr = m.get("avg_daily_run_rate", 0)
+                    item_doc = item.get("current_days_coverage", 0)
+                    rows.append({
+                        "Brand": item.get("brand", ""),
+                        "Purchase Status": item.get("purchase_status", ""),
+                        "Movement": item.get("movement", ""),
+                        "Stock Class": _classify_sku_stock(item_doc, lead_time_item, item_drr),
+                        "SKU Code": sku,
+                        "Item Name": item.get("item_name", ""),
+                        "Units Sold": m.get("total_units_sold", 0),
+                        "Units Returned": m.get("total_units_returned", 0),
+                        "Return %": round(m.get("total_units_returned", 0) / m.get("total_units_sold", 1) * 100, 2) if m.get("total_units_sold", 0) > 0 else 0,
+                        "Credit Notes": m.get("total_credit_notes", 0),
+                        "Transfer Orders": m.get("transfer_orders", 0),
+                        "Net Sales": m.get("total_sales", 0),
+                        "Revenue (₹)": m.get("total_amount", 0),
+                        "Growth Rate (%)": item.get("growth_rate"),
+                        "Avg Daily Run Rate": item_drr,
+                        f"Zoho WH Stock ({_latest_zoho_label})": item.get("latest_zoho_stock", 0),
+                        f"FBA Stock ({_latest_fba_label})": item.get("latest_fba_stock", 0),
+                        "Latest Net Stock": item.get("latest_total_stock", 0),
+                        "Net Inv. Value (₹)": round(item.get("latest_total_stock", 0) * rate, 2),
+                        "Stock in Transit": item.get("total_stock_in_transit", 0),
+                        "Days Cover (Stock / DRR)": m.get("avg_days_of_coverage", 0),
+                        "Current Days Coverage": item_doc,
+                        "Lead Time (days)": lead_time_item,
+                        "Safety Days": item.get("safety_days", 0),
+                        "Target Days": item.get("target_days", 0),
+                        "Excess / Order": item.get("excess_or_order", ""),
+                        "Order Qty": item.get("order_qty", 0),
+                        "Order Qty + Extra Qty": item.get("order_qty_plus_extra_qty", 0),
+                        "Order Qty (Rounded)": item.get("order_qty_plus_extra_qty_rounded", 0),
+                        "Total CBM": item.get("total_cbm", 0),
+                        "Days Total Inventory Lasts": item.get("days_total_inventory_lasts", 0),
+                        "Missed Sales (units)": item.get("missed_sales", 0),
+                        "Missed Sales DRR (units/day)": item.get("missed_sales_drr", 0),
+                        "Missed Sales Value (₹)": round(item.get("missed_sales", 0) * rate, 2),
+                        "Missed Sales Daily Value (₹)": round(item.get("missed_sales_drr", 0) * rate, 2),
+                    })
+                if rows:
+                    pd.DataFrame(rows).to_excel(writer, sheet_name="Product KPI", index=False)
+
+            else:
+                # Brand aggregation
+                brand_groups: Dict[str, list] = defaultdict(list)
+                for item in combined_data:
+                    brand = (item.get("brand") or "Unknown").strip() or "Unknown"
+                    brand_groups[brand].append(item)
+
+                rows = []
+                for brand in sorted(brand_groups.keys()):
+                    items = brand_groups[brand]
+                    kpi = _aggregate_brand_kpi(brand, items, brand_logistics_map, rate_map, period_days)
+                    cc = kpi["stock_classification"]["counts"]
+                    cp = kpi["stock_classification"]["pct"]
+                    rows.append({
+                        "Brand": brand,
+                        "SKUs": kpi["sku_count"],
+                        "Fast Movers": kpi["fast_mover_count"],
+                        "Medium Movers": kpi["medium_mover_count"],
+                        "Slow Movers": kpi["slow_mover_count"],
+                        "Units Sold": kpi["units_sold"],
+                        "Units Returned": kpi["units_returned"],
+                        "Return %": kpi["return_pct"],
+                        "Credit Notes": kpi["credit_notes"],
+                        "Transfer Orders": kpi["transfer_orders"],
+                        "Net Sales": kpi["net_sales"],
+                        "Revenue (₹)": kpi["revenue"],
+                        "Growth Rate (%)": kpi["growth_rate"],
+                        "DRR (Net Sales / 90)": kpi["drr"],
+                        f"Zoho WH Stock ({_latest_zoho_label})": kpi["latest_zoho_stock"],
+                        f"FBA Stock ({_latest_fba_label})": kpi["latest_fba_stock"],
+                        "Latest Net Stock": kpi["latest_net_stock"],
+                        "Net Inv. Value (₹)": kpi["net_sellable_inventory_value"],
+                        "Stock in Transit": kpi["stock_in_transit"],
+                        "Total CBM": kpi["total_cbm"],
+                        "Days Cover (Stock / DRR)": kpi["days_cover"],
+                        "Weighted Avg Days Cover": kpi["weighted_avg_days_cover"],
+                        "Current Days Coverage (Stock+Transit/DRR)": kpi["current_days_coverage"],
+                        "Lead Time (days)": kpi["lead_time"],
+                        "Safety Days (Medium)": kpi["safety_days"],
+                        "Target Days": kpi["target_days"],
+                        "SKUs - Reorder Risk": cc.get("reorder_risk", 0),
+                        "% Reorder Risk": cp.get("reorder_risk", 0),
+                        "SKUs - Healthy": cc.get("healthy", 0),
+                        "% Healthy": cp.get("healthy", 0),
+                        "SKUs - Heavy": cc.get("heavy", 0),
+                        "% Heavy": cp.get("heavy", 0),
+                        "SKUs - Overstock": cc.get("overstock", 0),
+                        "% Overstock": cp.get("overstock", 0),
+                        "SKUs - Dead": cc.get("dead", 0),
+                        "% Dead": cp.get("dead", 0),
+                        "SKUs Needing Order": kpi["order_count"],
+                        "SKUs in Excess": kpi["excess_count"],
+                        "SKUs No Movement": kpi["no_movement_count"],
+                        "Missed Sales (units, 90d)": kpi["missed_sales_units"],
+                        "Missed Sales (units/day)": kpi["missed_sales_daily_units"],
+                        "Missed Sales Value (₹, 90d)": kpi["missed_sales_value_total"],
+                        "Missed Sales Value (₹/day)": kpi["missed_sales_daily_value"],
+                    })
+
+                if rows:
+                    df = pd.DataFrame(rows)
+                    df.to_excel(writer, sheet_name="Brand KPI", index=False)
+
+                    from openpyxl.styles import PatternFill
+                    red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
+                    yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+                    ws = writer.sheets["Brand KPI"]
+                    dc_col = list(df.columns).index("Days Cover (Stock / DRR)") + 1
+                    lt_col = list(df.columns).index("Lead Time (days)") + 1
+                    tg_col = list(df.columns).index("Target Days") + 1
+
+                    for row_idx in range(2, len(rows) + 2):
+                        dc = ws.cell(row=row_idx, column=dc_col).value or 0
+                        lt = ws.cell(row=row_idx, column=lt_col).value or 60
+                        tg = ws.cell(row=row_idx, column=tg_col).value or 95
+                        fill = red_fill if dc > 0 and dc < lt else (yellow_fill if dc > 0 and dc < tg else None)
+                        if fill:
+                            for col_idx in range(1, len(df.columns) + 1):
+                                ws.cell(row=row_idx, column=col_idx).fill = fill
+
+        excel_buffer.seek(0)
+        file_bytes = excel_buffer.read()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"stock_cover_kpi_{breakdown}_{start_date}_to_{end_date}_{timestamp}.xlsx"
+
+        return Response(
+            content=file_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Length": str(len(file_bytes)),
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating dashboard KPI download: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to generate KPI download: {str(e)}")
+
+
 @router.get("/brands")
 def get_available_brands(db=Depends(get_database)):
     """Get list of available brands from products collection"""
