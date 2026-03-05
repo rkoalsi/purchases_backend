@@ -2386,7 +2386,6 @@ async def download_master_report(
                         f"Total Stock ({_latest_total_label})": item.get("latest_total_stock", 0),
                         f"Pupscribe WH Stock ({_latest_zoho_label})": item.get("latest_zoho_stock", 0),
                         f"FBA Stock ({_latest_fba_label})": item.get("latest_fba_stock", 0),
-                        "Avg Days of Coverage": metrics.get("avg_days_of_coverage", 0),
                         "In Stock": "Yes" if item.get("in_stock", False) else "No",
                         "Movement": item.get("movement", ""),
                         "Safety Days": item.get("safety_days", 0),
@@ -2446,7 +2445,6 @@ async def download_master_report(
                 _U  = _col(f"Total Stock ({_latest_total_label})")
                 _V  = _col(f"Pupscribe WH Stock ({_latest_zoho_label})")
                 _W  = _col(f"FBA Stock ({_latest_fba_label})")
-                _X  = _col("Avg Days of Coverage")
                 _AA = _col("Safety Days")
                 _AB = _col("Lead Time")
                 _AC = _col("Order Processing")
@@ -2488,17 +2486,14 @@ async def download_master_report(
                     # Total Stock (latest) = WH latest + FBA latest
                     ws[f"{_U}{r}"] = f"={_V}{r}+{_W}{r}"
 
-                    # Avg Days of Coverage = Total Stock / DRR
-                    ws[f"{_X}{r}"] = f"=IF({_N}{r}>0,{_R}{r}/{_N}{r},0)"
-
-                    # On-Hand Days Coverage = same as Avg Days of Coverage
-                    ws[f"{_AE}{r}"] = f"=IF({_N}{r}>0,{_R}{r}/{_N}{r},0)"
+                    # On-Hand Days Coverage = Latest Total Stock / DRR
+                    ws[f"{_AE}{r}"] = f"=IF({_N}{r}>0,{_U}{r}/{_N}{r},0)"
 
                     # Total Stock in Transit = sum of 3 transit cols
                     ws[f"{_AI}{r}"] = f"={_AF}{r}+{_AG}{r}+{_AH}{r}"
 
-                    # Current Days Coverage = (Total Stock + Total Transit) / DRR
-                    ws[f"{_AJ}{r}"] = f"=IF({_N}{r}>0,({_R}{r}+{_AI}{r})/{_N}{r},0)"
+                    # Current Days Coverage = (Latest Total Stock + Total Transit) / DRR
+                    ws[f"{_AJ}{r}"] = f"=IF({_N}{r}>0,({_U}{r}+{_AI}{r})/{_N}{r},0)"
 
                     # Target Days = Lead Time + Safety Days + Order Processing
                     ws[f"{_AD}{r}"] = f"={_AB}{r}+{_AA}{r}+{_AC}{r}"
