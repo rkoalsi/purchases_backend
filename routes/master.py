@@ -1847,6 +1847,43 @@ async def _generate_master_report_data(
                             f"{sum(1 for r in lookback_results.values() if r['found'])} found, "
                             f"{sum(1 for r in lookback_results.values() if not r['found'])} not found"
                         )
+
+                        # For SKUs using lookback DRR, fetch missed_sales from the same
+                        # lookback date range so missed_sales_drr is consistent with DRR.
+                        lookback_period_to_skus: Dict[str, List[str]] = {}
+                        for item in combined_data:
+                            if item.get("drr_source") == "previous_period":
+                                period_str = item.get("drr_lookback_period", "")
+                                if period_str and " to " in period_str:
+                                    lookback_period_to_skus.setdefault(period_str, []).append(
+                                        item.get("sku_code", "")
+                                    )
+
+                        if lookback_period_to_skus:
+                            unique_lb_periods = list(lookback_period_to_skus.keys())
+                            lb_missed_results = await asyncio.gather(
+                                *[
+                                    report_service.fetch_missed_sales(
+                                        p.split(" to ")[0].strip(), p.split(" to ")[1].strip()
+                                    )
+                                    for p in unique_lb_periods
+                                ],
+                                return_exceptions=True,
+                            )
+                            for i, period_str in enumerate(unique_lb_periods):
+                                result = lb_missed_results[i]
+                                if isinstance(result, Exception):
+                                    logger.error(
+                                        f"Missed sales lookback fetch failed for {period_str}: {result}"
+                                    )
+                                    continue
+                                for sku in lookback_period_to_skus[period_str]:
+                                    missed_sales_by_sku[sku] = result.get(sku, 0.0)
+                            logger.info(
+                                f"Updated missed_sales for "
+                                f"{sum(len(v) for v in lookback_period_to_skus.values())} "
+                                f"lookback SKUs across {len(unique_lb_periods)} periods"
+                            )
                     else:
                         for item in combined_data:
                             days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
