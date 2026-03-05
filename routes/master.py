@@ -362,7 +362,10 @@ class OptimizedMasterReportService:
 
             def _fetch():
                 pipeline = [
-                    {"$match": {"date": {"$gte": start_dt, "$lte": end_dt}}},
+                    {"$match": {
+                        "date": {"$gte": start_dt, "$lte": end_dt},
+                        "customer_name": {"$not": {"$regex": "ETRADE", "$options": "i"}},
+                    }},
                     {
                         "$group": {
                             "_id": "$item_code",
