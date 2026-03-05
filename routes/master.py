@@ -1434,10 +1434,12 @@ class OptimizedMasterReportService:
                 current_days_coverage = round((closing_stock + total_transit) / drr, 2)
             item["current_days_coverage"] = current_days_coverage
 
-            # Target days = lead_time + safety_days + review_days(10)
+            # Target days = lead_time + safety_days + order_processing
             safety_days = item.get("safety_days", 15)
             lead_time = item.get("lead_time", 60)
-            target_days = lead_time + safety_days + 10
+            order_processing = 10
+            item["order_processing"] = order_processing
+            target_days = lead_time + safety_days + order_processing
 
             # Missed Sales columns (inserted between Current Days Coverage and Target Days)
             missed_sales = missed_sales_by_sku.get(sku, 0)
@@ -1450,6 +1452,13 @@ class OptimizedMasterReportService:
             item["missed_sales_drr"] = missed_sales_drr
             extra_qty = round(missed_sales_drr * lead_time, 2)
             item["extra_qty"] = extra_qty
+
+            # Net Target Days
+            if lead_time >= current_days_coverage:
+                net_target_days = target_days - current_days_coverage
+            else:
+                net_target_days = target_days
+            item["net_target_days"] = round(net_target_days, 2)
 
             item["target_days"] = target_days
 
@@ -1480,7 +1489,7 @@ class OptimizedMasterReportService:
                 continue
 
             # Order quantity
-            order_qty = max(0, (target_days - current_days_coverage) * drr)
+            order_qty = max(0, net_target_days * drr)
             item["order_qty"] = round(order_qty, 2)
 
             # Order Qty + Extra Qty
@@ -2047,7 +2056,13 @@ async def _generate_master_report_data(
 
                 # Order quantity
                 extra_qty = item.get("extra_qty", 0)
-                order_qty = max(0, (target_days - current_days_coverage) * drr)
+                lead_time_val = item.get("lead_time", 60)
+                if lead_time_val >= current_days_coverage:
+                    net_target_days = target_days - current_days_coverage
+                else:
+                    net_target_days = target_days
+                item["net_target_days"] = round(net_target_days, 2)
+                order_qty = max(0, net_target_days * drr)
                 item["order_qty"] = round(order_qty, 2)
                 item["order_qty_plus_extra_qty"] = round(order_qty + extra_qty, 2)
 
@@ -2331,6 +2346,8 @@ async def download_master_report(
                         "Movement": item.get("movement", ""),
                         "Safety Days": item.get("safety_days", 0),
                         "Lead Time": item.get("lead_time", 0),
+                        "Order Processing": item.get("order_processing", 10),
+                        "Target Days": item.get("target_days", 0),
                         "On-Hand Days Coverage": item.get("on_hand_days_coverage", 0),
                         "Stock in Transit 1": item.get("stock_in_transit_1", 0),
                         "Stock in Transit 2": item.get("stock_in_transit_2", 0),
@@ -2340,7 +2357,7 @@ async def download_master_report(
                         "Missed Sales": item.get("missed_sales", 0),
                         "Missed Sales DRR": item.get("missed_sales_drr", 0),
                         "Extra Qty": item.get("extra_qty", 0),
-                        "Target Days": item.get("target_days", 0),
+                        "Net Target Days": item.get("net_target_days", 0),
                         "Excess / Order": item.get("excess_or_order", ""),
                         "Order Qty": item.get("order_qty", 0),
                         "Order Qty + Extra Qty": item.get("order_qty_plus_extra_qty", 0),
