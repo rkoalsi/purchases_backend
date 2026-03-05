@@ -1416,9 +1416,9 @@ class OptimizedMasterReportService:
             logistics = logistics_data.get(sku, {})
             purchase_status = logistics.get("purchase_status", "")
             transit = transit_data.get(sku, {})
-            sit_1 = logistics.get("stock_in_transit_1") or transit.get("transit_1", 0)
-            sit_2 = logistics.get("stock_in_transit_2") or transit.get("transit_2", 0)
-            sit_3 = logistics.get("stock_in_transit_3") or transit.get("transit_3", 0)
+            sit_1 = logistics["stock_in_transit_1"] if logistics.get("stock_in_transit_1") is not None else transit.get("transit_1", 0)
+            sit_2 = logistics["stock_in_transit_2"] if logistics.get("stock_in_transit_2") is not None else transit.get("transit_2", 0)
+            sit_3 = logistics["stock_in_transit_3"] if logistics.get("stock_in_transit_3") is not None else transit.get("transit_3", 0)
             item["stock_in_transit_1"] = sit_1
             item["stock_in_transit_2"] = sit_2
             item["stock_in_transit_3"] = sit_3
@@ -2144,7 +2144,12 @@ async def _generate_master_report_data(
 
                 current_drr = metrics.get("avg_daily_run_rate", 0)
                 past_drr = past_drr_by_sku.get(item.get("sku_code", ""), 0)
-                if past_drr and past_drr > 0:
+                # Lookback items have avg_daily_run_rate overwritten with a historical DRR,
+                # so comparing it against past_drr (90d before start_date) is directionally
+                # meaningless. Leave growth_rate blank for those items.
+                if item.get("drr_source") == "previous_period":
+                    item["growth_rate"] = None
+                elif past_drr and past_drr > 0:
                     item["growth_rate"] = round(((current_drr - past_drr) / past_drr) * 100, 2)
                 else:
                     item["growth_rate"] = None
