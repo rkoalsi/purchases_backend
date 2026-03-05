@@ -1454,10 +1454,10 @@ class OptimizedMasterReportService:
             item["extra_qty"] = extra_qty
 
             # Net Target Days
-            if lead_time >= current_days_coverage:
-                net_target_days = target_days - current_days_coverage
-            else:
+            if current_days_coverage < lead_time:
                 net_target_days = target_days
+            else:
+                net_target_days = target_days - current_days_coverage
             item["net_target_days"] = round(net_target_days, 2)
 
             item["target_days"] = target_days
@@ -2057,10 +2057,10 @@ async def _generate_master_report_data(
                 # Order quantity
                 extra_qty = item.get("extra_qty", 0)
                 lead_time_val = item.get("lead_time", 60)
-                if lead_time_val >= current_days_coverage:
-                    net_target_days = target_days - current_days_coverage
-                else:
+                if current_days_coverage < lead_time_val:
                     net_target_days = target_days
+                else:
+                    net_target_days = target_days - current_days_coverage
                 item["net_target_days"] = round(net_target_days, 2)
                 order_qty = max(0, net_target_days * drr)
                 item["order_qty"] = round(order_qty, 2)
@@ -2925,8 +2925,8 @@ def import_product_logistics(
     db=Depends(get_database),
 ):
     """
-    Import Item Status (col A), Stock in Transit 1 (col BU), Stock in Transit 2 (col BV),
-    CBM (col BX), and Case Pack (col BY) from the PSR Google Sheet Master tab.
+    Import Item Status (col A), Stock in Transit 1, Stock in Transit 2, CBM, and Case Pack
+    from the PSR Google Sheet Master tab, resolved by column header name.
     Maps BBCode (col B) to cf_sku_code. purchase_status, cbm, case_pack, and transit values
     are applied to ALL products sharing the same sku_code via update_many.
     """
@@ -2955,8 +2955,24 @@ def import_product_logistics(
         sh = gc.open_by_key("1xjPO-M8MScP4gLVI04QCdz1594DIkXh2_odAxtKlMWY")
         ws = sh.worksheet("Master")
 
-        # Fetch all rows at once (col A=status, B=BBCode, BX=col76=CBM, BY=col77=case_pack)
+        # Fetch all rows at once and resolve columns by header name
         all_rows = ws.get_all_values()
+
+        if not all_rows:
+            return JSONResponse(status_code=200, content={"message": "Sheet is empty", "updated": 0, "skipped": 0})
+
+        header = [h.strip() for h in all_rows[0]]
+
+        def _col(name: str) -> int:
+            try:
+                return header.index(name)
+            except ValueError:
+                return -1
+
+        sit1_idx = _col("Stock in Transit 1")
+        sit2_idx = _col("Stock in Transit 2")
+        cbm_idx = _col("CBM")
+        case_pack_idx = _col("Case Pack")
 
         products_collection = db.get_collection("products")
         updated_count = 0
@@ -2971,10 +2987,10 @@ def import_product_logistics(
                 continue
 
             raw_status = row[0].strip() if len(row) > 0 else ""
-            sit1_raw = row[73] if len(row) > 73 else ""   # BV
-            sit2_raw = row[74] if len(row) > 74 else ""   # BW
-            cbm_raw = row[76] if len(row) > 76 else ""    # BY
-            case_pack_raw = row[77] if len(row) > 77 else ""  # BZ
+            sit1_raw = row[sit1_idx] if sit1_idx >= 0 and len(row) > sit1_idx else ""
+            sit2_raw = row[sit2_idx] if sit2_idx >= 0 and len(row) > sit2_idx else ""
+            cbm_raw = row[cbm_idx] if cbm_idx >= 0 and len(row) > cbm_idx else ""
+            case_pack_raw = row[case_pack_idx] if case_pack_idx >= 0 and len(row) > case_pack_idx else ""
 
             def _to_float(val: str) -> float:
                 try:
