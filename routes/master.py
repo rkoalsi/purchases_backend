@@ -2419,22 +2419,128 @@ async def download_master_report(
                 combined_df = pd.DataFrame(combined_df_data)
                 combined_df.to_excel(writer, sheet_name=_sheet_name, index=False)
 
-                # Apply row highlighting based on DRR source
+                # period_days for Missed Sales DRR formula
+                try:
+                    _period_days = (_ed - _sd).days + 1
+                except Exception:
+                    _period_days = 30
+
+                # Inject Excel formulas for all computed columns
+                from openpyxl.utils import get_column_letter
                 from openpyxl.styles import PatternFill
+
+                ws = writer.sheets[_sheet_name]
+                cols_list = list(combined_df.columns)
+
+                def _col(name):
+                    return get_column_letter(cols_list.index(name) + 1)
+
+                _A  = _col("Purchase Status")
+                _F  = _col("Total Units Sold")
+                _G  = _col("Total Units Returned")
+                _J  = _col("Return %")
+                _N  = _col("Avg Daily Run Rate")
+                _R  = _col(f"Total Stock ({_end_date_label})")
+                _S  = _col(f"Pupscribe WH Stock ({_end_date_label})")
+                _T  = _col(f"FBA Stock ({_end_date_label})")
+                _U  = _col(f"Total Stock ({_latest_total_label})")
+                _V  = _col(f"Pupscribe WH Stock ({_latest_zoho_label})")
+                _W  = _col(f"FBA Stock ({_latest_fba_label})")
+                _X  = _col("Avg Days of Coverage")
+                _AA = _col("Safety Days")
+                _AB = _col("Lead Time")
+                _AC = _col("Order Processing")
+                _AD = _col("Target Days")
+                _AE = _col("On-Hand Days Coverage")
+                _AF = _col("Stock in Transit 1")
+                _AG = _col("Stock in Transit 2")
+                _AH = _col("Stock in Transit 3")
+                _AI = _col("Total Stock in Transit")
+                _AJ = _col("Current Days Coverage")
+                _AK = _col("Missed Sales")
+                _AL = _col("Missed Sales DRR")
+                _AM = _col("Extra Qty")
+                _AN = _col("Net Target Days")
+                _AO = _col("Excess / Order")
+                _AP = _col("Order Qty")
+                _AQ = _col("Order Qty + Extra Qty")
+                _AR = _col("CBM")
+                _AS = _col("Case Pack")
+                _AT = _col("Order Qty + Extra Qty (Rounded)")
+                _AU = _col("Total CBM")
+                _AV = _col("Days Current Order Lasts")
+                _AW = _col("Days Total Inventory Lasts")
+
+                drr_source_col_idx = cols_list.index("DRR Source") + 1  # 1-based
                 yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
                 red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
 
-                ws = writer.sheets[_sheet_name]
-                drr_source_col_idx = list(combined_df.columns).index("DRR Source") + 1  # 1-based
-
                 for row_idx in range(2, len(combined_df_data) + 2):  # Skip header row
-                    drr_source_val = ws.cell(row=row_idx, column=drr_source_col_idx).value
+                    r = row_idx
+                    inactive = f'OR({_A}{r}="inactive",{_A}{r}="discontinued until stock lasts")'
+
+                    # Return %
+                    ws[f"{_J}{r}"] = f"=IF({_F}{r}>0,{_G}{r}/{_F}{r}*100,0)"
+
+                    # Total Stock (end_date) = WH + FBA
+                    ws[f"{_R}{r}"] = f"={_S}{r}+{_T}{r}"
+
+                    # Total Stock (latest) = WH latest + FBA latest
+                    ws[f"{_U}{r}"] = f"={_V}{r}+{_W}{r}"
+
+                    # Avg Days of Coverage = Total Stock / DRR
+                    ws[f"{_X}{r}"] = f"=IF({_N}{r}>0,{_R}{r}/{_N}{r},0)"
+
+                    # On-Hand Days Coverage = same as Avg Days of Coverage
+                    ws[f"{_AE}{r}"] = f"=IF({_N}{r}>0,{_R}{r}/{_N}{r},0)"
+
+                    # Total Stock in Transit = sum of 3 transit cols
+                    ws[f"{_AI}{r}"] = f"={_AF}{r}+{_AG}{r}+{_AH}{r}"
+
+                    # Current Days Coverage = (Total Stock + Total Transit) / DRR
+                    ws[f"{_AJ}{r}"] = f"=IF({_N}{r}>0,({_R}{r}+{_AI}{r})/{_N}{r},0)"
+
+                    # Target Days = Lead Time + Safety Days + Order Processing
+                    ws[f"{_AD}{r}"] = f"={_AB}{r}+{_AA}{r}+{_AC}{r}"
+
+                    # Missed Sales DRR = MIN(Missed Sales / period_days, 0.5 * DRR), capped only if DRR > 0
+                    ws[f"{_AL}{r}"] = f"=IF({_N}{r}>0,MIN({_AK}{r}/{_period_days},0.5*{_N}{r}),{_AK}{r}/{_period_days})"
+
+                    # Extra Qty = Missed Sales DRR * Lead Time
+                    ws[f"{_AM}{r}"] = f"={_AL}{r}*{_AB}{r}"
+
+                    # Net Target Days = IF(Current Coverage < Lead Time, Target Days, Target Days - Current Coverage)
+                    ws[f"{_AN}{r}"] = f"=IF({_AJ}{r}<{_AB}{r},{_AD}{r},{_AD}{r}-{_AJ}{r})"
+
+                    # Excess / Order
+                    ws[f"{_AO}{r}"] = f'=IF({_N}{r}=0,"NO MOVEMENT",IF({_AJ}{r}<{_AD}{r},"ORDER","EXCESS"))'
+
+                    # Order Qty (0 for inactive/discontinued)
+                    ws[f"{_AP}{r}"] = f"=IF({inactive},0,MAX(0,{_AN}{r}*{_N}{r}))"
+
+                    # Order Qty + Extra Qty (only Extra Qty for inactive/discontinued)
+                    ws[f"{_AQ}{r}"] = f"=IF({inactive},{_AM}{r},{_AP}{r}+{_AM}{r})"
+
+                    # Order Qty + Extra Qty (Rounded) — FLOOR to nearest case pack
+                    ws[f"{_AT}{r}"] = f"=IF({inactive},0,IF({_AS}{r}>0,FLOOR({_AQ}{r},{_AS}{r}),ROUND({_AQ}{r},0)))"
+
+                    # Total CBM
+                    ws[f"{_AU}{r}"] = f"=IF({inactive},0,IF({_AS}{r}>0,({_AT}{r}/{_AS}{r})*{_AR}{r},0))"
+
+                    # Days Current Order Lasts
+                    ws[f"{_AV}{r}"] = f"=IF({inactive},0,IF({_N}{r}>0,{_AT}{r}/{_N}{r},0))"
+
+                    # Days Total Inventory Lasts = Current Days Coverage + Days Current Order Lasts
+                    ws[f"{_AW}{r}"] = f"=IF({inactive},{_AJ}{r},{_AJ}{r}+{_AV}{r})"
+
+                    # Apply row highlighting based on DRR source
+                    drr_source_val = ws.cell(row=r, column=drr_source_col_idx).value
                     if drr_source_val == "previous_period":
                         for col_idx in range(1, len(combined_df.columns) + 1):
-                            ws.cell(row=row_idx, column=col_idx).fill = yellow_fill
+                            ws.cell(row=r, column=col_idx).fill = yellow_fill
                     elif drr_source_val == "insufficient_stock":
                         for col_idx in range(1, len(combined_df.columns) + 1):
-                            ws.cell(row=row_idx, column=col_idx).fill = red_fill
+                            ws.cell(row=r, column=col_idx).fill = red_fill
 
         excel_buffer.seek(0)
         file_bytes = excel_buffer.read()
