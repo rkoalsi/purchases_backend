@@ -1448,6 +1448,7 @@ class OptimizedMasterReportService:
             missed_sales = missed_sales_by_sku.get(sku, 0)
             item["missed_sales"] = missed_sales
             missed_sales_drr_raw = missed_sales / period_days if period_days > 0 else 0.0
+            
             # Cap at 50% of true DRR to prevent over-ordering from missed sales spikes
             if drr > 0:
                 missed_sales_drr_raw = min(missed_sales_drr_raw, 0.5 * drr)
