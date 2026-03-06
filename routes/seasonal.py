@@ -152,13 +152,13 @@ async def _fetch_base_drr(
     return result
 
 
-async def _fetch_monthly_avg_sales(
+async def _fetch_monthly_sales_by_year(
     db,
     sku_to_item_id: Dict[str, str],
     end_date: str,
-) -> Dict[str, Dict[int, float]]:
+) -> Dict[str, Dict[int, Dict[int, float]]]:
     """
-    For each SKU return {month_num: avg_units} averaged across years.
+    For each SKU return {year: {month_num: units}}.
     Looks back 2 full years from end_date.
     """
     if not sku_to_item_id:
@@ -209,22 +209,12 @@ async def _fetch_monthly_avg_sales(
     raw = await asyncio.to_thread(_run)
     item_id_to_sku = {str(v): k for k, v in sku_to_item_id.items()}
 
-    result: Dict[str, Dict[int, float]] = {}
+    result: Dict[str, Dict[int, Dict[int, float]]] = {}
     for item_id, year_data in raw.items():
         sku = item_id_to_sku.get(item_id)
         if not sku:
             continue
-        monthly_avg: Dict[int, float] = {}
-        for month in range(1, 13):
-            values = [
-                year_data[yr][month]
-                for yr in year_data
-                if month in year_data[yr]
-            ]
-            if values:
-                monthly_avg[month] = round(sum(values) / len(values), 4)
-        if monthly_avg:
-            result[sku] = monthly_avg
+        result[sku] = {yr: dict(months) for yr, months in year_data.items()}
 
     return result
 
@@ -233,32 +223,20 @@ async def _fetch_monthly_avg_sales(
 # Excel builder
 # ---------------------------------------------------------------------------
 
-# Column definitions: (header label, width)
-_COLUMNS = [
-    ("SKU Code",                               14),
-    ("Item Name",                              32),
-    ("Brand",                                  16),
-    ("Status",                                 18),
-    ("Month",                                  8),
-    ("Historical Avg Units\n(Same Month, Last 2 Yrs)", 20),
-    ("Overall Monthly Avg\n= SUM(Jan..Dec Avg) / 12",   20),
-    ("Seasonal Index\n= Month Avg / Overall Avg",       18),
-    ("Base DRR\n(Period Units / Period Days)",           18),
-    ("Seasonal DRR\n= Base DRR × Seasonal Index",       20),
+# Static column definitions: (header label, width, colour)
+_STATIC_COLS_BEFORE = [
+    ("SKU Code",  14, "1F4E79"),
+    ("Item Name", 32, "1F4E79"),
+    ("Brand",     16, "1F4E79"),
+    ("Status",    18, "1F4E79"),
+    ("Month",      8, "1F4E79"),
 ]
-
-# Header fill colours per column (0-based index)
-_HEADER_COLOURS = [
-    "1F4E79",  # SKU Code     – dark blue
-    "1F4E79",  # Item Name
-    "1F4E79",  # Brand
-    "1F4E79",  # Status
-    "1F4E79",  # Month
-    "2E75B6",  # Hist Avg     – mid blue
-    "2E75B6",  # Overall Avg
-    "375623",  # Seasonal Idx – dark green
-    "C55A11",  # Base DRR     – orange
-    "7030A0",  # Seasonal DRR – purple
+_STATIC_COLS_AFTER = [
+    ("Historical Avg\n= AVERAGE(Year Cols)",            20, "2E75B6"),
+    ("Overall Monthly Avg\n= SUM(Jan..Dec Avg) / 12",   20, "2E75B6"),
+    ("Seasonal Index\n= Month Avg / Overall Avg",        18, "375623"),
+    ("Base DRR\n(Period Units / Period Days)",            18, "C55A11"),
+    ("Seasonal DRR\n= Base DRR × Seasonal Index",        20, "7030A0"),
 ]
 
 # Alternating row shades for even/odd SKU blocks
@@ -273,7 +251,7 @@ def _cell_fill(colour: str) -> PatternFill:
 def _build_excel(
     products: Dict[str, Dict],
     base_drr_by_sku: Dict[str, float],
-    monthly_avg_by_sku: Dict[str, Dict[int, float]],
+    monthly_sales_by_year: Dict[str, Dict[int, Dict[int, float]]],
     start_date: str,
     end_date: str,
 ) -> io.BytesIO:
@@ -284,11 +262,32 @@ def _build_excel(
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
+    # Determine year columns from end_date (last 2 full years)
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    years = sorted([end_dt.year - 2, end_dt.year - 1])
+    year_cols = [(f"{yr} Units\n(Jan–Dec)", 16, "2E75B6") for yr in years]
+
+    # Build full column list: static before + year cols + static after
+    all_cols = _STATIC_COLS_BEFORE + year_cols + _STATIC_COLS_AFTER
+    total_cols = len(all_cols)
+
+    # Column index references (1-based)
+    year_col_start = len(_STATIC_COLS_BEFORE) + 1          # e.g. 6
+    year_col_end   = year_col_start + len(years) - 1        # e.g. 7
+    hist_avg_col   = year_col_end + 1                        # e.g. 8
+    overall_avg_col = hist_avg_col + 1                       # e.g. 9
+    seasonal_idx_col = overall_avg_col + 1                   # e.g. 10
+    base_drr_col   = seasonal_idx_col + 1                    # e.g. 11
+    seasonal_drr_col = base_drr_col + 1                      # e.g. 12
+
+    hist_avg_ltr     = get_column_letter(hist_avg_col)
+    overall_avg_ltr  = get_column_letter(overall_avg_col)
+    seasonal_idx_ltr = get_column_letter(seasonal_idx_col)
+    base_drr_ltr     = get_column_letter(base_drr_col)
+
     # ── header row ──────────────────────────────────────────────────────────
     ws.row_dimensions[1].height = 48
-    for col_idx, ((label, width), colour) in enumerate(
-        zip(_COLUMNS, _HEADER_COLOURS), start=1
-    ):
+    for col_idx, (label, width, colour) in enumerate(all_cols, start=1):
         cell = ws.cell(row=1, column=col_idx, value=label)
         cell.font      = Font(bold=True, color="FFFFFF", size=10)
         cell.fill      = _cell_fill(colour)
@@ -298,34 +297,39 @@ def _build_excel(
     # Freeze header
     ws.freeze_panes = "A2"
 
-    # ── legend rows (rows 2-3) ───────────────────────────────────────────────
+    # ── legend rows ──────────────────────────────────────────────────────────
     legend_fill = _cell_fill("FFF2CC")
     legend_font = Font(italic=True, size=9, color="595959")
 
+    years_str = " & ".join(str(y) for y in years)
     legend_lines = [
-        "STEP 1: Historical Avg Units  → average of the same calendar month across the last 2 years of Zoho invoice data.",
-        "STEP 2: Overall Monthly Avg   → =SUM(Jan Avg … Dec Avg)/12  (total of all 12 monthly averages divided by 12).",
-        "STEP 3: Seasonal Index        → =Month Avg / Overall Monthly Avg   (1.0 = normal month; >1.0 = above average; <1.0 = below average).",
-        "STEP 4: Base DRR              → Total Zoho units sold in the selected period / number of days in the period.",
-        "STEP 5: Seasonal DRR          → =Base DRR × Seasonal Index   (projected daily run rate adjusted for seasonality).",
+        f"STEP 1: Year Columns ({years_str})   → total Zoho invoice units for that calendar month in each year.",
+        "STEP 2: Historical Avg            → =AVERAGE(year columns for the same row)  (average across the shown years).",
+        "STEP 3: Overall Monthly Avg       → =SUM(Jan Avg … Dec Avg)/12  (total of all 12 monthly averages divided by 12).",
+        "STEP 4: Seasonal Index            → =Month Avg / Overall Monthly Avg   (1.0 = normal month; >1.0 = above average; <1.0 = below average).",
+        "STEP 5: Base DRR                  → Total Zoho units sold in the selected period / number of days in the period.",
+        "STEP 6: Seasonal DRR              → =Base DRR × Seasonal Index   (projected daily run rate adjusted for seasonality).",
     ]
     for i, line in enumerate(legend_lines):
         r = 2 + i
         ws.row_dimensions[r].height = 15
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(_COLUMNS))
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=total_cols)
         cell = ws.cell(row=r, column=1, value=line)
         cell.font      = legend_font
         cell.fill      = legend_fill
         cell.alignment = Alignment(horizontal="left", vertical="center")
 
-    # ── data rows start at row 7 (1 header + 5 legend) ─────────────────────
-    DATA_START = 2 + len(legend_lines)  # = 7
+    # ── data rows ────────────────────────────────────────────────────────────
+    DATA_START = 2 + len(legend_lines)
 
-    # Sort SKUs by brand then item name
     sorted_skus = sorted(
         products.keys(),
         key=lambda s: (products[s].get("brand", ""), products[s].get("name", "")),
     )
+
+    # Year-column letter range for AVERAGE formula (e.g. "F{row}:G{row}")
+    yr_start_ltr = get_column_letter(year_col_start)
+    yr_end_ltr   = get_column_letter(year_col_end)
 
     current_row = DATA_START
     for sku_idx, sku in enumerate(sorted_skus):
@@ -334,17 +338,16 @@ def _build_excel(
         brand           = pdata.get("brand", "")
         purchase_status = pdata.get("purchase_status", "")
         base_drr        = base_drr_by_sku.get(sku, 0.0)
-        monthly_avg     = monthly_avg_by_sku.get(sku, {})
+        sku_year_data   = monthly_sales_by_year.get(sku, {})
 
         block_start = current_row
         block_end   = current_row + 11  # 12 rows inclusive
 
-        shade = _SHADE_EVEN if sku_idx % 2 == 0 else _SHADE_ODD
+        shade    = _SHADE_EVEN if sku_idx % 2 == 0 else _SHADE_ODD
         row_fill = _cell_fill(shade)
 
         for month_num in range(1, 13):
-            row     = current_row + month_num - 1
-            avg_val = monthly_avg.get(month_num, 0.0)
+            row = current_row + month_num - 1
 
             ws.cell(row=row, column=1, value=sku)
             ws.cell(row=row, column=2, value=name)
@@ -352,23 +355,41 @@ def _build_excel(
             ws.cell(row=row, column=4, value=purchase_status)
             ws.cell(row=row, column=5, value=MONTH_NAMES[month_num - 1])
 
-            # Col 6: Historical Avg Units (raw value)
-            ws.cell(row=row, column=6, value=round(avg_val, 4))
+            # Year columns
+            for yr_offset, yr in enumerate(years):
+                col = year_col_start + yr_offset
+                units = sku_year_data.get(yr, {}).get(month_num, 0.0)
+                ws.cell(row=row, column=col, value=round(units, 4))
 
-            # Col 7: Overall Monthly Avg  →  Excel formula summing the block's 12 avg cells / 12
-            ws.cell(row=row, column=7, value=f"=SUM($F${block_start}:$F${block_end})/12")
+            # Hist Avg: AVERAGE of year columns (skips zeros via AVERAGEIF or simple AVERAGE)
+            ws.cell(
+                row=row, column=hist_avg_col,
+                value=f"=IFERROR(AVERAGE({yr_start_ltr}{row}:{yr_end_ltr}{row}),0)"
+            )
 
-            # Col 8: Seasonal Index  →  Excel formula: Month Avg / Overall Avg
-            ws.cell(row=row, column=8, value=f"=IF(G{row}=0,1,F{row}/G{row})")
+            # Overall Monthly Avg: sum of Hist Avg column for this SKU block / 12
+            ws.cell(
+                row=row, column=overall_avg_col,
+                value=f"=SUM(${hist_avg_ltr}${block_start}:${hist_avg_ltr}${block_end})/12"
+            )
 
-            # Col 9: Base DRR (same for all months of this SKU)
-            ws.cell(row=row, column=9, value=round(base_drr, 4))
+            # Seasonal Index
+            ws.cell(
+                row=row, column=seasonal_idx_col,
+                value=f"=IF({overall_avg_ltr}{row}=0,1,{hist_avg_ltr}{row}/{overall_avg_ltr}{row})"
+            )
 
-            # Col 10: Seasonal DRR  →  Excel formula: Base DRR × Seasonal Index
-            ws.cell(row=row, column=10, value=f"=I{row}*H{row}")
+            # Base DRR (same for all months of this SKU)
+            ws.cell(row=row, column=base_drr_col, value=round(base_drr, 4))
+
+            # Seasonal DRR
+            ws.cell(
+                row=row, column=seasonal_drr_col,
+                value=f"={base_drr_ltr}{row}*{seasonal_idx_ltr}{row}"
+            )
 
             # Styling
-            for col in range(1, len(_COLUMNS) + 1):
+            for col in range(1, total_cols + 1):
                 cell           = ws.cell(row=row, column=col)
                 cell.fill      = row_fill
                 cell.alignment = (left if col == 2 else center)
@@ -376,17 +397,16 @@ def _build_excel(
 
         # Number formatting for formula columns
         for row in range(block_start, block_end + 1):
-            ws.cell(row=row, column=7).number_format = "0.0000"
-            ws.cell(row=row, column=8).number_format = "0.0000"
-            ws.cell(row=row, column=10).number_format = "0.0000"
+            ws.cell(row=row, column=hist_avg_col).number_format    = "0.0000"
+            ws.cell(row=row, column=overall_avg_col).number_format = "0.0000"
+            ws.cell(row=row, column=seasonal_idx_col).number_format = "0.0000"
+            ws.cell(row=row, column=seasonal_drr_col).number_format = "0.0000"
 
         # Thick bottom border to visually separate SKU blocks
-        border_bottom = None
         try:
             from openpyxl.styles import Border, Side
-            thin = Side(style="thin", color="BFBFBF")
             thick = Side(style="medium", color="595959")
-            for col in range(1, len(_COLUMNS) + 1):
+            for col in range(1, total_cols + 1):
                 cell = ws.cell(row=block_end, column=col)
                 existing = cell.border
                 cell.border = Border(
@@ -448,10 +468,10 @@ async def download_seasonal_report(
 
         sku_to_item_id = {sku: pdata["item_id"] for sku, pdata in products.items()}
 
-        # 2. Base DRR + historical monthly averages (parallel)
-        base_drr_by_sku, monthly_avg_by_sku = await asyncio.gather(
+        # 2. Base DRR + historical monthly sales by year (parallel)
+        base_drr_by_sku, monthly_sales_by_year = await asyncio.gather(
             _fetch_base_drr(db, sku_to_item_id, start_date, end_date, period_days),
-            _fetch_monthly_avg_sales(db, sku_to_item_id, end_date),
+            _fetch_monthly_sales_by_year(db, sku_to_item_id, end_date),
         )
 
         # 3. Build Excel (CPU work off the event loop)
@@ -459,7 +479,7 @@ async def download_seasonal_report(
             _build_excel,
             products,
             base_drr_by_sku,
-            monthly_avg_by_sku,
+            monthly_sales_by_year,
             start_date,
             end_date,
         )
