@@ -2538,6 +2538,19 @@ async def download_master_report(
                         for col_idx in range(1, len(combined_df.columns) + 1):
                             ws.cell(row=r, column=col_idx).fill = red_fill
 
+                # Auto-fit column widths: header text drives the width; skip formula cells
+                for col_cells in ws.columns:
+                    col_letter = get_column_letter(col_cells[0].column)
+                    max_len = 0
+                    for cell in col_cells:
+                        if cell.value is None:
+                            continue
+                        val = str(cell.value)
+                        if val.startswith("="):
+                            continue  # skip formulas — display value is computed, not the formula string
+                        max_len = max(max_len, len(val))
+                    ws.column_dimensions[col_letter].width = min(max_len + 3, 30)
+
         excel_buffer.seek(0)
         file_bytes = excel_buffer.read()
 

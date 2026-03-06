@@ -232,11 +232,11 @@ _STATIC_COLS_BEFORE = [
     ("Month",      8, "1F4E79"),
 ]
 _STATIC_COLS_AFTER = [
-    ("Historical Avg\n= AVERAGE(Year Cols)",            20, "2E75B6"),
-    ("Overall Monthly Avg\n= SUM(Jan..Dec Avg) / 12",   20, "2E75B6"),
-    ("Seasonal Index\n= Month Avg / Overall Avg",        18, "375623"),
-    ("Base DRR\n(Period Units / Period Days)",            18, "C55A11"),
-    ("Seasonal DRR\n= Base DRR × Seasonal Index",        20, "7030A0"),
+    ("Monthly Avg\n= AVG(Year Cols)",                     18, "2E75B6"),
+    ("__OVERALL_AVG__",                                   22, "2E75B6"),  # label set dynamically in _build_excel
+    ("Seasonal Index\n= Month Avg / Overall Avg",          18, "375623"),
+    ("Base DRR\n(Period Units / Period Days)",              18, "C55A11"),
+    ("Seasonal DRR\n= Base DRR × Seasonal Index",          20, "7030A0"),
 ]
 
 # Alternating row shades for even/odd SKU blocks
@@ -262,28 +262,37 @@ def _build_excel(
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
-    # Determine year columns from end_date (last 2 full years)
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    years = sorted([end_dt.year - 2, end_dt.year - 1])
-    year_cols = [(f"{yr} Units\n(Jan–Dec)", 16, "2E75B6") for yr in years]
+    # Show one column per calendar year covered by the selected date range
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt   = datetime.strptime(end_date,   "%Y-%m-%d")
+    display_years = list(range(start_dt.year, end_dt.year + 1))
+    year_cols = [(f"{yr} Units\n(Jan–Dec)", 16, "2E75B6") for yr in display_years]
 
-    # Build full column list: static before + year cols + static after
-    all_cols = _STATIC_COLS_BEFORE + year_cols + _STATIC_COLS_AFTER
+    # Build full column list; override the dynamic overall-avg label
+    yr_range = f"{display_years[0]}" if len(display_years) == 1 else f"{display_years[0]}–{display_years[-1]}"
+    overall_avg_label = f"Avg Monthly Demand\n({yr_range})"
+    static_after = [
+        (overall_avg_label if lbl == "__OVERALL_AVG__" else lbl, w, c)
+        for lbl, w, c in _STATIC_COLS_AFTER
+    ]
+    all_cols = _STATIC_COLS_BEFORE + year_cols + static_after
     total_cols = len(all_cols)
 
     # Column index references (1-based)
-    year_col_start = len(_STATIC_COLS_BEFORE) + 1          # e.g. 6
-    year_col_end   = year_col_start + len(years) - 1        # e.g. 7
-    hist_avg_col   = year_col_end + 1                        # e.g. 8
-    overall_avg_col = hist_avg_col + 1                       # e.g. 9
-    seasonal_idx_col = overall_avg_col + 1                   # e.g. 10
-    base_drr_col   = seasonal_idx_col + 1                    # e.g. 11
-    seasonal_drr_col = base_drr_col + 1                      # e.g. 12
+    year_col_start    = len(_STATIC_COLS_BEFORE) + 1              # e.g. 6
+    year_col_end      = year_col_start + len(display_years) - 1   # e.g. 7
+    monthly_avg_col   = year_col_end + 1                           # e.g. 8
+    overall_avg_col   = monthly_avg_col + 1                        # e.g. 9
+    seasonal_idx_col  = overall_avg_col + 1                        # e.g. 10
+    base_drr_col      = seasonal_idx_col + 1                       # e.g. 11
+    seasonal_drr_col  = base_drr_col + 1                           # e.g. 12
 
-    hist_avg_ltr     = get_column_letter(hist_avg_col)
-    overall_avg_ltr  = get_column_letter(overall_avg_col)
-    seasonal_idx_ltr = get_column_letter(seasonal_idx_col)
-    base_drr_ltr     = get_column_letter(base_drr_col)
+    yr_start_ltr      = get_column_letter(year_col_start)
+    yr_end_ltr        = get_column_letter(year_col_end)
+    monthly_avg_ltr   = get_column_letter(monthly_avg_col)
+    overall_avg_ltr   = get_column_letter(overall_avg_col)
+    seasonal_idx_ltr  = get_column_letter(seasonal_idx_col)
+    base_drr_ltr      = get_column_letter(base_drr_col)
 
     # ── header row ──────────────────────────────────────────────────────────
     ws.row_dimensions[1].height = 48
@@ -301,12 +310,12 @@ def _build_excel(
     legend_fill = _cell_fill("FFF2CC")
     legend_font = Font(italic=True, size=9, color="595959")
 
-    years_str = " & ".join(str(y) for y in years)
+    yrs_str = " & ".join(str(y) for y in display_years)
     legend_lines = [
-        f"STEP 1: Year Columns ({years_str})   → total Zoho invoice units for that calendar month in each year.",
-        "STEP 2: Historical Avg            → =AVERAGE(year columns for the same row)  (average across the shown years).",
-        "STEP 3: Overall Monthly Avg       → =SUM(Jan Avg … Dec Avg)/12  (total of all 12 monthly averages divided by 12).",
-        "STEP 4: Seasonal Index            → =Month Avg / Overall Monthly Avg   (1.0 = normal month; >1.0 = above average; <1.0 = below average).",
+        f"STEP 1: Year columns ({yrs_str})  → Zoho invoice units for that calendar month in each respective year.",
+        f"STEP 2: Monthly Avg               → =AVERAGE({yrs_str} cols)  (average units for that month across both years).",
+        f"STEP 3: {overall_avg_label.replace(chr(10), ' ')}  → =SUM(Jan Avg … Dec Avg)/12  (average of the 12 monthly averages).",
+        "STEP 4: Seasonal Index            → =Month Avg / Avg Monthly Demand   (1.0 = normal; >1.0 = above average; <1.0 = below average).",
         "STEP 5: Base DRR                  → Total Zoho units sold in the selected period / number of days in the period.",
         "STEP 6: Seasonal DRR              → =Base DRR × Seasonal Index   (projected daily run rate adjusted for seasonality).",
     ]
@@ -326,10 +335,6 @@ def _build_excel(
         products.keys(),
         key=lambda s: (products[s].get("brand", ""), products[s].get("name", "")),
     )
-
-    # Year-column letter range for AVERAGE formula (e.g. "F{row}:G{row}")
-    yr_start_ltr = get_column_letter(year_col_start)
-    yr_end_ltr   = get_column_letter(year_col_end)
 
     current_row = DATA_START
     for sku_idx, sku in enumerate(sorted_skus):
@@ -355,28 +360,28 @@ def _build_excel(
             ws.cell(row=row, column=4, value=purchase_status)
             ws.cell(row=row, column=5, value=MONTH_NAMES[month_num - 1])
 
-            # Year columns
-            for yr_offset, yr in enumerate(years):
+            # Year columns (2025, 2026)
+            for yr_offset, yr in enumerate(display_years):
                 col = year_col_start + yr_offset
                 units = sku_year_data.get(yr, {}).get(month_num, 0.0)
                 ws.cell(row=row, column=col, value=round(units, 4))
 
-            # Hist Avg: AVERAGE of year columns (skips zeros via AVERAGEIF or simple AVERAGE)
+            # Monthly Avg = AVERAGE of the two year columns
             ws.cell(
-                row=row, column=hist_avg_col,
-                value=f"=IFERROR(AVERAGE({yr_start_ltr}{row}:{yr_end_ltr}{row}),0)"
+                row=row, column=monthly_avg_col,
+                value=f"=AVERAGE({yr_start_ltr}{row}:{yr_end_ltr}{row})"
             )
 
-            # Overall Monthly Avg: sum of Hist Avg column for this SKU block / 12
+            # Avg Monthly Demand: sum of Monthly Avg block / 12
             ws.cell(
                 row=row, column=overall_avg_col,
-                value=f"=SUM(${hist_avg_ltr}${block_start}:${hist_avg_ltr}${block_end})/12"
+                value=f"=SUM(${monthly_avg_ltr}${block_start}:${monthly_avg_ltr}${block_end})/12"
             )
 
             # Seasonal Index
             ws.cell(
                 row=row, column=seasonal_idx_col,
-                value=f"=IF({overall_avg_ltr}{row}=0,1,{hist_avg_ltr}{row}/{overall_avg_ltr}{row})"
+                value=f"=IF({overall_avg_ltr}{row}=0,1,{monthly_avg_ltr}{row}/{overall_avg_ltr}{row})"
             )
 
             # Base DRR (same for all months of this SKU)
@@ -395,12 +400,12 @@ def _build_excel(
                 cell.alignment = (left if col == 2 else center)
                 cell.font      = Font(size=10)
 
-        # Number formatting for formula columns
+        # Number formatting
         for row in range(block_start, block_end + 1):
-            ws.cell(row=row, column=hist_avg_col).number_format    = "0.0000"
-            ws.cell(row=row, column=overall_avg_col).number_format = "0.0000"
-            ws.cell(row=row, column=seasonal_idx_col).number_format = "0.0000"
-            ws.cell(row=row, column=seasonal_drr_col).number_format = "0.0000"
+            ws.cell(row=row, column=monthly_avg_col).number_format   = "0.0000"
+            ws.cell(row=row, column=overall_avg_col).number_format   = "0.0000"
+            ws.cell(row=row, column=seasonal_idx_col).number_format  = "0.0000"
+            ws.cell(row=row, column=seasonal_drr_col).number_format  = "0.0000"
 
         # Thick bottom border to visually separate SKU blocks
         try:
