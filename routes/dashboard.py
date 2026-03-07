@@ -196,6 +196,25 @@ class MultiSourceDashboardService:
             logger.error(f"Error in batch loading product names: {e}")
             return {}
 
+    async def get_active_skus(self) -> Set[str]:
+        """Return set of cf_sku_code values where purchase_status is 'active'."""
+        try:
+            products_collection = self.database.get_collection("products")
+
+            def _fetch():
+                return list(products_collection.find(
+                    {"purchase_status": "active"},
+                    {"cf_sku_code": 1, "_id": 0},
+                ))
+
+            docs = await asyncio.to_thread(_fetch)
+            active = {d["cf_sku_code"] for d in docs if d.get("cf_sku_code")}
+            logger.info(f"Found {len(active)} active SKUs")
+            return active
+        except Exception as e:
+            logger.error(f"Error fetching active SKUs: {e}")
+            return set()
+
     @staticmethod
     def safe_float(value: Any, default: float = 0.0) -> float:
         """Safely convert value to float"""
@@ -647,6 +666,16 @@ async def get_top_performing_products(
         )
 
         logger.info(f"Combined data for {len(combined_data)} unique SKUs")
+
+        # Filter to active products only
+        active_skus = await dashboard_service.get_active_skus()
+        if active_skus:
+            before = len(combined_data)
+            combined_data = [
+                item for item in combined_data
+                if item.get("sku_code") in active_skus
+            ]
+            logger.info(f"Filtered to {len(combined_data)} active SKUs (removed {before - len(combined_data)})")
 
         # VALIDATION: Check that all items have metrics structure
         items_without_metrics = [
