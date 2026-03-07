@@ -1,5 +1,5 @@
-from datetime import datetime
-from typing import List, Optional, Dict, Any, Set
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any, Set, Tuple
 from fastapi import Query
 from pydantic import BaseModel
 import calendar
@@ -14,9 +14,6 @@ from ..database import get_database
 
 logger = logging.getLogger(__name__)
 
-# --- Configuration ---
-# Use environment variables for production
-
 AMAZON_SKU_COLLECTION = "amazon_sku_mapping"
 AMAZON_SALES_COLLECTION = "amazon_sales"
 AMAZON_INVENTORY_COLLECTION = "amazon_inventory"
@@ -29,15 +26,26 @@ BLINKIT_REPORT_COLLECTION = "blinkit_sales_inventory_reports"
 
 router = APIRouter()
 
+_RISK_CRITICAL_DAYS = 7
+_RISK_LOW_DAYS = 21
+
 
 class ProductMetrics(BaseModel):
-    avg_daily_on_stock_days: float
-    avg_weekly_on_stock_days: float
-    avg_monthly_on_stock_days: float
+    in_stock_rate: float             # fraction of period days with inventory (replaces avg_daily_on_stock_days)
+    avg_weekly_on_stock_days: float  # in_stock_rate * 7
+    avg_monthly_on_stock_days: float # in_stock_rate * 30
     total_sales_in_period: int
-    days_of_coverage: float
+    total_returns_in_period: int
+    total_amount: float
+    days_of_coverage: float          # closing_stock / stock-day DRR (calendar fallback)
     days_with_inventory: int
     closing_stock: int
+    sessions: int
+    daily_run_rate: float
+    risk_level: str                  # "critical" ≤7d, "low" 8-21d, "healthy" >21d
+    suggested_order_qty: int         # max(0, target_days * drr - closing_stock)
+    missed_sales_qty: float          # units of missed/cancelled demand in period
+    mom_growth_pct: Optional[float] = None  # % change vs prior equivalent period
 
 
 class TopProduct(BaseModel):
@@ -47,8 +55,8 @@ class TopProduct(BaseModel):
     metrics: ProductMetrics
     year: int
     month: int
-    sources: List[str]  # Added to show which sources contributed
-    city: Optional[str] = "Multiple"  # Default for multi-source data
+    sources: List[str]
+    city: Optional[str] = "Multiple"
 
 
 class TopProductsResponse(BaseModel):
@@ -65,105 +73,94 @@ class MultiSourceDashboardService:
         self.database = database
         self._product_name_cache = {}
 
-    async def get_blinkit_data(
-        self, start_date: datetime, end_date: datetime
-    ) -> List[Dict]:
-        """Fetch Blinkit data using the SAME function as master report"""
+    async def get_blinkit_data(self, start_date: datetime, end_date: datetime) -> List[Dict]:
         try:
             from .blinkit import generate_report_by_date_range
-
-            start_date_str = start_date.strftime("%Y-%m-%d")
-            end_date_str = end_date.strftime("%Y-%m-%d")
-
-            # Use EXACT same function as master report
             report_data = await generate_report_by_date_range(
-                start_date=start_date_str, end_date=end_date_str, database=self.database
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d"),
+                database=self.database,
             )
-
-            # Extract data from report response - handle different return formats
             if isinstance(report_data, dict):
                 return report_data.get("data", [])
-            elif isinstance(report_data, list):
-                return report_data
-            else:
-                return []
-
+            return report_data if isinstance(report_data, list) else []
         except Exception as e:
             logger.error(f"Error fetching Blinkit data: {e}")
             return []
 
-    async def get_amazon_data(
-        self, start_date: datetime, end_date: datetime
-    ) -> List[Dict]:
-        """Fetch Amazon data using the SAME function as master report"""
+    async def get_amazon_data(self, start_date: datetime, end_date: datetime) -> List[Dict]:
         try:
             from .amazon import generate_report_by_date_range
-
-            start_date_str = start_date.strftime("%Y-%m-%d")
-            end_date_str = end_date.strftime("%Y-%m-%d")
-
-            # Use EXACT same function as master report
             report_data = await generate_report_by_date_range(
-                start_date=start_date_str,
-                end_date=end_date_str,
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d"),
                 database=self.database,
                 report_type="all",
             )
-
             return report_data if isinstance(report_data, list) else []
-
         except Exception as e:
             logger.error(f"Error fetching Amazon data: {e}")
             return []
 
-    async def get_zoho_data(
-        self, start_date: datetime, end_date: datetime
-    ) -> List[Dict]:
-        """Fetch Zoho data using the SAME function as master report"""
+    async def get_zoho_data(self, start_date: datetime, end_date: datetime) -> List[Dict]:
         try:
             from .zoho import get_sales_report_fast
-
-            start_date_str = start_date.strftime("%Y-%m-%d")
-            end_date_str = end_date.strftime("%Y-%m-%d")
-
-            # Use EXACT same function as master report
             response = await get_sales_report_fast(
-                start_date=start_date_str, end_date=end_date_str, db=self.database
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d"),
+                db=self.database,
             )
-
-            # Handle response EXACTLY like master report
-            report_data = []
             if hasattr(response, "body"):
                 import json
-
                 content = json.loads(response.body)
-                report_data = content.get("data", [])
-            elif isinstance(response, dict):
-                report_data = response.get("data", [])
-            else:
-                report_data = response if isinstance(response, list) else []
-
-            return report_data
-
+                return content.get("data", [])
+            if isinstance(response, dict):
+                return response.get("data", [])
+            return response if isinstance(response, list) else []
         except Exception as e:
             logger.error(f"Error fetching Zoho data: {e}")
             return []
 
-    async def batch_load_product_names(self, sku_codes: Set[str]) -> Dict[str, str]:
-        """Batch load product names - SAME as master report"""
-        if not sku_codes:
+    async def get_missed_sales_by_sku(
+        self, start_date: datetime, end_date: datetime
+    ) -> Dict[str, float]:
+        """Return {sku_code: total_missed_sales_qty} for the period."""
+        try:
+            collection = self.database["missed_sales"]
+
+            def _fetch():
+                return list(collection.find(
+                    {
+                        "date": {
+                            "$gte": start_date,
+                            "$lte": end_date.replace(hour=23, minute=59, second=59),
+                        }
+                    },
+                    {"item_code": 1, "missed_sales_quantity": 1, "_id": 0},
+                ))
+
+            docs = await asyncio.to_thread(_fetch)
+            result: Dict[str, float] = defaultdict(float)
+            for doc in docs:
+                sku = doc.get("item_code")
+                qty = doc.get("missed_sales_quantity", 0)
+                if sku:
+                    result[sku] += float(qty or 0)
+            return dict(result)
+        except Exception as e:
+            logger.error(f"Error fetching missed sales: {e}")
             return {}
 
+    async def batch_load_product_names(self, sku_codes: Set[str]) -> Dict[str, str]:
+        if not sku_codes:
+            return {}
         try:
-            # Filter out invalid SKUs
             valid_skus = {sku for sku in sku_codes if sku and sku != "Unknown SKU"}
-
             if not valid_skus:
                 return {}
 
             products_collection = self.database.get_collection("products")
 
-            # Single query to get all products - run in thread to avoid blocking event loop
             def _fetch_products():
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(valid_skus)}},
@@ -171,19 +168,12 @@ class MultiSourceDashboardService:
                 ))
 
             products = await asyncio.to_thread(_fetch_products)
-
-            # Create mapping
-            sku_to_name = {}
-            for product in products:
-                sku_code = product.get("cf_sku_code")
-                name = product.get("name")
-                if sku_code and name:
-                    sku_to_name[sku_code] = name
-
-            # Cache the results
+            sku_to_name = {
+                p["cf_sku_code"]: p["name"]
+                for p in products
+                if p.get("cf_sku_code") and p.get("name")
+            }
             self._product_name_cache.update(sku_to_name)
-
-            # Add unknown items to cache to avoid future queries
             for sku in valid_skus:
                 if sku not in sku_to_name:
                     sku_to_name[sku] = "Unknown Item"
@@ -191,13 +181,11 @@ class MultiSourceDashboardService:
 
             logger.info(f"Batch loaded {len(sku_to_name)} product names")
             return sku_to_name
-
         except Exception as e:
             logger.error(f"Error in batch loading product names: {e}")
             return {}
 
     async def get_active_skus(self) -> Set[str]:
-        """Return set of cf_sku_code values where purchase_status is 'active'."""
         try:
             products_collection = self.database.get_collection("products")
 
@@ -217,7 +205,6 @@ class MultiSourceDashboardService:
 
     @staticmethod
     def safe_float(value: Any, default: float = 0.0) -> float:
-        """Safely convert value to float"""
         try:
             if value is None or value == "":
                 return default
@@ -227,7 +214,6 @@ class MultiSourceDashboardService:
 
     @staticmethod
     def safe_int(value: Any, default: int = 0) -> int:
-        """Safely convert value to int"""
         try:
             if value is None or value == "":
                 return default
@@ -238,7 +224,7 @@ class MultiSourceDashboardService:
     def normalize_single_source_data(
         self, source: str, data: List[Dict], product_name_map: Dict[str, str]
     ) -> List[Dict]:
-        """Use EXACT same normalization as master report"""
+        """Normalize source data to a common schema."""
         if not isinstance(data, list):
             return []
 
@@ -249,14 +235,9 @@ class MultiSourceDashboardService:
                 continue
 
             try:
-                # Get SKU and canonical name
-                sku_code = (item.get("sku_code") or "Unknown SKU").strip()
-                if not sku_code:
-                    sku_code = "Unknown SKU"
-
+                sku_code = (item.get("sku_code") or "Unknown SKU").strip() or "Unknown SKU"
                 canonical_name = product_name_map.get(sku_code, "Unknown Item")
 
-                # Source-specific normalization - EXACT same logic as master report
                 if source == "blinkit":
                     metrics = item.get("metrics", {}) or {}
                     normalized_item = {
@@ -266,23 +247,13 @@ class MultiSourceDashboardService:
                         "sku_code": sku_code,
                         "city": item.get("city", "Unknown City"),
                         "warehouse": item.get("warehouse", "Unknown Warehouse"),
-                        "units_sold": self.safe_float(
-                            metrics.get("total_sales_in_period")
-                        ),
-                        "units_returned": self.safe_float(
-                            metrics.get("total_returns_in_period")
-                        ),
+                        "units_sold": self.safe_float(metrics.get("total_sales_in_period")),
+                        "units_returned": self.safe_float(metrics.get("total_returns_in_period")),
                         "total_amount": 0.0,
                         "closing_stock": self.safe_float(metrics.get("closing_stock")),
-                        "days_in_stock": self.safe_int(
-                            metrics.get("days_with_inventory")
-                        ),
-                        "daily_run_rate": self.safe_float(
-                            metrics.get("avg_daily_on_stock_days")
-                        ),
-                        "days_of_coverage": self.safe_float(
-                            metrics.get("days_of_coverage")
-                        ),
+                        "days_in_stock": self.safe_int(metrics.get("days_with_inventory")),
+                        "daily_run_rate": self.safe_float(metrics.get("avg_daily_on_stock_days")),
+                        "days_of_coverage": self.safe_float(metrics.get("days_of_coverage")),
                         "sessions": 0,
                     }
 
@@ -293,7 +264,6 @@ class MultiSourceDashboardService:
                         if isinstance(warehouses, list) and warehouses
                         else "Unknown Warehouse"
                     )
-
                     normalized_item = {
                         "source": "amazon",
                         "item_name": canonical_name,
@@ -331,22 +301,12 @@ class MultiSourceDashboardService:
                 else:
                     continue
 
-                # Calculate days of coverage if needed
-                if (
-                    normalized_item["daily_run_rate"] > 0
-                    and normalized_item["days_of_coverage"] == 0
-                ):
+                if normalized_item["daily_run_rate"] > 0 and normalized_item["days_of_coverage"] == 0:
                     normalized_item["days_of_coverage"] = round(
-                        normalized_item["closing_stock"]
-                        / normalized_item["daily_run_rate"],
-                        2,
+                        normalized_item["closing_stock"] / normalized_item["daily_run_rate"], 2
                     )
 
-                # Only add items with sales or returns
-                if (
-                    normalized_item["units_sold"] > 0
-                    or normalized_item["units_returned"] > 0
-                ):
+                if normalized_item["units_sold"] > 0 or normalized_item["units_returned"] > 0:
                     normalized_data.append(normalized_item)
 
             except Exception as e:
@@ -355,586 +315,489 @@ class MultiSourceDashboardService:
 
         return normalized_data
 
+    @staticmethod
+    def _compute_risk_level(days_of_coverage: float) -> str:
+        if days_of_coverage <= _RISK_CRITICAL_DAYS:
+            return "critical"
+        if days_of_coverage <= _RISK_LOW_DAYS:
+            return "low"
+        return "healthy"
+
     def combine_normalized_data_for_dashboard(
         self,
         all_normalized_data: List[List[Dict]],
         start_date: datetime,
         end_date: datetime,
+        target_days: int = 30,
+        missed_sales_map: Optional[Dict[str, float]] = None,
+        prior_sales_by_sku: Optional[Dict[str, float]] = None,
     ) -> List[Dict]:
-        """Combine normalized data and convert to dashboard format - FIXED VERSION"""
-        sku_data = defaultdict(
-            lambda: {
-                "sku_code": "",
-                "item_name": "Unknown Item",
-                "item_id": "",
-                "sources": set(),
-                "combined_metrics": {
-                    "total_units_sold": 0.0,
-                    "total_units_returned": 0.0,
-                    "total_amount": 0.0,
-                    "total_closing_stock": 0.0,
-                    "total_sessions": 0.0,
-                    "total_days_in_stock": 0.0,
-                    "avg_daily_run_rate": 0.0,
-                    "avg_days_of_coverage": 0.0,
-                },
-            }
-        )
+        sku_data: Dict[str, Dict] = defaultdict(lambda: {
+            "sku_code": "",
+            "item_name": "Unknown Item",
+            "item_id": "",
+            "sources": set(),
+            "combined_metrics": {
+                "total_units_sold": 0.0,
+                "total_units_returned": 0.0,
+                "total_amount": 0.0,
+                "total_closing_stock": 0.0,
+                "total_sessions": 0.0,
+                "total_days_in_stock": 0.0,
+            },
+        })
 
-        # Single pass through all data - SAME as master report
         for source_data in all_normalized_data:
             if not isinstance(source_data, list):
                 continue
-
             for item in source_data:
                 if not isinstance(item, dict):
                     continue
 
                 sku = item.get("sku_code", "Unknown SKU") or "Unknown SKU"
-                source = item.get("source", "unknown")
 
-                # Initialize if first time seeing this SKU
                 if sku_data[sku]["sku_code"] == "":
                     sku_data[sku]["sku_code"] = sku
                     sku_data[sku]["item_name"] = item.get("item_name", "Unknown Item")
                     sku_data[sku]["item_id"] = str(item.get("item_id", ""))
 
-                # Add source
-                sku_data[sku]["sources"].add(source)
+                sku_data[sku]["sources"].add(item.get("source", "unknown"))
 
-                # Update metrics efficiently
-                metrics = sku_data[sku]["combined_metrics"]
-                metrics["total_units_sold"] += self.safe_float(item.get("units_sold"))
-                metrics["total_units_returned"] += self.safe_float(
-                    item.get("units_returned")
-                )
-                metrics["total_amount"] += self.safe_float(item.get("total_amount"))
-                metrics["total_closing_stock"] += self.safe_float(
-                    item.get("closing_stock")
-                )
-                metrics["total_sessions"] += self.safe_float(item.get("sessions"))
-                metrics["total_days_in_stock"] += self.safe_float(
-                    item.get("days_in_stock")
-                )
+                m = sku_data[sku]["combined_metrics"]
+                m["total_units_sold"] += self.safe_float(item.get("units_sold"))
+                m["total_units_returned"] += self.safe_float(item.get("units_returned"))
+                m["total_amount"] += self.safe_float(item.get("total_amount"))
+                m["total_closing_stock"] += self.safe_float(item.get("closing_stock"))
+                m["total_sessions"] += self.safe_float(item.get("sessions"))
+                m["total_days_in_stock"] += self.safe_float(item.get("days_in_stock"))
 
-        # Calculate metrics and convert to dashboard format
         days_in_period = (end_date - start_date).days + 1
         result = []
 
         for sku, data in sku_data.items():
-            if (
-                data["combined_metrics"]["total_units_sold"] <= 0
-            ):  # Skip items with no sales
+            m = data["combined_metrics"]
+            if m["total_units_sold"] <= 0:
                 continue
 
-            # Calculate metrics
-            metrics = data["combined_metrics"]
-            total_units = metrics["total_units_sold"] + metrics["total_units_returned"]
-            total_days = metrics["total_days_in_stock"]
+            total_days = m["total_days_in_stock"]
 
-            # Calculate averages
+            # DRR: net units sold / stock days (calendar-day fallback).
+            # Matches the master report's avg_daily_run_rate logic exactly.
             if total_days > 0:
-                metrics["avg_daily_run_rate"] = round(total_units / total_days, 2)
+                drr = round(m["total_units_sold"] / total_days, 2)
+            elif days_in_period > 0:
+                drr = round(m["total_units_sold"] / days_in_period, 4)
+            else:
+                drr = 0.0
 
-            if metrics["avg_daily_run_rate"] > 0:
-                metrics["avg_days_of_coverage"] = round(
-                    metrics["total_closing_stock"] / metrics["avg_daily_run_rate"], 2
-                )
+            # days_of_coverage using stock-day DRR (same denominator as master report)
+            days_of_coverage = round(m["total_closing_stock"] / drr, 2) if drr > 0 else 0.0
 
-            # Dashboard-specific calculations
-            avg_daily_sales = (
-                metrics["total_units_sold"] / days_in_period
-                if days_in_period > 0
-                else 0
-            )
-            days_of_coverage = (
-                metrics["total_closing_stock"] / avg_daily_sales
-                if avg_daily_sales > 0
-                else 0
-            )
+            # In-stock rate: fraction of period days the item had stock
+            in_stock_rate = round(total_days / days_in_period, 4) if days_in_period > 0 else 0.0
 
-            avg_daily_on_stock_days = (
-                metrics["total_days_in_stock"] / days_in_period
-                if days_in_period > 0
-                else 0
-            )
-            avg_weekly_on_stock_days = avg_daily_on_stock_days * 7
-            avg_monthly_on_stock_days = avg_daily_on_stock_days * 30
+            # Suggested order to reach target_days of coverage
+            suggested_order_qty = max(0, int(round(target_days * drr - m["total_closing_stock"])))
+
+            risk_level = self._compute_risk_level(days_of_coverage)
+            missed_qty = float((missed_sales_map or {}).get(sku, 0))
+
+            # MOM / period-over-period growth
+            mom_growth_pct: Optional[float] = None
+            if prior_sales_by_sku is not None:
+                prior_sales = prior_sales_by_sku.get(sku, 0.0)
+                if prior_sales > 0:
+                    mom_growth_pct = round(
+                        (m["total_units_sold"] - prior_sales) / prior_sales * 100, 1
+                    )
+                elif m["total_units_sold"] > 0:
+                    mom_growth_pct = 100.0  # new product (no prior sales)
 
             sources_list = list(data["sources"])
             city = "Multiple" if len(sources_list) > 1 else sources_list[0].title()
 
-            # FIXED: Ensure ALL items have consistent metrics structure
             product_data = {
-                "item_id": (
-                    int(data["item_id"]) if str(data["item_id"]).isdigit() else 0
-                ),
+                "item_id": int(data["item_id"]) if str(data["item_id"]).isdigit() else 0,
                 "item_name": data["item_name"],
                 "sku_code": data["sku_code"],
                 "city": city,
                 "sources": sources_list,
                 "metrics": {
-                    "avg_daily_on_stock_days": round(avg_daily_on_stock_days, 2),
-                    "avg_weekly_on_stock_days": round(avg_weekly_on_stock_days, 2),
-                    "avg_monthly_on_stock_days": round(avg_monthly_on_stock_days, 2),
-                    "total_sales_in_period": int(metrics["total_units_sold"]),
-                    "total_returns_in_period": int(metrics["total_units_returned"]),
-                    "total_amount": round(metrics["total_amount"], 2),
-                    "days_of_coverage": round(days_of_coverage, 2),
-                    "days_with_inventory": int(metrics["total_days_in_stock"]),
-                    "closing_stock": int(metrics["total_closing_stock"]),
-                    "sessions": int(metrics["total_sessions"]),  # Added for consistency
-                    "daily_run_rate": round(
-                        metrics["avg_daily_run_rate"], 2
-                    ),  # Added for consistency
+                    "in_stock_rate": in_stock_rate,
+                    "avg_weekly_on_stock_days": round(in_stock_rate * 7, 2),
+                    "avg_monthly_on_stock_days": round(in_stock_rate * 30, 2),
+                    "total_sales_in_period": int(m["total_units_sold"]),
+                    "total_returns_in_period": int(m["total_units_returned"]),
+                    "total_amount": round(m["total_amount"], 2),
+                    "days_of_coverage": days_of_coverage,
+                    "days_with_inventory": int(total_days),
+                    "closing_stock": int(m["total_closing_stock"]),
+                    "sessions": int(m["total_sessions"]),
+                    "daily_run_rate": drr,
+                    "risk_level": risk_level,
+                    "suggested_order_qty": suggested_order_qty,
+                    "missed_sales_qty": missed_qty,
+                    "mom_growth_pct": mom_growth_pct,
                 },
                 "year": start_date.year,
                 "month": start_date.month,
             }
             result.append(product_data)
 
-            # Debug logging to verify metrics structure
-            logger.debug(
-                f"Created metrics for {sku} from sources {sources_list}: {product_data['metrics']}"
-            )
-
-        logger.info(
-            f"Combined {len(result)} products with consistent metrics structure"
-        )
+        logger.info(f"Combined {len(result)} products")
         return result
+
+    @staticmethod
+    def _extract_sales_by_sku(combined_data: List[Dict]) -> Dict[str, float]:
+        """Extract {sku_code: total_units_sold} from already-combined data."""
+        return {
+            item["sku_code"]: float(item["metrics"]["total_sales_in_period"])
+            for item in combined_data
+            if item.get("sku_code") and item.get("metrics")
+        }
 
 
 def get_month_date_range(year: int, month: int):
-    """Get the start and end dates for a given month and year."""
     start_date = datetime(year, month, 1)
     last_day = calendar.monthrange(year, month)[1]
     end_date = datetime(year, month, last_day, 23, 59, 59)
     return start_date, end_date
 
 
+def _parse_date_params(
+    start_date: Optional[str],
+    end_date: Optional[str],
+    year: Optional[int],
+    month: Optional[int],
+) -> Tuple[datetime, datetime]:
+    if start_date and end_date:
+        try:
+            parsed_start = datetime.strptime(start_date, "%Y-%m-%d")
+            parsed_end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59
+            )
+            return parsed_start, parsed_end
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid date format. Use YYYY-MM-DD.",
+            )
+    cur = datetime.now()
+    return get_month_date_range(year or cur.year, month or cur.month)
+
+
+
+_SORT_OPTIONS = {
+    "total_sales": (lambda x: x.get("metrics", {}).get("total_sales_in_period", 0), True),
+    "days_of_coverage": (lambda x: x.get("metrics", {}).get("days_of_coverage", 0), False),
+    "drr": (lambda x: x.get("metrics", {}).get("daily_run_rate", 0), True),
+    "missed_sales": (lambda x: x.get("metrics", {}).get("missed_sales_qty", 0), True),
+}
+
+
 @router.get("/top-products", response_model=TopProductsResponse)
 async def get_top_performing_products(
     limit: int = Query(10, ge=1, le=50, description="Number of top products to return"),
-    start_date: Optional[str] = Query(
-        None, description="Start date (YYYY-MM-DD format, default: current month start)"
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    year: Optional[int] = Query(None, description="Year (legacy)"),
+    month: Optional[int] = Query(None, ge=1, le=12, description="Month (legacy)"),
+    include_blinkit: bool = Query(True),
+    include_amazon: bool = Query(True),
+    include_zoho: bool = Query(True),
+    sort_by: str = Query(
+        "total_sales",
+        description="Sort field: total_sales | days_of_coverage (urgent first) | drr | missed_sales",
     ),
-    end_date: Optional[str] = Query(
-        None, description="End date (YYYY-MM-DD format, default: current month end)"
+    target_days: int = Query(
+        30, ge=1, le=365, description="Target days of coverage for suggested_order_qty"
     ),
-    year: Optional[int] = Query(
-        None, description="Year to filter by (legacy, use start_date/end_date instead)"
+    include_trend: bool = Query(
+        False, description="Include period-over-period growth % (fetches prior period in parallel)"
     ),
-    month: Optional[int] = Query(
-        None,
-        ge=1,
-        le=12,
-        description="Month to filter by (legacy, use start_date/end_date instead)",
-    ),
-    include_blinkit: bool = Query(True, description="Include Blinkit data"),
-    include_amazon: bool = Query(True, description="Include Amazon data"),
-    include_zoho: bool = Query(True, description="Include Zoho data"),
     db=Depends(get_database),
 ):
-    """
-    FIXED: Get top performing products with consistent metrics structure for all sources.
-    """
     try:
-        # Handle date parameters (prioritize start_date/end_date over year/month)
-        if start_date and end_date:
-            try:
-                parsed_start_date = datetime.strptime(start_date, "%Y-%m-%d")
-                parsed_end_date = datetime.strptime(end_date, "%Y-%m-%d")
-                parsed_end_date = parsed_end_date.replace(hour=23, minute=59, second=59)
-            except ValueError:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid date format. Use YYYY-MM-DD format.",
-                )
-        else:
-            current_date = datetime.now()
-            target_year = year or current_date.year
-            target_month = month or current_date.month
-            parsed_start_date, parsed_end_date = get_month_date_range(
-                target_year, target_month
-            )
+        parsed_start, parsed_end = _parse_date_params(start_date, end_date, year, month)
 
-        logger.info(
-            f"FIXED: Generating dashboard with consistent metrics for {parsed_start_date} to {parsed_end_date}"
+        service = MultiSourceDashboardService(db)
+
+        # Build source task list (order preserved, no index guessing)
+        source_tasks: List = []
+        task_sources: List[str] = []
+        if include_blinkit:
+            source_tasks.append(service.get_blinkit_data(parsed_start, parsed_end))
+            task_sources.append("blinkit")
+        if include_amazon:
+            source_tasks.append(service.get_amazon_data(parsed_start, parsed_end))
+            task_sources.append("amazon")
+        if include_zoho:
+            source_tasks.append(service.get_zoho_data(parsed_start, parsed_end))
+            task_sources.append("zoho")
+
+        if not source_tasks:
+            raise HTTPException(status_code=400, detail="At least one data source must be selected")
+
+        # Prior period for trend (same duration, ending the day before start)
+        prior_source_tasks: List = []
+        prior_task_sources: List[str] = []
+        prior_start = prior_end = None
+        if include_trend:
+            period_days = (parsed_end.date() - parsed_start.date()).days + 1
+            prior_end = parsed_start - timedelta(days=1)
+            prior_start = prior_end - timedelta(days=period_days - 1)
+            for src in task_sources:
+                if src == "blinkit":
+                    prior_source_tasks.append(service.get_blinkit_data(prior_start, prior_end))
+                elif src == "amazon":
+                    prior_source_tasks.append(service.get_amazon_data(prior_start, prior_end))
+                elif src == "zoho":
+                    prior_source_tasks.append(service.get_zoho_data(prior_start, prior_end))
+                prior_task_sources.append(src)
+
+        # All parallel: active_skus + missed_sales + source data [+ prior period]
+        all_results = await asyncio.gather(
+            service.get_active_skus(),
+            service.get_missed_sales_by_sku(parsed_start, parsed_end),
+            *source_tasks,
+            *prior_source_tasks,
+            return_exceptions=True,
         )
 
-        # Initialize service
-        dashboard_service = MultiSourceDashboardService(db)
+        active_skus: Set[str] = all_results[0] if not isinstance(all_results[0], Exception) else set()
+        missed_sales_map: Dict[str, float] = (
+            all_results[1] if not isinstance(all_results[1], Exception) else {}
+        )
+        source_results = all_results[2:2 + len(source_tasks)]
+        prior_results = all_results[2 + len(source_tasks):]
 
-        # Step 1: Fetch all data
-        tasks = []
-        if include_blinkit:
-            tasks.append(
-                dashboard_service.get_blinkit_data(parsed_start_date, parsed_end_date)
-            )
-        if include_amazon:
-            tasks.append(
-                dashboard_service.get_amazon_data(parsed_start_date, parsed_end_date)
-            )
-        if include_zoho:
-            tasks.append(
-                dashboard_service.get_zoho_data(parsed_start_date, parsed_end_date)
-            )
-
-        if not tasks:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="At least one data source must be selected",
-            )
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Process results - filter out exceptions and empty results
-        raw_source_data = []
-        source_names = []
-
-        for i, result in enumerate(results):
+        # Collect valid source data (tagged by source name)
+        raw_source_data: List[Tuple[str, List[Dict]]] = []
+        for src_name, result in zip(task_sources, source_results):
             if isinstance(result, Exception):
-                logger.error(f"Task {i} failed: {str(result)}")
+                logger.error(f"{src_name} fetch failed: {result}")
                 continue
             if isinstance(result, list) and result:
-                raw_source_data.append(result)
-                # Determine source name based on order
-                if include_blinkit and len(raw_source_data) == 1:
-                    source_names.append("blinkit")
-                elif include_amazon and len(raw_source_data) == (
-                    2 if include_blinkit else 1
-                ):
-                    source_names.append("amazon")
-                elif include_zoho:
-                    source_names.append("zoho")
+                raw_source_data.append((src_name, result))
 
         if not raw_source_data:
             return TopProductsResponse(
                 products=[],
                 total_count=0,
-                current_month=parsed_start_date.month,
-                current_year=parsed_start_date.year,
+                current_month=parsed_start.month,
+                current_year=parsed_start.year,
             )
 
-        # Step 2: Extract SKU codes and batch load product names
-        all_sku_codes = set()
-        for source_data in raw_source_data:
-            for item in source_data:
-                if isinstance(item, dict):
-                    sku = item.get("sku_code")
-                    if sku and sku.strip():
-                        all_sku_codes.add(sku.strip())
+        # Batch-load product names from all sources
+        all_sku_codes = {
+            item.get("sku_code", "").strip()
+            for _, source_data in raw_source_data
+            for item in source_data
+            if isinstance(item, dict) and item.get("sku_code", "").strip()
+        }
+        product_name_map = await service.batch_load_product_names(all_sku_codes)
 
-        product_name_map = await dashboard_service.batch_load_product_names(
-            all_sku_codes
-        )
-        logger.info(f"Loaded names for {len(product_name_map)} products")
-
-        # Step 3: Normalize data
-        all_normalized_data = []
-
-        for i, source_data in enumerate(raw_source_data):
-            # Map to correct source names
-            if include_blinkit and i == 0:
-                source_name = "blinkit"
-            elif include_amazon and i == (1 if include_blinkit else 0):
-                source_name = "amazon"
-            elif include_zoho and i == (
-                (1 if include_blinkit else 0) + (1 if include_amazon else 0)
-            ):
-                source_name = "zoho"
-            else:
-                source_name = f"unknown_{i}"
-            normalized = dashboard_service.normalize_single_source_data(
-                source_name, source_data, product_name_map
-            )
+        # Normalize current period
+        all_normalized: List[List[Dict]] = []
+        for src_name, source_data in raw_source_data:
+            normalized = service.normalize_single_source_data(src_name, source_data, product_name_map)
             if normalized:
-                all_normalized_data.append(normalized)
-                logger.info(f"Normalized {len(normalized)} {source_name} items")
+                all_normalized.append(normalized)
+                logger.info(f"Normalized {len(normalized)} {src_name} items")
 
-        if not all_normalized_data:
+        if not all_normalized:
             return TopProductsResponse(
                 products=[],
                 total_count=0,
-                current_month=parsed_start_date.month,
-                current_year=parsed_start_date.year,
+                current_month=parsed_start.month,
+                current_year=parsed_start.year,
             )
 
-        # Step 4: Combine normalized data - FIXED VERSION
-        combined_data = dashboard_service.combine_normalized_data_for_dashboard(
-            all_normalized_data, parsed_start_date, parsed_end_date
+        # Prior period for trend
+        prior_sales_by_sku: Optional[Dict[str, float]] = None
+        if include_trend and prior_results and prior_start and prior_end:
+            prior_normalized: List[List[Dict]] = []
+            for src_name, result in zip(prior_task_sources, prior_results):
+                if isinstance(result, Exception):
+                    continue
+                if isinstance(result, list) and result:
+                    n = service.normalize_single_source_data(src_name, result, product_name_map)
+                    if n:
+                        prior_normalized.append(n)
+            if prior_normalized:
+                prior_combined = service.combine_normalized_data_for_dashboard(
+                    prior_normalized, prior_start, prior_end, target_days=target_days
+                )
+                prior_sales_by_sku = service._extract_sales_by_sku(prior_combined)
+
+        # Combine current period
+        combined_data = service.combine_normalized_data_for_dashboard(
+            all_normalized,
+            parsed_start,
+            parsed_end,
+            target_days=target_days,
+            missed_sales_map=missed_sales_map,
+            prior_sales_by_sku=prior_sales_by_sku,
         )
 
-        logger.info(f"Combined data for {len(combined_data)} unique SKUs")
-
-        # Filter to active products only
-        active_skus = await dashboard_service.get_active_skus()
+        # Filter to active SKUs
         if active_skus:
             before = len(combined_data)
-            combined_data = [
-                item for item in combined_data
-                if item.get("sku_code") in active_skus
-            ]
-            logger.info(f"Filtered to {len(combined_data)} active SKUs (removed {before - len(combined_data)})")
-
-        # VALIDATION: Check that all items have metrics structure
-        items_without_metrics = [
-            item for item in combined_data if "metrics" not in item
-        ]
-        if items_without_metrics:
-            logger.error(
-                f"FOUND {len(items_without_metrics)} items without metrics structure!"
-            )
-            for item in items_without_metrics[:3]:  # Log first 3 for debugging
-                logger.error(
-                    f"Item without metrics: {item.get('sku_code', 'Unknown')} - {item.keys()}"
-                )
-        else:
+            combined_data = [d for d in combined_data if d.get("sku_code") in active_skus]
             logger.info(
-                f"✓ ALL {len(combined_data)} items have consistent metrics structure"
+                f"Filtered to {len(combined_data)} active SKUs (removed {before - len(combined_data)})"
             )
 
-        # Step 5: Sort by total sales and limit
-        sorted_products = sorted(
-            combined_data,
-            key=lambda x: x.get("metrics", {}).get(
-                "total_sales_in_period", 0
-            ),  # Safe access
-            reverse=True,
-        )[:limit]
-        # Log summary for verification
-        total_sales = sum(
-            p.get("metrics", {}).get("total_sales_in_period", 0)
-            for p in sorted_products
-        )
-        total_stock = sum(
-            p.get("metrics", {}).get("closing_stock", 0) for p in sorted_products
-        )
-        total_amount = sum(
-            p.get("metrics", {}).get("total_amount", 0) for p in sorted_products
-        )
+        # Sort
+        sort_key, reverse = _SORT_OPTIONS.get(sort_by, _SORT_OPTIONS["total_sales"])
+        sorted_products = sorted(combined_data, key=sort_key, reverse=reverse)[:limit]
 
         logger.info(
-            f"DASHBOARD TOTALS - Sales: {total_sales}, Stock: {total_stock}, Amount: {total_amount}"
-        )
-        logger.info(
-            f"Returning {len(sorted_products)} products from {len(combined_data)} total SKUs"
+            f"Returning {len(sorted_products)} of {len(combined_data)} SKUs, sorted by {sort_by}"
         )
 
         return TopProductsResponse(
             products=sorted_products,
             total_count=len(combined_data),
-            current_month=parsed_start_date.month,
-            current_year=parsed_start_date.year,
+            current_month=parsed_start.month,
+            current_year=parsed_start.year,
         )
 
     except PyMongoError as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}",
-        )
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
-        logger.error(f"Error in FIXED top products: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal server error: {str(e)}",
-        )
+        logger.error(f"Error in top products: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 @router.get("/top-products/summary")
-async def get_top_products_summary_fixed(
-    start_date: Optional[str] = Query(
-        None, description="Start date (YYYY-MM-DD format, default: current month start)"
-    ),
-    end_date: Optional[str] = Query(
-        None, description="End date (YYYY-MM-DD format, default: current month end)"
-    ),
-    year: Optional[int] = Query(
-        None, description="Year to filter by (legacy, use start_date/end_date instead)"
-    ),
-    month: Optional[int] = Query(
-        None,
-        ge=1,
-        le=12,
-        description="Month to filter by (legacy, use start_date/end_date instead)",
-    ),
-    include_blinkit: bool = Query(True, description="Include Blinkit data"),
-    include_amazon: bool = Query(True, description="Include Amazon data"),
-    include_zoho: bool = Query(True, description="Include Zoho data"),
+async def get_top_products_summary(
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    year: Optional[int] = Query(None, description="Year (legacy)"),
+    month: Optional[int] = Query(None, ge=1, le=12, description="Month (legacy)"),
+    include_blinkit: bool = Query(True),
+    include_amazon: bool = Query(True),
+    include_zoho: bool = Query(True),
+    target_days: int = Query(30, ge=1, le=365),
     db=Depends(get_database),
 ):
-    """
-    FIXED: Get summary statistics with consistent metrics access.
-    """
     try:
-        # Handle date parameters (same as top products)
-        if start_date and end_date:
-            try:
-                parsed_start_date = datetime.strptime(start_date, "%Y-%m-%d")
-                parsed_end_date = datetime.strptime(end_date, "%Y-%m-%d")
-                parsed_end_date = parsed_end_date.replace(hour=23, minute=59, second=59)
-            except ValueError:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid date format. Use YYYY-MM-DD format.",
-                )
-        else:
-            current_date = datetime.now()
-            target_year = year or current_date.year
-            target_month = month or current_date.month
-            parsed_start_date, parsed_end_date = get_month_date_range(
-                target_year, target_month
-            )
+        parsed_start, parsed_end = _parse_date_params(start_date, end_date, year, month)
 
-        logger.info(
-            f"FIXED: Generating summary with consistent metrics for {parsed_start_date} to {parsed_end_date}"
+        service = MultiSourceDashboardService(db)
+
+        source_tasks: List = []
+        task_sources: List[str] = []
+        if include_blinkit:
+            source_tasks.append(service.get_blinkit_data(parsed_start, parsed_end))
+            task_sources.append("blinkit")
+        if include_amazon:
+            source_tasks.append(service.get_amazon_data(parsed_start, parsed_end))
+            task_sources.append("amazon")
+        if include_zoho:
+            source_tasks.append(service.get_zoho_data(parsed_start, parsed_end))
+            task_sources.append("zoho")
+
+        if not source_tasks:
+            raise HTTPException(status_code=400, detail="At least one data source must be selected")
+
+        all_results = await asyncio.gather(
+            service.get_active_skus(),
+            service.get_missed_sales_by_sku(parsed_start, parsed_end),
+            *source_tasks,
+            return_exceptions=True,
         )
 
-        # Use the EXACT same logic as top products up to the combination step
-        dashboard_service = MultiSourceDashboardService(db)
+        active_skus: Set[str] = all_results[0] if not isinstance(all_results[0], Exception) else set()
+        missed_sales_map: Dict[str, float] = (
+            all_results[1] if not isinstance(all_results[1], Exception) else {}
+        )
+        source_results = all_results[2:]
 
-        tasks = []
-        if include_blinkit:
-            tasks.append(
-                dashboard_service.get_blinkit_data(parsed_start_date, parsed_end_date)
-            )
-        if include_amazon:
-            tasks.append(
-                dashboard_service.get_amazon_data(parsed_start_date, parsed_end_date)
-            )
-        if include_zoho:
-            tasks.append(
-                dashboard_service.get_zoho_data(parsed_start_date, parsed_end_date)
-            )
+        empty_response = {
+            "total_products": 0,
+            "total_sales": 0.0,
+            "avg_sales": 0.0,
+            "total_closing_stock": 0.0,
+            "total_amount": 0.0,
+            "total_missed_sales_qty": 0.0,
+            "total_suggested_order_qty": 0,
+            "by_risk_level": {"critical": 0, "low": 0, "healthy": 0},
+            "source_counts": {},
+            "sources_included": [],
+            "year": parsed_start.year,
+            "month": parsed_start.month,
+            "start_date": parsed_start.strftime("%Y-%m-%d"),
+            "end_date": parsed_end.strftime("%Y-%m-%d"),
+        }
 
-        if not tasks:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="At least one data source must be selected",
-            )
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Process results (same as top products)
-        raw_source_data = []
-        source_names = []
-
-        for i, result in enumerate(results):
+        raw_source_data: List[Tuple[str, List[Dict]]] = []
+        source_counts: Dict[str, int] = {}
+        for src_name, result in zip(task_sources, source_results):
             if isinstance(result, Exception):
-                logger.error(f"Task {i} failed: {str(result)}")
+                logger.error(f"{src_name} fetch failed: {result}")
                 continue
             if isinstance(result, list) and result:
-                raw_source_data.append(result)
-                if include_blinkit and len(raw_source_data) == 1:
-                    source_names.append("blinkit")
-                elif include_amazon and len(raw_source_data) == (
-                    2 if include_blinkit else 1
-                ):
-                    source_names.append("amazon")
-                elif include_zoho:
-                    source_names.append("zoho")
+                raw_source_data.append((src_name, result))
 
         if not raw_source_data:
-            return {
-                "total_products": 0,
-                "total_sales": 0.0,
-                "avg_sales": 0.0,
-                "total_closing_stock": 0.0,
-                "total_amount": 0.0,
-                "source_counts": {},
-                "sources_included": [],
-                "year": parsed_start_date.year,
-                "month": parsed_start_date.month,
-                "start_date": parsed_start_date.strftime("%Y-%m-%d"),
-                "end_date": parsed_end_date.strftime("%Y-%m-%d"),
-            }
+            return empty_response
 
-        # Extract SKUs and normalize (same as top products)
-        all_sku_codes = set()
-        for source_data in raw_source_data:
-            for item in source_data:
-                if isinstance(item, dict):
-                    sku = item.get("sku_code")
-                    if sku and sku.strip():
-                        all_sku_codes.add(sku.strip())
+        all_sku_codes = {
+            item.get("sku_code", "").strip()
+            for _, source_data in raw_source_data
+            for item in source_data
+            if isinstance(item, dict) and item.get("sku_code", "").strip()
+        }
+        product_name_map = await service.batch_load_product_names(all_sku_codes)
 
-        product_name_map = await dashboard_service.batch_load_product_names(
-            all_sku_codes
-        )
-
-        all_normalized_data = []
-        source_counts = {}
-
-        for i, source_data in enumerate(raw_source_data):
-            if include_blinkit and i == 0:
-                source_name = "blinkit"
-            elif include_amazon and i == (1 if include_blinkit else 0):
-                source_name = "amazon"
-            elif include_zoho and i == (
-                (1 if include_blinkit else 0) + (1 if include_amazon else 0)
-            ):
-                source_name = "zoho"
-            else:
-                source_name = f"unknown_{i}"
-
-            normalized = dashboard_service.normalize_single_source_data(
-                source_name, source_data, product_name_map
-            )
+        all_normalized: List[List[Dict]] = []
+        for src_name, source_data in raw_source_data:
+            normalized = service.normalize_single_source_data(src_name, source_data, product_name_map)
             if normalized:
-                all_normalized_data.append(normalized)
-                source_counts[source_name] = len(normalized)
-                logger.info(f"Normalized {len(normalized)} {source_name} items")
+                all_normalized.append(normalized)
+                source_counts[src_name] = len(normalized)
 
-        if not all_normalized_data:
-            return {
-                "total_products": 0,
-                "total_sales": 0.0,
-                "avg_sales": 0.0,
-                "total_closing_stock": 0.0,
-                "total_amount": 0.0,
-                "source_counts": {},
-                "sources_included": [],
-                "year": parsed_start_date.year,
-                "month": parsed_start_date.month,
-                "start_date": parsed_start_date.strftime("%Y-%m-%d"),
-                "end_date": parsed_end_date.strftime("%Y-%m-%d"),
-            }
+        if not all_normalized:
+            return empty_response
 
-        # FIXED: Use the SAME combined data logic as top products
-        combined_data = dashboard_service.combine_normalized_data_for_dashboard(
-            all_normalized_data, parsed_start_date, parsed_end_date
+        combined_data = service.combine_normalized_data_for_dashboard(
+            all_normalized,
+            parsed_start,
+            parsed_end,
+            target_days=target_days,
+            missed_sales_map=missed_sales_map,
         )
 
-        logger.info(f"Combined data for {len(combined_data)} unique SKUs")
+        if active_skus:
+            combined_data = [d for d in combined_data if d.get("sku_code") in active_skus]
 
-        # FIXED: Aggregate from the same metrics structure as top products
         total_products = len(combined_data)
         total_sales = 0.0
         total_closing_stock = 0.0
         total_amount = 0.0
+        total_missed = 0.0
+        total_suggested = 0
+        by_risk: Dict[str, int] = {"critical": 0, "low": 0, "healthy": 0}
 
         for item in combined_data:
             metrics = item.get("metrics", {})
-            if not metrics:  # Log items without metrics for debugging
-                logger.warning(
-                    f"Item {item.get('sku_code', 'Unknown')} has no metrics structure"
-                )
+            if not metrics:
                 continue
+            total_sales += service.safe_float(metrics.get("total_sales_in_period", 0))
+            total_closing_stock += service.safe_float(metrics.get("closing_stock", 0))
+            total_amount += service.safe_float(metrics.get("total_amount", 0))
+            total_missed += service.safe_float(metrics.get("missed_sales_qty", 0))
+            total_suggested += int(metrics.get("suggested_order_qty", 0))
+            risk = metrics.get("risk_level", "healthy")
+            by_risk[risk] = by_risk.get(risk, 0) + 1
 
-            total_sales += dashboard_service.safe_float(
-                metrics.get("total_sales_in_period", 0)
-            )
-            total_closing_stock += dashboard_service.safe_float(
-                metrics.get("closing_stock", 0)
-            )
-            total_amount += dashboard_service.safe_float(metrics.get("total_amount", 0))
+        avg_sales = total_sales / total_products if total_products > 0 else 0.0
 
-        avg_sales = total_sales / total_products if total_products > 0 else 0
-
-        # Validation logging
         logger.info(
-            f"SUMMARY TOTALS - Products: {total_products}, Sales: {total_sales}, Stock: {total_closing_stock}, Amount: {total_amount}"
+            f"SUMMARY: {total_products} active SKUs, sales={total_sales}, "
+            f"stock={total_closing_stock}, amount={total_amount}"
         )
 
         return {
@@ -943,23 +806,19 @@ async def get_top_products_summary_fixed(
             "avg_sales": round(avg_sales, 2),
             "total_closing_stock": round(total_closing_stock, 2),
             "total_amount": round(total_amount, 2),
+            "total_missed_sales_qty": round(total_missed, 2),
+            "total_suggested_order_qty": total_suggested,
+            "by_risk_level": by_risk,
             "source_counts": source_counts,
             "sources_included": list(source_counts.keys()),
-            "year": parsed_start_date.year,
-            "month": parsed_start_date.month,
-            "start_date": parsed_start_date.strftime("%Y-%m-%d"),
-            "end_date": parsed_end_date.strftime("%Y-%m-%d"),
+            "year": parsed_start.year,
+            "month": parsed_start.month,
+            "start_date": parsed_start.strftime("%Y-%m-%d"),
+            "end_date": parsed_end.strftime("%Y-%m-%d"),
         }
 
     except PyMongoError as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}",
-        )
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
-        logger.error(f"Error in FIXED summary: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal server error: {str(e)}",
-        )
+        logger.error(f"Error in summary: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

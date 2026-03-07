@@ -1534,6 +1534,7 @@ async def _generate_master_report_data(
     include_zoho: bool,
     db,
     brand: str = None,
+    dashboard_mode: bool = False,
 ):
     """
     Internal function that generates full master report data (with raw individual_reports).
@@ -1744,9 +1745,10 @@ async def _generate_master_report_data(
 
         # Step 4a+4b: DRR lookback + enrichment data fetched in parallel
         if combined_data:
-            # Only do lookback and highlighting for date ranges >= 90 days
+            # Only do lookback and highlighting for date ranges >= 90 days.
+            # dashboard_mode skips lookback entirely (saves 20-40s for the KPI endpoint).
             skus_needing_lookback_list = []
-            if period_days >= 90:
+            if period_days >= 90 and not dashboard_mode:
                 for item in combined_data:
                     days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
                     sku = item.get("sku_code", "")
@@ -1784,6 +1786,7 @@ async def _generate_master_report_data(
 
             # Start past-90d DRR fetch as a background task so it runs concurrently
             # with the DRR lookback below. all_product_data is now fully populated.
+            # dashboard_mode skips this to avoid the extra historical aggregation query.
             _full_sku_to_item_id = {
                 sku: pdata["item_id"]
                 for sku, pdata in all_product_data.items()
@@ -1791,7 +1794,7 @@ async def _generate_master_report_data(
             }
             _past_drr_task = (
                 asyncio.create_task(report_service.fetch_past_90d_drr(_full_sku_to_item_id, start_date))
-                if _full_sku_to_item_id else None
+                if _full_sku_to_item_id and not dashboard_mode else None
             )
 
             # DRR lookback (needs sku_to_item_id from above)
@@ -2645,8 +2648,11 @@ def _aggregate_brand_kpi(
             drr_w_total += item_drr
     growth_rate = round(drr_w_sum / drr_w_total, 2) if drr_w_total > 0 else None
 
-    # Brand-level DRR and days cover
-    drr = round(net_sales / period_days, 4) if period_days > 0 else 0.0
+    # Brand-level DRR = sum of per-SKU avg_daily_run_rate.
+    # This matches the master report exactly: each SKU's DRR uses
+    # (units_sold - credit_notes) / days_in_stock (calendar fallback),
+    # so summing them gives total brand demand in units/day on the same basis.
+    drr = round(sum(i.get("combined_metrics", {}).get("avg_daily_run_rate", 0) for i in items), 4)
     days_cover = round(latest_net_stock / drr, 2) if drr > 0 else 0.0
     current_days_coverage = round((latest_net_stock + stock_in_transit) / drr, 2) if drr > 0 else 0.0
 
@@ -2714,7 +2720,8 @@ def _aggregate_brand_kpi(
         key=lambda x: x["days_cover"],
     )
     sku_lowest_10 = sku_detail[:10]
-    sku_highest_10 = list(reversed(sku_detail[-10:]))
+    _lowest_codes = {s["sku_code"] for s in sku_lowest_10}
+    sku_highest_10 = [s for s in reversed(sku_detail) if s["sku_code"] not in _lowest_codes][:10]
 
     return {
         "brand": brand,
@@ -2757,8 +2764,18 @@ def _aggregate_brand_kpi(
     }
 
 
+# Module-level TTL cache for dashboard-kpi (always last 90 days — no point recomputing
+# on every page load). Invalidated automatically after _DASHBOARD_KPI_TTL seconds.
+_dashboard_kpi_cache: Dict[str, Any] = {}
+_dashboard_kpi_cache_ts: float = 0.0
+_DASHBOARD_KPI_TTL: int = 900  # 15 minutes
+
+
 @router.get("/dashboard-kpi")
-async def get_dashboard_kpi(db=Depends(get_database)):
+async def get_dashboard_kpi(
+    refresh: bool = False,
+    db=Depends(get_database),
+):
     """
     Stock Cover KPI Dashboard – last 90 days, aggregated by brand.
 
@@ -2766,7 +2783,17 @@ async def get_dashboard_kpi(db=Depends(get_database)):
     return %, growth %, missed sales (units+value/day), total CBM, net inventory value,
     stock classification per SKU (Reorder Risk / Healthy / Heavy / Overstock / Dead),
     and the 10 lowest / 10 highest days-cover SKUs per brand.
+
+    Results are cached for 15 minutes. Pass ?refresh=true to force recomputation.
     """
+    import time as _time
+    global _dashboard_kpi_cache, _dashboard_kpi_cache_ts
+
+    # Serve from cache if fresh and not force-refreshed
+    if not refresh and _dashboard_kpi_cache and (_time.time() - _dashboard_kpi_cache_ts) < _DASHBOARD_KPI_TTL:
+        logger.info("Serving dashboard-kpi from cache")
+        return JSONResponse(status_code=200, content=_dashboard_kpi_cache)
+
     try:
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=89)).strftime("%Y-%m-%d")
@@ -2775,7 +2802,7 @@ async def get_dashboard_kpi(db=Depends(get_database)):
         service = OptimizedMasterReportService(db)
 
         content, brand_logistics_map = await asyncio.gather(
-            _generate_master_report_data(start_date, end_date, True, db),
+            _generate_master_report_data(start_date, end_date, True, db, dashboard_mode=True),
             service.get_brand_logistics(),
         )
 
@@ -2788,10 +2815,12 @@ async def get_dashboard_kpi(db=Depends(get_database)):
             sku: float(pdata.get("rate") or 0) for sku, pdata in product_data_map.items()
         }
 
-        # Group by brand
+        # Group by brand — skip products with no brand set
         brand_groups: Dict[str, list] = defaultdict(list)
         for item in combined_data:
-            brand = (item.get("brand") or "Unknown").strip() or "Unknown"
+            brand = (item.get("brand") or "").strip()
+            if not brand:
+                continue
             brand_groups[brand].append(item)
 
         brands_kpi = [
@@ -2807,7 +2836,7 @@ async def get_dashboard_kpi(db=Depends(get_database)):
         total_net_stock = sum(b["latest_net_stock"] for b in brands_kpi)
         total_units_sold = sum(b["units_sold"] for b in brands_kpi)
         total_units_returned = sum(b["units_returned"] for b in brands_kpi)
-        total_drr = round(total_net_sales / period_days, 4) if period_days > 0 else 0.0
+        total_drr = round(sum(b["drr"] for b in brands_kpi), 4)
         total_days_cover = round(total_net_stock / total_drr, 2) if total_drr > 0 else 0.0
         total_transit = sum(b["stock_in_transit"] for b in brands_kpi)
         total_current_coverage = round((total_net_stock + total_transit) / total_drr, 2) if total_drr > 0 else 0.0
@@ -2831,7 +2860,7 @@ async def get_dashboard_kpi(db=Depends(get_database)):
             for k, v in global_class_counts.items()
         }
 
-        return JSONResponse(status_code=200, content={
+        response_payload = {
             "period": {"start_date": start_date, "end_date": end_date, "days": period_days},
             "brands": brands_kpi,
             "totals": {
@@ -2865,7 +2894,11 @@ async def get_dashboard_kpi(db=Depends(get_database)):
             },
             "latest_stock_dates": content.get("latest_stock_dates", {}),
             "meta": content.get("meta", {}),
-        })
+        }
+        _dashboard_kpi_cache = response_payload
+        _dashboard_kpi_cache_ts = _time.time()
+        logger.info("Dashboard KPI computed and cached")
+        return JSONResponse(status_code=200, content=response_payload)
 
     except HTTPException:
         raise
@@ -2963,10 +2996,12 @@ async def download_dashboard_kpi(
                     pd.DataFrame(rows).to_excel(writer, sheet_name="Product KPI", index=False)
 
             else:
-                # Brand aggregation
+                # Brand aggregation — skip products with no brand set
                 brand_groups: Dict[str, list] = defaultdict(list)
                 for item in combined_data:
-                    brand = (item.get("brand") or "Unknown").strip() or "Unknown"
+                    brand = (item.get("brand") or "").strip()
+                    if not brand:
+                        continue
                     brand_groups[brand].append(item)
 
                 rows = []
