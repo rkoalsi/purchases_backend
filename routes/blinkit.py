@@ -206,7 +206,7 @@ sku_cache = SKUCache()
 
 SKU_COLLECTION = "blinkit_sku_mapping"
 RETURN_COLLECTION = "blinkit_returns"
-TEMP_SALES_COLLECTION = "blinkit_sales_temp"
+TEMP_SALES_COLLECTION = "blinkit_sales"
 INVENTORY_COLLECTION = "blinkit_inventory"
 
 CITIES = [
@@ -1013,25 +1013,13 @@ async def upload_inventory_data(
     file: UploadFile = File(...), database=Depends(get_database)
 ):
     """
-    Optimized inventory data upload with city-level aggregation.
-    Supports both OLD and NEW Blinkit inventory file formats.
+    Upload Blinkit Ageing Inventory data (Daily Ageing sheet from payout folder).
 
-    Supported Formats:
-
-    1. OLD FORMAT (Legacy):
-       - Standard Excel file with columns: Item ID, Backend Outlet, Date, Qty
-       - Header row is the first row
-       - Date column already present
-
-    2. NEW FORMAT (Current - auto-detected):
-       - First row contains timestamp: "This sheet was generated at YYYY-MM-DD HH:MM:SS"
-       - Second row contains section headers (Product details, Warehouse details, etc.)
-       - Third row contains column headers
-       - Key columns: Item ID, Warehouse Facility Name (→ Backend Outlet),
-                      Total sellable (→ Qty), Item Name
-       - Date is automatically extracted from the timestamp
-
-    The function automatically detects which format is being used and processes accordingly.
+    Expected format:
+    - Sheet name: "Daily Ageing"
+    - Headers at row 4 (skiprows=3)
+    - Fixed columns: State, Item ID, Item Name, ...
+    - Remaining columns are dates (YYYY-MM-DD) with daily inventory quantities
     """
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(
@@ -1044,251 +1032,167 @@ async def upload_inventory_data(
 
         file_content = await file.read()
 
-        # Detect file format by checking the first row
-        def detect_and_parse_format(file_content):
-            # Read first row to detect format
-            df_check = pd.read_excel(BytesIO(file_content), engine="openpyxl", header=None, nrows=1)
-            first_cell = str(df_check.iloc[0, 0])
+        def parse_ageing_inventory(file_content):
+            df = pd.read_excel(
+                BytesIO(file_content),
+                sheet_name="Daily Ageing",
+                skiprows=3,
+                engine="openpyxl",
+            )
+            logger.info(f"Daily Ageing columns: {list(df.columns)}")
 
-            # New format detection: first cell contains timestamp
-            if "This sheet was generated at" in first_cell:
-                logger.info("Detected NEW inventory format (with timestamp in first cell)")
+            if "State" not in df.columns or "Item ID" not in df.columns:
+                raise ValueError(
+                    f"Expected 'State' and 'Item ID' columns. Found: {list(df.columns)}"
+                )
 
-                # Extract date from timestamp using regex
-                match = re.search(r'(\d{4}-\d{2}-\d{2})', first_cell)
-                if match:
-                    extracted_date = match.group(1)
-                    logger.info(f"Successfully extracted date from timestamp: {extracted_date}")
-                else:
-                    # Fallback to today's date if extraction fails
-                    extracted_date = datetime.now().strftime("%Y-%m-%d")
-                    logger.warning(f"Could not extract date from timestamp '{first_cell}', using today's date: {extracted_date}")
+            # Identify date columns (YYYY-MM-DD format)
+            date_cols = [
+                c for c in df.columns if re.match(r"^\d{4}-\d{2}-\d{2}$", str(c))
+            ]
+            if not date_cols:
+                raise ValueError("No date columns found in Daily Ageing sheet.")
 
-                # Read actual data (skip first 2 rows: row 0 = timestamp, row 1 = section headers, row 2 = column headers)
-                df = pd.read_excel(BytesIO(file_content), engine="openpyxl", skiprows=2)
+            logger.info(f"Found {len(date_cols)} date columns: {date_cols}")
 
-                logger.info(f"New format columns found: {list(df.columns)[:10]}...")
+            # Keep only needed columns and melt date columns into rows
+            id_vars = ["State", "Item ID", "Item Name"]
+            df = df[id_vars + date_cols].copy()
+            df = df.dropna(subset=["Item ID"])
 
-                # Map new format columns to old format column names
-                if "Warehouse Facility Name" in df.columns:
-                    df["Backend Outlet"] = df["Warehouse Facility Name"]
-                    logger.info("Mapped 'Warehouse Facility Name' → 'Backend Outlet'")
-                else:
-                    logger.warning("'Warehouse Facility Name' column not found in new format")
+            melted = df.melt(
+                id_vars=id_vars,
+                value_vars=date_cols,
+                var_name="Date",
+                value_name="Qty",
+            )
 
-                if "Total sellable" in df.columns:
-                    df["Qty"] = df["Total sellable"]
-                    logger.info("Mapped 'Total sellable' → 'Qty'")
-                else:
-                    logger.warning("'Total sellable' column not found in new format")
+            # Drop zero/null inventory rows
+            melted["Qty"] = pd.to_numeric(melted["Qty"], errors="coerce").fillna(0)
+            melted = melted[melted["Qty"] > 0].copy()
 
-                # Also map Item Name if present
-                if "Item Name" in df.columns and "Item Name" not in df.columns:
-                    logger.info("Item Name column found in new format")
-
-                # Add Date column with extracted date
-                df["Date"] = extracted_date
-                logger.info(f"Added 'Date' column with value: {extracted_date}")
-
-                return df
-            else:
-                logger.info("Detected OLD inventory format (standard Excel format)")
-                # Old format: read normally
-                df = pd.read_excel(BytesIO(file_content), engine="openpyxl")
-                logger.info(f"Old format columns found: {list(df.columns)}")
-                return df
+            logger.info(f"After melt and filter: {len(melted)} rows")
+            return melted
 
         with ThreadPoolExecutor() as executor:
             df = await asyncio.get_event_loop().run_in_executor(
-                executor,
-                detect_and_parse_format,
-                file_content
-            )
-
-        # Validate required columns
-        required_cols = ["Item ID", "Backend Outlet", "Date", "Qty"]
-        if not all(col in df.columns for col in required_cols):
-            missing = [col for col in required_cols if col not in df.columns]
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Missing required columns: {', '.join(missing)}. Available columns: {', '.join(df.columns)}",
+                executor, parse_ageing_inventory, file_content
             )
 
         inventory_collection = database.get_collection(INVENTORY_COLLECTION)
         sku_collection = database.get_collection(SKU_COLLECTION)
 
-        # Get cached SKU mapping
         sku_map_dict = await sku_cache.get_sku_mapping(sku_collection)
         logger.info(f"Retrieved SKU mapping with {len(sku_map_dict)} entries")
-        logger.info(json.dumps(serialize_mongo_document(sku_map_dict), indent=4))
-        # Clean and process data efficiently
-        df = df.dropna(subset=["Item ID"])
 
-        # CRITICAL FIX: Ensure Item ID conversion is consistent with sales data
+        # Ensure Item ID is int
         df["Item ID"] = (
             pd.to_numeric(df["Item ID"], errors="coerce").fillna(0).astype(int)
         )
-        df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0)
 
-        # Clean Backend Outlet names
-        df["Backend Outlet"] = df["Backend Outlet"].astype(str).str.strip()
-
-        # Process dates
-        def process_inventory_dates(dates):
-            processed = []
-            for date in dates:
-                parsed_date = safe_strptime(date, "%Y-%m-%d")
-                if parsed_date:
-                    processed.append(
-                        parsed_date.replace(hour=0, minute=0, second=0, microsecond=0)
-                    )
-                else:
-                    processed.append(None)
-            return processed
+        # Parse dates
+        def parse_dates(dates):
+            result = []
+            for d in dates:
+                parsed = safe_strptime(str(d), "%Y-%m-%d")
+                result.append(
+                    parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+                    if parsed
+                    else None
+                )
+            return result
 
         with ThreadPoolExecutor() as executor:
             df["processed_date"] = await asyncio.get_event_loop().run_in_executor(
-                executor, process_inventory_dates, df["Date"].tolist()
+                executor, parse_dates, df["Date"].tolist()
             )
 
-        # Remove rows with invalid dates
         df = df.dropna(subset=["processed_date"])
 
-        # Apply SKU mapping with proper type conversion
+        # Apply SKU mapping
         def get_sku_info(item_id):
-            # Ensure item_id is converted to int for mapping lookup
             try:
-                item_id_int = int(item_id)
-                sku_info = sku_map_dict.get(item_id_int, {})
+                sku_info = sku_map_dict.get(int(item_id), {})
                 return {
                     "sku_code": sku_info.get("sku_code", "Unknown SKU"),
                     "item_name": sku_info.get("item_name", "Unknown Item"),
                 }
             except (ValueError, TypeError):
-                logger.info(f"Invalid Item ID for SKU mapping: {item_id}")
                 return {"sku_code": "Unknown SKU", "item_name": "Unknown Item"}
 
-        # Apply SKU mapping
-        sku_mapping_results = df["Item ID"].apply(get_sku_info)
-        df["sku_code"] = [result["sku_code"] for result in sku_mapping_results]
-        df["item_name"] = [result["item_name"] for result in sku_mapping_results]
+        sku_results = df["Item ID"].apply(get_sku_info)
+        df["sku_code"] = [r["sku_code"] for r in sku_results]
+        df["item_name"] = [r["item_name"] for r in sku_results]
 
-        # Handle item names from file if available
+        # Use Item Name from file where available
         if "Item Name" in df.columns:
             df["item_name"] = df["Item Name"].fillna(df["item_name"])
 
-        # Add city mapping
-        df["city"] = df["Backend Outlet"].apply(
-            lambda warehouse: get_city_from_warehouse(
-                warehouse, CITIES, WAREHOUSE_CITY_MAP
-            )
+        # Use State directly as the location field
+        df["state"] = df["State"].astype(str).str.strip()
+
+        # Filter out unknown SKUs
+        df_valid = df[df["sku_code"] != "Unknown SKU"].copy()
+        df_unknown = df[df["sku_code"] == "Unknown SKU"].copy()
+        logger.info(
+            f"Valid SKUs: {len(df_valid)}, Unknown SKUs excluded: {len(df_unknown)}"
         )
 
-        # IMPORTANT: Filter out records with Unknown SKU BEFORE aggregation
-        # This prevents Unknown SKU records from being created in the first place
-        df_with_valid_sku = df[df["sku_code"] != "Unknown SKU"].copy()
-        df_with_unknown_sku = df[df["sku_code"] == "Unknown SKU"].copy()
-
-        logger.info(f"Proceeding with {len(df_with_valid_sku)} records with valid SKUs")
-        logger.info(f"Excluding {len(df_with_unknown_sku)} records with Unknown SKUs")
-
-        if len(df_with_unknown_sku) > 0:
-            logger.info("Records with Unknown SKU (will be excluded):")
-            for _, row in df_with_unknown_sku.head(5).iterrows():
-                logger.info(
-                    f"  Item ID: {row['Item ID']}, Warehouse: {row['Backend Outlet']}, Qty: {row['Qty']}"
-                )
-
-        # Proceed with city-level aggregation using only valid SKU records
-        aggregation_columns = [
-            "sku_code",
-            "city",
-            "processed_date",
-            "Item ID",
-            "item_name",
-        ]
-
-        # Perform city-level aggregation on valid SKU records only
+        # Aggregate by (sku_code, state, date, item_id)
+        agg_cols = ["sku_code", "state", "processed_date", "Item ID", "item_name"]
         aggregated_df = (
-            df_with_valid_sku.groupby(aggregation_columns, as_index=False)
-            .agg(
-                {
-                    "Qty": "sum",
-                    "Backend Outlet": lambda x: " + ".join(sorted(set(x))),
-                }
-            )
+            df_valid.groupby(agg_cols, as_index=False)
+            .agg({"Qty": "sum"})
             .reset_index(drop=True)
         )
+        aggregated_df.rename(columns={"Qty": "warehouse_inventory"}, inplace=True)
 
-        logger.info(f"After city aggregation: {len(aggregated_df)} records")
+        logger.info(f"After aggregation: {len(aggregated_df)} records")
 
-        # Verify no Unknown SKUs in final data
-        final_unknown_count = len(
-            aggregated_df[aggregated_df["sku_code"] == "Unknown SKU"]
-        )
-        if final_unknown_count > 0:
-            logger.info(
-                f"WARNING: {final_unknown_count} Unknown SKU records still present after filtering!"
-            )
-        else:
-            logger.info("✓ No Unknown SKU records in final aggregated data")
-
-        aggregated_df.rename(
-            columns={
-                "Qty": "warehouse_inventory",
-                "Backend Outlet": "combined_warehouses",
-            },
-            inplace=True,
-        )
-
-        # Rest of the function remains the same...
-        # (Delete old records and insert new ones)
-
+        # Delete old records for the same dates/skus/states
         dates_to_process = list(aggregated_df["processed_date"].unique())
         skus_to_process = list(aggregated_df["sku_code"].unique())
-        cities_to_process = list(aggregated_df["city"].unique())
+        states_to_process = list(aggregated_df["state"].unique())
 
-        logger.info(
-            f"Cleaning up old records for {len(dates_to_process)} dates, {len(skus_to_process)} SKUs, {len(cities_to_process)} cities..."
+        delete_result = inventory_collection.delete_many(
+            {
+                "date": {"$in": dates_to_process},
+                "sku_code": {"$in": skus_to_process},
+                "city": {"$in": states_to_process},
+            }
         )
-
-        delete_filter = {
-            "date": {"$in": dates_to_process},
-            "sku_code": {"$in": skus_to_process},
-            "city": {"$in": cities_to_process},
-        }
-
-        delete_result = inventory_collection.delete_many(delete_filter)
         logger.info(f"Deleted {delete_result.deleted_count} old inventory records")
 
-        # Insert new city-aggregated records
+        # Insert new records (store state in the `city` field for report compatibility)
         bulk_operations = []
         for _, row in aggregated_df.iterrows():
-            document = {
-                "sku_code": row["sku_code"],
-                "city": row["city"],
-                "date": row["processed_date"],
-                "item_id": int(row["Item ID"]),
-                "item_name": row["item_name"],
-                "warehouse_inventory": float(row["warehouse_inventory"]),
-                "combined_warehouses": row["combined_warehouses"],
-            }
-            bulk_operations.append(InsertOne(document))
+            bulk_operations.append(
+                InsertOne(
+                    {
+                        "sku_code": row["sku_code"],
+                        "city": row["state"],
+                        "date": row["processed_date"],
+                        "item_id": int(row["Item ID"]),
+                        "item_name": row["item_name"],
+                        "warehouse_inventory": float(row["warehouse_inventory"]),
+                    }
+                )
+            )
 
         insert_count = 0
         if bulk_operations:
-            batch_size = 1000
-            for i in range(0, len(bulk_operations), batch_size):
-                batch = bulk_operations[i : i + batch_size]
+            for i in range(0, len(bulk_operations), 1000):
+                batch = bulk_operations[i : i + 1000]
                 result = inventory_collection.bulk_write(batch, ordered=False)
                 insert_count += result.inserted_count
 
-        excluded_unknown_count = len(df_with_unknown_sku)
-
         return {
-            "message": f"Successfully uploaded and processed inventory data with city-level aggregation. "
-            f"Deleted {delete_result.deleted_count} old records, inserted {insert_count} new city-aggregated records. "
-            f"Excluded {excluded_unknown_count} records with Unknown SKU."
+            "message": (
+                f"Successfully uploaded Ageing Inventory data. "
+                f"Deleted {delete_result.deleted_count} old records, "
+                f"inserted {insert_count} new records across {len(states_to_process)} states. "
+                f"Excluded {len(df_unknown)} records with unknown SKU."
+            )
         }
 
     except HTTPException as e:
