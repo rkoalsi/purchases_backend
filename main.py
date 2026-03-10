@@ -119,12 +119,12 @@ app.include_router(seasonal_router, prefix="/seasonal", tags=["seasonal"])
 # --- Protected Swagger / ReDoc / OpenAPI schema ---
 @app.get("/docs", include_in_schema=False, dependencies=[Depends(_verify_docs_credentials)])
 async def swagger_ui():
-    return get_swagger_ui_html(openapi_url="/openapi.json", title="Pupscribe API Docs")
+    return get_swagger_ui_html(openapi_url="openapi.json", title="Pupscribe API Docs")
 
 
 @app.get("/redoc", include_in_schema=False, dependencies=[Depends(_verify_docs_credentials)])
 async def redoc_ui():
-    return get_redoc_html(openapi_url="/openapi.json", title="Pupscribe API Docs")
+    return get_redoc_html(openapi_url="openapi.json", title="Pupscribe API Docs")
 
 
 @app.get("/openapi.json", include_in_schema=False, dependencies=[Depends(_verify_docs_credentials)])
