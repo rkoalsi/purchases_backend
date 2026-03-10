@@ -558,6 +558,7 @@ class OptimizedMasterReportService:
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(valid_skus)}},
                     {"cf_sku_code": 1, "item_id": 1, "name": 1, "rate": 1, "brand": 1, "cbm": 1, "case_pack": 1,
+                     "cf_item_code": 1,
                      "purchase_status": 1, "stock_in_transit_1": 1, "stock_in_transit_2": 1,
                      "stock_in_transit_3": 1, "created_at": 1, "_id": 0},
                 ))
@@ -585,6 +586,7 @@ class OptimizedMasterReportService:
                     "brand": product.get("brand", ""),
                     "cbm": self.safe_float(product.get("cbm")),
                     "case_pack": self.safe_float(product.get("case_pack")),
+                    "manufacturer_code": product.get("cf_item_code", "") or "",
                     "purchase_status": product.get("purchase_status", ""),
                     "stock_in_transit_1": self.safe_float(product.get("stock_in_transit_1")),
                     "stock_in_transit_2": self.safe_float(product.get("stock_in_transit_2")),
@@ -1397,6 +1399,48 @@ class OptimizedMasterReportService:
             logger.error(f"Error fetching product logistics: {e}")
             return {}
 
+    async def fetch_latest_po_unit_prices(self, sku_codes: Set[str]) -> Dict[str, Dict]:
+        """Fetch unit price (rate) and currency_code from the latest purchase order per SKU.
+        Matches via line_items.item_custom_fields where api_name == 'cf_sku_code'.
+        Returns {sku_code: {"rate": float, "currency_code": str}}."""
+        if not sku_codes:
+            return {}
+        try:
+            po_collection = self.database.get_collection("purchase_orders")
+            sku_list = [s for s in sku_codes if s]
+
+            def _fetch():
+                pipeline = [
+                    {"$unwind": "$line_items"},
+                    {"$unwind": "$line_items.item_custom_fields"},
+                    {"$match": {
+                        "line_items.item_custom_fields.api_name": "cf_sku_code",
+                        "line_items.item_custom_fields.value": {"$in": sku_list},
+                    }},
+                    {"$sort": {"date": -1}},
+                    {"$group": {
+                        "_id": "$line_items.item_custom_fields.value",
+                        "rate": {"$first": "$line_items.rate"},
+                        "currency_code": {"$first": "$currency_code"},
+                    }},
+                ]
+                result = {}
+                for doc in po_collection.aggregate(pipeline):
+                    sku = doc.get("_id")
+                    if sku:
+                        result[sku] = {
+                            "rate": float(doc.get("rate") or 0),
+                            "currency_code": doc.get("currency_code", "") or "",
+                        }
+                return result
+
+            result = await asyncio.to_thread(_fetch)
+            logger.info(f"Fetched latest PO unit prices for {len(result)} SKUs")
+            return result
+        except Exception as e:
+            logger.error(f"Error fetching latest PO unit prices: {e}")
+            return {}
+
     @staticmethod
     def enrich_with_order_calculations(
         combined_data: List[Dict],
@@ -1404,10 +1448,13 @@ class OptimizedMasterReportService:
         logistics_data: Dict[str, Dict],
         missed_sales_by_sku: Dict[str, float] = None,
         period_days: int = 30,
+        current_period_missed_sales_by_sku: Dict[str, float] = None,
     ) -> List[Dict]:
         """Add order calculation columns to each item in combined_data"""
         if missed_sales_by_sku is None:
             missed_sales_by_sku = {}
+        if current_period_missed_sales_by_sku is None:
+            current_period_missed_sales_by_sku = {}
 
         for item in combined_data:
             sku = item.get("sku_code", "")
@@ -1445,7 +1492,12 @@ class OptimizedMasterReportService:
             target_days = lead_time + safety_days + order_processing
 
             # Missed Sales columns (inserted between Current Days Coverage and Target Days)
-            missed_sales = missed_sales_by_sku.get(sku, 0)
+            # For demand-override items use current-period missed sales; otherwise use
+            # whatever is in missed_sales_by_sku (which may be lookback-period for those SKUs)
+            if item.get("order_qty_demand_override"):
+                missed_sales = current_period_missed_sales_by_sku.get(sku, 0)
+            else:
+                missed_sales = missed_sales_by_sku.get(sku, 0)
             item["missed_sales"] = missed_sales
             missed_sales_drr_raw = missed_sales / period_days if period_days > 0 else 0.0
             
@@ -1490,10 +1542,20 @@ class OptimizedMasterReportService:
                 item["total_cbm"] = 0
                 item["days_current_order_lasts"] = 0
                 item["days_total_inventory_lasts"] = round(current_days_coverage, 2)
+                item["order_qty_basis"] = ""
                 continue
 
             # Order quantity
             order_qty = max(0, net_target_days * drr)
+
+            # Demand-based override: when current-period sales exceed lookback sales,
+            # use current-period sales as the order qty instead of DRR × target days
+            if item.get("order_qty_demand_override"):
+                order_qty = round(item.get("current_period_sales_for_override", 0), 2)
+                item["order_qty_basis"] = "Current Period Sales"
+            else:
+                item["order_qty_basis"] = ""
+
             item["order_qty"] = round(order_qty, 2)
 
             # Order Qty + Extra Qty
@@ -1633,6 +1695,9 @@ async def _generate_master_report_data(
             logger.error(f"Missed sales fetch failed: {missed_sales_by_sku}")
             missed_sales_by_sku = {}
 
+        # Preserve current-period missed sales before any lookback overrides
+        current_period_missed_sales_by_sku = dict(missed_sales_by_sku)
+
         # Placeholders — filled after enrichment in a separate parallel step
         latest_zoho_by_sku: Dict[str, float] = {}
         latest_fba_by_sku: Dict[str, float] = {}
@@ -1759,13 +1824,15 @@ async def _generate_master_report_data(
             new_skus = combined_sku_codes - all_sku_codes
 
             # Fire off ALL independent DB queries in parallel:
-            # 1. sku_to_item_id (for lookback)
-            # 2. brand_logistics (for enrichment)
-            # 3. transit_data (for enrichment)
-            # 4. extra_product_data (if new SKUs from composite expansion)
+            # 1. brand_logistics (for enrichment)
+            # 2. transit_data (for enrichment)
+            # 3. po_unit_prices (latest purchase order rate per SKU)
+            # 4. sku_to_item_id (for DRR lookback, if needed)
+            # 5. extra_product_data (if new SKUs from composite expansion)
             parallel_tasks = [
                 report_service.get_brand_logistics(),
                 report_service.get_stock_in_transit(),
+                report_service.fetch_latest_po_unit_prices(combined_sku_codes),
             ]
             if skus_needing_lookback_list:
                 parallel_tasks.append(report_service.fetch_sku_to_item_id_map(set(skus_needing_lookback_list)))
@@ -1776,7 +1843,8 @@ async def _generate_master_report_data(
 
             brand_logistics = parallel_results[0] if not isinstance(parallel_results[0], Exception) else {}
             transit_data = parallel_results[1] if not isinstance(parallel_results[1], Exception) else {}
-            idx = 2
+            po_unit_prices = parallel_results[2] if not isinstance(parallel_results[2], Exception) else {}
+            idx = 3
             sku_to_item_id = {}
             if skus_needing_lookback_list:
                 sku_to_item_id = parallel_results[idx] if not isinstance(parallel_results[idx], Exception) else {}
@@ -1838,6 +1906,12 @@ async def _generate_master_report_data(
                                     item["drr_lookback_days_in_stock"] = lb["days_in_stock"]
                                     item["drr_lookback_sales"] = lb["units_sold"]
                                     item["highlight"] = "yellow"
+                                    # If current-period sales exceed lookback sales, flag for
+                                    # demand-based order qty override (order qty = current sales)
+                                    current_net_sales = metrics.get("total_sales", 0)
+                                    if lb["units_sold"] < current_net_sales:
+                                        item["order_qty_demand_override"] = True
+                                        item["current_period_sales_for_override"] = current_net_sales
                                 else:
                                     item["drr_source"] = "insufficient_stock"
                                     item["drr_lookback_period"] = ""
@@ -2044,14 +2118,15 @@ async def _generate_master_report_data(
             try:
                 combined_data = report_service.classify_movement(combined_data, brand_logistics, product_brands, logistics_data)
                 combined_data = report_service.enrich_with_order_calculations(
-                    combined_data, transit_data, logistics_data, missed_sales_by_sku, period_days
+                    combined_data, transit_data, logistics_data, missed_sales_by_sku, period_days,
+                    current_period_missed_sales_by_sku,
                 )
                 logger.info(f"Enriched {len(combined_data)} items with movement and order calculations")
             except Exception as e:
                 logger.error(f"Error in movement classification and order calculations: {e}")
                 errors.append(f"Movement/order enrichment error: {str(e)}")
 
-            # Attach latest current stock to each item
+            # Attach latest current stock, PO unit prices, and manufacturer code to each item
             for item in combined_data:
                 sku = item.get("sku_code", "")
                 lz = round(latest_zoho_by_sku.get(sku, 0), 2)
@@ -2059,6 +2134,10 @@ async def _generate_master_report_data(
                 item["latest_zoho_stock"] = lz
                 item["latest_fba_stock"] = lf
                 item["latest_total_stock"] = round(lz + lf, 2)
+                po_price = po_unit_prices.get(sku, {})
+                item["unit_price"] = po_price.get("rate", 0)
+                item["unit_price_currency"] = po_price.get("currency_code", "")
+                item["manufacturer_code"] = all_product_data.get(sku, {}).get("manufacturer_code", "")
 
             # Recalculate days-coverage columns and all downstream order calculations
             # using latest DB stock instead of end-of-period closing stock.
@@ -2275,11 +2354,116 @@ async def get_master_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
     include_zoho: bool = Query(True, description="Include Zoho data"),
-    brand: str = Query(None, description="Filter by brand name"),
+    brand: str = Query(None, description="Filter by brand name (e.g. 'Truelove'). Omit for all brands."),
     db=Depends(get_database),
 ):
     """
-    Optimized master report with batch processing and parallel execution
+    Generate the master inventory & sales report for a given date range.
+
+    ## Processing Pipeline
+
+    ### 1. Parallel Data Fetching
+    All data sources are fetched concurrently to minimise latency:
+    - **Zoho** – the **sole source of sales data**. Covers invoices and credit notes
+      from the Pupscribe Warehouse for the period. Blinkit and Amazon sales are
+      intentionally excluded; all sales are tracked through Zoho.
+    - **Amazon FBA closing stock** – fetched from `amazon_ledger` for inventory
+      purposes only (not sales). Represents FBA inventory as of `end_date`.
+    - **Composite products map** – bundle-to-component expansion rules
+    - **Transfer orders** – inter-warehouse transfers for the period (excluded from net sales)
+    - **Missed sales** – unfulfilled demand logged for the period
+
+    ### 2. SKU & Product Data Resolution
+    All SKU codes extracted from Zoho and FBA stock are batch-loaded from the
+    products collection in a single query — fetching name, rate, brand, CBM,
+    case pack, purchase status, and stock-in-transit fields.
+
+    ### 3. Per-Source Normalisation
+    Zoho records are converted to a canonical structure
+    (`{sku_code, units_sold, units_returned, amount, days_in_stock, closing_stock, …}`).
+    Zoho separates invoice units from credit-note units explicitly.
+
+    ### 4. Data Combination & Composite Expansion
+    Normalised records from all sources are merged by `sku_code`.
+    Composite / bundle SKUs are exploded into their components using the
+    composite products map; each component's quantities are scaled by its
+    `quantity` multiplier. Combined metrics computed per SKU:
+    - `total_units_sold`, `total_credit_notes`, `total_amount`
+    - `total_closing_stock` = Zoho Pupscribe Warehouse stock + FBA stock
+    - `avg_daily_run_rate` (DRR) = net units sold ÷ days in stock (or period days if always in stock)
+    - `total_sales` = units_sold − credit_notes − transfer_orders
+
+    ### 5. DRR Lookback (≥ 90-day reports only)
+    For SKUs with fewer than 60 days in stock during the current period
+    (insufficient data for a reliable DRR), the system looks back up to 6
+    previous 90-day windows to find a period where the SKU had ≥ 90 days
+    in stock. If found:
+    - DRR is replaced with the historical value (`drr_source = "previous_period"`, highlighted yellow in Excel)
+    - Missed sales are also re-fetched from that same lookback window for consistency
+    - **Demand override:** if current-period net sales exceed lookback-period sales,
+      `order_qty` is set to current-period sales and `extra_qty` uses current-period
+      missed sales (`order_qty_basis = "Current Period Sales"`)
+    - If no valid lookback period is found, the SKU is marked `drr_source = "insufficient_stock"` (red in Excel)
+
+    ### 6. Brand Logistics Enrichment
+    Lead time, safety days, and movement-class thresholds are loaded per brand
+    from the `brand_logistics` collection and applied to each SKU.
+    Open purchase orders are queried to derive stock-in-transit values
+    (used as a fallback when the product record doesn't have manual SIT values).
+
+    ### 7. Movement Classification
+    Within each brand group, SKUs are ranked by volume and revenue percentiles:
+    - **Fast Mover** – top tier by both volume and revenue
+    - **Medium Mover** – mid tier
+    - **Slow Mover** – bottom tier or zero movement
+
+    ### 8. Order Quantity Calculations
+    For each SKU (skipped for inactive / discontinued items):
+    - `target_days` = lead_time + safety_days + order_processing (10 days fixed)
+    - `current_days_coverage` = (closing_stock + stock_in_transit) ÷ DRR
+    - `net_target_days` = target_days − current_days_coverage (floored at target_days if already under lead time)
+    - `order_qty` = max(0, net_target_days × DRR)
+    - `extra_qty` = missed_sales_drr × lead_time (capped at 50 % of DRR to prevent spikes)
+    - `order_qty_plus_extra_qty_rounded` = rounded down to nearest case pack multiple
+    - `total_cbm` = (rounded_qty ÷ case_pack) × CBM per case
+
+    ### 9. Latest Stock Injection
+    Real-time stock (latest record in DB, regardless of report period) is attached
+    to each SKU (`latest_zoho_stock`, `latest_fba_stock`, `latest_total_stock`).
+    All coverage and order calculations are then **recomputed** using this latest
+    stock so recommendations reflect current inventory, not end-of-period snapshot.
+
+    ### 10. FBA-Only Stub Rows
+    SKUs that have FBA stock as of `end_date` but zero sales in the period are
+    injected as stub rows so they appear in the report with their stock and
+    order-coverage data even though no sales were recorded.
+
+    ### 11. Growth Rate & Return %
+    Calculated using a background-fetched 90-day trailing DRR compared against
+    the report-period DRR. Return % = total_units_returned ÷ total_units_sold.
+
+    ## Response
+    Returns a JSON object with:
+    - **`combined_data`** – array of enriched SKU objects (see field list below)
+    - **`summary`** – totals/averages across all SKUs
+    - **`individual_reports`** – per-source metadata (success, record count, errors)
+    - **`latest_stock_dates`** – date of the most recent stock record in DB for Zoho and FBA
+    - **`meta`** – execution time and timestamp
+
+    ## Key Fields on Each SKU in `combined_data`
+    | Field | Description |
+    |---|---|
+    | `sku_code` | Internal SKU identifier |
+    | `avg_daily_run_rate` | Units sold per day (DRR) |
+    | `drr_source` | `current_period` / `previous_period` / `insufficient_stock` |
+    | `drr_lookback_period` | Date range used for lookback DRR (if applicable) |
+    | `total_closing_stock` | Zoho Pupscribe Warehouse stock + FBA stock as of `end_date` |
+    | `latest_total_stock` | Zoho Pupscribe Warehouse stock + FBA stock as of latest DB record |
+    | `current_days_coverage` | Days of inventory on hand at current DRR |
+    | `order_qty_plus_extra_qty_rounded` | Final suggested order quantity (case-pack rounded) |
+    | `missed_sales` | Unfulfilled demand units for the period |
+    | `movement` | `Fast Mover` / `Medium Mover` / `Slow Mover` |
+    | `excess_or_order` | `ORDER` / `EXCESS` / `NO MOVEMENT` |
     """
     content = await _generate_master_report_data(
         start_date, end_date, include_zoho, db, brand=brand,
@@ -2304,11 +2488,105 @@ async def download_master_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
     include_zoho: bool = Query(True, description="Include Zoho data"),
-    brand: str = Query(None, description="Filter by brand name"),
+    brand: str = Query(None, description="Filter by brand name (e.g. 'Truelove'). Omit for all brands."),
     db=Depends(get_database),
 ):
     """
-    Download master report as Excel file with multiple sheets.
+    Download the master report as an Excel (.xlsx) file.
+
+    Runs the exact same processing pipeline as `GET /master-report` and writes
+    the result to a multi-sheet Excel workbook streamed back as an attachment.
+
+    > **Note on data sources:** Sales data comes exclusively from **Zoho** (Pupscribe
+    > Warehouse invoices and credit notes). Blinkit and Amazon sales are not included.
+    > Amazon FBA is used only for closing stock / inventory figures.
+
+    ## Excel Workbook Structure
+
+    ### Master Sheet (`{brand} {start} to {end}` or `Master {start} to {end}`)
+    One row per SKU. Columns are grouped as follows:
+
+    **Identity**
+    - `Purchase Status` – active / inactive / discontinued until stock lasts
+    - `Is New` – Yes if the product was created within the report window
+    - `SKU Code`, `Item Name`
+
+    **Sales Metrics**
+    - `Total Amount` – gross revenue for the period
+    - `Total Units Sold` – gross units sold across all channels
+    - `Total Units Returned` – customer returns
+    - `Transfer Orders` – inter-warehouse transfers (excluded from net sales)
+    - `Net Total Sales` – units_sold − returns − transfer_orders
+    - `Return %`
+
+    **DRR & Stock Quality**
+    - `Days in Stock` – days the SKU was in stock during the period
+    - `Lookback Days in Stock` – days in stock during the lookback period (if used)
+    - `Lookback Sales` – units sold during the lookback period (if used)
+    - `Avg Daily Run Rate` – DRR used for order calculations
+    - `Growth Rate (%)` – change vs. trailing 90-day DRR
+    - `DRR Source` – `current_period` / `previous_period` / `insufficient_stock`
+    - `DRR Lookback Period` – date range of the lookback window (e.g. `2025-09-01 to 2025-12-01`)
+
+    **Stock Snapshot (period end)**
+    - `Total Stock ({end_date})` – Zoho Pupscribe Warehouse stock + FBA stock as of `end_date`
+    - `Pupscribe WH Stock ({end_date})` – Zoho Pupscribe Warehouse stock as of `end_date`
+    - `FBA Stock ({end_date})`
+
+    **Stock Snapshot (latest DB record)**
+    - `Total Stock ({latest_date})` – Zoho Pupscribe Warehouse stock + FBA stock (most recent record in DB, used for order calculations)
+    - `Pupscribe WH Stock ({latest_zoho_date})` – Zoho Pupscribe Warehouse stock as of latest DB record
+    - `FBA Stock ({latest_fba_date})`
+
+    **Inventory Status**
+    - `In Stock` – Yes / No as of the latest record
+    - `Movement` – Fast / Medium / Slow Mover (classified within brand group)
+
+    **Order Parameters**
+    - `Safety Days`, `Lead Time`, `Order Processing` (fixed 10 days), `Target Days`
+    - `On-Hand Days Coverage` – days of stock based on period-end stock
+    - `Stock in Transit 1 / 2 / 3`, `Total Stock in Transit`
+    - `Current Days Coverage` – (latest stock + transit) ÷ DRR
+
+    **Missed Sales**
+    - `Missed Sales` – unfulfilled demand units for the period (or lookback period if demand-override)
+    - `Missed Sales DRR` – missed units ÷ period days (capped at 50 % of DRR)
+    - `Extra Qty` – additional buffer = missed_sales_drr × lead_time
+
+    **Order Quantities**
+    - `Net Target Days` – target_days − current_days_coverage
+    - `Excess / Order` – ORDER / EXCESS / NO MOVEMENT
+    - `Order Qty` – net_target_days × DRR (or current-period sales for demand-override rows)
+    - `Order Qty + Extra Qty` – order_qty + extra_qty
+    - `CBM`, `Case Pack`
+    - `Order Qty + Extra Qty (Rounded)` – floored to nearest case pack multiple (row highlighted green when demand override was applied)
+    - `Total CBM` – (rounded_qty ÷ case_pack) × CBM per case
+    - `Days Current Order Lasts` – rounded_qty ÷ DRR
+    - `Days Total Inventory Lasts` – current_days_coverage + days_current_order_lasts
+
+    ## Conditional Row Formatting
+    | Colour | Meaning |
+    |---|---|
+    | Green | Lookback DRR is used but current-period sales exceed lookback sales — order qty overridden to current-period sales |
+    | Yellow | DRR is sourced from a previous lookback period (insufficient current-period stock data) |
+    | Red | Insufficient stock in both current and all lookback periods — DRR is unreliable |
+
+    ## Excel Formulas
+    Several columns are written as live Excel formulas rather than static values
+    so the sheet remains interactive:
+    - `Missed Sales DRR` = Missed Sales ÷ period days
+    - `Extra Qty` = Missed Sales DRR × Lead Time
+    - `Net Target Days` = Target Days − Current Days Coverage
+    - `Order Qty` = max(0, Net Target Days × Avg DRR)
+    - `Order Qty + Extra Qty` = Order Qty + Extra Qty
+    - `Order Qty + Extra Qty (Rounded)` = FLOOR to case pack
+    - `Total CBM` = (Rounded Qty ÷ Case Pack) × CBM
+    - `Days Current Order Lasts` = Rounded Qty ÷ DRR
+    - `Days Total Inventory Lasts` = Current Days Coverage + Days Current Order Lasts
+
+    ## Response
+    Returns a binary `.xlsx` file as a streaming attachment.
+    Filename format: `master_report_{start_date}_to_{end_date}_{YYYYMMDD_HHMMSS}.xlsx`
     """
     try:
         # Get the full master report data (with raw individual_reports for Excel sheets)
@@ -2357,20 +2635,38 @@ async def download_master_report(
         # Create Excel file
         excel_buffer = io.BytesIO()
 
+        # Track which Excel data rows (0-based) are demand-override (green) rows
+        demand_override_row_indices: set = set()
+
+        # currency_code → Excel number format using symbol prefix (shared by master + draft sheets)
+        _CURRENCY_FORMATS: Dict[str, str] = {
+            "USD": '$#,##0.00',
+            "EUR": '€#,##0.00',
+            "GBP": '£#,##0.00',
+            "CNY": '¥#,##0.00',
+            "INR": '₹#,##0.00',
+        }
+        _DEFAULT_NUMBER_FMT = "#,##0.00"
+
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
             # Master Sheet
             combined_df_data = []
+            _master_unit_price_currencies: list = []
             for item in combined_data:
                 if not isinstance(item, dict):
                     continue
+                if item.get("order_qty_demand_override"):
+                    demand_override_row_indices.add(len(combined_df_data))
 
                 metrics = item.get("combined_metrics", {})
+                _master_unit_price_currencies.append(item.get("unit_price_currency", "") or "")
                 combined_df_data.append(
                     {
                         "Purchase Status": item.get("purchase_status", ""),
                         "Is New": "Yes" if item.get("is_new", False) else "No",
                         "SKU Code": item.get("sku_code", ""),
                         "Item Name": item.get("item_name", ""),
+                        "Unit Price": item.get("unit_price", 0),
                         "Total Amount": metrics.get("total_amount", 0),
                         "Total Units Sold": metrics.get("total_units_sold", 0),
                         "Total Units Returned": metrics.get("total_units_returned", 0),
@@ -2441,6 +2737,7 @@ async def download_master_report(
                 _A  = _col("Purchase Status")
                 _F  = _col("Total Units Sold")
                 _G  = _col("Total Units Returned")
+                _I  = _col("Net Total Sales")
                 _J  = _col("Return %")
                 _N  = _col("Avg Daily Run Rate")
                 _R  = _col(f"Total Stock ({_end_date_label})")
@@ -2476,6 +2773,7 @@ async def download_master_report(
                 drr_source_col_idx = cols_list.index("DRR Source") + 1  # 1-based
                 yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
                 red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
+                green_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
 
                 for row_idx in range(2, len(combined_df_data) + 2):  # Skip header row
                     r = row_idx
@@ -2515,7 +2813,11 @@ async def download_master_report(
                     ws[f"{_AO}{r}"] = f'=IF({_N}{r}=0,"NO MOVEMENT",IF({_AJ}{r}<{_AD}{r},"ORDER","EXCESS"))'
 
                     # Order Qty (0 for inactive/discontinued)
-                    ws[f"{_AP}{r}"] = f"=IF({inactive},0,MAX(0,{_AN}{r}*{_N}{r}))"
+                    # For demand-override rows (green), use Net Total Sales directly
+                    if (row_idx - 2) in demand_override_row_indices:
+                        ws[f"{_AP}{r}"] = f"={_I}{r}"
+                    else:
+                        ws[f"{_AP}{r}"] = f"=IF({inactive},0,MAX(0,{_AN}{r}*{_N}{r}))"
 
                     # Order Qty + Extra Qty (only Extra Qty for inactive/discontinued)
                     ws[f"{_AQ}{r}"] = f"=IF({inactive},{_AM}{r},{_AP}{r}+{_AM}{r})"
@@ -2532,14 +2834,27 @@ async def download_master_report(
                     # Days Total Inventory Lasts = Current Days Coverage + Days Current Order Lasts
                     ws[f"{_AW}{r}"] = f"=IF({inactive},{_AJ}{r},{_AJ}{r}+{_AV}{r})"
 
-                    # Apply row highlighting based on DRR source
+                    # Apply row highlighting based on DRR source / demand override
+                    # row_idx is 1-based (row 2 = first data row); convert to 0-based for the set
+                    data_row_idx = row_idx - 2
                     drr_source_val = ws.cell(row=r, column=drr_source_col_idx).value
-                    if drr_source_val == "previous_period":
+                    if data_row_idx in demand_override_row_indices:
+                        # Green: lookback DRR used but current-period sales are higher
+                        # — order qty has been overridden to current-period sales
+                        for col_idx in range(1, len(combined_df.columns) + 1):
+                            ws.cell(row=r, column=col_idx).fill = green_fill
+                    elif drr_source_val == "previous_period":
                         for col_idx in range(1, len(combined_df.columns) + 1):
                             ws.cell(row=r, column=col_idx).fill = yellow_fill
                     elif drr_source_val == "insufficient_stock":
                         for col_idx in range(1, len(combined_df.columns) + 1):
                             ws.cell(row=r, column=col_idx).fill = red_fill
+
+                # Apply currency symbol number format to Unit Price column
+                _up_col_letter = _col("Unit Price")
+                for i, currency_code in enumerate(_master_unit_price_currencies):
+                    num_fmt = _CURRENCY_FORMATS.get(currency_code.upper(), _DEFAULT_NUMBER_FMT)
+                    ws[f"{_up_col_letter}{i + 2}"].number_format = num_fmt
 
                 # Auto-fit column widths: header text drives the width; skip formula cells
                 for col_cells in ws.columns:
@@ -2553,6 +2868,73 @@ async def download_master_report(
                             continue  # skip formulas — display value is computed, not the formula string
                         max_len = max(max_len, len(val))
                     ws.column_dimensions[col_letter].width = min(max_len + 3, 30)
+
+            # Draft Order sheet — only when a brand filter is active
+            if brand and combined_df_data:
+                _today_label = datetime.now().strftime("%d %b %Y")
+                _draft_sheet_name = f"Draft Order {_today_label}"[:31]
+
+                draft_rows = []
+                for item in combined_data:
+                    if not isinstance(item, dict):
+                        continue
+                    draft_rows.append({
+                        "Manufacturer Code": item.get("manufacturer_code", ""),
+                        "BBCode": item.get("sku_code", ""),
+                        "Item Name": item.get("item_name", ""),
+                        "Qty": None,
+                        "Unit Price": item.get("unit_price", 0) or None,
+                        "Total": None,
+                        "Case Pack": item.get("case_pack", 0),
+                        "Cartons": None,
+                        "CBM": item.get("cbm", 0),
+                        "Total CBM": None,
+                        "_currency": item.get("unit_price_currency", ""),
+                    })
+
+                if draft_rows:
+                    # Build DataFrame without the internal _currency helper column
+                    draft_df = pd.DataFrame([{k: v for k, v in r.items() if k != "_currency"} for r in draft_rows])
+                    draft_df.to_excel(writer, sheet_name=_draft_sheet_name, index=False)
+
+                    ws_draft = writer.sheets[_draft_sheet_name]
+                    draft_cols = list(draft_df.columns)
+
+                    def _dcol(name):
+                        return get_column_letter(draft_cols.index(name) + 1)
+
+                    _dqty  = _dcol("Qty")
+                    _dup   = _dcol("Unit Price")
+                    _dtot  = _dcol("Total")
+                    _dcp   = _dcol("Case Pack")
+                    _dcar  = _dcol("Cartons")
+                    _dcbm  = _dcol("CBM")
+                    _dtcbm = _dcol("Total CBM")
+
+                    for r_idx, row in enumerate(draft_rows):
+                        r = r_idx + 2  # 1-based, skip header
+                        ws_draft[f"{_dtot}{r}"]  = f"={_dqty}{r}*{_dup}{r}"
+                        ws_draft[f"{_dcar}{r}"]  = f"=IF({_dcp}{r}>0,{_dqty}{r}/{_dcp}{r},0)"
+                        ws_draft[f"{_dtcbm}{r}"] = f"={_dcbm}{r}*{_dcp}{r}"
+
+                        # Apply currency symbol number format to Unit Price and Total cells
+                        currency_code = row.get("_currency", "") or ""
+                        num_fmt = _CURRENCY_FORMATS.get(currency_code.upper(), _DEFAULT_NUMBER_FMT)
+                        ws_draft[f"{_dup}{r}"].number_format = num_fmt
+                        ws_draft[f"{_dtot}{r}"].number_format = num_fmt
+
+                    # Auto-fit columns
+                    for col_cells in ws_draft.columns:
+                        col_letter = get_column_letter(col_cells[0].column)
+                        max_len = 0
+                        for cell in col_cells:
+                            if cell.value is None:
+                                continue
+                            val = str(cell.value)
+                            if val.startswith("="):
+                                continue
+                            max_len = max(max_len, len(val))
+                        ws_draft.column_dimensions[col_letter].width = min(max_len + 3, 30)
 
         excel_buffer.seek(0)
         file_bytes = excel_buffer.read()

@@ -1,5 +1,12 @@
-from fastapi import FastAPI
+import os
+import secrets
+from dotenv import load_dotenv
+load_dotenv()
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from .routes.auth import router as auth_router
 from .routes.users import router as user_router
 from .routes.amazon import router as amazon_router
@@ -49,7 +56,27 @@ async def lifespan(app: FastAPI):
     
     logger.info("Application shutdown complete")
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+_docs_security = HTTPBasic()
+
+
+def _verify_docs_credentials(credentials: HTTPBasicCredentials = Depends(_docs_security)):
+    docs_username = os.getenv("DOCS_USERNAME", "")
+    docs_password = os.getenv("DOCS_PASSWORD", "")
+    if not docs_username or not docs_password:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Docs credentials not configured",
+        )
+    valid_username = secrets.compare_digest(credentials.username.encode(), docs_username.encode())
+    valid_password = secrets.compare_digest(credentials.password.encode(), docs_password.encode())
+    if not (valid_username and valid_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
 
 origins = [
     "http://localhost:3000",
@@ -87,3 +114,19 @@ app.include_router(dashboard_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(workflow_router, prefix="/workflows", tags=["workflow"])
 app.include_router(missed_sales_router, prefix="/missed_sales", tags=["missed_sales"])
 app.include_router(seasonal_router, prefix="/seasonal", tags=["seasonal"])
+
+
+# --- Protected Swagger / ReDoc / OpenAPI schema ---
+@app.get("/docs", include_in_schema=False, dependencies=[Depends(_verify_docs_credentials)])
+async def swagger_ui():
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="Pupscribe API Docs")
+
+
+@app.get("/redoc", include_in_schema=False, dependencies=[Depends(_verify_docs_credentials)])
+async def redoc_ui():
+    return get_redoc_html(openapi_url="/openapi.json", title="Pupscribe API Docs")
+
+
+@app.get("/openapi.json", include_in_schema=False, dependencies=[Depends(_verify_docs_credentials)])
+async def openapi_schema():
+    return JSONResponse(app.openapi())
