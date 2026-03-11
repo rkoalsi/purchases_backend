@@ -2920,8 +2920,12 @@ async def download_master_report(
                     _dcbm  = _dcol("CBM")
                     _dtcbm = _dcol("Total CBM")
 
+                    # Escape single quotes in sheet name for cross-sheet formula reference
+                    _master_sheet_ref = _sheet_name.replace("'", "''")
+
                     for r_idx, row in enumerate(draft_rows):
                         r = r_idx + 2  # 1-based, skip header
+                        ws_draft[f"{_dqty}{r}"]  = f"='{_master_sheet_ref}'!{_AT}{r}"
                         ws_draft[f"{_dtot}{r}"]  = f"={_dqty}{r}*{_dup}{r}"
                         ws_draft[f"{_dcar}{r}"]  = f"=IF({_dcp}{r}>0,{_dqty}{r}/{_dcp}{r},0)"
                         ws_draft[f"{_dtcbm}{r}"] = f"={_dcbm}{r}*{_dcp}{r}"
