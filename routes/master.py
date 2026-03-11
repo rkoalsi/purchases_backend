@@ -2398,12 +2398,15 @@ async def get_master_report(
     (insufficient data for a reliable DRR), the system looks back up to 6
     previous 90-day windows to find a period where the SKU had ≥ 90 days
     in stock. If found:
-    - DRR is replaced with the historical value (`drr_source = "previous_period"`, highlighted yellow in Excel)
+    - DRR is replaced with the historical value (`drr_source = "previous_period"`, `highlight = "yellow"`)
     - Missed sales are also re-fetched from that same lookback window for consistency
-    - **Demand override:** if current-period net sales exceed lookback-period sales,
-      `order_qty` is set to current-period sales and `extra_qty` uses current-period
-      missed sales (`order_qty_basis = "Current Period Sales"`)
-    - If no valid lookback period is found, the SKU is marked `drr_source = "insufficient_stock"` (red in Excel)
+    - **Demand override (green):** if current-period net sales exceed lookback-period sales,
+      `order_qty` is set to current-period sales, `extra_qty` uses current-period missed sales,
+      and `order_qty_demand_override = True` is set on the item (`highlight` remains `"yellow"` in
+      the JSON but the row is coloured **green** in the Excel download to distinguish it from
+      plain yellow lookback rows)
+    - If no valid lookback period is found, the SKU is marked `drr_source = "insufficient_stock"`
+      (`highlight = "red"`)
 
     ### 6. Brand Logistics Enrichment
     Lead time, safety days, and movement-class thresholds are loaded per brand
@@ -2457,6 +2460,11 @@ async def get_master_report(
     | `avg_daily_run_rate` | Units sold per day (DRR) |
     | `drr_source` | `current_period` / `previous_period` / `insufficient_stock` |
     | `drr_lookback_period` | Date range used for lookback DRR (if applicable) |
+    | `drr_lookback_days_in_stock` | Days in stock during the lookback period (if applicable) |
+    | `drr_lookback_sales` | Units sold during the lookback period (if applicable) |
+    | `highlight` | Row highlight hint: `null` (normal) / `"yellow"` (lookback DRR) / `"red"` (insufficient stock) |
+    | `order_qty_demand_override` | `true` when current-period net sales exceed lookback sales — order qty is overridden to current-period sales; these rows are coloured **green** in the Excel download |
+    | `current_period_sales_for_override` | Net sales used as order qty when demand override is active |
     | `total_closing_stock` | Zoho Pupscribe Warehouse stock + FBA stock as of `end_date` |
     | `latest_total_stock` | Zoho Pupscribe Warehouse stock + FBA stock as of latest DB record |
     | `current_days_coverage` | Days of inventory on hand at current DRR |
@@ -2565,11 +2573,12 @@ async def download_master_report(
     - `Days Total Inventory Lasts` – current_days_coverage + days_current_order_lasts
 
     ## Conditional Row Formatting
-    | Colour | Meaning |
-    |---|---|
-    | Green | Lookback DRR is used but current-period sales exceed lookback sales — order qty overridden to current-period sales |
-    | Yellow | DRR is sourced from a previous lookback period (insufficient current-period stock data) |
-    | Red | Insufficient stock in both current and all lookback periods — DRR is unreliable |
+    | Colour | Condition | Meaning |
+    |---|---|---|
+    | Green | `order_qty_demand_override = true` (takes precedence over yellow) | Lookback DRR is used **and** current-period net sales exceed lookback-period sales — order qty is overridden to current-period net sales (`order_qty_basis = "Current Period Sales"`) |
+    | Yellow | `drr_source = "previous_period"` and no demand override | DRR is sourced from a previous lookback period due to insufficient stock days (< 60) in the current period |
+    | Red | `drr_source = "insufficient_stock"` | Fewer than 60 days in stock in both the current period and all 6 lookback windows — DRR cannot be reliably estimated |
+    | (no fill) | `drr_source = "current_period"` | DRR uses the current-period data (≥ 60 days in stock) |
 
     ## Excel Formulas
     Several columns are written as live Excel formulas rather than static values
@@ -3161,12 +3170,82 @@ async def get_dashboard_kpi(
     """
     Stock Cover KPI Dashboard – last 90 days, aggregated by brand.
 
-    Includes: net sales, DRR, net stock, days cover (aggregate + weighted avg),
-    return %, growth %, missed sales (units+value/day), total CBM, net inventory value,
-    stock classification per SKU (Reorder Risk / Healthy / Heavy / Overstock / Dead),
-    and the 10 lowest / 10 highest days-cover SKUs per brand.
+    Runs the full master-report pipeline for the last 90 days (Zoho sales + latest stock)
+    and aggregates the result by brand. Results are cached for 15 minutes.
+    Pass `?refresh=true` to force recomputation.
 
-    Results are cached for 15 minutes. Pass ?refresh=true to force recomputation.
+    ## Response Structure
+
+    ### `period`
+    - `start_date`, `end_date`, `days` – the 90-day window used
+
+    ### `brands` (array, sorted most-critical first)
+    One object per brand. Key fields:
+
+    | Field | Description |
+    |---|---|
+    | `brand` | Brand name |
+    | `sku_count` | Number of active SKUs in the brand |
+    | `units_sold` | Gross units sold in the period |
+    | `units_returned` | Gross units returned |
+    | `credit_notes` | Credit-note units |
+    | `transfer_orders` | Inter-warehouse transfer units |
+    | `net_sales` | units_sold − credit_notes − transfer_orders |
+    | `revenue` | Gross revenue (₹) |
+    | `return_pct` | units_returned ÷ units_sold × 100 |
+    | `growth_rate` | Weighted-average growth rate vs. trailing DRR (% change) |
+    | `drr` | Brand-level DRR = sum of per-SKU avg_daily_run_rate |
+    | `days_cover` | latest_net_stock ÷ DRR |
+    | `current_days_coverage` | (latest_net_stock + stock_in_transit) ÷ DRR |
+    | `weighted_avg_days_cover` | Stock-weighted average days cover across SKUs |
+    | `latest_net_stock` | Zoho WH stock + FBA stock (most recent DB record) |
+    | `latest_zoho_stock` | Zoho Pupscribe Warehouse stock (most recent DB record) |
+    | `latest_fba_stock` | Amazon FBA stock (most recent DB record) |
+    | `net_sellable_inventory_value` | latest_net_stock × per-SKU rate (₹) |
+    | `stock_in_transit` | Open purchase-order stock in transit |
+    | `total_cbm` | Total cubic metres for suggested orders |
+    | `lead_time` | Brand lead time (days) from brand_logistics |
+    | `safety_days` | Medium-mover safety days from brand_logistics |
+    | `target_days` | lead_time + safety_days + 10 (order processing) |
+    | `alert_level` | Colour-coded health indicator (see below) |
+    | `order_count` | SKUs flagged as ORDER |
+    | `excess_count` | SKUs flagged as EXCESS |
+    | `no_movement_count` | SKUs flagged as NO MOVEMENT |
+    | `fast_mover_count` / `medium_mover_count` / `slow_mover_count` | Movement breakdown |
+    | `missed_sales_units` | Total unfulfilled demand units in the period |
+    | `missed_sales_daily_units` | missed_sales_units ÷ period_days |
+    | `missed_sales_value_total` | missed_sales_units × rate (₹) |
+    | `missed_sales_daily_value` | missed_sales_value_total ÷ period_days (₹/day) |
+    | `stock_classification` | `{ counts: {...}, pct: {...} }` with keys reorder_risk / healthy / heavy / overstock / dead |
+    | `sku_lowest_10` | 10 SKUs with the lowest days cover (excluding dead/no-movement) |
+    | `sku_highest_10` | 10 SKUs with the highest days cover (excluding those already in lowest 10) |
+
+    ### `alert_level` – Brand Health Colour
+    | Value | Colour | Condition |
+    |---|---|---|
+    | `0` | **Green** – Healthy | `days_cover ≥ target_days` (brand has sufficient stock for the full replenishment cycle) |
+    | `1` | **Yellow** – Caution | `lead_time ≤ days_cover < target_days` (stock covers lead time but is below target buffer) |
+    | `2` | **Red** – Critical | `0 < days_cover < lead_time` (stock will run out before a replenishment order can arrive) |
+    | `3` | **Grey** – No Movement | `drr = 0` (no sales recorded in the period) |
+
+    ### SKU Stock Classification (per `stock_classification`)
+    | Class | Condition |
+    |---|---|
+    | `reorder_risk` | `0 < days_cover < lead_time` |
+    | `healthy` | `lead_time ≤ days_cover < 2 × lead_time` |
+    | `heavy` | `2 × lead_time ≤ days_cover < 3 × lead_time` |
+    | `overstock` | `days_cover ≥ 3 × lead_time` |
+    | `dead` | `drr = 0` (no movement) |
+
+    ### `totals`
+    Cross-brand aggregates for all the same fields listed above.
+
+    ### `global_stock_classification`
+    Aggregate counts and percentages across all brands.
+
+    ### `latest_stock_dates`
+    - `zoho` – date of the most recent Zoho WH stock record in DB
+    - `fba` – date of the most recent FBA stock record in DB
     """
     import time as _time
     global _dashboard_kpi_cache, _dashboard_kpi_cache_ts
@@ -3295,7 +3374,85 @@ async def download_dashboard_kpi(
     breakdown: str = Query("brand", description="'brand' for brand-level or 'product' for SKU-level"),
     db=Depends(get_database),
 ):
-    """Download Stock Cover KPI as Excel. breakdown=brand or breakdown=product."""
+    """
+    Download the Stock Cover KPI as an Excel (.xlsx) file.
+
+    Runs the same 90-day master-report pipeline as `GET /dashboard-kpi` and writes
+    the aggregated result to a single-sheet Excel workbook.
+
+    ## Query Parameters
+    - `breakdown=brand` *(default)* – one row per brand, aggregated KPIs
+    - `breakdown=product` – one row per active SKU, individual KPIs
+
+    ## Excel Sheet: `Brand KPI` (breakdown=brand)
+    One row per brand. Columns:
+
+    **Identity & Movers**
+    - `Brand`, `SKUs`, `Fast Movers`, `Medium Movers`, `Slow Movers`
+
+    **Sales**
+    - `Units Sold`, `Units Returned`, `Return %`
+    - `Credit Notes`, `Transfer Orders`, `Net Sales`, `Revenue (₹)`
+    - `Growth Rate (%)`
+
+    **Inventory & DRR**
+    - `DRR (Net Sales / 90)` – brand-level DRR (sum of per-SKU DRR)
+    - `Zoho WH Stock ({latest_date})`, `FBA Stock ({latest_date})`, `Latest Net Stock`
+    - `Net Inv. Value (₹)` – latest stock × per-SKU rate
+    - `Stock in Transit`, `Total CBM`
+
+    **Coverage**
+    - `Days Cover (Stock / DRR)` – latest_net_stock ÷ DRR
+    - `Weighted Avg Days Cover` – stock-weighted average days cover across SKUs
+    - `Current Days Coverage (Stock+Transit/DRR)`
+    - `Lead Time (days)`, `Safety Days (Medium)`, `Target Days`
+
+    **Stock Classification**
+    - `SKUs - Reorder Risk / Healthy / Heavy / Overstock / Dead`
+    - `% Reorder Risk / Healthy / Heavy / Overstock / Dead`
+    - `SKUs Needing Order`, `SKUs in Excess`, `SKUs No Movement`
+
+    **Missed Sales**
+    - `Missed Sales (units, 90d)`, `Missed Sales (units/day)`
+    - `Missed Sales Value (₹, 90d)`, `Missed Sales Value (₹/day)`
+
+    ### Conditional Row Formatting (Brand KPI sheet)
+    | Colour | Condition | Meaning |
+    |---|---|---|
+    | Red | `0 < Days Cover < Lead Time` | Critical – stock will run out before a new order can arrive |
+    | Yellow | `Lead Time ≤ Days Cover < Target Days` | Caution – below the target safety buffer |
+    | (no fill) | `Days Cover ≥ Target Days` or no movement | Healthy / no movement – no action required |
+
+    ## Excel Sheet: `Product KPI` (breakdown=product)
+    One row per active SKU. Columns:
+
+    **Identity**
+    - `Brand`, `Purchase Status`, `Movement`, `Stock Class`
+    - `SKU Code`, `Item Name`
+
+    **Sales**
+    - `Units Sold`, `Units Returned`, `Return %`
+    - `Credit Notes`, `Transfer Orders`, `Net Sales`, `Revenue (₹)`
+    - `Growth Rate (%)`, `Avg Daily Run Rate`
+
+    **Inventory**
+    - `Zoho WH Stock ({latest_date})`, `FBA Stock ({latest_date})`, `Latest Net Stock`
+    - `Net Inv. Value (₹)`, `Stock in Transit`
+
+    **Coverage & Orders**
+    - `Days Cover (Stock / DRR)`, `Current Days Coverage`
+    - `Lead Time (days)`, `Safety Days`, `Target Days`
+    - `Excess / Order`, `Order Qty`, `Order Qty + Extra Qty`, `Order Qty (Rounded)`
+    - `Total CBM`, `Days Total Inventory Lasts`
+
+    **Missed Sales**
+    - `Missed Sales (units)`, `Missed Sales DRR (units/day)`
+    - `Missed Sales Value (₹)`, `Missed Sales Daily Value (₹)`
+
+    ## Response
+    Returns a binary `.xlsx` file as a streaming attachment.
+    Filename format: `stock_cover_kpi_{breakdown}_{start_date}_to_{end_date}_{YYYYMMDD_HHMMSS}.xlsx`
+    """
     try:
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=89)).strftime("%Y-%m-%d")
