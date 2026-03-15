@@ -494,6 +494,124 @@ class OptimizedMasterReportService:
             logger.error(f"Error fetching FBA closing stock: {e}")
             return {}
 
+    async def fetch_vendor_central_by_sku(self, start_date: str, end_date: str) -> Dict[str, Dict]:
+        """Fetch Vendor Central (Etrade) closing stock and DRR per SKU for the given period.
+        ASINs are mapped to SKU codes via amazon_sku_mapping.
+        Returns {sku_code: {closing_stock, drr}, "__latest_inv_date__": "YYYY-MM-DD"}."""
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+            end = datetime.strptime(end_date, "%Y-%m-%d")
+
+            vc_sales_col = self.database.get_collection("amazon_vendor_sales")
+            vc_inv_col = self.database.get_collection("amazon_vendor_inventory")
+            sku_mapping_col = self.database.get_collection("amazon_sku_mapping")
+
+            def _fetch():
+                # Aggregate VC sales per ASIN over the period
+                pipeline = [
+                    {"$match": {"date": {"$gte": start, "$lte": end}}},
+                    {
+                        "$group": {
+                            "_id": "$asin",
+                            "total_units_sold": {"$sum": "$orderedUnits"},
+                            "days_in_stock": {
+                                "$sum": {
+                                    "$cond": [{"$gt": ["$orderedUnits", 0]}, 1, 0]
+                                }
+                            },
+                        }
+                    },
+                ]
+                sales_by_asin = {}
+                for doc in vc_sales_col.aggregate(pipeline):
+                    asin = doc["_id"]
+                    if asin:
+                        sales_by_asin[asin] = {
+                            "units_sold": doc.get("total_units_sold", 0) or 0,
+                            "days_in_stock": doc.get("days_in_stock", 0) or 0,
+                        }
+
+                if not sales_by_asin:
+                    return {}
+
+                asins = list(sales_by_asin.keys())
+
+                # Find the latest available inventory date across all ASINs
+                latest_inv_doc = vc_inv_col.find_one(
+                    {"asin": {"$in": asins}, "date": {"$lte": end}},
+                    sort=[("date", -1)],
+                    projection={"date": 1},
+                )
+                latest_inv_date = ""
+                if latest_inv_doc and latest_inv_doc.get("date"):
+                    d = latest_inv_doc["date"]
+                    if isinstance(d, datetime):
+                        latest_inv_date = d.strftime("%Y-%m-%d")
+                    else:
+                        latest_inv_date = str(d)[:10]
+
+                # Fetch the latest closing stock per ASIN on or before end_date
+                inv_pipeline = [
+                    {"$match": {"asin": {"$in": asins}, "date": {"$lte": end}}},
+                    {"$sort": {"date": -1}},
+                    {
+                        "$group": {
+                            "_id": "$asin",
+                            "closing_stock": {"$first": "$sellableOnHandInventoryUnits"},
+                        }
+                    },
+                ]
+                stock_by_asin = {}
+                for doc in vc_inv_col.aggregate(inv_pipeline):
+                    asin = doc["_id"]
+                    if asin:
+                        stock_by_asin[asin] = float(doc.get("closing_stock", 0) or 0)
+
+                # Map ASINs → SKU codes
+                sku_docs = list(sku_mapping_col.find(
+                    {"item_id": {"$in": asins}},
+                    {"item_id": 1, "sku_code": 1, "_id": 0},
+                ).sort("_id", 1))
+
+                asin_to_sku = {}
+                for doc in sku_docs:
+                    asin = doc.get("item_id")
+                    sku = doc.get("sku_code")
+                    if asin and sku:
+                        asin_to_sku[asin] = sku
+
+                # Build result by SKU (sum if multiple ASINs share a SKU)
+                result = {}
+                for asin, sales in sales_by_asin.items():
+                    sku = asin_to_sku.get(asin)
+                    if not sku:
+                        continue
+                    stock = stock_by_asin.get(asin, 0)
+                    units = sales["units_sold"]
+                    days = sales["days_in_stock"]
+                    if sku not in result:
+                        result[sku] = {"closing_stock": 0.0, "units_sold": 0.0, "days_in_stock": 0}
+                    result[sku]["closing_stock"] += stock
+                    result[sku]["units_sold"] += units
+                    result[sku]["days_in_stock"] += days
+
+                # Compute DRR per SKU
+                period_days = (end - start).days + 1
+                for sku, d in result.items():
+                    days = d["days_in_stock"] or period_days
+                    d["drr"] = round(d["units_sold"] / days, 4) if days > 0 else 0.0
+
+                result["__latest_inv_date__"] = latest_inv_date
+                return result
+
+            data = await asyncio.to_thread(_fetch)
+            logger.info(f"Fetched Vendor Central data for {len(data)} SKUs")
+            return data
+
+        except Exception as e:
+            logger.error(f"Error fetching vendor central by SKU: {e}")
+            return {}
+
     async def batch_load_product_names(self, sku_codes: Set[str]) -> Dict[str, str]:
         """Batch load all product names in a single database query"""
         if not sku_codes:
@@ -1695,6 +1813,7 @@ async def _generate_master_report_data(
                     report_service.fetch_fba_closing_stock(end_date),
                     report_service.fetch_transfer_orders(start_date, end_date),
                     report_service.fetch_missed_sales(start_date, end_date),
+                    report_service.fetch_vendor_central_by_sku(start_date, end_date),
                     return_exceptions=True,
                 ),
                 timeout=180.0,
@@ -1705,12 +1824,13 @@ async def _generate_master_report_data(
                 detail="Report generation timed out",
             )
 
-        # Last four suffix results: composite, fba_stock, transfer_orders, missed_sales
-        results = all_results[:-4]
-        composite_products_map_raw = all_results[-4]
-        fba_stock_by_sku = all_results[-3]
-        transfer_orders_by_sku = all_results[-2]
-        missed_sales_by_sku = all_results[-1]
+        # Last five suffix results: composite, fba_stock, transfer_orders, missed_sales, vc_by_sku
+        results = all_results[:-5]
+        composite_products_map_raw = all_results[-5]
+        fba_stock_by_sku = all_results[-4]
+        transfer_orders_by_sku = all_results[-3]
+        missed_sales_by_sku = all_results[-2]
+        vc_by_sku = all_results[-1]
 
         if isinstance(composite_products_map_raw, Exception):
             logger.error(f"Composite products fetch failed: {composite_products_map_raw}")
@@ -1724,6 +1844,10 @@ async def _generate_master_report_data(
         if isinstance(missed_sales_by_sku, Exception):
             logger.error(f"Missed sales fetch failed: {missed_sales_by_sku}")
             missed_sales_by_sku = {}
+        if isinstance(vc_by_sku, Exception):
+            logger.error(f"Vendor Central fetch failed: {vc_by_sku}")
+            vc_by_sku = {}
+        vc_latest_inv_date = vc_by_sku.pop("__latest_inv_date__", "")
 
         # Preserve current-period missed sales before any lookback overrides
         current_period_missed_sales_by_sku = dict(missed_sales_by_sku)
@@ -2156,7 +2280,7 @@ async def _generate_master_report_data(
                 logger.error(f"Error in movement classification and order calculations: {e}")
                 errors.append(f"Movement/order enrichment error: {str(e)}")
 
-            # Attach latest current stock, PO unit prices, and manufacturer code to each item
+            # Attach latest current stock, PO unit prices, manufacturer code, and Etrade VC data
             for item in combined_data:
                 sku = item.get("sku_code", "")
                 lz = round(latest_zoho_by_sku.get(sku, 0), 2)
@@ -2168,6 +2292,14 @@ async def _generate_master_report_data(
                 item["unit_price"] = po_price.get("rate", 0)
                 item["unit_price_currency"] = po_price.get("currency_code", "")
                 item["manufacturer_code"] = all_product_data.get(sku, {}).get("manufacturer_code", "")
+                # Etrade (Vendor Central) inventory
+                vc_data = vc_by_sku.get(sku, {})
+                vc_stock = round(vc_data.get("closing_stock", 0), 2)
+                vc_drr = vc_data.get("drr", 0)
+                metrics_ref = item.get("combined_metrics", {})
+                metrics_ref["etrade_inventory"] = vc_stock
+                metrics_ref["etrade_drr"] = round(vc_drr, 4)
+                metrics_ref["etrade_days_inventory_lasts"] = round(vc_stock / vc_drr, 2) if vc_drr > 0 else 0.0
 
             # Recalculate days-coverage columns and all downstream order calculations
             # using latest DB stock instead of end-of-period closing stock.
@@ -2359,6 +2491,7 @@ async def _generate_master_report_data(
             "latest_stock_dates": {
                 "zoho": latest_zoho_date,
                 "fba": latest_fba_date,
+                "etrade": vc_latest_inv_date,
             },
             "meta": {
                 "execution_time_seconds": round(execution_time, 2),
@@ -2670,6 +2803,7 @@ async def download_master_report(
         _latest_fba_label = _fmt_date(latest_stock_dates.get("fba", ""))
         # For total, use the more recent of the two
         _latest_total_label = _latest_fba_label if latest_stock_dates.get("fba", "") >= latest_stock_dates.get("zoho", "") else _latest_zoho_label
+        _etrade_inv_label = _fmt_date(latest_stock_dates.get("etrade", "")) or _end_date_label
 
         # Create Excel file
         excel_buffer = io.BytesIO()
@@ -2752,6 +2886,9 @@ async def download_master_report(
                         "Total CBM": item.get("total_cbm", 0),
                         "Days Current Order Lasts": item.get("days_current_order_lasts", 0),
                         "Days Total Inventory Lasts": item.get("days_total_inventory_lasts", 0),
+                        f"Etrade Inventory ({_etrade_inv_label})": metrics.get("etrade_inventory", 0),
+                        "Etrade DRR": metrics.get("etrade_drr", 0),
+                        "Days Total Inventory Lasts (Etrade)": 0,
                     }
                 )
 
@@ -2811,6 +2948,9 @@ async def download_master_report(
                 _AU = _col("Total CBM")
                 _AV = _col("Days Current Order Lasts")
                 _AW = _col("Days Total Inventory Lasts")
+                _etrade_inv  = _col(f"Etrade Inventory ({_etrade_inv_label})")
+                _etrade_drr  = _col("Etrade DRR")
+                _etrade_days = _col("Days Total Inventory Lasts (Etrade)")
 
                 drr_source_col_idx = cols_list.index("DRR Source") + 1  # 1-based
                 yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
@@ -2876,6 +3016,9 @@ async def download_master_report(
 
                     # Days Total Inventory Lasts = Current Days Coverage + Days Current Order Lasts
                     ws[f"{_AW}{r}"] = f"=IF({inactive},{_AJ}{r},{_AJ}{r}+{_AV}{r})"
+
+                    # Days Total Inventory Lasts (Etrade) = Etrade Inventory / Etrade DRR
+                    ws[f"{_etrade_days}{r}"] = f"=IF({_etrade_drr}{r}>0,{_etrade_inv}{r}/{_etrade_drr}{r},0)"
 
                     # Apply row highlighting based on DRR source / demand override
                     # row_idx is 1-based (row 2 = first data row); convert to 0-based for the set
@@ -3523,6 +3666,7 @@ async def download_dashboard_kpi(
 
         _latest_zoho_label = _fmt_date(latest_stock_dates.get("zoho", ""))
         _latest_fba_label = _fmt_date(latest_stock_dates.get("fba", ""))
+        _etrade_inv_label = _fmt_date(latest_stock_dates.get("etrade", "")) or _fmt_date(end_date)
 
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
@@ -3567,6 +3711,9 @@ async def download_dashboard_kpi(
                         "Order Qty (Rounded)": item.get("order_qty_plus_extra_qty_rounded", 0),
                         "Total CBM": item.get("total_cbm", 0),
                         "Days Total Inventory Lasts": item.get("days_total_inventory_lasts", 0),
+                        f"Etrade Inventory ({_etrade_inv_label})": m.get("etrade_inventory", 0),
+                        "Etrade DRR": m.get("etrade_drr", 0),
+                        "Days Total Inventory Lasts (Etrade)": m.get("etrade_days_inventory_lasts", 0),
                         "Missed Sales (units)": item.get("missed_sales", 0),
                         "Missed Sales DRR (units/day)": item.get("missed_sales_drr", 0),
                         "Missed Sales Value (₹)": round(item.get("missed_sales", 0) * rate, 2),
