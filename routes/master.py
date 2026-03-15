@@ -2858,7 +2858,7 @@ async def download_master_report(
                     # For demand-override rows (green), use Net Total Sales × confidence multiplier
                     # For all other rows: MAX(0, Net Target Days × DRR) × confidence multiplier
                     if (row_idx - 2) in demand_override_row_indices:
-                        ws[f"{_AP}{r}"] = f"={_I}{r}*{_AX}{r}"
+                        ws[f"{_AP}{r}"] = f'=IF({_AO}{r}="EXCESS",0,{_I}{r}*{_AX}{r})'
                     else:
                         ws[f"{_AP}{r}"] = f"=IF({inactive},0,MAX(0,{_AN}{r}*{_N}{r})*{_AX}{r})"
 
