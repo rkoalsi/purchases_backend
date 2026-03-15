@@ -8,11 +8,75 @@ from datetime import datetime, timedelta
 from ..database import get_database
 import requests
 from bson import ObjectId
+from typing import Dict
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+SLACK_URL = os.getenv("SLACK_URL")
+
+
+def send_slack_notification(
+    title: str, success: bool = True, details: Dict = None, error_msg: str = None
+):
+    """Send a Slack notification for cron job success or failure."""
+    if not SLACK_URL:
+        logger.warning("SLACK_URL not configured, skipping notification")
+        return
+
+    try:
+        emoji = ":white_check_mark:" if success else ":x:"
+        status = "✅ SUCCESS" if success else "❌ FAILED"
+
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{emoji} {title} - {status}",
+                    "emoji": True,
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n*Job:* {title}",
+                },
+            },
+        ]
+
+        if success and details:
+            detail_text = ""
+            if "processed" in details:
+                detail_text += f"*Items Processed:* {details['processed']}\n"
+            if "inserted" in details:
+                detail_text += f"*New Records:* {details['inserted']}\n"
+            if "duration" in details:
+                detail_text += f"*Duration:* {details['duration']:.1f}s\n"
+            if detail_text:
+                blocks.append(
+                    {"type": "section", "text": {"type": "mrkdwn", "text": detail_text.strip()}}
+                )
+
+        if not success and error_msg:
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Error:* ```{error_msg[:500]}```",
+                    },
+                }
+            )
+
+        response = requests.post(SLACK_URL, json={"blocks": blocks}, timeout=10)
+        if response.status_code != 200:
+            logger.error(f"Slack notification failed: {response.status_code} - {response.text}")
+    except Exception as e:
+        logger.error(f"Error sending Slack notification: {e}")
 
 # Global scheduler instance
 scheduler = AsyncIOScheduler()
@@ -235,27 +299,35 @@ class APIScheduler:
             logger.error(f"Error updating composite products in MongoDB: {e}")
             raise
 
-    async def sync_composite_items(self):
+    async def sync_composite_items(self, notify: bool = False):
         """Main function to sync composite items to database"""
         try:
             logger.info("Starting composite items sync")
             await self.get_access_token()
-            # Get composite items
             composite_items = await self.get_composite_items()
 
             if not composite_items:
                 logger.warning("No composite items retrieved, skipping database update")
                 return
 
-            # Update the database
             await self.update_composite_products_db(composite_items)
 
             logger.info(
                 f"Composite items sync completed successfully. Processed {len(composite_items)} items"
             )
+            if notify:
+                send_slack_notification(
+                    "Purchases Backend - Composite Items Sync",
+                    success=True,
+                    details={"processed": len(composite_items)},
+                )
 
         except Exception as e:
             logger.error(f"Composite items sync failed: {e}")
+            if notify:
+                send_slack_notification(
+                    "Purchases Backend - Composite Items Sync", success=False, error_msg=str(e)
+                )
             raise
     async def get_settlements(self):
         try:
@@ -280,9 +352,11 @@ class APIScheduler:
             await self.get_sc_sales_traffic()
 
             logger.info("Daily task execution completed successfully")
+            send_slack_notification("Purchases Backend - Daily Sync", success=True)
 
         except Exception as e:
             logger.error(f"Daily task execution failed: {str(e)}")
+            send_slack_notification("Purchases Backend - Daily Sync", success=False, error_msg=str(e))
 
     async def weekly_task_execution(self):
         """Weekly tasks including composite items sync"""
@@ -293,9 +367,11 @@ class APIScheduler:
             await self.sync_composite_items()
 
             logger.info("Weekly task execution completed successfully")
+            send_slack_notification("Purchases Backend - Weekly Composite Items Sync", success=True)
 
         except Exception as e:
             logger.error(f"Weekly task execution failed: {str(e)}")
+            send_slack_notification("Purchases Backend - Weekly Composite Items Sync", success=False, error_msg=str(e))
 
 
 api_scheduler = APIScheduler()
@@ -313,7 +389,7 @@ async def scheduled_weekly_task():
 
 async def scheduled_composite_items_task():
     """Wrapper function for composite items sync - can be scheduled separately"""
-    await api_scheduler.sync_composite_items()
+    await api_scheduler.sync_composite_items(notify=True)
 
 
 def setup_scheduler():
@@ -321,7 +397,7 @@ def setup_scheduler():
     # Daily tasks
     scheduler.add_job(
         scheduled_daily_task,
-        trigger=CronTrigger(hour=0, minute=0, timezone="UTC"),
+        trigger=CronTrigger(hour=14, minute=45, timezone="UTC"),
         id="daily_api_calls",
         name="Daily API Calls",
         replace_existing=True,
