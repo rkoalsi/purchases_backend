@@ -1556,6 +1556,36 @@ class OptimizedMasterReportService:
             else:
                 item["order_qty_basis"] = ""
 
+            # Confidence tier dampening for red (insufficient_stock) items.
+            # These products have < 60 days in stock across all lookback windows,
+            # so their DRR is unreliable. Scale back the order qty based on how
+            # much data we have and the product's movement classification.
+            # Tiers are calibrated for a 90-day reporting period.
+            if item.get("drr_source") == "insufficient_stock":
+                days_in_stock = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
+                movement = item.get("movement", "Slow Mover")
+
+                if days_in_stock < 15:
+                    base_multiplier = 0.25
+                elif days_in_stock < 30:
+                    base_multiplier = 0.5
+                elif days_in_stock < 60:
+                    base_multiplier = 0.75
+                else:
+                    base_multiplier = 1.0
+
+                confidence_multiplier = min(1.0, max(0.1, base_multiplier))
+                order_qty = order_qty * confidence_multiplier
+                item["confidence_multiplier"] = confidence_multiplier
+
+                dampener_label = f"Dampened {int(round(confidence_multiplier * 100))}% ({days_in_stock}d, {movement})"
+                if item.get("order_qty_demand_override"):
+                    item["order_qty_basis"] = f"Current Period Sales · {dampener_label}"
+                else:
+                    item["order_qty_basis"] = dampener_label
+            else:
+                item["confidence_multiplier"] = 1.0
+
             item["order_qty"] = round(order_qty, 2)
 
             # Order Qty + Extra Qty
@@ -2676,7 +2706,7 @@ async def download_master_report(
                         "SKU Code": item.get("sku_code", ""),
                         "Item Name": item.get("item_name", ""),
                         "Unit Price": item.get("unit_price", 0),
-                        "Total Amount": metrics.get("total_amount", 0),
+                        "Total Amount": f"₹{metrics.get('total_amount', 0)}",
                         "Total Units Sold": metrics.get("total_units_sold", 0),
                         "Total Units Returned": metrics.get("total_units_returned", 0),
                         "Transfer Orders": metrics.get("transfer_orders", 0),
@@ -2711,8 +2741,10 @@ async def download_master_report(
                         "Missed Sales DRR": item.get("missed_sales_drr", 0),
                         "Extra Qty": item.get("extra_qty", 0),
                         "Net Target Days": item.get("net_target_days", 0),
+                        "Confidence Multiplier": item.get("confidence_multiplier", 1.0),
                         "Excess / Order": item.get("excess_or_order", ""),
                         "Order Qty": item.get("order_qty", 0),
+                        "Order Qty Basis": item.get("order_qty_basis", ""),
                         "Order Qty + Extra Qty": item.get("order_qty_plus_extra_qty", 0),
                         "CBM": item.get("cbm", 0),
                         "Case Pack": item.get("case_pack", 0),
@@ -2769,6 +2801,7 @@ async def download_master_report(
                 _AL = _col("Missed Sales DRR")
                 _AM = _col("Extra Qty")
                 _AN = _col("Net Target Days")
+                _AX = _col("Confidence Multiplier")
                 _AO = _col("Excess / Order")
                 _AP = _col("Order Qty")
                 _AQ = _col("Order Qty + Extra Qty")
@@ -2822,11 +2855,12 @@ async def download_master_report(
                     ws[f"{_AO}{r}"] = f'=IF({_N}{r}=0,"NO MOVEMENT",IF({_AJ}{r}<{_AD}{r},"ORDER","EXCESS"))'
 
                     # Order Qty (0 for inactive/discontinued)
-                    # For demand-override rows (green), use Net Total Sales directly
+                    # For demand-override rows (green), use Net Total Sales × confidence multiplier
+                    # For all other rows: MAX(0, Net Target Days × DRR) × confidence multiplier
                     if (row_idx - 2) in demand_override_row_indices:
-                        ws[f"{_AP}{r}"] = f"={_I}{r}"
+                        ws[f"{_AP}{r}"] = f"={_I}{r}*{_AX}{r}"
                     else:
-                        ws[f"{_AP}{r}"] = f"=IF({inactive},0,MAX(0,{_AN}{r}*{_N}{r}))"
+                        ws[f"{_AP}{r}"] = f"=IF({inactive},0,MAX(0,{_AN}{r}*{_N}{r})*{_AX}{r})"
 
                     # Order Qty + Extra Qty (only Extra Qty for inactive/discontinued)
                     ws[f"{_AQ}{r}"] = f"=IF({inactive},{_AM}{r},{_AP}{r}+{_AM}{r})"
@@ -2864,6 +2898,9 @@ async def download_master_report(
                 for i, currency_code in enumerate(_master_unit_price_currencies):
                     num_fmt = _CURRENCY_FORMATS.get(currency_code.upper(), _DEFAULT_NUMBER_FMT)
                     ws[f"{_up_col_letter}{i + 2}"].number_format = num_fmt
+
+                # Hide the Confidence Multiplier column (used by Order Qty formula, not for display)
+                ws.column_dimensions[_AX].hidden = True
 
                 # Auto-fit column widths: header text drives the width; skip formula cells
                 for col_cells in ws.columns:
