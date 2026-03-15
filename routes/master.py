@@ -513,7 +513,7 @@ class OptimizedMasterReportService:
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(valid_skus)}},
                     {"cf_sku_code": 1, "name": 1, "_id": 0},
-                ))
+                ).sort("_id", 1))
 
             products = await asyncio.to_thread(_fetch_products)
 
@@ -561,7 +561,7 @@ class OptimizedMasterReportService:
                      "cf_item_code": 1,
                      "purchase_status": 1, "stock_in_transit_1": 1, "stock_in_transit_2": 1,
                      "stock_in_transit_3": 1, "created_at": 1, "_id": 0},
-                ))
+                ).sort("_id", 1))
 
             products = await asyncio.to_thread(_fetch_all)
 
@@ -1045,7 +1045,7 @@ class OptimizedMasterReportService:
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(sku_codes)}},
                     {"cf_sku_code": 1, "brand": 1, "_id": 0}
-                ))
+                ).sort("_id", 1))
 
             products = await asyncio.to_thread(_fetch)
             return {p.get("cf_sku_code"): p.get("brand", "") for p in products if p.get("cf_sku_code")}
@@ -1066,7 +1066,7 @@ class OptimizedMasterReportService:
                 docs = products_collection.find(
                     {"cf_sku_code": {"$in": list(sku_codes)}},
                     {"item_id": 1, "cf_sku_code": 1, "_id": 0}
-                )
+                ).sort("_id", 1)
                 result = {}
                 for doc in docs:
                     sku = doc.get("cf_sku_code", "")
@@ -1376,7 +1376,7 @@ class OptimizedMasterReportService:
                     {"cf_sku_code": {"$in": list(sku_codes)}},
                     {"cf_sku_code": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1,
                      "stock_in_transit_1": 1, "stock_in_transit_2": 1, "stock_in_transit_3": 1, "_id": 0}
-                ))
+                ).sort("_id", 1))
 
             products = await asyncio.to_thread(_fetch_logistics)
 
