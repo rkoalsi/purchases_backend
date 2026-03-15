@@ -1835,7 +1835,7 @@ async def upload_sku_mapping(
     try:
         file_content = await file.read()
         df = pd.read_excel(
-            BytesIO(file_content), sheet_name="Sheet2"
+            BytesIO(file_content), sheet_name="Sheet1"
         )
 
         # Validate required columns
@@ -1854,7 +1854,7 @@ async def upload_sku_mapping(
         delete_result = sku_collection.delete_many({})
         logger.info(f"Deleted {delete_result.deleted_count} existing SKU mappings.")
 
-        data_to_insert = []
+        data_by_item_id = {}
         for _, row in df.iterrows():
             item_id = str(row["ASIN"]).strip() if pd.notna(row["ASIN"]) else None
             sku_code = str(row["SKU"]).strip() if pd.notna(row["SKU"]) else None
@@ -1865,15 +1865,15 @@ async def upload_sku_mapping(
             if (
                 item_id and sku_code and item_name
             ):  # Ensure essential fields are present
-                data_to_insert.append(
-                    {
-                        "item_id": item_id,
-                        "sku_code": sku_code,
-                        "item_name": item_name,
-                    }
-                )
+                data_by_item_id[item_id] = {
+                    "item_id": item_id,
+                    "sku_code": sku_code,
+                    "item_name": item_name,
+                }
             else:
                 logger.info(f"Skipping SKU row due to missing data: {row.to_dict()}")
+
+        data_to_insert = list(data_by_item_id.values())
 
         if not data_to_insert:
             return {"message": "No valid SKU mapping data found to insert."}
