@@ -1898,6 +1898,155 @@ async def upload_sku_mapping(
         )
 
 
+SHEET_ID      = "1tn_Lj3KR0zXY8B-8ZUkSznZgE4YzyjtAkcpdHzBCgt4"
+SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
+
+# Google Sheet column names (row 2 is the real header)
+GS_COL_ASIN  = "Amazon ASIN"
+GS_COL_SKU   = "SKU Code (Final)"
+GS_COL_NAME  = "Amazon Final Title"
+
+
+def _fetch_sheet_rows() -> dict:
+    """Return {asin: {sku_code, sheet_name}} from the master Google Sheet."""
+    import csv as _csv, io as _io
+    resp = requests.get(SHEET_CSV_URL, timeout=30)
+    resp.raise_for_status()
+    lines = resp.text.splitlines()
+    if len(lines) < 2:
+        raise ValueError("Google Sheet has fewer than 2 rows")
+    reader = _csv.DictReader(_io.StringIO("\n".join(lines[1:])))
+    result = {}
+    for row in reader:
+        asin     = (row.get(GS_COL_ASIN) or "").strip()
+        sku_code = (row.get(GS_COL_SKU) or "").strip()
+        name     = (row.get(GS_COL_NAME) or "").strip()
+        if asin and sku_code:
+            result[asin] = {"sku_code": sku_code, "sheet_name": name}
+    return result
+
+
+def _fetch_sp_listings() -> list:
+    """Fetch all active listings via GET_MERCHANT_LISTINGS_ALL_DATA report."""
+    import csv as _csv, io as _io
+
+    # 1. Request report
+    report_resp = make_sp_api_request(
+        "/reports/2021-06-30/reports",
+        method="POST",
+        data={"reportType": "GET_MERCHANT_LISTINGS_ALL_DATA", "marketplaceIds": [MARKETPLACE_ID]},
+    )
+    report_id = report_resp.get("reportId")
+    if not report_id:
+        raise ValueError(f"No reportId returned: {report_resp}")
+
+    # 2. Poll
+    max_wait, elapsed = 600, 0
+    doc_id = None
+    while elapsed < max_wait:
+        status_resp = make_sp_api_request(f"/reports/2021-06-30/reports/{report_id}")
+        ps = status_resp.get("processingStatus", "")
+        if ps == "DONE":
+            doc_id = status_resp.get("reportDocumentId")
+            break
+        elif ps in ("FATAL", "CANCELLED"):
+            raise ValueError(f"Report ended with status {ps}")
+        time.sleep(15)
+        elapsed += 15
+    if not doc_id:
+        raise TimeoutError("Listings report timed out")
+
+    # 3. Download
+    doc_info = make_sp_api_request(f"/reports/2021-06-30/documents/{doc_id}")
+    dl_url = doc_info.get("url")
+    if not dl_url:
+        raise ValueError("No download URL in report document")
+    raw_resp = requests.get(dl_url, timeout=120)
+    raw_resp.raise_for_status()
+    raw = raw_resp.content
+    if doc_info.get("compressionAlgorithm") == "GZIP":
+        raw = gzip.decompress(raw)
+    text = None
+    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        text = raw.decode("latin-1")
+
+    # 4. Parse TSV
+    reader = _csv.DictReader(_io.StringIO(text), delimiter="\t")
+    listings = []
+    for row in reader:
+        asin = (row.get("asin1") or "").strip()
+        if asin:
+            listings.append({
+                "asin":       asin,
+                "seller_sku": (row.get("seller-sku") or "").strip(),
+                "item_name":  (row.get("item-name") or "").strip(),
+            })
+    return listings
+
+
+@router.post("/sync-sku-mapping")
+async def sync_sku_mapping(database=Depends(get_database)):
+    """
+    Syncs amazon_sku_mapping from SP-API + Google Sheet.
+    SP-API provides item_name; Google Sheet provides sku_code.
+    """
+    try:
+        sp_listings, sheet_by_asin = await asyncio.gather(
+            asyncio.to_thread(_fetch_sp_listings),
+            asyncio.to_thread(_fetch_sheet_rows),
+        )
+
+        collection = database.get_collection(SKU_COLLECTION)
+
+        def _upsert():
+            collection.create_index([("item_id", ASCENDING)], unique=True)
+            inserted = modified = unchanged = 0
+            for listing in sp_listings:
+                sheet = sheet_by_asin.get(listing["asin"])
+                # Prefer sheet sku_code; fall back to seller_sku from SP-API
+                sku_code = sheet["sku_code"] if sheet else listing["seller_sku"]
+                result = collection.update_one(
+                    {"item_id": listing["asin"]},
+                    {"$set": {
+                        "item_id":    listing["asin"],
+                        "seller_sku": listing["seller_sku"],
+                        "item_name":  listing["item_name"],
+                        "sku_code":   sku_code,
+                    }},
+                    upsert=True,
+                )
+                if result.upserted_id:
+                    inserted += 1
+                elif result.modified_count:
+                    modified += 1
+                else:
+                    unchanged += 1
+            return inserted, modified, unchanged
+
+        inserted, modified, unchanged = await asyncio.to_thread(_upsert)
+
+        return {
+            "message": "Sync complete",
+            "inserted": inserted,
+            "updated": modified,
+            "unchanged": unchanged,
+            "total_sp_listings": len(sp_listings),
+        }
+
+    except Exception as e:
+        logger.error(f"sync-sku-mapping error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )
+
+
 @router.post("/create_single_item")
 def create_single_item(body: dict):
     try:

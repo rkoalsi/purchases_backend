@@ -397,7 +397,7 @@ def setup_scheduler():
     # Daily tasks
     scheduler.add_job(
         scheduled_daily_task,
-        trigger=CronTrigger(hour=14, minute=45, timezone="UTC"),
+        trigger=CronTrigger(hour=0, minute=0, timezone="UTC"),
         id="daily_api_calls",
         name="Daily API Calls",
         replace_existing=True,
