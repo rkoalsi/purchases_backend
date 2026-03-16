@@ -53,6 +53,7 @@ class ReportRequest(BaseModel):
 # Use environment variables for production
 
 PRODUCTS_COLLECTION = "products"
+COMPOSITE_COLLECTION = "composite_products"
 INVOICES_COLLECTION = "invoices"
 PURCHASE_ORDER_COLLECTION = "purchase_orders"
 
@@ -236,6 +237,50 @@ def get_products(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred while getting the products: {str(e)}",
         )
+
+
+@router.get("/composite-products")
+def get_composite_products(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
+    search: str = Query(None),
+):
+    """Paginated composite products from the composite_products collection."""
+    try:
+        db = get_database()
+        collection = db[COMPOSITE_COLLECTION]
+
+        query_filter = {}
+        if search:
+            rx = {"$regex": search, "$options": "i"}
+            query_filter["$or"] = [
+                {"name": rx},
+                {"sku_code": rx},
+                {"composite_item_id": rx},
+            ]
+
+        total_count = collection.count_documents(query_filter)
+        total_pages = math.ceil(total_count / limit) if total_count > 0 else 1
+        skip = (page - 1) * limit
+
+        items = serialize_mongo_document(
+            list(collection.find(query_filter).sort("name", 1).skip(skip).limit(limit))
+        )
+
+        return JSONResponse(content={
+            "items": items,
+            "pagination": {
+                "currentPage": page,
+                "totalPages": total_pages,
+                "totalItems": total_count,
+                "limit": limit,
+                "hasNextPage": page < total_pages,
+                "hasPrevPage": page > 1,
+            },
+        })
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/products/summary")
