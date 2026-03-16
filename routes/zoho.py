@@ -104,6 +104,7 @@ def get_products(
     search: str = Query(None, description="Search term for product name or SKU"),
     category: str = Query(None, description="Filter by category"),
     status: str = Query(None, description="Filter by status (active/inactive)"),
+    brand: str = Query(None, description="Filter by brand"),
     sort_by: str = Query(
         "name", description="Sort by field (name, price, stock, created_date)"
     ),
@@ -139,9 +140,14 @@ def get_products(
             query_filter["$or"] = [
                 {"name": search_regex},
                 {"sku": search_regex},
+                {"cf_sku_code": search_regex},
                 {"item_id": search_regex},
                 {"description": search_regex},
             ]
+
+        # Brand filter
+        if brand:
+            query_filter["brand"] = brand
 
         # Category filter
         if category:
@@ -237,6 +243,34 @@ def get_products(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred while getting the products: {str(e)}",
         )
+
+
+@router.get("/sku-brand-map")
+def get_sku_brand_map():
+    """
+    Returns a flat {sku: brand} mapping for all products that have a brand set.
+    Used by platform item pages (Amazon, Blinkit) for client-side brand filtering.
+    """
+    try:
+        db = get_database()
+        collection = db[PRODUCTS_COLLECTION]
+        cursor = collection.find(
+            {"brand": {"$exists": True, "$ne": ""}},
+            {"cf_sku_code": 1, "brand": 1, "_id": 0},
+        )
+        result = {}
+        for doc in cursor:
+            sku = doc.get("cf_sku_code")
+            brand = doc.get("brand")
+            if sku and brand:
+                result[str(sku)] = brand
+        return JSONResponse(content=result)
+    except PyMongoError as e:
+        logger.info(f"MongoDB Error Getting SKU Brand Map: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    except Exception as e:
+        logger.info(f"Error Getting SKU Brand Map: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/composite-products")
