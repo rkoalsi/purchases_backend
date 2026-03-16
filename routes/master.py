@@ -2008,7 +2008,6 @@ async def _generate_master_report_data(
 
             # Start past-90d DRR fetch as a background task so it runs concurrently
             # with the DRR lookback below. all_product_data is now fully populated.
-            # dashboard_mode skips this to avoid the extra historical aggregation query.
             _full_sku_to_item_id = {
                 sku: pdata["item_id"]
                 for sku, pdata in all_product_data.items()
@@ -2016,7 +2015,7 @@ async def _generate_master_report_data(
             }
             _past_drr_task = (
                 asyncio.create_task(report_service.fetch_past_90d_drr(_full_sku_to_item_id, start_date))
-                if _full_sku_to_item_id and not dashboard_mode else None
+                if _full_sku_to_item_id else None
             )
 
             # DRR lookback (needs sku_to_item_id from above)
