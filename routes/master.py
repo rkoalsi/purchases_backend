@@ -3107,7 +3107,7 @@ async def download_master_report(
                         ws_draft[f"{_dqty}{r}"]  = f"='{_master_sheet_ref}'!{_AT}{r}"
                         ws_draft[f"{_dtot}{r}"]  = f"={_dqty}{r}*{_dup}{r}"
                         ws_draft[f"{_dcar}{r}"]  = f"=IF({_dcp}{r}>0,{_dqty}{r}/{_dcp}{r},0)"
-                        ws_draft[f"{_dtcbm}{r}"] = f"={_dcbm}{r}*{_dcp}{r}"
+                        ws_draft[f"{_dtcbm}{r}"] = f"={_dcbm}{r}*{_dcar}{r}"
 
                         # Apply currency symbol number format to Unit Price and Total cells
                         currency_code = row.get("_currency", "") or ""
