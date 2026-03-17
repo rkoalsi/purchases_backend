@@ -3115,6 +3115,59 @@ async def download_master_report(
                         ws_draft[f"{_dup}{r}"].number_format = num_fmt
                         ws_draft[f"{_dtot}{r}"].number_format = num_fmt
 
+                    # ── Totals row ──────────────────────────────────────────
+                    from openpyxl.styles import Border, Side, Font
+
+                    _last_data_row = len(draft_rows) + 1  # last data row (1-based)
+                    _total_row     = _last_data_row + 1   # totals row
+
+                    _thick_top = Border(
+                        top=Side(border_style="medium", color="000000")
+                    )
+                    _bold_font = Font(bold=True)
+
+                    # Label
+                    _item_col = _dcol("Item Name")
+                    _label_cell = ws_draft[f"{_item_col}{_total_row}"]
+                    _label_cell.value = "Total"
+                    _label_cell.font  = _bold_font
+                    _label_cell.border = _thick_top
+
+                    # SUM formulas with units
+                    _totals: list[tuple[str, str, str]] = [
+                        # (col_letter, formula,  number_format)
+                        (_dqty,  f"=SUM({_dqty}{2}:{_dqty}{_last_data_row})",   "#,##0"),
+                        (_dtot,  f"=SUM({_dtot}{2}:{_dtot}{_last_data_row})",   None),   # currency set below
+                        (_dcar,  f"=SUM({_dcar}{2}:{_dcar}{_last_data_row})",   "#,##0.00"),
+                        (_dtcbm, f"=SUM({_dtcbm}{2}:{_dtcbm}{_last_data_row})", '#,##0.00 "m³"'),
+                    ]
+
+                    # Determine currency format for the Total sum cell
+                    _currencies = list({r.get("_currency", "") or "" for r in draft_rows})
+                    _sum_currency_fmt = _CURRENCY_FORMATS.get(
+                        _currencies[0].upper() if len(_currencies) == 1 else "",
+                        _DEFAULT_NUMBER_FMT,
+                    )
+
+                    for _col_ltr, _formula, _fmt in _totals:
+                        _c = ws_draft[f"{_col_ltr}{_total_row}"]
+                        _c.value  = _formula
+                        _c.font   = _bold_font
+                        _c.border = _thick_top
+                        if _col_ltr == _dtot:
+                            _c.number_format = _sum_currency_fmt
+                        elif _fmt:
+                            _c.number_format = _fmt
+
+                    # Apply the top border to all other columns in the totals row so the
+                    # divider spans the full width of the table.
+                    for _dc in draft_cols:
+                        _cl = _dcol(_dc)
+                        if _cl in {_item_col, _dqty, _dtot, _dcar, _dtcbm}:
+                            continue  # already handled
+                        _bc = ws_draft[f"{_cl}{_total_row}"]
+                        _bc.border = _thick_top
+
                     # Auto-fit columns
                     for col_cells in ws_draft.columns:
                         col_letter = get_column_letter(col_cells[0].column)
