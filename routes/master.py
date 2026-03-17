@@ -1519,17 +1519,22 @@ class OptimizedMasterReportService:
 
     async def fetch_latest_po_unit_prices(self, sku_codes: Set[str]) -> Dict[str, Dict]:
         """Fetch unit price (rate) and currency_code from the latest purchase order per SKU.
-        Matches via line_items.item_custom_fields where api_name == 'cf_sku_code'.
+        Pass 1: matches via line_items.item_custom_fields where api_name == 'cf_sku_code'.
+        Pass 2 (fallback): for SKUs not found in pass 1, matches by line_items.item_id
+                           via a products-collection lookup (handles POs without custom fields).
         Returns {sku_code: {"rate": float, "currency_code": str}}."""
         if not sku_codes:
             return {}
         try:
             po_collection = self.database.get_collection("purchase_orders")
+            products_collection = self.database.get_collection("products")
             sku_list = [s for s in sku_codes if s]
 
             def _fetch():
+                # Pass 1: match via item_custom_fields.cf_sku_code
                 pipeline = [
                     {"$unwind": "$line_items"},
+                    {"$match": {"line_items.rate": {"$gt": 0}}},
                     {"$unwind": "$line_items.item_custom_fields"},
                     {"$match": {
                         "line_items.item_custom_fields.api_name": "cf_sku_code",
@@ -1550,6 +1555,49 @@ class OptimizedMasterReportService:
                             "rate": float(doc.get("rate") or 0),
                             "currency_code": doc.get("currency_code", "") or "",
                         }
+
+                # Pass 2: fallback for SKUs not found (PO line items without cf_sku_code)
+                missing_skus = [s for s in sku_list if s not in result]
+                if missing_skus:
+                    # Build item_id → sku map for missing SKUs from products collection
+                    item_id_to_sku: Dict[str, str] = {}
+                    for doc in products_collection.find(
+                        {"cf_sku_code": {"$in": missing_skus}},
+                        {"item_id": 1, "cf_sku_code": 1, "_id": 0},
+                    ):
+                        iid = doc.get("item_id")
+                        sku = doc.get("cf_sku_code", "")
+                        if iid and sku:
+                            item_id_to_sku[str(iid)] = sku
+
+                    if item_id_to_sku:
+                        str_ids = list(item_id_to_sku.keys())
+                        int_ids = [int(i) for i in str_ids if i.isdigit()]
+                        pipeline2 = [
+                            {"$unwind": "$line_items"},
+                            {"$match": {"$and": [
+                                {"$or": [
+                                    {"line_items.item_id": {"$in": str_ids}},
+                                    {"line_items.item_id": {"$in": int_ids}},
+                                ]},
+                                {"line_items.rate": {"$gt": 0}},
+                            ]}},
+                            {"$sort": {"date": -1}},
+                            {"$group": {
+                                "_id": "$line_items.item_id",
+                                "rate": {"$first": "$line_items.rate"},
+                                "currency_code": {"$first": "$currency_code"},
+                            }},
+                        ]
+                        for doc in po_collection.aggregate(pipeline2):
+                            iid = str(doc.get("_id", ""))
+                            sku = item_id_to_sku.get(iid)
+                            if sku and sku not in result:
+                                result[sku] = {
+                                    "rate": float(doc.get("rate") or 0),
+                                    "currency_code": doc.get("currency_code", "") or "",
+                                }
+
                 return result
 
             result = await asyncio.to_thread(_fetch)
