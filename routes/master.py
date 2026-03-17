@@ -1580,17 +1580,17 @@ class OptimizedMasterReportService:
             drr = metrics.get("avg_daily_run_rate", 0)
             closing_stock = metrics.get("total_closing_stock", 0)
 
-            # Transit data: prefer product-stored values, fallback to PO-derived
+            # Transit data: always derived from open purchase orders
             logistics = logistics_data.get(sku, {})
             purchase_status = logistics.get("purchase_status", "")
             transit = transit_data.get(sku, {})
-            sit_1 = logistics["stock_in_transit_1"] if logistics.get("stock_in_transit_1") is not None else transit.get("transit_1", 0)
-            sit_2 = logistics["stock_in_transit_2"] if logistics.get("stock_in_transit_2") is not None else transit.get("transit_2", 0)
-            sit_3 = logistics["stock_in_transit_3"] if logistics.get("stock_in_transit_3") is not None else transit.get("transit_3", 0)
+            sit_1 = transit.get("transit_1", 0)
+            sit_2 = transit.get("transit_2", 0)
+            sit_3 = transit.get("transit_3", 0)
             item["stock_in_transit_1"] = sit_1
             item["stock_in_transit_2"] = sit_2
             item["stock_in_transit_3"] = sit_3
-            total_transit = sit_1 + sit_2 + sit_3
+            total_transit = transit.get("total", 0)  # sum of ALL open PO lines, not just 3
             item["total_stock_in_transit"] = total_transit
 
             # Days coverage
@@ -3283,14 +3283,17 @@ def _aggregate_brand_kpi(
     days_cover = round(latest_net_stock / drr, 2) if drr > 0 else 0.0
     current_days_coverage = round((latest_net_stock + stock_in_transit) / drr, 2) if drr > 0 else 0.0
 
-    # Weighted-average days cover (weight = per-SKU latest stock, exclude dead SKUs)
+    # Weighted-average days cover (weight = per-SKU on-hand + in-transit stock).
+    # Exclude dead SKUs (drr==0 or coverage > 3× lead time) — they distort the
+    # average without providing actionable reorder signal.
+    _dead_threshold = 3 * lead_time
     stock_w_total = 0.0
     weighted_doc_sum = 0.0
     for i in items:
         item_drr = i.get("combined_metrics", {}).get("avg_daily_run_rate", 0)
-        item_stock = i.get("latest_total_stock", 0)
+        item_stock = i.get("latest_total_stock", 0) + i.get("total_stock_in_transit", 0)
         item_doc = i.get("current_days_coverage", 0)
-        if item_drr > 0 and item_stock > 0:
+        if item_drr > 0 and item_stock > 0 and item_doc <= _dead_threshold:
             weighted_doc_sum += item_stock * item_doc
             stock_w_total += item_stock
     weighted_avg_days_cover = round(weighted_doc_sum / stock_w_total, 2) if stock_w_total > 0 else 0.0
