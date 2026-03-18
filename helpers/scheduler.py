@@ -341,22 +341,62 @@ class APIScheduler:
             raise
 
     async def daily_task_execution(self):
-        try:
-            logger.info(f"Starting daily task execution at {datetime.now()}")
+        logger.info(f"Starting daily task execution at {datetime.now()}")
 
-            await self.get_sc_inventory()
-            await self.get_vc_inventory()
-            await self.get_vc_sales_traffic()
-            await self.get_returns()
-            await self.get_settlements()
-            await self.get_sc_sales_traffic()
+        tasks = [
+            ("SC Inventory Ledger", self.get_sc_inventory),
+            ("VC Vendor Inventory", self.get_vc_inventory),
+            ("VC Vendor Sales", self.get_vc_sales_traffic),
+            ("Amazon Returns", self.get_returns),
+            ("Amazon Settlements", self.get_settlements),
+            ("SC Sales Traffic", self.get_sc_sales_traffic),
+        ]
 
-            logger.info("Daily task execution completed successfully")
-            send_slack_notification("Purchases Backend - Daily Sync", success=True)
+        results = {}
+        for name, fn in tasks:
+            try:
+                await fn()
+                results[name] = ("success", None)
+            except Exception as e:
+                logger.error(f"{name} failed: {str(e)}")
+                results[name] = ("failed", str(e))
 
-        except Exception as e:
-            logger.error(f"Daily task execution failed: {str(e)}")
-            send_slack_notification("Purchases Backend - Daily Sync", success=False, error_msg=str(e))
+        all_success = all(status == "success" for status, _ in results.values())
+        logger.info(f"Daily task execution finished. All success: {all_success}")
+
+        # Build detailed Slack message
+        lines = []
+        for name, (status, err) in results.items():
+            if status == "success":
+                lines.append(f":white_check_mark: *{name}* — completed")
+            else:
+                err_snippet = f": `{err[:200]}`" if err else ""
+                lines.append(f":x: *{name}* — failed{err_snippet}")
+
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{'✅' if all_success else '❌'} Daily Sync — {'All tasks completed' if all_success else 'Some tasks failed'}",
+                    "emoji": True,
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n" + "\n".join(lines),
+                },
+            },
+        ]
+
+        if SLACK_URL:
+            try:
+                import requests as _requests
+                _requests.post(SLACK_URL, json={"blocks": blocks}, timeout=10)
+            except Exception as e:
+                logger.error(f"Error sending Slack notification: {e}")
 
     async def weekly_task_execution(self):
         """Weekly tasks including composite items sync"""
