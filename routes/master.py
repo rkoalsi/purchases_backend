@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, status, Depends, Query
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Optional
 import asyncio
 import pandas as pd
 import io
@@ -2394,7 +2394,11 @@ async def _generate_master_report_data(
                 else:
                     net_target_days = target_days - current_days_coverage
                 item["net_target_days"] = round(net_target_days, 2)
-                order_qty = max(0, net_target_days * drr)
+                confidence_multiplier = item.get("confidence_multiplier", 1.0)
+                if item.get("order_qty_demand_override"):
+                    order_qty = item.get("current_period_sales_for_override", 0) * confidence_multiplier
+                else:
+                    order_qty = max(0, net_target_days * drr) * confidence_multiplier
                 item["order_qty"] = round(order_qty, 2)
                 item["order_qty_plus_extra_qty"] = round(order_qty + extra_qty, 2)
 
@@ -3442,16 +3446,28 @@ def _aggregate_brand_kpi(
     }
 
 
-# Module-level TTL cache for dashboard-kpi (always last 90 days — no point recomputing
-# on every page load). Invalidated automatically after _DASHBOARD_KPI_TTL seconds.
-_dashboard_kpi_cache: Dict[str, Any] = {}
-_dashboard_kpi_cache_ts: float = 0.0
+# Module-level TTL cache for dashboard-kpi, keyed by "{start_date}_{end_date}".
+_dashboard_kpi_cache: Dict[str, Dict[str, Any]] = {}
+_dashboard_kpi_cache_ts: Dict[str, float] = {}
 _DASHBOARD_KPI_TTL: int = 900  # 15 minutes
+
+
+def _dashboard_kpi_default_dates() -> tuple[str, str]:
+    """Return (start_date, end_date) for the default 90-day window ending on the previous Sunday."""
+    today = datetime.now()
+    # Python weekday(): Mon=0 … Sun=6.  We want the most recent Sunday that is not today.
+    days_since_sunday = 7 if today.weekday() == 6 else (today.weekday() + 1)
+    prev_sunday = today - timedelta(days=days_since_sunday)
+    end = prev_sunday.strftime("%Y-%m-%d")
+    start = (prev_sunday - timedelta(days=89)).strftime("%Y-%m-%d")
+    return start, end
 
 
 @router.get("/dashboard-kpi")
 async def get_dashboard_kpi(
     refresh: bool = False,
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD (default: 90 days ending previous Sunday)"),
+    end_date: Optional[str] = Query(None, description="End date YYYY-MM-DD (default: previous Sunday)"),
     db=Depends(get_database),
 ):
     """
@@ -3537,20 +3553,26 @@ async def get_dashboard_kpi(
     import time as _time
     global _dashboard_kpi_cache, _dashboard_kpi_cache_ts
 
+    # Resolve dates – fall back to default 90-day window ending previous Sunday
+    if not start_date or not end_date:
+        start_date, end_date = _dashboard_kpi_default_dates()
+
+    cache_key = f"{start_date}_{end_date}"
+
     # Serve from cache if fresh and not force-refreshed
-    if not refresh and _dashboard_kpi_cache and (_time.time() - _dashboard_kpi_cache_ts) < _DASHBOARD_KPI_TTL:
-        logger.info("Serving dashboard-kpi from cache")
-        return JSONResponse(status_code=200, content=_dashboard_kpi_cache)
+    if not refresh and cache_key in _dashboard_kpi_cache and (_time.time() - _dashboard_kpi_cache_ts.get(cache_key, 0)) < _DASHBOARD_KPI_TTL:
+        logger.info("Serving dashboard-kpi from cache (key=%s)", cache_key)
+        return JSONResponse(status_code=200, content=_dashboard_kpi_cache[cache_key])
 
     try:
-        end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=89)).strftime("%Y-%m-%d")
-        period_days = 90
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        period_days = max(1, (end_dt - start_dt).days + 1)
 
         service = OptimizedMasterReportService(db)
 
         content, brand_logistics_map = await asyncio.gather(
-            _generate_master_report_data(start_date, end_date, True, db, dashboard_mode=True),
+            _generate_master_report_data(start_date, end_date, True, db),
             service.get_brand_logistics(),
         )
 
@@ -3643,9 +3665,9 @@ async def get_dashboard_kpi(
             "latest_stock_dates": content.get("latest_stock_dates", {}),
             "meta": content.get("meta", {}),
         }
-        _dashboard_kpi_cache = response_payload
-        _dashboard_kpi_cache_ts = _time.time()
-        logger.info("Dashboard KPI computed and cached")
+        _dashboard_kpi_cache[cache_key] = response_payload
+        _dashboard_kpi_cache_ts[cache_key] = _time.time()
+        logger.info("Dashboard KPI computed and cached (key=%s)", cache_key)
         return JSONResponse(status_code=200, content=response_payload)
 
     except HTTPException:
@@ -3659,6 +3681,8 @@ async def get_dashboard_kpi(
 @router.get("/dashboard-kpi/download")
 async def download_dashboard_kpi(
     breakdown: str = Query("brand", description="'brand' for brand-level or 'product' for SKU-level"),
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD (default: 90 days ending previous Sunday)"),
+    end_date: Optional[str] = Query(None, description="End date YYYY-MM-DD (default: previous Sunday)"),
     db=Depends(get_database),
 ):
     """
@@ -3741,9 +3765,11 @@ async def download_dashboard_kpi(
     Filename format: `stock_cover_kpi_{breakdown}_{start_date}_to_{end_date}_{YYYYMMDD_HHMMSS}.xlsx`
     """
     try:
-        end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=89)).strftime("%Y-%m-%d")
-        period_days = 90
+        if not start_date or not end_date:
+            start_date, end_date = _dashboard_kpi_default_dates()
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        period_days = max(1, (end_dt - start_dt).days + 1)
 
         service = OptimizedMasterReportService(db)
         content, brand_logistics_map = await asyncio.gather(
