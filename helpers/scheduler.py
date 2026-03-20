@@ -180,7 +180,7 @@ class APIScheduler:
     async def get_returns(self):
         try:
             logger.info("Executing Amazon Returns API call...")
-            response = await self.client.post(f"/amazon/sync/daily-returns")
+            response = await self.client.post(f"/amazon/sync/daily-returns", timeout=700.0)
             response.raise_for_status()
             logger.info(
                 f"returns Amazon Returns API call successful: {response.status_code}"
