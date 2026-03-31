@@ -432,6 +432,115 @@ async def scheduled_composite_items_task():
     await api_scheduler.sync_composite_items(notify=True)
 
 
+async def generate_and_send_draft_order_slack_report():
+    """Aggregate draft order data by brand (last 90 days) and post a summary to Slack."""
+    try:
+        from ..routes.master import _generate_master_report_data
+
+        db = get_database()
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=90)
+
+        report_data = await _generate_master_report_data(
+            start_date=start_date.strftime("%Y-%m-%d"),
+            end_date=end_date.strftime("%Y-%m-%d"),
+            include_zoho=True,
+            db=db,
+        )
+
+        combined_data = report_data.get("combined_data", [])
+
+        currency_symbols = {"USD": "$", "EUR": "€", "GBP": "£", "CNY": "¥", "INR": "₹"}
+
+        # Aggregate by brand
+        brand_totals: Dict[str, Dict] = {}
+        for item in combined_data:
+            if not isinstance(item, dict):
+                continue
+            brand = item.get("brand") or "Unknown"
+            total_cbm = float(item.get("total_cbm") or 0)
+            qty_rounded = float(item.get("order_qty_plus_extra_qty_rounded") or 0)
+            unit_price = float(item.get("unit_price") or 0)
+            currency = item.get("unit_price_currency") or "USD"
+
+            if brand not in brand_totals:
+                brand_totals[brand] = {"total_cbm": 0.0, "amounts": {}}
+
+            brand_totals[brand]["total_cbm"] += total_cbm
+            brand_totals[brand]["amounts"][currency] = (
+                brand_totals[brand]["amounts"].get(currency, 0.0) + qty_rounded * unit_price
+            )
+
+        def fmt_amount(currency: str, amount: float) -> str:
+            sym = currency_symbols.get(currency, currency)
+            return f"{sym}{amount:,.2f}"
+
+        today_label = datetime.now().strftime("%d %b %Y")
+
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f":package: Daily Draft Order Summary — {today_label}",
+                    "emoji": True,
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Period:* {start_date.strftime('%d %b %Y')} → {today_label}  (90 days)",
+                },
+            },
+            {"type": "divider"},
+        ]
+
+        for brand in sorted(brand_totals.keys()):
+            data = brand_totals[brand]
+            cbm = data["total_cbm"]
+            amounts = {cur: amt for cur, amt in data["amounts"].items() if amt > 0}
+
+            if cbm == 0 and not amounts:
+                continue
+
+            amount_str = "  |  ".join(fmt_amount(cur, amt) for cur, amt in amounts.items())
+            if not amount_str:
+                amount_str = "—"
+
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*{brand}*\n• CBM: `{cbm:.4f}`\n• Total: {amount_str}",
+                    },
+                }
+            )
+
+        blocks.append({"type": "divider"})
+
+        if SLACK_URL:
+            response = requests.post(SLACK_URL, json={"blocks": blocks}, timeout=10)
+            if response.status_code != 200:
+                logger.error(
+                    f"Draft order Slack report failed: {response.status_code} - {response.text}"
+                )
+            else:
+                logger.info("Draft order Slack report sent successfully")
+        else:
+            logger.warning("SLACK_URL not configured, skipping draft order report")
+
+    except Exception as e:
+        logger.error(f"Error generating draft order Slack report: {e}")
+        send_slack_notification("Draft Order Daily Report", success=False, error_msg=str(e))
+
+
+async def scheduled_draft_order_report():
+    """Wrapper for the daily draft order Slack report (11:45 AM IST = 06:15 UTC)."""
+    await generate_and_send_draft_order_slack_report()
+
+
 def setup_scheduler():
     """Configure and start the scheduler"""
     # Daily tasks
@@ -450,6 +559,16 @@ def setup_scheduler():
         trigger=CronTrigger(hour="22", minute=0, second=0),
         id="composite_items_sync",
         name="Composite Items Sync",
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+
+    # Daily draft order report at 11 AM IST (05:30 UTC)
+    scheduler.add_job(
+        scheduled_draft_order_report,
+        trigger=CronTrigger(hour=6, minute=15, timezone="UTC"),
+        id="daily_draft_order_report",
+        name="Daily Draft Order Slack Report",
         replace_existing=True,
         misfire_grace_time=300,
     )
