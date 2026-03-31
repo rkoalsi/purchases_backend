@@ -566,7 +566,7 @@ def setup_scheduler():
     # Daily draft order report at 11 AM IST (05:30 UTC)
     scheduler.add_job(
         scheduled_draft_order_report,
-        trigger=CronTrigger(hour=6, minute=15, timezone="UTC"),
+        trigger=CronTrigger(hour=4, minute=0, timezone="UTC"),
         id="daily_draft_order_report",
         name="Daily Draft Order Slack Report",
         replace_existing=True,
