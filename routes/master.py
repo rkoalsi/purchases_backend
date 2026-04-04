@@ -2339,6 +2339,8 @@ async def _generate_master_report_data(
                 item["unit_price"] = po_price.get("rate", 0)
                 item["unit_price_currency"] = po_price.get("currency_code", "")
                 item["manufacturer_code"] = all_product_data.get(sku, {}).get("manufacturer_code", "")
+                item["mrp"] = product_rates.get(sku)
+                item["brand"] = product_brands.get(sku, "")
                 # Etrade (Vendor Central) inventory
                 vc_data = vc_by_sku.get(sku, {})
                 vc_stock = round(vc_data.get("closing_stock", 0), 2)
@@ -2889,7 +2891,10 @@ async def download_master_report(
                         "Purchase Status": item.get("purchase_status", ""),
                         "Is New": "Yes" if item.get("is_new", False) else "No",
                         "SKU Code": item.get("sku_code", ""),
+                        "Brand": item.get("brand", ""),
                         "Item Name": item.get("item_name", ""),
+                        "MRP": item.get("mrp") or 0,
+                        "Collection Value": 0,
                         "Unit Price": item.get("unit_price", 0),
                         "Total Amount": f"₹{metrics.get('total_amount', 0)}",
                         "Total Units Sold": metrics.get("total_units_sold", 0),
@@ -2964,6 +2969,9 @@ async def download_master_report(
                     return get_column_letter(cols_list.index(name) + 1)
 
                 _A  = _col("Purchase Status")
+                _brand_col = _col("Brand")
+                _mrp_col   = _col("MRP")
+                _cv_col    = _col("Collection Value")
                 _F  = _col("Total Units Sold")
                 _G  = _col("Total Units Returned")
                 _I  = _col("Net Total Sales")
@@ -3014,6 +3022,11 @@ async def download_master_report(
 
                     # Return %
                     ws[f"{_J}{r}"] = f"=IF({_F}{r}>0,{_G}{r}/{_F}{r}*100,0)"
+
+                    # Collection Value = MRP × Pupscribe WH Stock (latest)
+                    ws[f"{_cv_col}{r}"] = f"={_mrp_col}{r}*{_V}{r}"
+                    ws[f"{_mrp_col}{r}"].number_format = '₹#,##0.00'
+                    ws[f"{_cv_col}{r}"].number_format = '₹#,##0.00'
 
                     # Total Stock (end_date) = WH + FBA
                     ws[f"{_R}{r}"] = f"={_S}{r}+{_T}{r}"
@@ -3095,6 +3108,10 @@ async def download_master_report(
 
                 # Hide the Confidence Multiplier column (used by Order Qty formula, not for display)
                 ws.column_dimensions[_AX].hidden = True
+
+                # Hide Brand column for individual brand reports (redundant when filtered to one brand)
+                if brand:
+                    ws.column_dimensions[_brand_col].hidden = True
 
                 # Auto-fit column widths: header text drives the width; skip formula cells
                 for col_cells in ws.columns:
