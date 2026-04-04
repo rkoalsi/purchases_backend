@@ -2894,7 +2894,6 @@ async def download_master_report(
                         "Brand": item.get("brand", ""),
                         "Item Name": item.get("item_name", ""),
                         "MRP": item.get("mrp") or 0,
-                        "Collection Value": 0,
                         "Unit Price": item.get("unit_price", 0),
                         "Total Amount": f"₹{metrics.get('total_amount', 0)}",
                         "Total Units Sold": metrics.get("total_units_sold", 0),
@@ -2945,6 +2944,8 @@ async def download_master_report(
                         f"Etrade Inventory ({_etrade_inv_label})": metrics.get("etrade_inventory", 0),
                         "Etrade DRR": metrics.get("etrade_drr", 0),
                         "Days Total Inventory Lasts (Etrade)": 0,
+                        "Total MRP": 0,
+                        "Collection Value": 0,
                     }
                 )
 
@@ -2970,8 +2971,9 @@ async def download_master_report(
 
                 _A  = _col("Purchase Status")
                 _brand_col = _col("Brand")
-                _mrp_col   = _col("MRP")
-                _cv_col    = _col("Collection Value")
+                _mrp_col        = _col("MRP")
+                _total_mrp_col  = _col("Total MRP")
+                _cv_col         = _col("Collection Value")
                 _F  = _col("Total Units Sold")
                 _G  = _col("Total Units Returned")
                 _I  = _col("Net Total Sales")
@@ -3023,9 +3025,12 @@ async def download_master_report(
                     # Return %
                     ws[f"{_J}{r}"] = f"=IF({_F}{r}>0,{_G}{r}/{_F}{r}*100,0)"
 
-                    # Collection Value = MRP × Pupscribe WH Stock (latest)
-                    ws[f"{_cv_col}{r}"] = f"={_mrp_col}{r}*{_V}{r}"
-                    ws[f"{_mrp_col}{r}"].number_format = '₹#,##0.00'
+                    # Total MRP = MRP × Pupscribe WH Stock (latest)
+                    ws[f"{_total_mrp_col}{r}"] = f"={_mrp_col}{r}*{_V}{r}"
+                    ws[f"{_total_mrp_col}{r}"].number_format = '₹#,##0.00'
+
+                    # Collection Value = Total MRP / 2
+                    ws[f"{_cv_col}{r}"] = f"={_total_mrp_col}{r}/2"
                     ws[f"{_cv_col}{r}"].number_format = '₹#,##0.00'
 
                     # Total Stock (end_date) = WH + FBA
