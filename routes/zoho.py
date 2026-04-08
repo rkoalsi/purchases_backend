@@ -14,9 +14,10 @@ import threading
 from fastapi.responses import JSONResponse, StreamingResponse
 import concurrent.futures
 from pymongo.errors import PyMongoError
+from bson import ObjectId
 from ..database import get_database, serialize_mongo_document
 from pydantic import BaseModel, validator
-from typing import List
+from typing import List, Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -243,6 +244,38 @@ def get_products(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred while getting the products: {str(e)}",
         )
+
+
+PURCHASE_STATUS_OPTIONS = {"active", "inactive", "discontinued until stock lasts"}
+
+
+class PurchaseStatusUpdate(BaseModel):
+    purchase_status: str
+
+
+@router.patch("/products/{item_id}/purchase-status")
+def update_purchase_status(item_id: str, body: PurchaseStatusUpdate):
+    """Update the purchase_status field of a product."""
+    if body.purchase_status not in PURCHASE_STATUS_OPTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid purchase_status. Must be one of: {', '.join(PURCHASE_STATUS_OPTIONS)}",
+        )
+    try:
+        db = get_database()
+        collection = db[PRODUCTS_COLLECTION]
+        result = collection.update_one(
+            {"_id": ObjectId(item_id)},
+            {"$set": {"purchase_status": body.purchase_status}},
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Product not found")
+        return JSONResponse(content={"success": True, "purchase_status": body.purchase_status})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.info(f"Error updating purchase_status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/sku-brand-map")
