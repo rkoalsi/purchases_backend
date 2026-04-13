@@ -206,149 +206,187 @@ class OptimizedMasterReportService:
             return {}
 
     async def fetch_latest_zoho_wh_stock(self) -> Dict:
-        """Fetch the most recent Pupscribe WH stock per SKU from zoho_warehouse_stock.
-        Uses a 2-step approach: find_one(sort date desc) to get the latest date cheaply,
-        then query only that date's records — avoids sorting the whole collection.
-        Returns {"by_sku": {sku_code: qty}, "latest_date": "YYYY-MM-DD" | None}."""
+        """Fetch the two most recent Pupscribe WH stock snapshots per SKU from
+        zoho_warehouse_stock.
+        Returns {
+            "by_sku": {sku: qty},        # latest date
+            "latest_date": "YYYY-MM-DD",
+            "prev_by_sku": {sku: qty},   # one snapshot before latest
+            "prev_date": "YYYY-MM-DD" | None,
+        }."""
         try:
             stock_collection = self.database["zoho_warehouse_stock"]
             products_collection = self.database["products"]
 
             def _fetch():
                 # Step 1: cheaply find the latest date (O(1) with a date index).
-                # No filter so MongoDB can use a plain date index without touching
-                # the document body to check zoho_item_id existence.
                 latest_doc = stock_collection.find_one(
                     {},
                     sort=[("date", -1)],
                     projection={"date": 1},
                 )
                 if not latest_doc:
-                    return {"by_sku": {}, "latest_date": None}
+                    return {"by_sku": {}, "latest_date": None, "prev_by_sku": {}, "prev_date": None}
                 latest_date = latest_doc["date"]
 
-                # Step 2: aggregate only that one date's records.
-                # Use $ne: None (excludes null/missing) instead of $exists+$ne — same
-                # semantics but friendlier to index use.
-                pipeline = [
-                    {"$match": {"date": latest_date, "zoho_item_id": {"$ne": None}}},
-                    {
-                        "$group": {
-                            "_id": "$zoho_item_id",
-                            "stock": {
-                                "$first": {
-                                    "$ifNull": [
-                                        "$warehouses.Pupscribe Enterprises Private Limited",
-                                        0,
-                                    ]
-                                }
-                            },
-                        }
-                    },
-                ]
-                by_item_id: Dict[str, float] = {}
-                for doc in stock_collection.aggregate(pipeline, allowDiskUse=True):
-                    item_id = doc["_id"]
-                    stock = float(doc.get("stock", 0) or 0)
-                    by_item_id[str(item_id)] = stock
+                # Step 1b: find the previous available date (snapshot before latest).
+                prev_doc = stock_collection.find_one(
+                    {"date": {"$lt": latest_date}},
+                    sort=[("date", -1)],
+                    projection={"date": 1},
+                )
+                prev_date = prev_doc["date"] if prev_doc else None
+
+                def _agg_date(target_date):
+                    """Aggregate Pupscribe WH stock by zoho_item_id for target_date."""
+                    pipeline = [
+                        {"$match": {"date": target_date, "zoho_item_id": {"$ne": None}}},
+                        {
+                            "$group": {
+                                "_id": "$zoho_item_id",
+                                "stock": {
+                                    "$first": {
+                                        "$ifNull": [
+                                            "$warehouses.Pupscribe Enterprises Private Limited",
+                                            0,
+                                        ]
+                                    }
+                                },
+                            }
+                        },
+                    ]
+                    result: Dict[str, float] = {}
+                    for doc in stock_collection.aggregate(pipeline, allowDiskUse=True):
+                        result[str(doc["_id"])] = float(doc.get("stock", 0) or 0)
+                    return result
+
+                # Aggregate both snapshots in sequence (same thread, avoids two round-trips).
+                by_item_id = _agg_date(latest_date)
+                prev_by_item_id = _agg_date(prev_date) if prev_date is not None else {}
+
+                latest_date_str = latest_date.strftime("%Y-%m-%d")
+                prev_date_str = prev_date.strftime("%Y-%m-%d") if prev_date is not None else None
 
                 if not by_item_id:
-                    return {"by_sku": {}, "latest_date": latest_date.strftime("%Y-%m-%d")}
+                    return {
+                        "by_sku": {}, "latest_date": latest_date_str,
+                        "prev_by_sku": {}, "prev_date": prev_date_str,
+                    }
 
-                # Step 3: map zoho_item_id → cf_sku_code via products
-                by_sku: Dict[str, float] = {}
+                # Step 3: collect all item_ids from both snapshots, resolve SKUs once.
+                all_item_ids = set(by_item_id) | set(prev_by_item_id)
+                item_id_to_sku: Dict[str, str] = {}
                 for doc in products_collection.find(
-                    {"item_id": {"$in": list(by_item_id.keys())}},
+                    {"item_id": {"$in": list(all_item_ids)}},
                     {"item_id": 1, "cf_sku_code": 1, "_id": 0},
                 ):
                     iid = str(doc.get("item_id", ""))
                     sku = doc.get("cf_sku_code", "")
                     if iid and sku:
-                        by_sku[sku] = by_sku.get(sku, 0) + by_item_id.get(iid, 0)
+                        item_id_to_sku[iid] = sku
 
-                return {"by_sku": by_sku, "latest_date": latest_date.strftime("%Y-%m-%d")}
+                def _map_to_sku(item_id_map):
+                    by_sku: Dict[str, float] = {}
+                    for iid, qty in item_id_map.items():
+                        sku = item_id_to_sku.get(iid)
+                        if sku:
+                            by_sku[sku] = by_sku.get(sku, 0) + qty
+                    return by_sku
+
+                return {
+                    "by_sku": _map_to_sku(by_item_id),
+                    "latest_date": latest_date_str,
+                    "prev_by_sku": _map_to_sku(prev_by_item_id),
+                    "prev_date": prev_date_str,
+                }
 
             result = await asyncio.to_thread(_fetch)
             logger.info(
                 f"Fetched latest Zoho WH stock for {len(result.get('by_sku', {}))} SKUs, "
-                f"date: {result.get('latest_date')}"
+                f"date: {result.get('latest_date')}; prev snapshot: {result.get('prev_date')}"
             )
             return result
 
         except Exception as e:
             logger.error(f"Error fetching latest Zoho WH stock: {e}")
-            return {"by_sku": {}, "latest_date": None}
+            return {"by_sku": {}, "latest_date": None, "prev_by_sku": {}, "prev_date": None}
 
     async def fetch_latest_fba_stock(self) -> Dict:
-        """Fetch the most recent FBA stock per SKU from amazon_ledger.
-        Uses a 2-step approach: find_one(sort date desc) to get the latest date cheaply,
-        then run the standard closing-stock pipeline bounded to that date.
-        Returns {"by_sku": {sku_code: qty}, "latest_date": "YYYY-MM-DD" | None}."""
+        """Fetch the two most recent FBA stock snapshots per SKU from amazon_ledger.
+        Returns {
+            "by_sku": {sku: qty},        # latest date
+            "latest_date": "YYYY-MM-DD" | None,
+            "prev_by_sku": {sku: qty},   # one snapshot before latest
+            "prev_date": "YYYY-MM-DD" | None,
+        }."""
         try:
             ledger_collection = self.database["amazon_ledger"]
             sku_mapping_collection = self.database["amazon_sku_mapping"]
 
             def _fetch():
-                # Step 1: cheaply find the latest date (O(1) with a date index)
-                latest_doc = ledger_collection.find_one(
-                    {"disposition": "SELLABLE", "location": {"$ne": "VKSX"}},
+                _filter = {"disposition": "SELLABLE", "location": {"$ne": "VKSX"}}
+                # Step 1: find latest date
+                latest_doc = ledger_collection.find_one(_filter, sort=[("date", -1)], projection={"date": 1})
+                if not latest_doc:
+                    return {"by_sku": {}, "latest_date": None, "prev_by_sku": {}, "prev_date": None}
+                latest_date = latest_doc["date"]
+
+                # Step 1b: find previous available date
+                prev_doc = ledger_collection.find_one(
+                    {**_filter, "date": {"$lt": latest_date}},
                     sort=[("date", -1)],
                     projection={"date": 1},
                 )
-                if not latest_doc:
-                    return {"by_sku": {}, "latest_date": None}
-                latest_date = latest_doc["date"]
+                prev_date = prev_doc["date"] if prev_doc else None
 
-                # Step 2: same pipeline as fetch_fba_closing_stock but bounded to latest_date
-                pipeline = [
-                    {
-                        "$match": {
-                            "date": {"$eq": latest_date},
-                            "disposition": "SELLABLE",
-                            "location": {"$ne": "VKSX"},
-                        }
-                    },
-                    {
-                        "$group": {
-                            "_id": "$asin",
-                            "closing_stock": {"$sum": "$ending_warehouse_balance"},
-                        }
-                    },
-                ]
-                asin_stock: Dict[str, float] = {}
-                for doc in ledger_collection.aggregate(pipeline):
-                    asin = doc["_id"]
-                    stock = float(doc.get("closing_stock", 0) or 0)
-                    if stock > 0:
-                        asin_stock[asin] = stock
+                def _agg_date(target_date):
+                    pipeline = [
+                        {"$match": {"date": {"$eq": target_date}, "disposition": "SELLABLE", "location": {"$ne": "VKSX"}}},
+                        {"$group": {"_id": "$asin", "closing_stock": {"$sum": "$ending_warehouse_balance"}}},
+                    ]
+                    result = {}
+                    for doc in ledger_collection.aggregate(pipeline):
+                        stock = float(doc.get("closing_stock", 0) or 0)
+                        if stock > 0:
+                            result[doc["_id"]] = stock
+                    return result
 
-                date_str = latest_date.strftime("%Y-%m-%d")
-                if not asin_stock:
-                    return {"by_sku": {}, "latest_date": date_str}
+                asin_stock = _agg_date(latest_date)
+                prev_asin_stock = _agg_date(prev_date) if prev_date is not None else {}
 
+                # Single SKU mapping lookup for both snapshots
+                all_asins = set(asin_stock) | set(prev_asin_stock)
                 sku_docs = list(sku_mapping_collection.find(
-                    {"item_id": {"$in": list(asin_stock.keys())}},
+                    {"item_id": {"$in": list(all_asins)}},
                     {"item_id": 1, "sku_code": 1, "_id": 0},
                 ))
-                by_sku: Dict[str, float] = {}
-                for doc in sku_docs:
-                    asin = doc.get("item_id")
-                    sku = doc.get("sku_code")
-                    if asin and sku and asin in asin_stock:
-                        by_sku[sku] = by_sku.get(sku, 0) + asin_stock[asin]
+                asin_to_sku = {doc["item_id"]: doc["sku_code"] for doc in sku_docs if doc.get("item_id") and doc.get("sku_code")}
 
-                return {"by_sku": by_sku, "latest_date": date_str}
+                def _map_to_sku(asin_map):
+                    by_sku: Dict[str, float] = {}
+                    for asin, qty in asin_map.items():
+                        sku = asin_to_sku.get(asin)
+                        if sku:
+                            by_sku[sku] = by_sku.get(sku, 0) + qty
+                    return by_sku
+
+                return {
+                    "by_sku": _map_to_sku(asin_stock),
+                    "latest_date": latest_date.strftime("%Y-%m-%d"),
+                    "prev_by_sku": _map_to_sku(prev_asin_stock),
+                    "prev_date": prev_date.strftime("%Y-%m-%d") if prev_date else None,
+                }
 
             result = await asyncio.to_thread(_fetch)
             logger.info(
-                f"Fetched latest FBA stock for {len(result.get('by_sku', {}))} SKUs, "
-                f"date: {result.get('latest_date')}"
+                f"Fetched latest FBA stock for {len(result.get('by_sku', {}))} SKUs "
+                f"(latest: {result.get('latest_date')}, prev: {result.get('prev_date')})"
             )
             return result
 
         except Exception as e:
             logger.error(f"Error fetching latest FBA stock: {e}")
-            return {"by_sku": {}, "latest_date": None}
+            return {"by_sku": {}, "latest_date": None, "prev_by_sku": {}, "prev_date": None}
 
     async def fetch_missed_sales(self, start_date: str, end_date: str) -> Dict[str, float]:
         """Fetch total missed_sales_quantity from missed_sales collection grouped by item_code (= cf_sku_code).
@@ -1905,6 +1943,10 @@ async def _generate_master_report_data(
         latest_fba_by_sku: Dict[str, float] = {}
         latest_zoho_date: str = ""
         latest_fba_date: str = ""
+        prev_zoho_by_sku: Dict[str, float] = {}
+        prev_zoho_date: str = ""
+        prev_fba_by_sku: Dict[str, float] = {}
+        prev_fba_date: str = ""
 
         # Process results
         individual_reports = {}
@@ -2247,11 +2289,15 @@ async def _generate_master_report_data(
                 if not isinstance(lz_res, Exception):
                     latest_zoho_by_sku = lz_res.get("by_sku", {})
                     latest_zoho_date = lz_res.get("latest_date") or ""
+                    prev_zoho_by_sku = lz_res.get("prev_by_sku", {})
+                    prev_zoho_date = lz_res.get("prev_date") or ""
                 else:
                     logger.error(f"Latest Zoho WH stock fetch failed: {lz_res}")
                 if not isinstance(lf_res, Exception):
                     latest_fba_by_sku = lf_res.get("by_sku", {})
                     latest_fba_date = lf_res.get("latest_date") or ""
+                    prev_fba_by_sku = lf_res.get("prev_by_sku", {})
+                    prev_fba_date = lf_res.get("prev_date") or ""
                 else:
                     logger.error(f"Latest FBA stock fetch failed: {lf_res}")
             except asyncio.TimeoutError:
@@ -2335,6 +2381,8 @@ async def _generate_master_report_data(
                 item["latest_zoho_stock"] = lz
                 item["latest_fba_stock"] = lf
                 item["latest_total_stock"] = round(lz + lf, 2)
+                item["prev_zoho_stock"] = round(prev_zoho_by_sku.get(sku, 0), 2)
+                item["prev_fba_stock"] = round(prev_fba_by_sku.get(sku, 0), 2)
                 po_price = po_unit_prices.get(sku, {})
                 item["unit_price"] = po_price.get("rate", 0)
                 item["unit_price_currency"] = po_price.get("currency_code", "")
@@ -2543,7 +2591,9 @@ async def _generate_master_report_data(
             "errors": errors,
             "latest_stock_dates": {
                 "zoho": latest_zoho_date,
+                "prev_zoho": prev_zoho_date,
                 "fba": latest_fba_date,
+                "prev_fba": prev_fba_date,
                 "etrade": vc_latest_inv_date,
             },
             "meta": {
@@ -2754,7 +2804,7 @@ async def download_master_report(
 
     **Stock Snapshot (period end)**
     - `Total Stock ({end_date})` – Zoho Pupscribe Warehouse stock + FBA stock as of `end_date`
-    - `Pupscribe WH Stock ({end_date})` – Zoho Pupscribe Warehouse stock as of `end_date`
+    - `Pupscribe WH Stock ({prev_zoho_date})` – Zoho Pupscribe Warehouse stock from the snapshot one day before the latest DB record
     - `FBA Stock ({end_date})`
 
     **Stock Snapshot (latest DB record)**
@@ -2853,9 +2903,12 @@ async def download_master_report(
             except Exception:
                 return d or "Latest"
         _latest_zoho_label = _fmt_date(latest_stock_dates.get("zoho", ""))
-        _latest_fba_label = _fmt_date(latest_stock_dates.get("fba", ""))
+        _prev_zoho_label   = _fmt_date(latest_stock_dates.get("prev_zoho", ""))
+        _latest_fba_label  = _fmt_date(latest_stock_dates.get("fba", ""))
+        _prev_fba_label    = _fmt_date(latest_stock_dates.get("prev_fba", ""))
         # For total, use the more recent of the two
         _latest_total_label = _latest_fba_label if latest_stock_dates.get("fba", "") >= latest_stock_dates.get("zoho", "") else _latest_zoho_label
+        _prev_total_label   = _prev_fba_label if latest_stock_dates.get("prev_fba", "") >= latest_stock_dates.get("prev_zoho", "") else _prev_zoho_label
         _etrade_inv_label = _fmt_date(latest_stock_dates.get("etrade", "")) or _end_date_label
 
         # Create Excel file
@@ -2908,12 +2961,12 @@ async def download_master_report(
                         "Growth Rate (%)": item.get("growth_rate"),
                         "DRR Source": item.get("drr_source", "current_period"),
                         "DRR Lookback Period": item.get("drr_lookback_period", ""),
-                        f"Total Stock ({_end_date_label})": metrics.get("total_closing_stock", 0),
-                        f"Pupscribe WH Stock ({_end_date_label})": metrics.get("pupscribe_wh_stock", 0),
-                        f"FBA Stock ({_end_date_label})": metrics.get("fba_closing_stock", 0),
-                        f"Total Stock ({_latest_total_label})": item.get("latest_total_stock", 0),
+                        f"Pupscribe WH Stock ({_prev_zoho_label})": item.get("prev_zoho_stock", 0),
+                        f"FBA Stock ({_prev_fba_label})": item.get("prev_fba_stock", 0),
+                        f"Total Stock ({_prev_total_label})": 0,
                         f"Pupscribe WH Stock ({_latest_zoho_label})": item.get("latest_zoho_stock", 0),
                         f"FBA Stock ({_latest_fba_label})": item.get("latest_fba_stock", 0),
+                        f"Total Stock ({_latest_total_label})": item.get("latest_total_stock", 0),
                         "In Stock": "Yes" if item.get("in_stock", False) else "No",
                         "Movement": item.get("movement", ""),
                         "Safety Days": item.get("safety_days", 0),
@@ -2979,12 +3032,12 @@ async def download_master_report(
                 _I  = _col("Net Total Sales")
                 _J  = _col("Return %")
                 _N  = _col("Avg Daily Run Rate")
-                _R  = _col(f"Total Stock ({_end_date_label})")
-                _S  = _col(f"Pupscribe WH Stock ({_end_date_label})")
-                _T  = _col(f"FBA Stock ({_end_date_label})")
-                _U  = _col(f"Total Stock ({_latest_total_label})")
+                _S  = _col(f"Pupscribe WH Stock ({_prev_zoho_label})")
+                _T  = _col(f"FBA Stock ({_prev_fba_label})")
+                _R  = _col(f"Total Stock ({_prev_total_label})")
                 _V  = _col(f"Pupscribe WH Stock ({_latest_zoho_label})")
                 _W  = _col(f"FBA Stock ({_latest_fba_label})")
+                _U  = _col(f"Total Stock ({_latest_total_label})")
                 _AA = _col("Safety Days")
                 _AB = _col("Lead Time")
                 _AC = _col("Order Processing")
@@ -3033,7 +3086,7 @@ async def download_master_report(
                     ws[f"{_cv_col}{r}"] = f"={_total_mrp_col}{r}/2"
                     ws[f"{_cv_col}{r}"].number_format = '₹#,##0.00'
 
-                    # Total Stock (end_date) = WH + FBA
+                    # Total Stock (prev) = prev WH + prev FBA
                     ws[f"{_R}{r}"] = f"={_S}{r}+{_T}{r}"
 
                     # Total Stock (latest) = WH latest + FBA latest
