@@ -218,12 +218,20 @@ def _validate_seller_central(rows: list[dict], products: dict[str, dict]) -> lis
         file_mrp = row["mrp"]
         mrp_match = not file_mrp or db_mrp is None or _compare_numeric(file_mrp, db_mrp)
 
+        file_sp = row.get("sp", "")
+        sp_match = True
+        if file_sp and file_mrp:
+            try:
+                sp_match = round(float(file_sp), 2) <= round(float(file_mrp), 2)
+            except (ValueError, TypeError):
+                sp_match = True
+
         results.append({
             "source": "Seller Central",
             "sku": sku,
             "item_name": item_name,
             "found": True,
-            "has_mismatch": not hsn_match or not gst_match or not mrp_match,
+            "has_mismatch": not hsn_match or not gst_match or not mrp_match or not sp_match,
             "hsn": {"file": file_hsn, "db": db_hsn or "—", "match": hsn_match},
             "gst": {
                 "file": gst_file_display,
@@ -236,7 +244,7 @@ def _validate_seller_central(rows: list[dict], products: dict[str, dict]) -> lis
                 "db": str(db_mrp) if db_mrp is not None else "—",
                 "match": mrp_match,
             },
-            "sp": {"file": row.get("sp", "")},
+            "sp": {"file": file_sp, "mrp_file": file_mrp, "match": sp_match},
         })
     return results
 
@@ -303,7 +311,7 @@ def _build_excel(sc_results: list[dict], vc_results: list[dict]) -> bytes:
         "HSN (File)", "HSN (DB)", "HSN",
         "GST (File)", "GST (DB)", "GST",
         "MRP (File)", "MRP (DB)", "MRP",
-        "SP (File)",
+        "SP (File)", "SP vs MRP",
     ]
     VC_HEADERS = [
         "SKU", "Item Name", "Status",
@@ -340,13 +348,14 @@ def _build_excel(sc_results: list[dict], vc_results: list[dict]) -> bytes:
                         hsn.get("file", ""), hsn.get("db", ""), "Match" if hsn.get("match") else "Mismatch",
                         gst.get("file", ""), gst.get("db", ""), "Match" if gst.get("match") else "Mismatch",
                         mrp.get("file", ""), mrp.get("db", ""), "Match" if mrp.get("match") else "Mismatch",
-                        sp.get("file", ""),
+                        sp.get("file", ""), "OK" if sp.get("match", True) else f"SP > MRP ({sp.get('mrp_file', '')})",
                     ])
                     excel_row = ws[ws.max_row]
                     excel_row[2].fill = red_fill if row["has_mismatch"] else green_fill
                     excel_row[5].fill = _status_fill(hsn.get("match"))
                     excel_row[8].fill = _status_fill(gst.get("match"))
                     excel_row[11].fill = _status_fill(mrp.get("match"))
+                    excel_row[13].fill = _status_fill(sp.get("match", True))
                 else:
                     ws.append([
                         row["sku"], row["item_name"], status,
@@ -382,10 +391,10 @@ def _build_excel(sc_results: list[dict], vc_results: list[dict]) -> bytes:
 async def _run_validation(
     seller_central_file: Optional[UploadFile],
     vendor_central_file: Optional[UploadFile],
-) -> tuple[list, list, list, list]:
+) -> tuple[list, list]:
     """
     Core validation logic. Either file may be None.
-    Returns (sc_rows, vc_rows, sc_results, vc_results).
+    Returns (sc_results, vc_results).
     """
     if not seller_central_file and not vendor_central_file:
         raise HTTPException(
@@ -425,7 +434,7 @@ async def _run_validation(
     sc_results = _validate_seller_central(sc_rows, products) if sc_rows else []
     vc_results = _validate_vendor_central(vc_rows, products) if vc_rows else []
 
-    return sc_rows, vc_rows, sc_results, vc_results
+    return sc_results, vc_results
 
 
 @router.post("/validate")
@@ -438,7 +447,7 @@ async def validate_amazon_listings(
     Either file is optional — at least one must be supplied.
     Returns all rows with per-field match status.
     """
-    sc_rows, vc_rows, sc_results, vc_results = await _run_validation(
+    sc_results, vc_results = await _run_validation(
         seller_central_file, vendor_central_file
     )
     return {
@@ -462,7 +471,7 @@ async def download_amazon_listing_validation(
     Same as /validate but returns a highlighted Excel file with all rows.
     Either file is optional — at least one must be supplied.
     """
-    sc_rows, vc_rows, sc_results, vc_results = await _run_validation(
+    sc_results, vc_results = await _run_validation(
         seller_central_file, vendor_central_file
     )
     excel_bytes = await asyncio.to_thread(_build_excel, sc_results, vc_results)

@@ -251,6 +251,7 @@ class APIScheduler:
                                 }
                                 for c in components
                             ],
+                            "rate":item['rate'],
                             "last_updated": datetime.now(),
                             "created_at": datetime.now(),
                         }

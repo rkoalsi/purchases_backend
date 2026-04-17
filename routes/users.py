@@ -4,10 +4,21 @@ from ..database import get_database, serialize_mongo_document
 from bson import ObjectId
 from pydantic import BaseModel
 from typing import List, Optional
+from passlib.context import CryptContext
 import logging
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+class CreateUserRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: Optional[str] = "user"
+    status: Optional[str] = "active"
 
 
 class UpdateUserRequest(BaseModel):
@@ -46,6 +57,57 @@ def get_users():
         raise e
     except Exception as e:
         logger.error(f"Error fetching users: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred: {e}",
+        )
+
+
+@router.post("")
+def create_user(request: CreateUserRequest):
+    try:
+        db = get_database()
+        existing = db["purchase_users"].find_one({"email": request.email})
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"User with email '{request.email}' already exists",
+            )
+        doc = {
+            "name": request.name,
+            "email": request.email,
+            "password": pwd_context.hash(request.password),
+            "role": request.role,
+            "status": request.status,
+            "permissions": [],
+        }
+        result = db["purchase_users"].insert_one(doc)
+        created = db["purchase_users"].find_one({"_id": result.inserted_id})
+        return JSONResponse(status_code=201, content=serialize_mongo_document(created))
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error creating user: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred: {e}",
+        )
+
+
+@router.delete("/{user_id}")
+def delete_user(user_id: str):
+    try:
+        db = get_database()
+        result = db["purchase_users"].delete_one({"_id": ObjectId(user_id)})
+        if result.deleted_count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+            )
+        return JSONResponse(status_code=200, content={"message": "User deleted"})
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error deleting user: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred: {e}",
