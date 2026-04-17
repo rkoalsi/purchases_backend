@@ -168,22 +168,28 @@ def _compare_numeric(file_val: str, db_val) -> bool:
 
 
 def _validate_seller_central(rows: list[dict], products: dict[str, dict]) -> list[dict]:
-    mismatches = []
+    """Return ALL rows with per-field match status. Skips Amazon example placeholder rows."""
+    results = []
     for row in rows:
         sku = row["sku"]
+        # Skip Amazon template example placeholder row
+        if sku.upper() == "ABC123":
+            continue
+
         product = products.get(sku)
 
         if not product:
-            mismatches.append(
-                {
-                    "source": "Seller Central",
-                    "sku": sku,
-                    "field": "SKU",
-                    "file_value": sku,
-                    "db_value": "—",
-                    "issue": "SKU not found in database",
-                }
-            )
+            results.append({
+                "source": "Seller Central",
+                "sku": sku,
+                "item_name": "—",
+                "found": False,
+                "has_mismatch": True,
+                "hsn": None,
+                "gst": None,
+                "mrp": None,
+                "sp": {"file": row.get("sp", "")},
+            })
             continue
 
         db_hsn = str(product.get("hsn_or_sac") or "").strip()
@@ -191,156 +197,179 @@ def _validate_seller_central(rows: list[dict], products: dict[str, dict]) -> lis
         db_gst = _get_db_gst(product)
         item_name = product.get("item_name", "")
 
-        # HSN check
-        if row["hsn"] and not _compare_hsn(row["hsn"], db_hsn):
-            mismatches.append(
-                {
-                    "source": "Seller Central",
-                    "sku": sku,
-                    "item_name": item_name,
-                    "field": "HSN",
-                    "file_value": row["hsn"],
-                    "db_value": db_hsn or "—",
-                    "issue": "HSN mismatch",
-                }
-            )
+        file_hsn = row["hsn"]
+        hsn_match = not file_hsn or _compare_hsn(file_hsn, db_hsn)
 
-        # GST / Tax Code check
-        file_tax_pct = TAX_CODE_MAP.get(row["tax_code"])
-        if row["tax_code"] and row["tax_code"] not in TAX_CODE_MAP:
-            mismatches.append(
-                {
-                    "source": "Seller Central",
-                    "sku": sku,
-                    "item_name": item_name,
-                    "field": "GST",
-                    "file_value": row["tax_code"],
-                    "db_value": f"{db_gst}%" if db_gst is not None else "—",
-                    "issue": "Unrecognised tax code",
-                }
-            )
-        elif file_tax_pct is not None and db_gst is not None and file_tax_pct != db_gst:
-            mismatches.append(
-                {
-                    "source": "Seller Central",
-                    "sku": sku,
-                    "item_name": item_name,
-                    "field": "GST",
-                    "file_value": f"{row['tax_code']} ({file_tax_pct}%)",
-                    "db_value": f"{db_gst}%",
-                    "issue": "GST rate mismatch",
-                }
-            )
+        file_tax_code = row["tax_code"]
+        file_tax_pct = TAX_CODE_MAP.get(file_tax_code)
+        if file_tax_code and file_tax_code not in TAX_CODE_MAP:
+            gst_match = False
+            gst_issue = "Unrecognised tax code"
+            gst_file_display = file_tax_code
+        elif file_tax_pct is not None and db_gst is not None:
+            gst_match = file_tax_pct == db_gst
+            gst_issue = None
+            gst_file_display = f"{file_tax_code} ({file_tax_pct}%)"
+        else:
+            gst_match = True
+            gst_issue = None
+            gst_file_display = f"{file_tax_code} ({file_tax_pct}%)" if file_tax_pct else file_tax_code
 
-        # MRP check
-        if row["mrp"] and db_mrp is not None and not _compare_numeric(row["mrp"], db_mrp):
-            mismatches.append(
-                {
-                    "source": "Seller Central",
-                    "sku": sku,
-                    "item_name": item_name,
-                    "field": "MRP",
-                    "file_value": row["mrp"],
-                    "db_value": str(db_mrp),
-                    "issue": "MRP mismatch",
-                }
-            )
+        file_mrp = row["mrp"]
+        mrp_match = not file_mrp or db_mrp is None or _compare_numeric(file_mrp, db_mrp)
 
-    return mismatches
+        results.append({
+            "source": "Seller Central",
+            "sku": sku,
+            "item_name": item_name,
+            "found": True,
+            "has_mismatch": not hsn_match or not gst_match or not mrp_match,
+            "hsn": {"file": file_hsn, "db": db_hsn or "—", "match": hsn_match},
+            "gst": {
+                "file": gst_file_display,
+                "db": f"{db_gst}%" if db_gst is not None else "—",
+                "match": gst_match,
+                "issue": gst_issue,
+            },
+            "mrp": {
+                "file": file_mrp,
+                "db": str(db_mrp) if db_mrp is not None else "—",
+                "match": mrp_match,
+            },
+            "sp": {"file": row.get("sp", "")},
+        })
+    return results
 
 
 def _validate_vendor_central(rows: list[dict], products: dict[str, dict]) -> list[dict]:
-    mismatches = []
+    """Return ALL rows with per-field match status. Skips Amazon example placeholder rows."""
+    results = []
     for row in rows:
         sku = row["sku"]
+        if sku.upper() == "ABC123":
+            continue
+
         product = products.get(sku)
 
         if not product:
-            mismatches.append(
-                {
-                    "source": "Vendor Central",
-                    "sku": sku,
-                    "field": "SKU",
-                    "file_value": sku,
-                    "db_value": "—",
-                    "issue": "SKU not found in database",
-                }
-            )
+            results.append({
+                "source": "Vendor Central",
+                "sku": sku,
+                "item_name": "—",
+                "found": False,
+                "has_mismatch": True,
+                "hsn": None,
+                "mrp": None,
+            })
             continue
 
         db_hsn = str(product.get("hsn_or_sac") or "").strip()
         db_mrp = product.get("rate")
         item_name = product.get("item_name", "")
 
-        # HSN check
-        if row["hsn"] and not _compare_hsn(row["hsn"], db_hsn):
-            mismatches.append(
-                {
-                    "source": "Vendor Central",
-                    "sku": sku,
-                    "item_name": item_name,
-                    "field": "HSN",
-                    "file_value": row["hsn"],
-                    "db_value": db_hsn or "—",
-                    "issue": "HSN mismatch",
-                }
-            )
+        file_hsn = row["hsn"]
+        file_mrp = row["mrp"]
+        hsn_match = not file_hsn or _compare_hsn(file_hsn, db_hsn)
+        mrp_match = not file_mrp or db_mrp is None or _compare_numeric(file_mrp, db_mrp)
 
-        # MRP check
-        if row["mrp"] and db_mrp is not None and not _compare_numeric(row["mrp"], db_mrp):
-            mismatches.append(
-                {
-                    "source": "Vendor Central",
-                    "sku": sku,
-                    "item_name": item_name,
-                    "field": "MRP",
-                    "file_value": row["mrp"],
-                    "db_value": str(db_mrp),
-                    "issue": "MRP mismatch",
-                }
-            )
-
-    return mismatches
+        results.append({
+            "source": "Vendor Central",
+            "sku": sku,
+            "item_name": item_name,
+            "found": True,
+            "has_mismatch": not hsn_match or not mrp_match,
+            "hsn": {"file": file_hsn, "db": db_hsn or "—", "match": hsn_match},
+            "mrp": {
+                "file": file_mrp,
+                "db": str(db_mrp) if db_mrp is not None else "—",
+                "match": mrp_match,
+            },
+        })
+    return results
 
 
-def _build_excel(sc_mismatches: list[dict], vc_mismatches: list[dict]) -> bytes:
+def _build_excel(sc_results: list[dict], vc_results: list[dict]) -> bytes:
     wb = Workbook()
 
+    green_fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
     red_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
     header_font = Font(bold=True)
 
-    HEADERS = ["SKU", "Item Name", "Field", "File Value", "DB Value", "Issue"]
+    def _status_fill(match):
+        return green_fill if match else red_fill
 
-    for sheet_name, data in [
-        ("Seller Central", sc_mismatches),
-        ("Vendor Central", vc_mismatches),
-    ]:
-        ws = wb.create_sheet(title=sheet_name)
-        ws.append(HEADERS)
+    SC_HEADERS = [
+        "SKU", "Item Name", "Status",
+        "HSN (File)", "HSN (DB)", "HSN",
+        "GST (File)", "GST (DB)", "GST",
+        "MRP (File)", "MRP (DB)", "MRP",
+        "SP (File)",
+    ]
+    VC_HEADERS = [
+        "SKU", "Item Name", "Status",
+        "HSN (File)", "HSN (DB)", "HSN",
+        "MRP (File)", "MRP (DB)", "MRP",
+    ]
+
+    def _write_sheet(ws, headers, data, is_sc: bool):
+        ws.append(headers)
         for cell in ws[1]:
             cell.font = header_font
 
         for row in data:
-            ws.append(
-                [
-                    row.get("sku", ""),
-                    row.get("item_name", ""),
-                    row.get("field", ""),
-                    row.get("file_value", ""),
-                    row.get("db_value", ""),
-                    row.get("issue", ""),
-                ]
-            )
-            # Highlight the row in light red
-            for cell in ws[ws.max_row]:
-                cell.fill = red_fill
+            if not row.get("found"):
+                if is_sc:
+                    ws.append([row["sku"], row["item_name"], "Not Found",
+                                "—", "—", "Not Found", "—", "—", "Not Found",
+                                "—", "—", "Not Found", "—"])
+                else:
+                    ws.append([row["sku"], row["item_name"], "Not Found",
+                                "—", "—", "Not Found", "—", "—", "Not Found"])
+                for cell in ws[ws.max_row]:
+                    cell.fill = red_fill
+            else:
+                hsn = row.get("hsn") or {}
+                mrp = row.get("mrp") or {}
+                status = "Mismatch" if row["has_mismatch"] else "Match"
 
-        # Auto-width columns
+                if is_sc:
+                    gst = row.get("gst") or {}
+                    sp = row.get("sp") or {}
+                    ws.append([
+                        row["sku"], row["item_name"], status,
+                        hsn.get("file", ""), hsn.get("db", ""), "Match" if hsn.get("match") else "Mismatch",
+                        gst.get("file", ""), gst.get("db", ""), "Match" if gst.get("match") else "Mismatch",
+                        mrp.get("file", ""), mrp.get("db", ""), "Match" if mrp.get("match") else "Mismatch",
+                        sp.get("file", ""),
+                    ])
+                    excel_row = ws[ws.max_row]
+                    excel_row[2].fill = red_fill if row["has_mismatch"] else green_fill
+                    excel_row[5].fill = _status_fill(hsn.get("match"))
+                    excel_row[8].fill = _status_fill(gst.get("match"))
+                    excel_row[11].fill = _status_fill(mrp.get("match"))
+                else:
+                    ws.append([
+                        row["sku"], row["item_name"], status,
+                        hsn.get("file", ""), hsn.get("db", ""), "Match" if hsn.get("match") else "Mismatch",
+                        mrp.get("file", ""), mrp.get("db", ""), "Match" if mrp.get("match") else "Mismatch",
+                    ])
+                    excel_row = ws[ws.max_row]
+                    excel_row[2].fill = red_fill if row["has_mismatch"] else green_fill
+                    excel_row[5].fill = _status_fill(hsn.get("match"))
+                    excel_row[8].fill = _status_fill(mrp.get("match"))
+
         for col in ws.columns:
             max_len = max((len(str(cell.value or "")) for cell in col), default=10)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
 
-    # Remove default blank sheet
+    if sc_results:
+        ws_sc = wb.create_sheet(title="Seller Central")
+        _write_sheet(ws_sc, SC_HEADERS, sc_results, is_sc=True)
+
+    if vc_results:
+        ws_vc = wb.create_sheet(title="Vendor Central")
+        _write_sheet(ws_vc, VC_HEADERS, vc_results, is_sc=False)
+
     if "Sheet" in wb.sheetnames:
         del wb["Sheet"]
 
@@ -356,7 +385,7 @@ async def _run_validation(
 ) -> tuple[list, list, list, list]:
     """
     Core validation logic. Either file may be None.
-    Returns (sc_rows, vc_rows, sc_mismatches, vc_mismatches).
+    Returns (sc_rows, vc_rows, sc_results, vc_results).
     """
     if not seller_central_file and not vendor_central_file:
         raise HTTPException(
@@ -393,10 +422,10 @@ async def _run_validation(
         )
 
     products = await asyncio.to_thread(_load_products_by_sku, all_skus)
-    sc_mismatches = _validate_seller_central(sc_rows, products) if sc_rows else []
-    vc_mismatches = _validate_vendor_central(vc_rows, products) if vc_rows else []
+    sc_results = _validate_seller_central(sc_rows, products) if sc_rows else []
+    vc_results = _validate_vendor_central(vc_rows, products) if vc_rows else []
 
-    return sc_rows, vc_rows, sc_mismatches, vc_mismatches
+    return sc_rows, vc_rows, sc_results, vc_results
 
 
 @router.post("/validate")
@@ -407,19 +436,20 @@ async def validate_amazon_listings(
     """
     Validate Amazon listing files against the products collection in MongoDB.
     Either file is optional — at least one must be supplied.
+    Returns all rows with per-field match status.
     """
-    sc_rows, vc_rows, sc_mismatches, vc_mismatches = await _run_validation(
+    sc_rows, vc_rows, sc_results, vc_results = await _run_validation(
         seller_central_file, vendor_central_file
     )
     return {
         "summary": {
-            "seller_central_rows": len(sc_rows),
-            "vendor_central_rows": len(vc_rows),
-            "seller_central_mismatches": len(sc_mismatches),
-            "vendor_central_mismatches": len(vc_mismatches),
+            "seller_central_rows": len(sc_results),
+            "vendor_central_rows": len(vc_results),
+            "seller_central_mismatches": sum(1 for r in sc_results if r["has_mismatch"]),
+            "vendor_central_mismatches": sum(1 for r in vc_results if r["has_mismatch"]),
         },
-        "seller_central": sc_mismatches,
-        "vendor_central": vc_mismatches,
+        "seller_central": sc_results,
+        "vendor_central": vc_results,
     }
 
 
@@ -429,13 +459,13 @@ async def download_amazon_listing_validation(
     vendor_central_file: Optional[UploadFile] = File(None),
 ):
     """
-    Same as /validate but returns a highlighted Excel file.
+    Same as /validate but returns a highlighted Excel file with all rows.
     Either file is optional — at least one must be supplied.
     """
-    sc_rows, vc_rows, sc_mismatches, vc_mismatches = await _run_validation(
+    sc_rows, vc_rows, sc_results, vc_results = await _run_validation(
         seller_central_file, vendor_central_file
     )
-    excel_bytes = await asyncio.to_thread(_build_excel, sc_mismatches, vc_mismatches)
+    excel_bytes = await asyncio.to_thread(_build_excel, sc_results, vc_results)
     return StreamingResponse(
         io.BytesIO(excel_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
