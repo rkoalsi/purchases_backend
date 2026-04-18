@@ -1,8 +1,10 @@
+import csv as _csv
 import io
 import logging
 import asyncio
 from typing import Optional
 
+import requests
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from openpyxl import load_workbook, Workbook
@@ -20,6 +22,22 @@ TAX_CODE_MAP = {
     "A_GEN_SUPERREDUCED": 5.0,
     "A_GEN_REDUCED": 12.0,
 }
+
+COMBO_SHEET_ID  = "1tn_Lj3KR0zXY8B-8ZUkSznZgE4YzyjtAkcpdHzBCgt4"
+COMBO_SHEET_GID = "1878034212"
+COMBO_SHEET_CSV_URL = (
+    f"https://docs.google.com/spreadsheets/d/{COMBO_SHEET_ID}"
+    f"/export?format=csv&gid={COMBO_SHEET_GID}"
+)
+
+# Column header names in the combo Google Sheet (row 2 is the real header)
+COMBO_COL_SKU = "SKU Code"
+COMBO_COL_MRP = "MRP"
+COMBO_COL_SP  = "SP"
+COMBO_COL_HSN = "HSN Code"
+COMBO_COL_GST  = "GST %"
+COMBO_COL_NAME = "Item Amazon Name"
+
 
 # Seller Central Template column letters
 SC_COLS = {
@@ -139,6 +157,46 @@ def _load_products_by_sku(skus: set[str]) -> dict[str, dict]:
     return {str(p["cf_sku_code"]).strip(): p for p in products}
 
 
+def _fetch_combo_sheet_data() -> dict[str, dict]:
+    """
+    Fetch combo product reference data from the Google Sheet.
+    Row 1 is empty, row 2 is the header — so we skip line 0 and use line 1 as header.
+    Returns {sku_code: {mrp, sp, hsn}} with string values.
+    """
+    resp = requests.get(COMBO_SHEET_CSV_URL, timeout=30)
+    resp.raise_for_status()
+    lines = resp.text.splitlines()
+    if len(lines) < 2:
+        raise ValueError("Combo Google Sheet has fewer than 2 rows")
+    reader = _csv.DictReader(io.StringIO("\n".join(lines[1:])))
+    result = {}
+    for row in reader:
+        sku = str(row.get(COMBO_COL_SKU) or "").strip()
+        if not sku:
+            continue
+        result[sku] = {
+            "mrp":       str(row.get(COMBO_COL_MRP)  or "").strip(),
+            "sp":        str(row.get(COMBO_COL_SP)   or "").strip(),
+            "hsn":       str(row.get(COMBO_COL_HSN)  or "").strip(),
+            "gst":       str(row.get(COMBO_COL_GST)  or "").strip(),
+            "item_name": str(row.get(COMBO_COL_NAME) or "").strip(),
+        }
+    return result
+
+
+def _load_composite_products(skus: set[str]) -> dict[str, dict]:
+    """
+    Return composite product docs keyed by sku_code, for the given SKU set.
+    Fetches item_tax_preferences so GST can be validated the same as single products.
+    """
+    db = get_database()
+    docs = db["composite_products"].find(
+        {"sku_code": {"$in": list(skus)}},
+        {"sku_code": 1, "item_tax_preferences": 1, "_id": 0},
+    )
+    return {str(d["sku_code"]).strip(): d for d in docs}
+
+
 def _get_db_gst(product: dict) -> Optional[float]:
     """Extract the intra GST percentage from item_tax_preferences."""
     prefs = product.get("item_tax_preferences") or []
@@ -167,13 +225,91 @@ def _compare_numeric(file_val: str, db_val) -> bool:
         return str(file_val).strip() == str(db_val).strip()
 
 
-def _validate_seller_central(rows: list[dict], products: dict[str, dict]) -> list[dict]:
+def _validate_seller_central(
+    rows: list[dict],
+    products: dict[str, dict],
+    combo_skus: set[str],
+    combo_data: dict[str, dict],
+) -> list[dict]:
     """Return ALL rows with per-field match status. Skips Amazon example placeholder rows."""
     results = []
     for row in rows:
         sku = row["sku"]
         # Skip Amazon template example placeholder row
         if sku.upper() == "ABC123":
+            continue
+
+        is_combo = sku in combo_skus
+
+        if is_combo:
+            combo = combo_data.get(sku)
+            if not combo:
+                results.append({
+                    "source": "Seller Central",
+                    "sku": sku,
+                    "item_name": "—",
+                    "found": False,
+                    "is_combo": True,
+                    "has_mismatch": True,
+                    "hsn": None,
+                    "gst": None,
+                    "mrp": None,
+                    "sp": {"file": row.get("sp", "")},
+                })
+                continue
+
+            file_hsn = row["hsn"]
+            sheet_hsn = combo["hsn"]
+            hsn_match = not file_hsn or not sheet_hsn or _compare_hsn(file_hsn, sheet_hsn)
+
+            file_mrp = row["mrp"]
+            sheet_mrp = combo["mrp"]
+            mrp_match = not file_mrp or not sheet_mrp or _compare_numeric(file_mrp, sheet_mrp)
+
+            file_sp = row.get("sp", "")
+            sheet_sp = combo["sp"]
+            sp_match = not file_sp or not sheet_sp or _compare_numeric(file_sp, sheet_sp)
+
+            file_tax_code = row["tax_code"]
+            file_tax_pct = TAX_CODE_MAP.get(file_tax_code)
+            sheet_gst_str = combo["gst"]
+            if file_tax_code and file_tax_code not in TAX_CODE_MAP:
+                gst_match = False
+                gst_issue = "Unrecognised tax code"
+                gst_file_display = file_tax_code
+            elif file_tax_pct is not None and sheet_gst_str:
+                try:
+                    gst_match = file_tax_pct == float(sheet_gst_str.rstrip("%"))
+                except ValueError:
+                    gst_match = True
+                gst_issue = None
+                gst_file_display = f"{file_tax_code} ({file_tax_pct}%)"
+            else:
+                gst_match = True
+                gst_issue = None
+                gst_file_display = f"{file_tax_code} ({file_tax_pct}%)" if file_tax_pct else file_tax_code
+
+            results.append({
+                "source": "Seller Central",
+                "sku": sku,
+                "item_name": combo.get("item_name") or "—",
+                "found": True,
+                "is_combo": True,
+                "has_mismatch": not hsn_match or not gst_match or not mrp_match or not sp_match,
+                "hsn": {"file": file_hsn, "db": sheet_hsn or "—", "match": hsn_match},
+                "gst": {
+                    "file": gst_file_display,
+                    "db": (f"{sheet_gst_str}%" if not sheet_gst_str.endswith("%") else sheet_gst_str) if sheet_gst_str else "—",
+                    "match": gst_match,
+                    "issue": gst_issue,
+                },
+                "mrp": {
+                    "file": file_mrp,
+                    "db": sheet_mrp or "—",
+                    "match": mrp_match,
+                },
+                "sp": {"file": file_sp, "db": sheet_sp or "—", "mrp_file": file_mrp, "match": sp_match},
+            })
             continue
 
         product = products.get(sku)
@@ -184,6 +320,7 @@ def _validate_seller_central(rows: list[dict], products: dict[str, dict]) -> lis
                 "sku": sku,
                 "item_name": "—",
                 "found": False,
+                "is_combo": False,
                 "has_mismatch": True,
                 "hsn": None,
                 "gst": None,
@@ -231,6 +368,7 @@ def _validate_seller_central(rows: list[dict], products: dict[str, dict]) -> lis
             "sku": sku,
             "item_name": item_name,
             "found": True,
+            "is_combo": False,
             "has_mismatch": not hsn_match or not gst_match or not mrp_match or not sp_match,
             "hsn": {"file": file_hsn, "db": db_hsn or "—", "match": hsn_match},
             "gst": {
@@ -249,12 +387,58 @@ def _validate_seller_central(rows: list[dict], products: dict[str, dict]) -> lis
     return results
 
 
-def _validate_vendor_central(rows: list[dict], products: dict[str, dict]) -> list[dict]:
+def _validate_vendor_central(
+    rows: list[dict],
+    products: dict[str, dict],
+    combo_skus: set[str],
+    combo_data: dict[str, dict],
+) -> list[dict]:
     """Return ALL rows with per-field match status. Skips Amazon example placeholder rows."""
     results = []
     for row in rows:
         sku = row["sku"]
         if sku.upper() == "ABC123":
+            continue
+
+        is_combo = sku in combo_skus
+
+        if is_combo:
+            combo = combo_data.get(sku)
+            if not combo:
+                results.append({
+                    "source": "Vendor Central",
+                    "sku": sku,
+                    "item_name": "—",
+                    "found": False,
+                    "is_combo": True,
+                    "has_mismatch": True,
+                    "hsn": None,
+                    "mrp": None,
+                })
+                continue
+
+            file_hsn = row["hsn"]
+            sheet_hsn = combo["hsn"]
+            hsn_match = not file_hsn or not sheet_hsn or _compare_hsn(file_hsn, sheet_hsn)
+
+            file_mrp = row["mrp"]
+            sheet_mrp = combo["mrp"]
+            mrp_match = not file_mrp or not sheet_mrp or _compare_numeric(file_mrp, sheet_mrp)
+
+            results.append({
+                "source": "Vendor Central",
+                "sku": sku,
+                "item_name": "—",
+                "found": True,
+                "is_combo": True,
+                "has_mismatch": not hsn_match or not mrp_match,
+                "hsn": {"file": file_hsn, "db": sheet_hsn or "—", "match": hsn_match},
+                "mrp": {
+                    "file": file_mrp,
+                    "db": sheet_mrp or "—",
+                    "match": mrp_match,
+                },
+            })
             continue
 
         product = products.get(sku)
@@ -265,6 +449,7 @@ def _validate_vendor_central(rows: list[dict], products: dict[str, dict]) -> lis
                 "sku": sku,
                 "item_name": "—",
                 "found": False,
+                "is_combo": False,
                 "has_mismatch": True,
                 "hsn": None,
                 "mrp": None,
@@ -285,6 +470,7 @@ def _validate_vendor_central(rows: list[dict], products: dict[str, dict]) -> lis
             "sku": sku,
             "item_name": item_name,
             "found": True,
+            "is_combo": False,
             "has_mismatch": not hsn_match or not mrp_match,
             "hsn": {"file": file_hsn, "db": db_hsn or "—", "match": hsn_match},
             "mrp": {
@@ -307,16 +493,16 @@ def _build_excel(sc_results: list[dict], vc_results: list[dict]) -> bytes:
         return green_fill if match else red_fill
 
     SC_HEADERS = [
-        "SKU", "Item Name", "Status",
-        "HSN (File)", "HSN (DB)", "HSN",
-        "GST (File)", "GST (DB)", "GST",
-        "MRP (File)", "MRP (DB)", "MRP",
-        "SP (File)", "SP vs MRP",
+        "SKU", "Item Name", "Type", "Status",
+        "HSN (File)", "HSN (Ref)", "HSN",
+        "GST (File)", "GST (Ref)", "GST",
+        "MRP (File)", "MRP (Ref)", "MRP",
+        "SP (File)", "SP (Ref)", "SP",
     ]
     VC_HEADERS = [
-        "SKU", "Item Name", "Status",
-        "HSN (File)", "HSN (DB)", "HSN",
-        "MRP (File)", "MRP (DB)", "MRP",
+        "SKU", "Item Name", "Type", "Status",
+        "HSN (File)", "HSN (Ref)", "HSN",
+        "MRP (File)", "MRP (Ref)", "MRP",
     ]
 
     def _write_sheet(ws, headers, data, is_sc: bool):
@@ -325,13 +511,14 @@ def _build_excel(sc_results: list[dict], vc_results: list[dict]) -> bytes:
             cell.font = header_font
 
         for row in data:
+            row_type = "Combo" if row.get("is_combo") else "Single"
             if not row.get("found"):
                 if is_sc:
-                    ws.append([row["sku"], row["item_name"], "Not Found",
+                    ws.append([row["sku"], row["item_name"], row_type, "Not Found",
                                 "—", "—", "Not Found", "—", "—", "Not Found",
-                                "—", "—", "Not Found", "—"])
+                                "—", "—", "Not Found", "—", "—", "Not Found"])
                 else:
-                    ws.append([row["sku"], row["item_name"], "Not Found",
+                    ws.append([row["sku"], row["item_name"], row_type, "Not Found",
                                 "—", "—", "Not Found", "—", "—", "Not Found"])
                 for cell in ws[ws.max_row]:
                     cell.fill = red_fill
@@ -343,29 +530,34 @@ def _build_excel(sc_results: list[dict], vc_results: list[dict]) -> bytes:
                 if is_sc:
                     gst = row.get("gst") or {}
                     sp = row.get("sp") or {}
+                    sp_ref = sp.get("db", "")
+                    if sp_ref:
+                        sp_status = "Match" if sp.get("match", True) else f"Mismatch (ref: {sp_ref})"
+                    else:
+                        sp_status = "OK" if sp.get("match", True) else f"SP > MRP ({sp.get('mrp_file', '')})"
                     ws.append([
-                        row["sku"], row["item_name"], status,
+                        row["sku"], row["item_name"], row_type, status,
                         hsn.get("file", ""), hsn.get("db", ""), "Match" if hsn.get("match") else "Mismatch",
                         gst.get("file", ""), gst.get("db", ""), "Match" if gst.get("match") else "Mismatch",
                         mrp.get("file", ""), mrp.get("db", ""), "Match" if mrp.get("match") else "Mismatch",
-                        sp.get("file", ""), "OK" if sp.get("match", True) else f"SP > MRP ({sp.get('mrp_file', '')})",
+                        sp.get("file", ""), sp_ref, sp_status,
                     ])
                     excel_row = ws[ws.max_row]
-                    excel_row[2].fill = red_fill if row["has_mismatch"] else green_fill
-                    excel_row[5].fill = _status_fill(hsn.get("match"))
-                    excel_row[8].fill = _status_fill(gst.get("match"))
-                    excel_row[11].fill = _status_fill(mrp.get("match"))
-                    excel_row[13].fill = _status_fill(sp.get("match", True))
+                    excel_row[3].fill = red_fill if row["has_mismatch"] else green_fill
+                    excel_row[6].fill = _status_fill(hsn.get("match"))
+                    excel_row[9].fill = _status_fill(gst.get("match"))
+                    excel_row[12].fill = _status_fill(mrp.get("match"))
+                    excel_row[15].fill = _status_fill(sp.get("match", True))
                 else:
                     ws.append([
-                        row["sku"], row["item_name"], status,
+                        row["sku"], row["item_name"], row_type, status,
                         hsn.get("file", ""), hsn.get("db", ""), "Match" if hsn.get("match") else "Mismatch",
                         mrp.get("file", ""), mrp.get("db", ""), "Match" if mrp.get("match") else "Mismatch",
                     ])
                     excel_row = ws[ws.max_row]
-                    excel_row[2].fill = red_fill if row["has_mismatch"] else green_fill
-                    excel_row[5].fill = _status_fill(hsn.get("match"))
-                    excel_row[8].fill = _status_fill(mrp.get("match"))
+                    excel_row[3].fill = red_fill if row["has_mismatch"] else green_fill
+                    excel_row[6].fill = _status_fill(hsn.get("match"))
+                    excel_row[9].fill = _status_fill(mrp.get("match"))
 
         for col in ws.columns:
             max_len = max((len(str(cell.value or "")) for cell in col), default=10)
@@ -430,9 +622,15 @@ async def _run_validation(
             detail="No SKU data found in the uploaded file(s). Ensure data rows start at row 6.",
         )
 
-    products = await asyncio.to_thread(_load_products_by_sku, all_skus)
-    sc_results = _validate_seller_central(sc_rows, products) if sc_rows else []
-    vc_results = _validate_vendor_central(vc_rows, products) if vc_rows else []
+    products, composite_products, combo_data = await asyncio.gather(
+        asyncio.to_thread(_load_products_by_sku, all_skus),
+        asyncio.to_thread(_load_composite_products, all_skus),
+        asyncio.to_thread(_fetch_combo_sheet_data),
+    )
+    combo_skus = set(composite_products.keys())
+
+    sc_results = _validate_seller_central(sc_rows, products, combo_skus, combo_data) if sc_rows else []
+    vc_results = _validate_vendor_central(vc_rows, products, combo_skus, combo_data) if vc_rows else []
 
     return sc_results, vc_results
 
