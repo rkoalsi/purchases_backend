@@ -3234,7 +3234,7 @@ async def download_master_report(
                     for r_idx, row in enumerate(draft_rows):
                         r = r_idx + 2  # 1-based, skip header
                         ws_draft[f"{_dqty}{r}"]  = (
-                            f"=XLOOKUP({_dbbcode}{r},"
+                            f"=_xlfn.XLOOKUP({_dbbcode}{r},"
                             f"'{_master_sheet_ref}'!{_master_sku_col}:{_master_sku_col},"
                             f"'{_master_sheet_ref}'!{_AT}:{_AT},0)"
                         )
