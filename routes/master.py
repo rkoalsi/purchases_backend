@@ -3218,7 +3218,8 @@ async def download_master_report(
                     def _dcol(name):
                         return get_column_letter(draft_cols.index(name) + 1)
 
-                    _dqty  = _dcol("Qty")
+                    _dqty   = _dcol("Qty")
+                    _dbbcode = _dcol("BBCode")
                     _dup   = _dcol("Unit Price")
                     _dtot  = _dcol("Total")
                     _dcp   = _dcol("Case Pack")
@@ -3228,10 +3229,15 @@ async def download_master_report(
 
                     # Escape single quotes in sheet name for cross-sheet formula reference
                     _master_sheet_ref = _sheet_name.replace("'", "''")
+                    _master_sku_col = _col("SKU Code")
 
                     for r_idx, row in enumerate(draft_rows):
                         r = r_idx + 2  # 1-based, skip header
-                        ws_draft[f"{_dqty}{r}"]  = f"='{_master_sheet_ref}'!{_AT}{r}"
+                        ws_draft[f"{_dqty}{r}"]  = (
+                            f"=XLOOKUP({_dbbcode}{r},"
+                            f"'{_master_sheet_ref}'!{_master_sku_col}:{_master_sku_col},"
+                            f"'{_master_sheet_ref}'!{_AT}:{_AT},0)"
+                        )
                         ws_draft[f"{_dtot}{r}"]  = f"={_dqty}{r}*{_dup}{r}"
                         ws_draft[f"{_dcar}{r}"]  = f"=IF({_dcp}{r}>0,{_dqty}{r}/{_dcp}{r},0)"
                         ws_draft[f"{_dtcbm}{r}"] = f"={_dcbm}{r}*{_dcar}{r}"
