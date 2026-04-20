@@ -2261,7 +2261,12 @@ async def generate_vendor_central_data(start, end, database, any_last_90_days: b
                         "if": {"$gt": ["$total_days_in_stock", 0]},
                         "then": {
                             "$divide": [
-                                "$total_units_sold",
+                                {
+                                    "$subtract": [
+                                        "$total_units_sold",
+                                        {"$ifNull": ["$total_returns", 0]},
+                                    ]
+                                },
                                 "$total_days_in_stock",
                             ]
                         },
@@ -2549,7 +2554,15 @@ async def generate_amazon_data(start, end, database, report_type, any_last_90_da
                         "$cond": {
                             "if": {"$gt": ["$total_days_in_stock", 0]},
                             "then": {
-                                "$divide": ["$total_units_sold", "$total_days_in_stock"]
+                                "$divide": [
+                                    {
+                                        "$subtract": [
+                                            "$total_units_sold",
+                                            {"$ifNull": ["$total_returns", 0]},
+                                        ]
+                                    },
+                                    "$total_days_in_stock",
+                                ]
                             },
                             "else": 0,
                         }
@@ -2676,8 +2689,9 @@ def combine_report_data(vendor_data, fba_seller_flex_data):
 
             # Recalculate DRR
             if combined_item["total_days_in_stock"] > 0:
+                net_units = combined_item["units_sold"] - combined_item.get("total_returns", 0)
                 combined_item["drr"] = round(
-                    combined_item["units_sold"] / combined_item["total_days_in_stock"],
+                    net_units / combined_item["total_days_in_stock"],
                     2,
                 )
 
