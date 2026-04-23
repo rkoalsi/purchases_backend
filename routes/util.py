@@ -29,12 +29,14 @@ async def download_template():
 
         # Create CI sheet with specified columns
         ci_sheet = wb.create_sheet("CI")
-        ci_sheet.append(["Name", "HSN", "Price"])
+        ci_sheet.append(["Name", "HSN", "Price", "SKU Code", "Manufacturer Code"])
 
         # Optional: Set column widths for better formatting
         ci_sheet.column_dimensions["A"].width = 20  # Name column
         ci_sheet.column_dimensions["B"].width = 15  # HSN column
         ci_sheet.column_dimensions["C"].width = 15  # Price column
+        ci_sheet.column_dimensions["D"].width = 20  # SKU Code column
+        ci_sheet.column_dimensions["E"].width = 20  # Manufacturer Code column
 
         # Create PL sheet with specified column
         pl_sheet = wb.create_sheet("PL")
@@ -304,6 +306,8 @@ def process_upload_data(file_content: bytes) -> bytes:
             "name": row["Name"],
             "hsn": str(int(row["HSN"])) if pd.notna(row["HSN"]) else "",
             "price": row["Price"] if pd.notna(row["Price"]) else 0,
+            "sku_code": str(row["SKU Code"]).strip() if "SKU Code" in ci_sheet.columns and pd.notna(row.get("SKU Code")) else "",
+            "manufacturer_code": str(row["Manufacturer Code"]).strip() if "Manufacturer Code" in ci_sheet.columns and pd.notna(row.get("Manufacturer Code")) else "",
         }
         for _, row in ci_sheet.iterrows()
         if isinstance(row["Name"], str) and pd.notna(row["Name"])
@@ -337,6 +341,8 @@ def process_upload_data(file_content: bytes) -> bytes:
         name = str(item.get("name")).strip()
         code = item.get("hsn")
         price = item.get("price")
+        sku_code = item.get("sku_code", "")
+        manufacturer_code = item.get("manufacturer_code", "")
         rounded_price = round(price, 6)
 
         items_from_db = get_items_from_db(name)
@@ -344,6 +350,8 @@ def process_upload_data(file_content: bytes) -> bytes:
             product = items_from_db[0]
             product_name = product.get("item_name")
             product_code = product.get("hsn_or_sac", "")
+            product_sku_code = str(product.get("cf_sku_code", "") or "").strip()
+            product_manufacturer_code = str(product.get("cf_item_code", "") or "").strip()
             product_price = next(
                 (
                     entry["rate"]
@@ -357,12 +365,16 @@ def process_upload_data(file_content: bytes) -> bytes:
                 compare_strings(name, product_name)
                 and compare_strings(code, product_code)
                 and compare_strings(rounded_price, product_price)
+                and compare_strings(sku_code, product_sku_code)
+                and compare_strings(manufacturer_code, product_manufacturer_code)
             ):
                 matched_ci.append(
                     {
                         "name": name,
                         "hsn": code,
                         "price": price,
+                        "sku_code": sku_code,
+                        "manufacturer_code": manufacturer_code,
                     }
                 )
             else:
@@ -375,6 +387,10 @@ def process_upload_data(file_content: bytes) -> bytes:
                     reasons.append(
                         f"Price {rounded_price} not matched with {product_price}"
                     )
+                if not compare_strings(sku_code, product_sku_code):
+                    reasons.append(f"SKU Code {sku_code} not matched with {product_sku_code}")
+                if not compare_strings(manufacturer_code, product_manufacturer_code):
+                    reasons.append(f"Manufacturer Code {manufacturer_code} not matched with {product_manufacturer_code}")
 
                 reason = "; ".join(reasons)
                 unmatched_ci.append(
@@ -382,6 +398,8 @@ def process_upload_data(file_content: bytes) -> bytes:
                         "name": name,
                         "hsn": code,
                         "price": price,
+                        "sku_code": sku_code,
+                        "manufacturer_code": manufacturer_code,
                         "reason": reason,
                     }
                 )
@@ -392,6 +410,8 @@ def process_upload_data(file_content: bytes) -> bytes:
                     "name": name,
                     "hsn": code,
                     "price": price,
+                    "sku_code": sku_code,
+                    "manufacturer_code": manufacturer_code,
                     "reason": reason,
                 }
             )

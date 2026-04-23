@@ -201,6 +201,7 @@ def create_report(
         report_data["reportOptions"] = report_options
 
     response = make_sp_api_request(endpoint, method="POST", data=report_data)
+    print(json.dumps(response, indent=4))
     report_id = response.get("reportId")
     logger.info(f"✅ Report created with ID: {report_id}")
     return report_id
@@ -662,6 +663,97 @@ async def refresh_amazon_token():
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
+
+
+@router.post("/report/{report_id}/insert")
+async def fetch_and_insert_report(report_id: str, db=Depends(get_database)):
+    """
+    Fetch a completed report by ID and insert its salesByAsin records into the sales collection.
+    """
+    logger.info(f"📋 Fetching report {report_id} for insertion")
+
+    report_status = get_report_status(report_id)
+    if not report_status:
+        raise HTTPException(status_code=404, detail="Report not found or empty response")
+
+    processing_status = report_status.get("processingStatus")
+    report_document_id = report_status.get("reportDocumentId")
+
+    if processing_status != "DONE":
+        return {"reportId": report_id, "processingStatus": processing_status, "detail": "Report not ready yet"}
+
+    if not report_document_id:
+        raise HTTPException(status_code=500, detail="Report DONE but no document ID returned")
+
+    report_data = download_report_data(report_document_id, is_gzipped=True)
+    if not report_data:
+        raise HTTPException(status_code=500, detail="Downloaded report data is empty")
+
+    parsed = json.loads(report_data)
+    sales_by_asin = parsed.get("salesByAsin", [])
+
+    if not sales_by_asin:
+        return {"reportId": report_id, "inserted": 0, "detail": "No salesByAsin data in report"}
+
+    spec = parsed.get("reportSpecification", {})
+    date_str = spec.get("dataStartTime", "")
+    date_obj = datetime.strptime(date_str, "%Y-%m-%d") if date_str else datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    current_time = datetime.now()
+
+    collection = db[SALES_COLLECTION]
+    existing_asins = set(collection.distinct("asin", {"date": date_obj}))
+    logger.info(f"📋 Found {len(existing_asins)} existing ASINs for {date_str}")
+
+    new_records = []
+    for asin_data in sales_by_asin:
+        if asin_data.get("asin") not in existing_asins:
+            asin_data["date"] = date_obj
+            asin_data["created_at"] = current_time
+            new_records.append(asin_data)
+
+    if new_records:
+        result = collection.insert_many(new_records, ordered=False)
+        inserted = len(result.inserted_ids)
+        logger.info(f"✅ Inserted {inserted} records for {date_str}")
+    else:
+        inserted = 0
+        logger.info(f"ℹ️ No new records to insert for {date_str}")
+
+    return {
+        "reportId": report_id,
+        "date": date_str,
+        "total_in_report": len(sales_by_asin),
+        "skipped_existing": len(sales_by_asin) - len(new_records),
+        "inserted": inserted,
+    }
+
+
+@router.get("/report/{report_id}")
+async def fetch_report_by_id(report_id: str):
+    """
+    Fetch and return the data for an already-generated report by its report ID.
+    """
+    logger.info(f"📋 Fetching report {report_id}")
+
+    report_status = get_report_status(report_id)
+    if not report_status:
+        raise HTTPException(status_code=404, detail="Report not found or empty response")
+
+    processing_status = report_status.get("processingStatus")
+    report_document_id = report_status.get("reportDocumentId")
+
+    if processing_status != "DONE":
+        return {"reportId": report_id, "processingStatus": processing_status, "detail": "Report not ready yet"}
+
+    if not report_document_id:
+        raise HTTPException(status_code=500, detail="Report DONE but no document ID returned")
+
+    report_data = download_report_data(report_document_id, is_gzipped=True)
+    if not report_data:
+        raise HTTPException(status_code=500, detail="Downloaded report data is empty")
+
+    parsed = json.loads(report_data)
+    return {"reportId": report_id, "processingStatus": processing_status, "data": parsed}
 
 
 @router.post("/sync/sales")

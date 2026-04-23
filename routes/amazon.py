@@ -2675,6 +2675,8 @@ def combine_report_data(vendor_data, fba_seller_flex_data):
                 "stock": (
                     vendor_item.get("stock", 0) + fba_item.get("closing_stock", 0)
                 ),  # Combined stock
+                "vendor_days_in_stock": vendor_item.get("total_days_in_stock", 0),
+                "fba_days_in_stock": fba_item.get("total_days_in_stock", 0),
                 "total_days_in_stock": max(
                     vendor_item.get("total_days_in_stock", 0),
                     fba_item.get("total_days_in_stock", 0),
@@ -2708,6 +2710,8 @@ def combine_report_data(vendor_data, fba_seller_flex_data):
                 vendor_item["stock"] = vendor_item.get("closing_stock", 0)
             if "total_returns" not in vendor_item:
                 vendor_item["total_returns"] = 0
+            vendor_item["vendor_days_in_stock"] = vendor_item.get("total_days_in_stock", 0)
+            vendor_item["fba_days_in_stock"] = 0
             vendor_item["data_source"] = "vendor_only"
             combined_results.append(vendor_item)
 
@@ -2716,6 +2720,8 @@ def combine_report_data(vendor_data, fba_seller_flex_data):
         if key not in processed_keys:
             # Add missing fields with default values
             fba_item["stock"] = fba_item.get("closing_stock", 0)
+            fba_item["vendor_days_in_stock"] = 0
+            fba_item["fba_days_in_stock"] = fba_item.get("total_days_in_stock", 0)
             fba_item["data_source"] = "fba_only"
             combined_results.append(fba_item)
 
@@ -2845,6 +2851,7 @@ async def download_report_by_date_range(
                 "Total Amount",
                 "Closing Stock",
                 "Stock",  # vendor_central includes both closing_stock and stock
+                "Total Returns",
                 "Total Days In Stock",
                 "Drr",
             ]
@@ -2861,6 +2868,8 @@ async def download_report_by_date_range(
                 "Closing Stock",
                 "Stock",  # Combined reports include both closing_stock and stock
                 "Total Returns",
+                "VC Days In Stock",
+                "FBA Days In Stock",
                 "Total Days In Stock",
                 "Drr",
                 "Data Source",  # Show which source the data came from
@@ -2929,6 +2938,41 @@ async def download_report_by_date_range(
             for cell in worksheet[1]:
                 cell.font = header_font
                 cell.fill = header_fill
+
+            # Build a header → column letter map for formula references
+            col_letter_map = {}
+            for cell in worksheet[1]:
+                if cell.value:
+                    col_letter_map[str(cell.value)] = cell.column_letter
+
+            # Write Excel formulas for DRR and (for "all") Total Days In Stock
+            units_col = col_letter_map.get("Units Sold")
+            returns_col = col_letter_map.get("Total Returns")
+            days_col = col_letter_map.get("Total Days In Stock")
+            drr_col = col_letter_map.get("DRR")
+            vc_days_col = col_letter_map.get("VC Days In Stock")
+            fba_days_col = col_letter_map.get("FBA Days In Stock")
+
+            for row_num in range(2, len(df) + 2):
+                # Total Days In Stock = MAX(VC, FBA) for "all" report
+                if report_type == "all" and vc_days_col and fba_days_col and days_col:
+                    worksheet[f"{days_col}{row_num}"] = (
+                        f"=MAX({vc_days_col}{row_num},{fba_days_col}{row_num})"
+                    )
+
+                # DRR = (Units Sold - Returns) / Days In Stock
+                if drr_col and units_col and days_col:
+                    if returns_col:
+                        worksheet[f"{drr_col}{row_num}"] = (
+                            f"=IF({days_col}{row_num}>0,"
+                            f"({units_col}{row_num}-IFERROR({returns_col}{row_num},0))"
+                            f"/{days_col}{row_num},0)"
+                        )
+                    else:
+                        worksheet[f"{drr_col}{row_num}"] = (
+                            f"=IF({days_col}{row_num}>0,"
+                            f"{units_col}{row_num}/{days_col}{row_num},0)"
+                        )
 
             # Special formatting for "all" report type - color code rows by data source
             if report_type == "all" and "Data Source" in df.columns:
@@ -3019,6 +3063,8 @@ def format_column_name(column_name):
         "Drr": "DRR",
         "Total Returns": "Total Returns",
         "Stock": "Stock",
+        "Vendor Days In Stock": "VC Days In Stock",
+        "Fba Days In Stock": "FBA Days In Stock",
     }
 
     return replacements.get(formatted, formatted)
