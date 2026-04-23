@@ -1,32 +1,34 @@
 import io
 import logging
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
+from ..database import get_database
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 SIZE_MAP = {
     "no size": "00",
-    "xxs": "01",
-    "x-small": "02",
-    "xsmall": "02",
-    "xs": "02",
-    "small": "03",
-    "s": "03",
-    "medium": "04",
-    "m": "04",
-    "large": "05",
-    "l": "05",
-    "x-large": "06",
-    "xlarge": "06",
-    "xl": "06",
-    "xxl": "07",
-    "xxxl": "08",
+    "xxxs": "01",
+    "xxs": "02",
+    "x-small": "03",
+    "xsmall": "03",
+    "xs": "03",
+    "small": "04",
+    "s": "04",
+    "medium": "05",
+    "m": "05",
+    "large": "06",
+    "l": "06",
+    "x-large": "07",
+    "xlarge": "07",
+    "xl": "07",
+    "xxl": "08",
+    "xxxl": "09",
 }
 
 # Shoe/boot sizes 1-8 map directly to zero-padded strings
@@ -49,7 +51,7 @@ COL_WIDTHS_TEMPLATE = [20, 20, 22, 22, 28, 15, 20, 15]
 COL_WIDTHS_OUTPUT   = [20, 20, 22, 22, 28, 15, 20, 15, 18, 35]
 
 
-def _get_code(name: str) -> str:
+def _get_initials(name: str) -> str:
     """2-letter initials: first letter of each word if multi-word, else first 2 chars."""
     parts = name.strip().split()
     if len(parts) >= 2:
@@ -58,6 +60,16 @@ def _get_code(name: str) -> str:
         return parts[0][:2].upper()
     if len(parts) == 1:
         return (parts[0][0] * 2).upper()
+    return "XX"
+
+
+def _get_first_two(name: str) -> str:
+    """First 2 letters of the name (ignoring spaces), padded with X if short."""
+    letters = name.strip().replace(" ", "")
+    if len(letters) >= 2:
+        return letters[:2].upper()
+    if len(letters) == 1:
+        return (letters[0] * 2).upper()
     return "XX"
 
 
@@ -71,10 +83,10 @@ def _generate_code(
     item_name: str,
     color: str,
 ) -> str:
-    brand_code = _get_code(brand)
+    brand_code = _get_initials(brand)
 
     is_wand = is_wand_toy.strip().lower() in ("yes", "y", "true", "1")
-    series_code = "WA" if is_wand else _get_code(series)
+    series_code = "WA" if is_wand else _get_first_two(series)
 
     is_cat = animal_type.strip().lower() == "cat"
     is_footwear = item_type.strip().lower() in ("shoes", "boots")
@@ -92,12 +104,12 @@ def _generate_code(
     else:
         size_code = SIZE_MAP.get(size.strip().lower(), "00")
 
-    item_code = _get_code(item_name)
-    color_code = _get_code(color)
+    item_code = _get_first_two(item_name)
+    color_code = _get_initials(color)
     return brand_code + series_code + size_code + item_code + color_code
 
 
-def _build_template_workbook() -> Workbook:
+def _build_template_workbook(brands: list[str] | None = None) -> Workbook:
     wb = Workbook()
     ws = wb.active
     ws.title = "BB Code Template"
@@ -115,6 +127,13 @@ def _build_template_workbook() -> Workbook:
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     ws.row_dimensions[1].height = 20
+
+    # Brand Name  (col A) — populated from DB if brands provided
+    if brands:
+        brands_csv = ",".join(b.replace(",", "") for b in brands)
+        dv_brand = DataValidation(type="list", formula1=f'"{brands_csv}"', allow_blank=False)
+        dv_brand.sqref = "A2:A10000"
+        ws.add_data_validation(dv_brand)
 
     # Is Wand Toy  (col C)
     dv_wand = DataValidation(type="list", formula1='"Yes,No"', allow_blank=False)
@@ -229,9 +248,14 @@ def _build_output_workbook(results: list[dict]) -> Workbook:
 
 
 @router.get("/template")
-def download_template():
+def download_template(db=Depends(get_database)):
     """Download the BB Code Generator XLSX template."""
-    wb = _build_template_workbook()
+    try:
+        brands = sorted(db.get_collection("products").find({"status": "active"}).distinct("brand"))
+        brands = [b for b in brands if b]
+    except Exception:
+        brands = []
+    wb = _build_template_workbook(brands)
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
