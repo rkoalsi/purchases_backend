@@ -69,12 +69,20 @@ def _parse_po_excel(file_bytes: bytes) -> tuple[str, str, list[dict]]:
     return po_number, vendor, items
 
 
-def _enrich_items(items: list[dict], po_number: str, db, use_stored_stock: bool = False) -> tuple[list[dict], str | None]:
+def _enrich_items(
+    items: list[dict],
+    po_number: str,
+    db,
+    use_stored_stock: bool = False,
+    po_date_str: str | None = None,
+) -> tuple[list[dict], str | None]:
     """Enrich PO items with product/stock/sales data. Returns (enriched_items, inventory_date_str).
 
     use_stored_stock=True: zoho_stock/current_stock/open_po/last_30_sales are read from the stored
     item fields (frozen at upload time). Only margin/product-derived fields are recomputed.
-    use_stored_stock=False (upload): all data is fetched live; supply_qty is set to final_supply_qty.
+    use_stored_stock=False: all data is fetched live.
+      - If po_date_str provided: zoho_stock and current_stock are fetched from T-2 (po_date - 2 days).
+      - supply_qty is set to final_supply_qty.
     """
     asins = [it["asin"] for it in items if it["asin"]]
     model_numbers = [it["model_number"] for it in items if it["model_number"]]
@@ -82,6 +90,14 @@ def _enrich_items(items: list[dict], po_number: str, db, use_stored_stock: bool 
     # detect old-format items that predate stock snapshotting — fall back to live fetch
     has_stored_stock = items and "zoho_stock" in items[0]
     effective_use_stored = use_stored_stock and has_stored_stock
+
+    # T-2: 2 days before PO date, used for both zoho and current stock snapshots
+    stock_cutoff: datetime | None = None
+    if po_date_str and not effective_use_stored:
+        try:
+            stock_cutoff = datetime.strptime(po_date_str, "%Y-%m-%d") - timedelta(days=2)
+        except ValueError:
+            pass
 
     # --- batch load products by cf_sku_code (always fresh — MRP/GST/HSN can change) ---
     products_by_model: dict[str, dict] = {}
@@ -121,8 +137,12 @@ def _enrich_items(items: list[dict], po_number: str, db, use_stored_stock: bool 
 
     # --- batch load vendor margins (always fresh — editable after upload) ---
     margins_by_asin: dict[str, float] = {}
-    for m in db[MARGINS_COLLECTION].find({"asin": {"$in": asins}}, {"asin": 1, "margin": 1}):
-        margins_by_asin[m["asin"]] = float(m["margin"])
+    cost_prices_by_asin: dict[str, float] = {}
+    for m in db[MARGINS_COLLECTION].find({"asin": {"$in": asins}}, {"asin": 1, "margin": 1, "cost_price_wo_tax": 1}):
+        if m.get("margin") is not None:
+            margins_by_asin[m["asin"]] = float(m["margin"])
+        if m.get("cost_price_wo_tax") is not None:
+            cost_prices_by_asin[m["asin"]] = float(m["cost_price_wo_tax"])
 
     # --- live stock/sales — only fetched at upload time (or for old-format items) ---
     zoho_latest: dict[str, int] = {}
@@ -136,16 +156,22 @@ def _enrich_items(items: list[dict], po_number: str, db, use_stored_stock: bool 
             p["item_id"] for p in products_by_model.values() if p.get("item_id")
         })
         if zoho_item_ids:
+            zoho_match: dict = {"zoho_item_id": {"$in": zoho_item_ids}}
+            if stock_cutoff:
+                zoho_match["date"] = {"$lte": stock_cutoff}
             for doc in db[ZOHO_STOCK_COLLECTION].aggregate([
-                {"$match": {"zoho_item_id": {"$in": zoho_item_ids}}},
+                {"$match": zoho_match},
                 {"$sort": {"date": -1}},
                 {"$group": {"_id": "$zoho_item_id", "warehouses": {"$first": "$warehouses"}}}
             ]):
                 wh = doc.get("warehouses", {})
                 zoho_latest[doc["_id"]] = int(sum(v for v in wh.values() if isinstance(v, (int, float)))) if isinstance(wh, dict) else 0
 
+        inv_match: dict = {"asin": {"$in": asins}}
+        if stock_cutoff:
+            inv_match["date"] = {"$lte": stock_cutoff}
         latest_inv = db[INVENTORY_COLLECTION].find_one(
-            {"asin": {"$in": asins}}, {"date": 1}, sort=[("date", -1)]
+            inv_match, {"date": 1}, sort=[("date", -1)]
         )
         inventory_date = latest_inv["date"] if latest_inv else None
         inventory_date_str = inventory_date.strftime("%Y-%m-%d") if inventory_date else None
@@ -156,25 +182,30 @@ def _enrich_items(items: list[dict], po_number: str, db, use_stored_stock: bool 
             ):
                 current_stock_by_asin[doc["asin"]] = int(doc.get("sellableOnHandInventoryUnits") or 0)
 
-        # open PO: sum accepted_qty (or supply_qty if accepted=0) from Processing/Packed POs only
+        # open PO: processing → supply_qty; packed/closed/intransit → accepted_qty
         for doc in db[PO_COLLECTION].aggregate([
-            {"$match": {"po_number": {"$ne": po_number}, "po_status": {"$in": ["processing", "packed"]}}},
+            {"$match": {"po_number": {"$ne": po_number}, "po_status": {"$in": ["processing", "packed", "closed", "intransit"]}}},
             {"$unwind": "$items"},
             {"$match": {"items.asin": {"$in": asins}}},
             {"$group": {
                 "_id": "$items.asin",
                 "total": {"$sum": {"$cond": {
-                    "if": {"$gt": [{"$ifNull": ["$items.accepted_qty", 0]}, 0]},
-                    "then": "$items.accepted_qty",
-                    "else": {"$ifNull": ["$items.supply_qty", "$items.requested_qty"]}
+                    "if": {"$eq": ["$po_status", "processing"]},
+                    "then": {"$ifNull": ["$items.supply_qty", "$items.requested_qty"]},
+                    "else": {"$ifNull": ["$items.accepted_qty", 0]}
                 }}}
             }}
         ]):
             open_po_by_asin[doc["_id"]] = int(doc["total"])
 
-        thirty_days_ago = datetime.now() - timedelta(days=30)
+        # Sales: 30 days ending at po_date (or now if no po_date provided)
+        if stock_cutoff:
+            sales_end = datetime.strptime(po_date_str, "%Y-%m-%d")
+        else:
+            sales_end = datetime.now()
+        sales_start = sales_end - timedelta(days=30)
         for doc in db[SALES_COLLECTION].aggregate([
-            {"$match": {"asin": {"$in": asins}, "date": {"$gte": thirty_days_ago}}},
+            {"$match": {"asin": {"$in": asins}, "date": {"$gte": sales_start, "$lte": sales_end}}},
             {"$group": {"_id": "$asin", "total_units": {"$sum": "$orderedUnits"}}}
         ]):
             sales_by_asin[doc["_id"]] = int(doc["total_units"])
@@ -192,7 +223,13 @@ def _enrich_items(items: list[dict], po_number: str, db, use_stored_stock: bool 
         gst = _extract_gst(product.get("item_tax_preferences") or [])
         mrp_wo_gst = round(mrp / (1 + gst / 100), 2) if (mrp and gst) else mrp
         margin = margins_by_asin.get(asin, None)
-        cost_price_wo_tax = round(mrp_wo_gst - mrp_wo_gst * margin, 2) if margin is not None else None
+        # Use directly stored cost_price_wo_tax if available, else compute from margin
+        if asin in cost_prices_by_asin:
+            cost_price_wo_tax = cost_prices_by_asin[asin]
+        elif margin is not None:
+            cost_price_wo_tax = round(mrp_wo_gst - mrp_wo_gst * margin, 2)
+        else:
+            cost_price_wo_tax = None
         etrade = item.get("etrade_unit_cost", 0)
         diff = round(etrade - cost_price_wo_tax, 2) if cost_price_wo_tax is not None else None
 
@@ -283,7 +320,7 @@ async def upload_vendor_po(
         if existing:
             raise ValueError(f"PO {po_number} already exists")
 
-        enriched_items, inventory_date = _enrich_items(items, po_number, db)
+        enriched_items, inventory_date = _enrich_items(items, po_number, db, po_date_str=po_date)
 
         doc = {
             "po_number": po_number,
@@ -333,39 +370,60 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
         if not doc:
             return None, None
         items = doc.get("items", [])
-        # use_stored_stock=True: zoho_stock/current_stock/open_po/last_30_sales come from stored items
-        enriched, _ = _enrich_items(items, po_number, db, use_stored_stock=True)
-        return doc, enriched
+        po_status = doc.get("po_status", "pending")
+        # frozen statuses: serve stored snapshot; pending/processing: re-fetch live (T-2 stock, sales ending at po_date)
+        use_stored = po_status in FROZEN_STATUSES
+        enriched, inv_date = _enrich_items(items, po_number, db, use_stored_stock=use_stored, po_date_str=doc.get("po_date"))
+        return doc, enriched, inv_date
 
-    doc, enriched = await asyncio.to_thread(_fetch)
+    doc, enriched, live_inv_date = await asyncio.to_thread(_fetch)
     if doc is None:
         raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+
+    po_status = doc["po_status"]
+    inv_date = doc.get("inventory_date") if po_status in FROZEN_STATUSES else live_inv_date
 
     return {
         "po_number": doc["po_number"],
         "vendor": doc.get("vendor"),
         "po_date": doc["po_date"],
-        "po_status": doc["po_status"],
-        "inventory_date": doc.get("inventory_date"),
+        "po_status": po_status,
+        "inventory_date": inv_date,
+        "po_update_date": doc.get("po_update_date"),
         "items": serialize_mongo_document(enriched),
     }
 
 
+VALID_STATUSES = {"pending", "processing", "packed", "closed", "intransit", "delivered", "completed"}
+FROZEN_STATUSES = {"packed", "closed", "intransit", "delivered", "completed"}
+
+
 @router.patch("/{po_number}/status")
 async def update_po_status(po_number: str, po_status: str, db=Depends(get_database)):
-    valid = {"pending", "processing", "packed", "closed", "completed"}
-    if po_status not in valid:
-        raise HTTPException(status_code=400, detail=f"status must be one of {valid}")
+    if po_status not in VALID_STATUSES:
+        raise HTTPException(status_code=400, detail=f"status must be one of {VALID_STATUSES}")
 
     def _update():
-        result = db[PO_COLLECTION].update_one(
-            {"po_number": po_number},
-            {"$set": {"po_status": po_status, "updated_at": datetime.now()}}
-        )
-        return result.matched_count
+        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
+        if not doc:
+            return None
 
-    matched = await asyncio.to_thread(_update)
-    if not matched:
+        update_fields: dict = {"po_status": po_status, "updated_at": datetime.now()}
+
+        # Transitioning into a frozen status: re-enrich with live data and store permanently
+        if po_status in FROZEN_STATUSES and doc.get("po_status") not in FROZEN_STATUSES:
+            enriched, inv_date = _enrich_items(
+                doc.get("items", []), po_number, db,
+                use_stored_stock=False, po_date_str=doc.get("po_date")
+            )
+            update_fields["items"] = enriched
+            update_fields["inventory_date"] = inv_date
+
+        db[PO_COLLECTION].update_one({"po_number": po_number}, {"$set": update_fields})
+        return po_status
+
+    result = await asyncio.to_thread(_update)
+    if result is None:
         raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
     return {"po_number": po_number, "po_status": po_status}
 
@@ -396,7 +454,9 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
         doc = db[PO_COLLECTION].find_one({"po_number": po_number})
         if not doc:
             return None, None
-        enriched, _ = _enrich_items(doc.get("items", []), po_number, db, use_stored_stock=True)
+        po_status = doc.get("po_status", "pending")
+        use_stored = po_status in FROZEN_STATUSES
+        enriched, _ = _enrich_items(doc.get("items", []), po_number, db, use_stored_stock=use_stored, po_date_str=doc.get("po_date"))
         return doc, enriched
 
     result = await asyncio.to_thread(_build)
@@ -541,19 +601,34 @@ async def get_margins(db=Depends(get_database)):
 
 
 @router.put("/margins/{asin}")
-async def upsert_margin(asin: str, margin: float, db=Depends(get_database)):
-    if not (0 <= margin <= 1):
+async def upsert_margin(
+    asin: str,
+    margin: Optional[float] = None,
+    cost_price_wo_tax: Optional[float] = None,
+    db=Depends(get_database),
+):
+    if margin is None and cost_price_wo_tax is None:
+        raise HTTPException(status_code=400, detail="At least one of margin or cost_price_wo_tax must be provided")
+    if margin is not None and not (0 <= margin <= 1):
         raise HTTPException(status_code=400, detail="margin must be between 0 and 1 (e.g. 0.35 for 35%)")
+    if cost_price_wo_tax is not None and cost_price_wo_tax < 0:
+        raise HTTPException(status_code=400, detail="cost_price_wo_tax must be >= 0")
+
+    fields: dict = {"asin": asin, "updated_at": datetime.now()}
+    if margin is not None:
+        fields["margin"] = margin
+    if cost_price_wo_tax is not None:
+        fields["cost_price_wo_tax"] = cost_price_wo_tax
 
     def _upsert():
         db[MARGINS_COLLECTION].update_one(
             {"asin": asin},
-            {"$set": {"asin": asin, "margin": margin, "updated_at": datetime.now()}},
+            {"$set": fields},
             upsert=True
         )
 
     await asyncio.to_thread(_upsert)
-    return {"asin": asin, "margin": margin}
+    return {"asin": asin, "margin": margin, "cost_price_wo_tax": cost_price_wo_tax}
 
 
 @router.get("/margins/bulk")

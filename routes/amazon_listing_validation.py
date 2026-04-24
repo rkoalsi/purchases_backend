@@ -184,6 +184,44 @@ def _fetch_combo_sheet_data() -> dict[str, dict]:
     return result
 
 
+def _load_vendor_margins_by_sku(skus: set[str]) -> dict[str, dict]:
+    """
+    Load vendor_margins for the given SKUs, keyed by sku_code.
+    Resolves SKU → ASIN via amazon_sku_mapping, then fetches vendor_margins by ASIN.
+    Returns {sku_code: {margin, cost_price_wo_tax}}.
+    """
+    db = get_database()
+    sku_list = list(skus)
+
+    # SKU → ASIN via amazon_sku_mapping
+    asin_by_sku: dict[str, str] = {}
+    for doc in db["amazon_sku_mapping"].find(
+        {"sku_code": {"$in": sku_list}},
+        {"sku_code": 1, "item_id": 1, "_id": 0},
+    ):
+        asin_by_sku[doc["sku_code"]] = doc["item_id"]
+
+    asins = list(asin_by_sku.values())
+    if not asins:
+        return {}
+
+    margins_by_asin: dict[str, dict] = {}
+    for m in db["vendor_margins"].find(
+        {"asin": {"$in": asins}},
+        {"asin": 1, "margin": 1, "cost_price_wo_tax": 1, "_id": 0},
+    ):
+        margins_by_asin[m["asin"]] = {
+            "margin": m.get("margin"),
+            "cost_price_wo_tax": m.get("cost_price_wo_tax"),
+        }
+
+    return {
+        sku: margins_by_asin[asin]
+        for sku, asin in asin_by_sku.items()
+        if asin in margins_by_asin
+    }
+
+
 def _load_composite_products(skus: set[str]) -> dict[str, dict]:
     """
     Return composite product docs keyed by sku_code, for the given SKU set.
@@ -392,6 +430,7 @@ def _validate_vendor_central(
     products: dict[str, dict],
     combo_skus: set[str],
     combo_data: dict[str, dict],
+    margins_by_sku: dict[str, dict],
 ) -> list[dict]:
     """Return ALL rows with per-field match status. Skips Amazon example placeholder rows."""
     results = []
@@ -401,6 +440,10 @@ def _validate_vendor_central(
             continue
 
         is_combo = sku in combo_skus
+        margin_data = margins_by_sku.get(sku, {})
+        stored_margin = margin_data.get("margin")
+        stored_cost_price = margin_data.get("cost_price_wo_tax")
+        margin_set = stored_margin is not None or stored_cost_price is not None
 
         if is_combo:
             combo = combo_data.get(sku)
@@ -414,6 +457,9 @@ def _validate_vendor_central(
                     "has_mismatch": True,
                     "hsn": None,
                     "mrp": None,
+                    "stored_margin": stored_margin,
+                    "stored_cost_price_wo_tax": stored_cost_price,
+                    "margin_configured": margin_set,
                 })
                 continue
 
@@ -431,13 +477,16 @@ def _validate_vendor_central(
                 "item_name": "—",
                 "found": True,
                 "is_combo": True,
-                "has_mismatch": not hsn_match or not mrp_match,
+                "has_mismatch": not hsn_match or not mrp_match or not margin_set,
                 "hsn": {"file": file_hsn, "db": sheet_hsn or "—", "match": hsn_match},
                 "mrp": {
                     "file": file_mrp,
                     "db": sheet_mrp or "—",
                     "match": mrp_match,
                 },
+                "stored_margin": stored_margin,
+                "stored_cost_price_wo_tax": stored_cost_price,
+                "margin_configured": margin_set,
             })
             continue
 
@@ -453,6 +502,9 @@ def _validate_vendor_central(
                 "has_mismatch": True,
                 "hsn": None,
                 "mrp": None,
+                "stored_margin": stored_margin,
+                "stored_cost_price_wo_tax": stored_cost_price,
+                "margin_configured": margin_set,
             })
             continue
 
@@ -471,13 +523,16 @@ def _validate_vendor_central(
             "item_name": item_name,
             "found": True,
             "is_combo": False,
-            "has_mismatch": not hsn_match or not mrp_match,
+            "has_mismatch": not hsn_match or not mrp_match or not margin_set,
             "hsn": {"file": file_hsn, "db": db_hsn or "—", "match": hsn_match},
             "mrp": {
                 "file": file_mrp,
                 "db": str(db_mrp) if db_mrp is not None else "—",
                 "match": mrp_match,
             },
+            "stored_margin": stored_margin,
+            "stored_cost_price_wo_tax": stored_cost_price,
+            "margin_configured": margin_set,
         })
     return results
 
@@ -503,6 +558,7 @@ def _build_excel(sc_results: list[dict], vc_results: list[dict]) -> bytes:
         "SKU", "Item Name", "Type", "Status",
         "HSN (File)", "HSN (Ref)", "HSN",
         "MRP (File)", "MRP (Ref)", "MRP",
+        "Margin % (Stored)", "Cost Price w/o Tax (Stored)", "Margin/Cost",
     ]
 
     def _write_sheet(ws, headers, data, is_sc: bool):
@@ -518,8 +574,13 @@ def _build_excel(sc_results: list[dict], vc_results: list[dict]) -> bytes:
                                 "—", "—", "Not Found", "—", "—", "Not Found",
                                 "—", "—", "Not Found", "—", "—", "Not Found"])
                 else:
+                    stored_margin = row.get("stored_margin")
+                    stored_cp = row.get("stored_cost_price_wo_tax")
                     ws.append([row["sku"], row["item_name"], row_type, "Not Found",
-                                "—", "—", "Not Found", "—", "—", "Not Found"])
+                                "—", "—", "Not Found", "—", "—", "Not Found",
+                                f"{round(stored_margin * 100, 2)}%" if stored_margin is not None else "—",
+                                str(round(stored_cp, 2)) if stored_cp is not None else "—",
+                                "Configured" if row.get("margin_configured") else "Not Configured"])
                 for cell in ws[ws.max_row]:
                     cell.fill = red_fill
             else:
@@ -549,15 +610,23 @@ def _build_excel(sc_results: list[dict], vc_results: list[dict]) -> bytes:
                     excel_row[12].fill = _status_fill(mrp.get("match"))
                     excel_row[15].fill = _status_fill(sp.get("match", True))
                 else:
+                    stored_margin = row.get("stored_margin")
+                    stored_cp = row.get("stored_cost_price_wo_tax")
+                    margin_configured = row.get("margin_configured", False)
+                    margin_display = f"{round(stored_margin * 100, 2)}%" if stored_margin is not None else "—"
+                    cp_display = str(round(stored_cp, 2)) if stored_cp is not None else "—"
+                    margin_status = "Configured" if margin_configured else "Not Configured"
                     ws.append([
                         row["sku"], row["item_name"], row_type, status,
                         hsn.get("file", ""), hsn.get("db", ""), "Match" if hsn.get("match") else "Mismatch",
                         mrp.get("file", ""), mrp.get("db", ""), "Match" if mrp.get("match") else "Mismatch",
+                        margin_display, cp_display, margin_status,
                     ])
                     excel_row = ws[ws.max_row]
                     excel_row[3].fill = red_fill if row["has_mismatch"] else green_fill
                     excel_row[6].fill = _status_fill(hsn.get("match"))
                     excel_row[9].fill = _status_fill(mrp.get("match"))
+                    excel_row[12].fill = green_fill if margin_configured else red_fill
 
         for col in ws.columns:
             max_len = max((len(str(cell.value or "")) for cell in col), default=10)
@@ -622,15 +691,23 @@ async def _run_validation(
             detail="No SKU data found in the uploaded file(s). Ensure data rows start at row 6.",
         )
 
-    products, composite_products, combo_data = await asyncio.gather(
+    vc_skus = {r["sku"] for r in vc_rows}
+
+    async def _maybe_load_margins():
+        if not vc_skus:
+            return {}
+        return await asyncio.to_thread(_load_vendor_margins_by_sku, vc_skus)
+
+    products, composite_products, combo_data, margins_by_sku = await asyncio.gather(
         asyncio.to_thread(_load_products_by_sku, all_skus),
         asyncio.to_thread(_load_composite_products, all_skus),
         asyncio.to_thread(_fetch_combo_sheet_data),
+        _maybe_load_margins(),
     )
     combo_skus = set(composite_products.keys())
 
     sc_results = _validate_seller_central(sc_rows, products, combo_skus, combo_data) if sc_rows else []
-    vc_results = _validate_vendor_central(vc_rows, products, combo_skus, combo_data) if vc_rows else []
+    vc_results = _validate_vendor_central(vc_rows, products, combo_skus, combo_data, margins_by_sku) if vc_rows else []
 
     return sc_results, vc_results
 
