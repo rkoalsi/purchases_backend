@@ -441,7 +441,7 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
         # Formula values — reference other cells
         formulas = {
             11: f"=IF(J{r}=\"\",\"\",I{r}-J{r})",                          # K  Supply - Accepted
-            13: f"=IF(L{r}=\"\",\"\",I{r}-L{r})",                          # M  Mismatch QTY
+            13: f"=IF(L{r}=\"\",\"\",J{r}-L{r})",                          # M  Mismatch QTY
             16: f"=ROUND(N{r}/(1+O{r}),2)",                                 # P  MRP w/o GST
             18: f"=IF(Q{r}=\"\",\"\",ROUND(P{r}*(1-Q{r}),2))",             # R  Cost Price w/o Tax
             19: f"=IF(R{r}=\"\",\"\",ROUND(R{r}*I{r},2))",                 # S  Total Cost
