@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta
 from pymongo.errors import PyMongoError
+from pymongo import ReplaceOne
 from ..database import get_database
 import os
 import requests
@@ -462,68 +463,54 @@ def background_refetch_sales(start_date_str: str, end_date_str: str, marketplace
         start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
         end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
         
-        # Delete existing records for the entire date range at once
-        delete_end = end_date + timedelta(days=1)
-        
-        logger.info(f"🗑️ [TASK-{task_id}] Deleting existing records from {start_date.date()} to {end_date.date()}")
-        
-        delete_result = collection.delete_many({
-            "date": {
-                "$gte": start_date,
-                "$lt": delete_end
-            }
-        })
-        
-        deleted_count = delete_result.deleted_count
-        logger.info(f"🗑️ [TASK-{task_id}] Deleted {deleted_count} existing records")
-        
         # Process each day individually
-        total_inserted = 0
+        total_upserted = 0
         current_date = start_date
-        
+
         while current_date <= end_date:
             date_str = current_date.strftime("%Y-%m-%d")
             logger.info(f"📅 [TASK-{task_id}] Processing date: {date_str}")
-            
+
             try:
                 start_datetime = f"{date_str}T00:00:00Z"
                 end_datetime = f"{date_str}T23:59:59Z"
-                
-                # Get sales data (no DB checks in this function anymore)
+
                 sales_traffic_data = get_vendor_sales(start_datetime, end_datetime)
-                
+
                 if sales_traffic_data:
-                    # Prepare all documents at once
-                    new_records = []
                     current_time = datetime.now()
                     date_obj = datetime.combine(current_date.date(), datetime.min.time())
-                    
+
+                    operations = []
                     for asin_data in sales_traffic_data:
                         asin_data["date"] = date_obj
                         asin_data["created_at"] = current_time
-                        new_records.append(asin_data)
-                    
-                    if new_records:
-                        # Bulk insert all records at once
-                        insert_result = collection.insert_many(new_records, ordered=False)
-                        day_inserted = len(insert_result.inserted_ids)
-                        total_inserted += day_inserted
-                        logger.info(f"✅ [TASK-{task_id}] Inserted {day_inserted} records for {date_str}")
-                    else:
-                        logger.info(f"ℹ️ [TASK-{task_id}] No records to insert for {date_str}")
+                        operations.append(
+                            ReplaceOne(
+                                {"asin": asin_data["asin"], "date": date_obj},
+                                asin_data,
+                                upsert=True,
+                            )
+                        )
+
+                    if operations:
+                        result = collection.bulk_write(operations, ordered=False)
+                        day_upserted = result.upserted_count + result.modified_count
+                        total_upserted += day_upserted
+                        logger.info(f"✅ [TASK-{task_id}] Upserted {day_upserted} records for {date_str}")
                 else:
                     logger.info(f"⚠️ [TASK-{task_id}] No sales data received for {date_str}")
-                
+
             except Exception as day_error:
                 logger.error(f"❌ [TASK-{task_id}] Error processing {date_str}: {day_error}")
-            
+
             current_date += timedelta(days=1)
-            
+
             # Small delay between dates to avoid rate limits
             if current_date <= end_date:
                 time.sleep(30)
-        
-        logger.info(f"✅ [TASK-{task_id}] Refetch completed! Deleted: {deleted_count}, Inserted: {total_inserted} records")
+
+        logger.info(f"✅ [TASK-{task_id}] Refetch completed! Upserted: {total_upserted} records")
         
     except Exception as e:
         logger.error(f"❌ [TASK-{task_id}] Background refetch failed: {e}")
@@ -618,6 +605,34 @@ def background_sync_inventory(start_datetime: str, end_datetime: str, marketplac
 
 
 # API Endpoints (unchanged)
+
+@router.get("/reports/sales")
+async def list_vc_sales_reports(
+    max_results: int = Query(default=10, ge=1, le=100),
+    created_since: Optional[str] = Query(default=None, description="ISO 8601 datetime, e.g. 2025-01-01T00:00:00Z"),
+    created_until: Optional[str] = Query(default=None, description="ISO 8601 datetime, e.g. 2025-04-23T23:59:59Z"),
+    processing_status: Optional[str] = Query(default=None, description="CANCELLED, DONE, FATAL, IN_PROGRESS, IN_QUEUE"),
+    next_token: Optional[str] = Query(default=None, description="Pagination token from a previous response"),
+):
+    """
+    List generated Amazon VC sales reports (GET_VENDOR_SALES_REPORT) from the SP API.
+    """
+    params: Dict[str, Any] = {
+        "reportTypes": "GET_VENDOR_SALES_REPORT",
+        "pageSize": max_results,
+    }
+    if created_since:
+        params["createdSince"] = created_since
+    if created_until:
+        params["createdUntil"] = created_until
+    if processing_status:
+        params["processingStatuses"] = processing_status
+    if next_token:
+        params["nextToken"] = next_token
+
+    response = make_sp_api_request("/reports/2021-06-30/reports", params=params)
+    return JSONResponse(status_code=status.HTTP_200_OK, content=response)
+
 
 @router.post("/auth/reload")
 async def reload_credentials():
