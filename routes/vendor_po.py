@@ -158,7 +158,7 @@ def _enrich_items(items: list[dict], po_number: str, db) -> tuple[list[dict], st
 
     # --- open PO quantities (same ASIN, other POs, status != completed) ---
     open_po_pipeline = [
-        {"$match": {"po_number": {"$ne": po_number}, "po_status": {"$ne": "completed"}}},
+        {"$match": {"po_number": {"$ne": po_number}, "po_status": {"$nin": ["completed", "closed"]}}},
         {"$unwind": "$items"},
         {"$match": {"items.asin": {"$in": asins}}},
         {"$group": {"_id": "$items.asin", "total": {"$sum": "$items.requested_qty"}}}
@@ -333,7 +333,7 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
 
 @router.patch("/{po_number}/status")
 async def update_po_status(po_number: str, po_status: str, db=Depends(get_database)):
-    valid = {"pending", "processing", "completed"}
+    valid = {"pending", "processing", "packed", "closed", "completed"}
     if po_status not in valid:
         raise HTTPException(status_code=400, detail=f"status must be one of {valid}")
 
