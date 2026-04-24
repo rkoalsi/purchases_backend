@@ -2313,6 +2313,7 @@ async def _generate_master_report_data(
                 fba_only_skus = {sku for sku in latest_fba_by_sku if sku not in existing_skus}
                 if fba_only_skus:
                     fba_only_product_data = await report_service.batch_load_all_product_data(fba_only_skus)
+                    all_product_data.update(fba_only_product_data)
                     for sku in sorted(fba_only_skus):
                         pdata = fba_only_product_data.get(sku, {})
                         # Respect brand filter if active
@@ -2379,6 +2380,7 @@ async def _generate_master_report_data(
 
                 if brand_sku_set:
                     brand_only_product_data = await report_service.batch_load_all_product_data(brand_sku_set)
+                    all_product_data.update(brand_only_product_data)
                     injected = 0
                     for sku in sorted(brand_sku_set):
                         pdata = brand_only_product_data.get(sku, {})
