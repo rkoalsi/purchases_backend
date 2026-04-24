@@ -61,20 +61,29 @@ def _parse_po_excel(file_bytes: bytes) -> tuple[str, str, list[dict]]:
             "title": str(row[7]).strip() if row[7] else "",
             "ship_to_location": str(row[2]).strip() if row[2] else "",
             "requested_qty": int(row[13]) if row[13] is not None else 0,
-            "supply_qty": int(row[14]) if row[14] is not None else None,
-            "accepted_qty": None,
+            "supply_qty": None,     # will be set to final_supply_qty after enrichment
+            "accepted_qty": 0,
             "received_qty": None,
             "etrade_unit_cost": float(row[15]) if row[15] is not None else 0.0,
         })
     return po_number, vendor, items
 
 
-def _enrich_items(items: list[dict], po_number: str, db) -> tuple[list[dict], str | None]:
-    """Enrich PO items with product/stock/sales data. Returns (enriched_items, inventory_date_str)."""
+def _enrich_items(items: list[dict], po_number: str, db, use_stored_stock: bool = False) -> tuple[list[dict], str | None]:
+    """Enrich PO items with product/stock/sales data. Returns (enriched_items, inventory_date_str).
+
+    use_stored_stock=True: zoho_stock/current_stock/open_po/last_30_sales are read from the stored
+    item fields (frozen at upload time). Only margin/product-derived fields are recomputed.
+    use_stored_stock=False (upload): all data is fetched live; supply_qty is set to final_supply_qty.
+    """
     asins = [it["asin"] for it in items if it["asin"]]
     model_numbers = [it["model_number"] for it in items if it["model_number"]]
 
-    # --- batch load products by cf_sku_code (model number) ---
+    # detect old-format items that predate stock snapshotting — fall back to live fetch
+    has_stored_stock = items and "zoho_stock" in items[0]
+    effective_use_stored = use_stored_stock and has_stored_stock
+
+    # --- batch load products by cf_sku_code (always fresh — MRP/GST/HSN can change) ---
     products_by_model: dict[str, dict] = {}
     for p in db[PRODUCTS_COLLECTION].find(
         {"cf_sku_code": {"$in": model_numbers}},
@@ -91,7 +100,6 @@ def _enrich_items(items: list[dict], po_number: str, db) -> tuple[list[dict], st
     ):
         sku_map_by_asin[m["item_id"]] = m["sku_code"]
 
-    # fill in any missing model → product via ASIN → sku_code mapping
     extra_skus = [
         sku_map_by_asin[asin]
         for asin in asins
@@ -105,77 +113,71 @@ def _enrich_items(items: list[dict], po_number: str, db) -> tuple[list[dict], st
         ):
             products_by_model[p["cf_sku_code"]] = p
 
-    # build asin → product lookup
     products_by_asin: dict[str, dict] = {}
     for asin in asins:
         sku = sku_map_by_asin.get(asin, "")
         if sku and sku in products_by_model:
             products_by_asin[asin] = products_by_model[sku]
 
-    # --- batch load zoho stock (latest date per zoho_item_id) ---
-    zoho_item_ids = list({
-        p["item_id"] for p in products_by_model.values() if p.get("item_id")
-    })
-    zoho_latest: dict[str, int] = {}
-    if zoho_item_ids:
-        pipeline = [
-            {"$match": {"zoho_item_id": {"$in": zoho_item_ids}}},
-            {"$sort": {"date": -1}},
-            {"$group": {
-                "_id": "$zoho_item_id",
-                "warehouses": {"$first": "$warehouses"}
-            }}
-        ]
-        for doc in db[ZOHO_STOCK_COLLECTION].aggregate(pipeline):
-            warehouses = doc.get("warehouses", {})
-            if isinstance(warehouses, dict):
-                total = sum(v for v in warehouses.values() if isinstance(v, (int, float)))
-            else:
-                total = 0
-            zoho_latest[doc["_id"]] = int(total)
-
-    # --- batch load vendor margins ---
+    # --- batch load vendor margins (always fresh — editable after upload) ---
     margins_by_asin: dict[str, float] = {}
     for m in db[MARGINS_COLLECTION].find({"asin": {"$in": asins}}, {"asin": 1, "margin": 1}):
         margins_by_asin[m["asin"]] = float(m["margin"])
 
-    # --- current stock: latest inventory date ---
-    latest_inv = db[INVENTORY_COLLECTION].find_one(
-        {"asin": {"$in": asins}},
-        {"date": 1},
-        sort=[("date", -1)]
-    )
-    inventory_date = latest_inv["date"] if latest_inv else None
-    inventory_date_str = inventory_date.strftime("%Y-%m-%d") if inventory_date else None
-
+    # --- live stock/sales — only fetched at upload time (or for old-format items) ---
+    zoho_latest: dict[str, int] = {}
     current_stock_by_asin: dict[str, int] = {}
-    if inventory_date:
-        for doc in db[INVENTORY_COLLECTION].find(
-            {"asin": {"$in": asins}, "date": inventory_date},
-            {"asin": 1, "sellableOnHandInventoryUnits": 1}
-        ):
-            current_stock_by_asin[doc["asin"]] = int(doc.get("sellableOnHandInventoryUnits") or 0)
-
-    # --- open PO quantities (same ASIN, other POs, status != completed) ---
-    open_po_pipeline = [
-        {"$match": {"po_number": {"$ne": po_number}, "po_status": {"$nin": ["completed", "closed"]}}},
-        {"$unwind": "$items"},
-        {"$match": {"items.asin": {"$in": asins}}},
-        {"$group": {"_id": "$items.asin", "total": {"$sum": "$items.requested_qty"}}}
-    ]
     open_po_by_asin: dict[str, int] = {}
-    for doc in db[PO_COLLECTION].aggregate(open_po_pipeline):
-        open_po_by_asin[doc["_id"]] = int(doc["total"])
-
-    # --- last 30 days sales ---
-    thirty_days_ago = datetime.now() - timedelta(days=30)
-    sales_pipeline = [
-        {"$match": {"asin": {"$in": asins}, "date": {"$gte": thirty_days_ago}}},
-        {"$group": {"_id": "$asin", "total_units": {"$sum": "$orderedUnits"}}}
-    ]
     sales_by_asin: dict[str, int] = {}
-    for doc in db[SALES_COLLECTION].aggregate(sales_pipeline):
-        sales_by_asin[doc["_id"]] = int(doc["total_units"])
+    inventory_date_str: str | None = None
+
+    if not effective_use_stored:
+        zoho_item_ids = list({
+            p["item_id"] for p in products_by_model.values() if p.get("item_id")
+        })
+        if zoho_item_ids:
+            for doc in db[ZOHO_STOCK_COLLECTION].aggregate([
+                {"$match": {"zoho_item_id": {"$in": zoho_item_ids}}},
+                {"$sort": {"date": -1}},
+                {"$group": {"_id": "$zoho_item_id", "warehouses": {"$first": "$warehouses"}}}
+            ]):
+                wh = doc.get("warehouses", {})
+                zoho_latest[doc["_id"]] = int(sum(v for v in wh.values() if isinstance(v, (int, float)))) if isinstance(wh, dict) else 0
+
+        latest_inv = db[INVENTORY_COLLECTION].find_one(
+            {"asin": {"$in": asins}}, {"date": 1}, sort=[("date", -1)]
+        )
+        inventory_date = latest_inv["date"] if latest_inv else None
+        inventory_date_str = inventory_date.strftime("%Y-%m-%d") if inventory_date else None
+        if inventory_date:
+            for doc in db[INVENTORY_COLLECTION].find(
+                {"asin": {"$in": asins}, "date": inventory_date},
+                {"asin": 1, "sellableOnHandInventoryUnits": 1}
+            ):
+                current_stock_by_asin[doc["asin"]] = int(doc.get("sellableOnHandInventoryUnits") or 0)
+
+        # open PO: sum accepted_qty (or supply_qty if accepted=0) from Processing/Packed POs only
+        for doc in db[PO_COLLECTION].aggregate([
+            {"$match": {"po_number": {"$ne": po_number}, "po_status": {"$in": ["processing", "packed"]}}},
+            {"$unwind": "$items"},
+            {"$match": {"items.asin": {"$in": asins}}},
+            {"$group": {
+                "_id": "$items.asin",
+                "total": {"$sum": {"$cond": {
+                    "if": {"$gt": [{"$ifNull": ["$items.accepted_qty", 0]}, 0]},
+                    "then": "$items.accepted_qty",
+                    "else": {"$ifNull": ["$items.supply_qty", "$items.requested_qty"]}
+                }}}
+            }}
+        ]):
+            open_po_by_asin[doc["_id"]] = int(doc["total"])
+
+        thirty_days_ago = datetime.now() - timedelta(days=30)
+        for doc in db[SALES_COLLECTION].aggregate([
+            {"$match": {"asin": {"$in": asins}, "date": {"$gte": thirty_days_ago}}},
+            {"$group": {"_id": "$asin", "total_units": {"$sum": "$orderedUnits"}}}
+        ]):
+            sales_by_asin[doc["_id"]] = int(doc["total_units"])
 
     # --- enrich each item ---
     enriched = []
@@ -191,29 +193,46 @@ def _enrich_items(items: list[dict], po_number: str, db) -> tuple[list[dict], st
         mrp_wo_gst = round(mrp / (1 + gst / 100), 2) if (mrp and gst) else mrp
         margin = margins_by_asin.get(asin, None)
         cost_price_wo_tax = round(mrp_wo_gst - mrp_wo_gst * margin, 2) if margin is not None else None
-        etrade = item["etrade_unit_cost"]
+        etrade = item.get("etrade_unit_cost", 0)
         diff = round(etrade - cost_price_wo_tax, 2) if cost_price_wo_tax is not None else None
-        supply_qty = item.get("supply_qty") or item["requested_qty"]
+
+        accepted_qty = item.get("accepted_qty") or 0
+        received_qty = item.get("received_qty")
+
+        if effective_use_stored:
+            zoho_stock = item.get("zoho_stock", 0)
+            current_stock = item.get("current_stock", 0)
+            open_po = item.get("open_po", 0)
+            last_30_sales = item.get("last_30_sales", 0)
+            supply_qty = item.get("supply_qty") or item["requested_qty"]
+        else:
+            zoho_stock = zoho_latest.get(zoho_item_id, 0) if zoho_item_id else 0
+            current_stock = current_stock_by_asin.get(asin, 0)
+            open_po = open_po_by_asin.get(asin, 0)
+            last_30_sales = sales_by_asin.get(asin, 0)
+            # compute final_supply_qty and use it as supply_qty
+            total_qty_tmp = current_stock + open_po
+            ads_tmp = round(last_30_sales / 30, 2)
+            target_tmp = round(ads_tmp * COVERAGE_DAYS, 0)
+            max_allowed_tmp = round(target_tmp - total_qty_tmp, 0)
+            if total_qty_tmp == 0:
+                supply_qty = item["requested_qty"]
+            else:
+                supply_qty = int(round(max(0, min(float(total_qty_tmp), float(max_allowed_tmp))), 0))
+
         total_cost = round(cost_price_wo_tax * supply_qty, 2) if cost_price_wo_tax is not None else None
         total_cost_gst = round(total_cost * (1 + gst / 100), 2) if (total_cost is not None and gst) else total_cost
 
-        zoho_stock = zoho_latest.get(zoho_item_id, 0) if zoho_item_id else 0
-        current_stock = current_stock_by_asin.get(asin, 0)
-        open_po = open_po_by_asin.get(asin, 0)
         total_qty = current_stock + open_po
-
-        last_30_sales = sales_by_asin.get(asin, 0)
         ads = round(last_30_sales / 30, 2)
         target_stock = round(ads * COVERAGE_DAYS, 0)
         max_allowed_qty = round(target_stock - total_qty, 0)
 
-        if total_qty == 0:
-            final_supply_qty = item["requested_qty"]
-        else:
-            final_supply_qty = int(round(max(0, min(float(total_qty), float(max_allowed_qty))), 0))
-
         enriched.append({
             **item,
+            "supply_qty": supply_qty,
+            "accepted_qty": accepted_qty,
+            "received_qty": received_qty,
             "zoho_mrp": mrp,
             "gst": gst,
             "mrp_wo_gst": mrp_wo_gst,
@@ -233,7 +252,7 @@ def _enrich_items(items: list[dict], po_number: str, db) -> tuple[list[dict], st
             "coverage_days": COVERAGE_DAYS,
             "target_stock": int(target_stock),
             "max_allowed_qty": int(max_allowed_qty),
-            "final_supply_qty": final_supply_qty,
+            "final_supply_qty": supply_qty,   # final = supply (they are always equal)
         })
 
     return enriched, inventory_date_str
@@ -275,7 +294,7 @@ async def upload_vendor_po(
             "item_count": len(items),
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
-            "items": items,  # raw items stored
+            "items": enriched_items,  # enriched items stored (stock/sales frozen at upload time)
         }
         db[PO_COLLECTION].insert_one(doc)
         return po_number, enriched_items, inventory_date
@@ -300,7 +319,7 @@ async def list_vendor_pos(db=Depends(get_database)):
             {},
             {"po_number": 1, "vendor": 1, "po_date": 1, "po_status": 1,
              "item_count": 1, "created_at": 1, "_id": 0}
-        ).sort("created_at", -1))
+        ).sort("po_date", -1))
 
     pos = await asyncio.to_thread(_fetch)
     return serialize_mongo_document(pos)
@@ -312,12 +331,13 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
     def _fetch():
         doc = db[PO_COLLECTION].find_one({"po_number": po_number})
         if not doc:
-            return None, None, None, None
+            return None, None
         items = doc.get("items", [])
-        enriched, inventory_date = _enrich_items(items, po_number, db)
-        return doc, items, enriched, inventory_date
+        # use_stored_stock=True: zoho_stock/current_stock/open_po/last_30_sales come from stored items
+        enriched, _ = _enrich_items(items, po_number, db, use_stored_stock=True)
+        return doc, enriched
 
-    doc, _, enriched, inventory_date = await asyncio.to_thread(_fetch)
+    doc, enriched = await asyncio.to_thread(_fetch)
     if doc is None:
         raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
 
@@ -326,7 +346,7 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
         "vendor": doc.get("vendor"),
         "po_date": doc["po_date"],
         "po_status": doc["po_status"],
-        "inventory_date": inventory_date,
+        "inventory_date": doc.get("inventory_date"),
         "items": serialize_mongo_document(enriched),
     }
 
@@ -350,6 +370,25 @@ async def update_po_status(po_number: str, po_status: str, db=Depends(get_databa
     return {"po_number": po_number, "po_status": po_status}
 
 
+@router.patch("/{po_number}/items/{asin}/accepted_qty")
+async def update_item_accepted_qty(po_number: str, asin: str, accepted_qty: int, db=Depends(get_database)):
+    """Update the accepted quantity for a specific item in a PO."""
+    if accepted_qty < 0:
+        raise HTTPException(status_code=400, detail="accepted_qty must be >= 0")
+
+    def _update():
+        result = db[PO_COLLECTION].update_one(
+            {"po_number": po_number, "items.asin": asin},
+            {"$set": {"items.$.accepted_qty": accepted_qty, "updated_at": datetime.now()}}
+        )
+        return result.matched_count
+
+    matched = await asyncio.to_thread(_update)
+    if not matched:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} / ASIN {asin} not found")
+    return {"po_number": po_number, "asin": asin, "accepted_qty": accepted_qty}
+
+
 @router.get("/{po_number}/download")
 async def download_po_report(po_number: str, db=Depends(get_database)):
     """Download enriched PO report as Excel."""
@@ -357,11 +396,11 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
         doc = db[PO_COLLECTION].find_one({"po_number": po_number})
         if not doc:
             return None, None
-        enriched, inventory_date = _enrich_items(doc.get("items", []), po_number, db)
-        return doc, enriched, inventory_date
+        enriched, _ = _enrich_items(doc.get("items", []), po_number, db, use_stored_stock=True)
+        return doc, enriched
 
     result = await asyncio.to_thread(_build)
-    doc, enriched, inventory_date = result
+    doc, enriched = result
     if doc is None:
         raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
 
@@ -377,7 +416,7 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
         top=Side(style="thin"), bottom=Side(style="thin")
     )
 
-    inv_date_label = inventory_date or "Latest"
+    inv_date_label = doc.get("inventory_date") or "Latest"
     headers = [
         ("PO Date", False), ("PO", False), ("PO Status", False), ("Ship to location", False),
         ("ASIN", True), ("Model Number", True), ("Title", True), ("Requested Qty", True),
