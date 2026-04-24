@@ -2359,6 +2359,68 @@ async def _generate_master_report_data(
                         combined_data.append(stub)
                     logger.info(f"Injected {len(fba_only_skus)} FBA-only stub items into combined_data")
 
+            # Inject stub rows for any brand products that still have no entry (zero sales,
+            # zero stock) so that every product for the requested brand always appears.
+            if brand:
+                existing_skus = {item.get("sku_code") for item in combined_data if item.get("sku_code")}
+
+                def _fetch_brand_skus():
+                    products_collection = report_service.database.get_collection("products")
+                    return list(products_collection.find(
+                        {"brand": {"$regex": f"^{brand}$", "$options": "i"}},
+                        {"cf_sku_code": 1, "_id": 0},
+                    ))
+
+                brand_products_raw = await asyncio.to_thread(_fetch_brand_skus)
+                brand_sku_set = {
+                    doc["cf_sku_code"] for doc in brand_products_raw
+                    if doc.get("cf_sku_code") and doc["cf_sku_code"] not in existing_skus
+                }
+
+                if brand_sku_set:
+                    brand_only_product_data = await report_service.batch_load_all_product_data(brand_sku_set)
+                    injected = 0
+                    for sku in sorted(brand_sku_set):
+                        pdata = brand_only_product_data.get(sku, {})
+                        stub_brand = pdata.get("brand", "") or ""
+                        name = pdata.get("name") or "Unknown Item"
+                        product_brands[sku] = stub_brand
+                        logistics_data[sku] = {
+                            "cbm": pdata.get("cbm", 0) or 0,
+                            "case_pack": pdata.get("case_pack", 0) or 0,
+                            "purchase_status": pdata.get("purchase_status", ""),
+                            "stock_in_transit_1": pdata.get("stock_in_transit_1", 0) or 0,
+                            "stock_in_transit_2": pdata.get("stock_in_transit_2", 0) or 0,
+                            "stock_in_transit_3": pdata.get("stock_in_transit_3", 0) or 0,
+                            "is_new": pdata.get("is_new", False),
+                        }
+                        stub = {
+                            "sku_code": sku,
+                            "item_name": name,
+                            "sources": [],
+                            "combined_metrics": {
+                                "total_units_sold": 0.0,
+                                "total_units_returned": 0.0,
+                                "total_credit_notes": 0.0,
+                                "total_amount": 0.0,
+                                "total_closing_stock": 0.0,
+                                "total_days_in_stock": 0.0,
+                                "avg_daily_run_rate": 0.0,
+                                "avg_days_of_coverage": 0.0,
+                                "fba_closing_stock": 0.0,
+                                "pupscribe_wh_stock": 0.0,
+                                "transfer_orders": 0.0,
+                                "total_sales": 0.0,
+                            },
+                            "in_stock": False,
+                            "drr_source": "current_period",
+                            "drr_lookback_period": "",
+                            "highlight": None,
+                        }
+                        combined_data.append(stub)
+                        injected += 1
+                    logger.info(f"Injected {injected} zero-activity brand stub items into combined_data")
+
             # Classify movement and compute order metrics now that all items — including
             # FBA-only stubs — have been added.  Running here ensures every product is
             # ranked within its own brand group rather than across all brands.
@@ -2946,6 +3008,7 @@ async def download_master_report(
                         "SKU Code": item.get("sku_code", ""),
                         "Brand": item.get("brand", ""),
                         "Item Name": item.get("item_name", ""),
+                        "Manufacturer Code": item.get("manufacturer_code", ""),
                         "MRP": item.get("mrp") or 0,
                         "Unit Price": item.get("unit_price", 0),
                         "Total Amount": f"₹{metrics.get('total_amount', 0)}",
