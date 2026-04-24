@@ -3,3 +3,6 @@ __pycache__
 .env
 *.xlsx
 creds.json
+scripts/import_po_history.py
+.gitignore
+scripts/import_seller_flex_returns.py
