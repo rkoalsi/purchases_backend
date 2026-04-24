@@ -3020,7 +3020,7 @@ async def download_report_by_date_range(
                 "Total Amount",
                 "Closing Stock",
                 "Stock",  # vendor_central includes both closing_stock and stock
-                "Total Returns",
+                "FBA Returns",
                 "Total Days In Stock",
                 "Drr",
             ]
@@ -3036,7 +3036,7 @@ async def download_report_by_date_range(
                 "Sessions",
                 "Closing Stock",
                 "Stock",  # Combined reports include both closing_stock and stock
-                "Total Returns",
+                "FBA Returns",
                 "SF Days In Stock",
                 "VC Days In Stock",
                 "FBA Days In Stock",
@@ -3055,7 +3055,7 @@ async def download_report_by_date_range(
                 "Total Amount",
                 "Sessions",
                 "Closing Stock",
-                "Total Returns",
+                "FBA Returns",
                 "Total Days In Stock",
                 "Drr",
             ]
@@ -3117,7 +3117,7 @@ async def download_report_by_date_range(
 
             # Write Excel formulas for DRR and (for "all") Total Days In Stock
             units_col = col_letter_map.get("Units Sold")
-            returns_col = col_letter_map.get("Total Returns")
+            returns_col = col_letter_map.get("FBA Returns")
             days_col = col_letter_map.get("Total Days In Stock")
             drr_col = col_letter_map.get("DRR")
             vc_days_col = col_letter_map.get("VC Days In Stock")
@@ -3231,7 +3231,7 @@ def format_column_name(column_name):
         "Data Source": "Data Source",
         "Total Days In Stock": "Total Days In Stock",
         "Drr": "DRR",
-        "Total Returns": "Total Returns",
+        "FBA Returns": "FBA Returns",
         "Stock": "Stock",
         "Vendor Days In Stock": "VC Days In Stock",
         "Fba Days In Stock": "FBA Days In Stock",
