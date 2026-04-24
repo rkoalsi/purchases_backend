@@ -32,6 +32,7 @@ SALES_COLLECTION = "amazon_sales_traffic"
 INVENTORY_COLLECTION = "amazon_ledger"
 FBA_RETURNS_COLLECTION = "amazon_fba_returns"
 SC_RETURNS_COLLECTION = "amazon_seller_central_returns"
+SELLER_FLEX_RETURNS_COLLECTION = "amazon_seller_flex_returns"
 
 router = APIRouter()
 
@@ -1178,6 +1179,119 @@ def get_amazon_sc_returns_data(
         )
 
 
+def normalize_seller_flex_return(record: Dict) -> Dict:
+    """
+    Flatten an External Fulfillment Returns API record into a MongoDB-friendly document.
+    """
+    metadata = record.get("returnMetadata") or {}
+    shipping = record.get("returnShippingInfo") or {}
+    channel = record.get("marketplaceChannelDetails") or {}
+    forward_tracking = shipping.get("forwardTrackingInfo") or {}
+    reverse_tracking = shipping.get("reverseTrackingInfo") or {}
+    marketplace_channel = channel.get("marketplaceChannel") or {}
+    invoice_info = metadata.get("invoiceInformation") or {}
+
+    def parse_dt(val):
+        if not val:
+            return None
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return val
+
+    return {
+        "return_id": record.get("id"),
+        "merchant_sku": record.get("merchantSku"),
+        "number_of_units": record.get("numberOfUnits"),
+        "status": record.get("status"),
+        "return_type": record.get("returnType"),
+        "return_sub_type": record.get("returnSubType"),
+        "fulfillment_location_id": record.get("fulfillmentLocationId"),
+        "return_location_id": record.get("returnLocationId"),
+        "package_delivery_mode": record.get("packageDeliveryMode"),
+        "creation_datetime": parse_dt(record.get("creationDateTime")),
+        "last_updated_datetime": parse_dt(record.get("lastUpdatedDateTime")),
+        # returnMetadata
+        "return_reason": metadata.get("returnReason"),
+        "rma_id": metadata.get("rmaId"),
+        "fulfillment_order_id": metadata.get("fulfillmentOrderId"),
+        "invoice_id": invoice_info.get("id"),
+        # shipping
+        "forward_carrier": forward_tracking.get("carrierName"),
+        "forward_tracking_id": forward_tracking.get("trackingId"),
+        "reverse_carrier": reverse_tracking.get("carrierName"),
+        "reverse_tracking_id": reverse_tracking.get("trackingId"),
+        "pickup_datetime": parse_dt(shipping.get("pickupDateTime")),
+        "delivery_datetime": parse_dt(shipping.get("deliveryDateTime")),
+        # marketplace channel
+        "marketplace_name": marketplace_channel.get("marketplaceName"),
+        "channel_name": marketplace_channel.get("channelName"),
+        "merchant_id": channel.get("merchantId"),
+        "shipment_id": channel.get("shipmentId"),
+        "customer_order_id": channel.get("customerOrderId"),
+        "channel_sku": channel.get("channelSku"),
+        "exchange_order_id": channel.get("exchangeOrderId"),
+    }
+
+
+def get_seller_flex_returns_data(
+    created_since: str,
+    created_until: str,
+    db: Any,
+    return_location_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+) -> List[Dict]:
+    """
+    Fetch Seller Flex returns via the External Fulfillment Returns API (v2024-09-11).
+    Paginates through all pages and deduplicates against existing DB records by return_id.
+    """
+    collection = db[SELLER_FLEX_RETURNS_COLLECTION]
+    existing_ids = set(collection.distinct("return_id"))
+    logger.info(f"Found {len(existing_ids)} existing seller flex return IDs in DB")
+
+    all_records: List[Dict] = []
+    next_token: Optional[str] = None
+    page = 0
+
+    while True:
+        page += 1
+        params: Dict[str, Any] = {
+            "createdSince": created_since,
+            "createdUntil": created_until,
+            "maxResults": 100,
+        }
+        if return_location_id:
+            params["returnLocationId"] = return_location_id
+        if status_filter:
+            params["status"] = status_filter
+        if next_token:
+            params["nextToken"] = next_token
+
+        logger.info(f"Fetching seller flex returns page {page} (nextToken={'yes' if next_token else 'none'})")
+        response = make_sp_api_request("/externalFulfillment/2024-09-11/returns", params=params)
+
+        items = response.get("returns") or response.get("items") or []
+        logger.info(f"Page {page}: received {len(items)} records")
+
+        for item in items:
+            normalized = normalize_seller_flex_return(item)
+            return_id = normalized.get("return_id")
+            if return_id and return_id in existing_ids:
+                logger.debug(f"Skipping duplicate seller flex return: {return_id}")
+                continue
+            if return_id:
+                existing_ids.add(return_id)
+            normalized["created_at"] = datetime.now()
+            all_records.append(normalized)
+
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+
+    logger.info(f"Total new seller flex return records to insert: {len(all_records)}")
+    return all_records
+
+
 # API Endpoints
 
 
@@ -1704,6 +1818,61 @@ async def sync_monthly_returns_data(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to sync monthly returns data: {str(e)}",
+        )
+
+
+@router.post("/sync/seller-flex-returns")
+async def sync_seller_flex_returns(
+    start_date: str,
+    end_date: str,
+    return_location_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    marketplace_ids: Optional[List[str]] = None,
+    db=Depends(get_database),
+):
+    """
+    Fetch Seller Flex returns via the External Fulfillment Returns API and store in DB.
+    Uses createdSince/createdUntil filter. Format: YYYY-MM-DD.
+
+    Optional filters:
+    - return_location_id: SmartConnect location ID
+    - status_filter: CREATED | CARRIER_NOTIFIED_TO_PICK_UP_FROM_CUSTOMER | DELIVERED | PROCESSED
+    """
+    try:
+        datetime.strptime(start_date, "%Y-%m-%d")
+        datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date format. Use YYYY-MM-DD")
+
+    created_since = f"{start_date}T00:00:00Z"
+    created_until = f"{end_date}T23:59:59Z"
+
+    try:
+        records = get_seller_flex_returns_data(
+            created_since=created_since,
+            created_until=created_until,
+            db=db,
+            return_location_id=return_location_id,
+            status_filter=status_filter,
+        )
+
+        inserted_count = await insert_data_to_db(SELLER_FLEX_RETURNS_COLLECTION, records, db)
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Seller Flex returns synced successfully",
+                "records_inserted": inserted_count,
+                "date_range": f"{start_date} to {end_date}",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error syncing Seller Flex returns: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to sync Seller Flex returns: {str(e)}",
         )
 
 
@@ -2868,6 +3037,7 @@ async def download_report_by_date_range(
                 "Closing Stock",
                 "Stock",  # Combined reports include both closing_stock and stock
                 "Total Returns",
+                "SF Days In Stock",
                 "VC Days In Stock",
                 "FBA Days In Stock",
                 "Total Days In Stock",
@@ -3615,3 +3785,255 @@ def get_settlements_summary(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate settlements summary: {str(e)}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Seller Flex Returns CSV Upload
+# ---------------------------------------------------------------------------
+
+SELLER_FLEX_RECON_DATE_FORMAT = "%d-%b-%Y"  # e.g. "01-Feb-2026"
+
+
+def _parse_recon_date(val: Any) -> Optional[datetime]:
+    if not val or (isinstance(val, float) and pd.isna(val)):
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, SELLER_FLEX_RECON_DATE_FORMAT)
+    except ValueError:
+        return None
+
+
+def _str_or_none(val: Any) -> Optional[str]:
+    """Return stripped string, or None for empty/NaN values."""
+    if val is None:
+        return None
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    s = str(val).strip()
+    return s if s else None
+
+
+def normalize_seller_flex_recon_row(row: Dict) -> Dict:
+    """Map CSV column names to MongoDB-friendly field names."""
+    units_raw = row.get("Units")
+    units = None
+    if units_raw is not None and not (isinstance(units_raw, float) and pd.isna(units_raw)):
+        try:
+            units = int(float(str(units_raw)))
+        except (ValueError, TypeError):
+            units = None
+
+    return {
+        "return_type": _str_or_none(row.get("Return Type")),
+        "customer_order_id": _str_or_none(row.get("Customer Order ID")),
+        "shipment_id": _str_or_none(row.get("Shipment ID")),
+        "sku": _str_or_none(row.get("SKU")),
+        "msku": _str_or_none(row.get("mSKU")),
+        "asin": _str_or_none(row.get("ASIN")),
+        "external_id1": _str_or_none(row.get("External ID1")),
+        "external_id2": _str_or_none(row.get("External ID2")),
+        "external_id3": _str_or_none(row.get("External ID3")),
+        "units": units,
+        "forward_leg_tracking_id": _str_or_none(row.get("Forward Leg Tracking ID")),
+        "reverse_leg_tracking_id": _str_or_none(row.get("Reverse Leg Tracking ID")),
+        "rma_id": _str_or_none(row.get("RMA ID")),
+        "return_status": _str_or_none(row.get("Return Status")),
+        "carrier": _str_or_none(row.get("Carrier")),
+        "pickup_date": _parse_recon_date(row.get("Pick -up date")),
+        "last_updated_on": _parse_recon_date(row.get("Last Updated On")),
+        "returned_with_otp": _str_or_none(row.get("Returned with OTP")),
+        "days_in_transit": _str_or_none(row.get("Days In-transit")),
+        "days_since_return_complete": _str_or_none(row.get("Days Since Return Complete")),
+        "return_reason": _str_or_none(row.get("Return Reason")),
+        "lpn": _str_or_none(row.get("LPN")),
+        "created_at": datetime.utcnow(),
+    }
+
+
+@router.get("/seller-flex-returns")
+async def get_seller_flex_returns(
+    start_date: str = Query(..., description="YYYY-MM-DD"),
+    end_date: str = Query(..., description="YYYY-MM-DD"),
+    db=Depends(get_database),
+):
+    """Return seller flex recon records for the given date range (filtered on last_updated_on)."""
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    query = {"last_updated_on": {"$gte": start, "$lte": end}}
+    collection = db[SELLER_FLEX_RETURNS_COLLECTION]
+    docs = await asyncio.to_thread(
+        lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("last_updated_on", 1))
+    )
+
+    import math
+
+    def _clean_doc(doc: Dict) -> Dict:
+        out = {}
+        for k, v in doc.items():
+            if isinstance(v, datetime):
+                out[k] = v.strftime("%Y-%m-%d")
+            elif isinstance(v, float) and math.isnan(v):
+                out[k] = None
+            else:
+                out[k] = v
+        return out
+
+    docs = [_clean_doc(d) for d in docs]
+    return JSONResponse(content={"records": docs, "total": len(docs)})
+
+
+@router.get("/seller-flex-returns/download")
+async def download_seller_flex_returns(
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    db=Depends(get_database),
+):
+    """Download seller flex recon records as an XLSX file."""
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    query = {"last_updated_on": {"$gte": start, "$lte": end}}
+    collection = db[SELLER_FLEX_RETURNS_COLLECTION]
+    docs = await asyncio.to_thread(
+        lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("last_updated_on", 1))
+    )
+
+    COLUMN_ORDER = [
+        "return_type", "customer_order_id", "shipment_id", "sku", "msku", "asin",
+        "external_id1", "external_id2", "external_id3", "units",
+        "forward_leg_tracking_id", "reverse_leg_tracking_id", "rma_id",
+        "return_status", "carrier", "pickup_date", "last_updated_on",
+        "returned_with_otp", "days_in_transit", "days_since_return_complete",
+        "return_reason", "lpn",
+    ]
+    HEADER_MAP = {
+        "return_type": "Return Type", "customer_order_id": "Customer Order ID",
+        "shipment_id": "Shipment ID", "sku": "SKU", "msku": "mSKU", "asin": "ASIN",
+        "external_id1": "External ID1", "external_id2": "External ID2",
+        "external_id3": "External ID3", "units": "Units",
+        "forward_leg_tracking_id": "Forward Leg Tracking ID",
+        "reverse_leg_tracking_id": "Reverse Leg Tracking ID",
+        "rma_id": "RMA ID", "return_status": "Return Status", "carrier": "Carrier",
+        "pickup_date": "Pick-up Date", "last_updated_on": "Last Updated On",
+        "returned_with_otp": "Returned with OTP", "days_in_transit": "Days In-transit",
+        "days_since_return_complete": "Days Since Return Complete",
+        "return_reason": "Return Reason", "lpn": "LPN",
+    }
+
+    rows = []
+    for doc in docs:
+        row = {}
+        for col in COLUMN_ORDER:
+            val = doc.get(col)
+            if isinstance(val, datetime):
+                val = val.strftime("%Y-%m-%d")
+            row[HEADER_MAP[col]] = val
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=[HEADER_MAP[c] for c in COLUMN_ORDER])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Seller Flex Returns")
+    buf.seek(0)
+
+    filename = f"seller_flex_returns_{start_date}_to_{end_date}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/upload/seller-flex-returns")
+async def upload_seller_flex_returns(
+    file: UploadFile = File(...),
+    db=Depends(get_database),
+):
+    """
+    Upload a Seller Flex Returns Reconciliation CSV.
+    Detects the date range from pickup_date / last_updated_on, deletes any
+    existing records in that range, then inserts the uploaded records.
+    """
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please upload a CSV file.",
+        )
+
+    try:
+        contents = await file.read()
+        df = pd.read_csv(BytesIO(contents), low_memory=False, dtype=str)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to parse CSV: {e}",
+        )
+
+    if df.empty:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV file is empty.",
+        )
+
+    records = df.to_dict("records")
+    normalized: List[Dict] = [normalize_seller_flex_recon_row(r) for r in records]
+
+    # Determine date range from pickup_date (fallback to last_updated_on)
+    all_dates: List[datetime] = []
+    for rec in normalized:
+        d = rec.get("pickup_date") or rec.get("last_updated_on")
+        if d:
+            all_dates.append(d)
+
+    if not all_dates:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid dates found in the CSV. Expected 'Pick -up date' or 'Last Updated On' in DD-Mon-YYYY format.",
+        )
+
+    range_start = min(all_dates)
+    range_end = max(all_dates)
+
+    collection = db[SELLER_FLEX_RETURNS_COLLECTION]
+
+    # Check for existing records in this date range
+    date_query = {
+        "$or": [
+            {"pickup_date": {"$gte": range_start, "$lte": range_end}},
+            {"last_updated_on": {"$gte": range_start, "$lte": range_end}},
+        ]
+    }
+    existing_count = await asyncio.to_thread(collection.count_documents, date_query)
+
+    deleted_count = 0
+    if existing_count > 0:
+        delete_result = await asyncio.to_thread(collection.delete_many, date_query)
+        deleted_count = delete_result.deleted_count
+        logger.info(f"Deleted {deleted_count} existing seller flex recon records for range {range_start} – {range_end}")
+
+    insert_result = await asyncio.to_thread(collection.insert_many, normalized)
+    inserted_count = len(insert_result.inserted_ids)
+    logger.info(f"Inserted {inserted_count} seller flex recon records")
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "message": "Seller Flex returns uploaded successfully.",
+            "date_range": {
+                "start": range_start.strftime("%Y-%m-%d"),
+                "end": range_end.strftime("%Y-%m-%d"),
+            },
+            "existing_deleted": deleted_count,
+            "records_inserted": inserted_count,
+        },
+    )
