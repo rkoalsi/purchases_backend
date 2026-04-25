@@ -75,8 +75,8 @@ def _enrich_items(
     db,
     use_stored_stock: bool = False,
     po_date_str: str | None = None,
-) -> tuple[list[dict], str | None]:
-    """Enrich PO items with product/stock/sales data. Returns (enriched_items, inventory_date_str).
+) -> tuple[list[dict], str | None, str | None]:
+    """Enrich PO items with product/stock/sales data. Returns (enriched_items, inventory_date_str, zoho_stock_date_str).
 
     use_stored_stock=True: zoho_stock/current_stock/open_po/last_30_sales are read from the stored
     item fields (frozen at upload time). Only margin/product-derived fields are recomputed.
@@ -150,6 +150,7 @@ def _enrich_items(
     open_po_by_asin: dict[str, int] = {}
     sales_by_asin: dict[str, int] = {}
     inventory_date_str: str | None = None
+    zoho_stock_date_str: str | None = None
 
     if not effective_use_stored:
         zoho_item_ids = list({
@@ -162,10 +163,14 @@ def _enrich_items(
             for doc in db[ZOHO_STOCK_COLLECTION].aggregate([
                 {"$match": zoho_match},
                 {"$sort": {"date": -1}},
-                {"$group": {"_id": "$zoho_item_id", "warehouses": {"$first": "$warehouses"}}}
+                {"$group": {"_id": "$zoho_item_id", "warehouses": {"$first": "$warehouses"}, "date": {"$first": "$date"}}}
             ]):
                 wh = doc.get("warehouses", {})
                 zoho_latest[doc["_id"]] = int(sum(v for v in wh.values() if isinstance(v, (int, float)))) if isinstance(wh, dict) else 0
+                if doc.get("date"):
+                    d = doc["date"].strftime("%Y-%m-%d") if hasattr(doc["date"], "strftime") else str(doc["date"])[:10]
+                    if zoho_stock_date_str is None or d > zoho_stock_date_str:
+                        zoho_stock_date_str = d
 
         inv_match: dict = {"asin": {"$in": asins}}
         if stock_cutoff:
@@ -292,7 +297,7 @@ def _enrich_items(
             "final_supply_qty": supply_qty,   # final = supply (they are always equal)
         })
 
-    return enriched, inventory_date_str
+    return enriched, inventory_date_str, zoho_stock_date_str
 
 
 # ─── endpoints ────────────────────────────────────────────────────────────────
@@ -320,7 +325,7 @@ async def upload_vendor_po(
         if existing:
             raise ValueError(f"PO {po_number} already exists")
 
-        enriched_items, inventory_date = _enrich_items(items, po_number, db, po_date_str=po_date)
+        enriched_items, inventory_date, zoho_stock_date = _enrich_items(items, po_number, db, po_date_str=po_date)
 
         doc = {
             "po_number": po_number,
@@ -328,22 +333,24 @@ async def upload_vendor_po(
             "po_date": po_date,
             "po_status": "pending",
             "inventory_date": inventory_date,
+            "zoho_stock_date": zoho_stock_date,
             "item_count": len(items),
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
             "items": enriched_items,  # enriched items stored (stock/sales frozen at upload time)
         }
         db[PO_COLLECTION].insert_one(doc)
-        return po_number, enriched_items, inventory_date
+        return po_number, enriched_items, inventory_date, zoho_stock_date
 
     try:
-        po_number, enriched_items, inventory_date = await asyncio.to_thread(_process)
+        po_number, enriched_items, inventory_date, zoho_stock_date = await asyncio.to_thread(_process)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     return JSONResponse(status_code=201, content={
         "po_number": po_number,
         "inventory_date": inventory_date,
+        "zoho_stock_date": zoho_stock_date,
         "items": serialize_mongo_document(enriched_items),
     })
 
@@ -368,20 +375,24 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
     def _fetch():
         doc = db[PO_COLLECTION].find_one({"po_number": po_number})
         if not doc:
-            return None, None
+            return None, None, None, None
         items = doc.get("items", [])
         po_status = doc.get("po_status", "pending")
         # frozen statuses: serve stored snapshot; pending/processing: re-fetch live (T-2 stock, sales ending at po_date)
         use_stored = po_status in FROZEN_STATUSES
-        enriched, inv_date = _enrich_items(items, po_number, db, use_stored_stock=use_stored, po_date_str=doc.get("po_date"))
-        return doc, enriched, inv_date
+        enriched, inv_date, zoho_date = _enrich_items(items, po_number, db, use_stored_stock=use_stored, po_date_str=doc.get("po_date"))
+        return doc, enriched, inv_date, zoho_date
 
-    doc, enriched, live_inv_date = await asyncio.to_thread(_fetch)
+    doc, enriched, live_inv_date, live_zoho_date = await asyncio.to_thread(_fetch)
     if doc is None:
         raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
 
     po_status = doc["po_status"]
-    inv_date = doc.get("inventory_date") if po_status in FROZEN_STATUSES else live_inv_date
+    # For new-format frozen POs, live_inv_date is None (stored snapshot used).
+    # For old-format frozen POs (no zoho_stock in items), live_inv_date is freshly computed
+    # with T-2 cutoff — prefer it over the stale stored value.
+    inv_date = live_inv_date if live_inv_date is not None else doc.get("inventory_date")
+    zoho_date = live_zoho_date if live_zoho_date is not None else doc.get("zoho_stock_date")
 
     return {
         "po_number": doc["po_number"],
@@ -389,6 +400,7 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
         "po_date": doc["po_date"],
         "po_status": po_status,
         "inventory_date": inv_date,
+        "zoho_stock_date": zoho_date,
         "po_update_date": doc.get("po_update_date"),
         "items": serialize_mongo_document(enriched),
     }
@@ -412,12 +424,13 @@ async def update_po_status(po_number: str, po_status: str, db=Depends(get_databa
 
         # Transitioning into a frozen status: re-enrich with live data and store permanently
         if po_status in FROZEN_STATUSES and doc.get("po_status") not in FROZEN_STATUSES:
-            enriched, inv_date = _enrich_items(
+            enriched, inv_date, zoho_date = _enrich_items(
                 doc.get("items", []), po_number, db,
                 use_stored_stock=False, po_date_str=doc.get("po_date")
             )
             update_fields["items"] = enriched
             update_fields["inventory_date"] = inv_date
+            update_fields["zoho_stock_date"] = zoho_date
 
         db[PO_COLLECTION].update_one({"po_number": po_number}, {"$set": update_fields})
         return po_status
@@ -456,7 +469,7 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
             return None, None
         po_status = doc.get("po_status", "pending")
         use_stored = po_status in FROZEN_STATUSES
-        enriched, _ = _enrich_items(doc.get("items", []), po_number, db, use_stored_stock=use_stored, po_date_str=doc.get("po_date"))
+        enriched, _, __ = _enrich_items(doc.get("items", []), po_number, db, use_stored_stock=use_stored, po_date_str=doc.get("po_date"))
         return doc, enriched
 
     result = await asyncio.to_thread(_build)
