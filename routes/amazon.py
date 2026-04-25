@@ -33,6 +33,7 @@ INVENTORY_COLLECTION = "amazon_ledger"
 FBA_RETURNS_COLLECTION = "amazon_fba_returns"
 SC_RETURNS_COLLECTION = "amazon_seller_central_returns"
 SELLER_FLEX_RETURNS_COLLECTION = "amazon_seller_flex_returns"
+VENDOR_CENTRAL_RETURNS_COLLECTION = "amazon_vendor_central_returns"
 
 router = APIRouter()
 
@@ -4029,6 +4030,340 @@ async def upload_seller_flex_returns(
         status_code=status.HTTP_200_OK,
         content={
             "message": "Seller Flex returns uploaded successfully.",
+            "date_range": {
+                "start": range_start.strftime("%Y-%m-%d"),
+                "end": range_end.strftime("%Y-%m-%d"),
+            },
+            "existing_deleted": deleted_count,
+            "records_inserted": inserted_count,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# FBA Returns – read-only endpoints (data synced via SP-API elsewhere)
+# ---------------------------------------------------------------------------
+
+def _clean_doc(doc: Dict) -> Dict:
+    import math
+    out = {}
+    for k, v in doc.items():
+        if isinstance(v, datetime):
+            out[k] = v.strftime("%Y-%m-%d")
+        elif isinstance(v, float) and math.isnan(v):
+            out[k] = None
+        else:
+            out[k] = v
+    return out
+
+
+@router.get("/fba-returns")
+async def get_fba_returns(
+    start_date: str = Query(..., description="YYYY-MM-DD"),
+    end_date: str = Query(..., description="YYYY-MM-DD"),
+    db=Depends(get_database),
+):
+    """Return FBA returns records for the given date range (filtered on return_date)."""
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    query = {"return_date": {"$gte": start, "$lte": end}}
+    collection = db[FBA_RETURNS_COLLECTION]
+    docs = await asyncio.to_thread(
+        lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("return_date", 1))
+    )
+    docs = [_clean_doc(d) for d in docs]
+    return JSONResponse(content={"records": docs, "total": len(docs)})
+
+
+@router.get("/fba-returns/download")
+async def download_fba_returns(
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    db=Depends(get_database),
+):
+    """Download FBA returns records as an XLSX file."""
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    query = {"return_date": {"$gte": start, "$lte": end}}
+    collection = db[FBA_RETURNS_COLLECTION]
+    docs = await asyncio.to_thread(
+        lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("return_date", 1))
+    )
+
+    COLUMN_ORDER = [
+        "return_date", "amazon_order_id", "sku_code", "asin", "fnsku",
+        "product_name", "quantity", "fulfillment_center_id",
+        "detailed_disposition", "reason", "license_plate_number", "customer_comments",
+    ]
+    HEADER_MAP = {
+        "return_date": "Return Date", "amazon_order_id": "Order ID",
+        "sku_code": "SKU", "asin": "ASIN", "fnsku": "FNSKU",
+        "product_name": "Product Name", "quantity": "Quantity",
+        "fulfillment_center_id": "FC ID", "detailed_disposition": "Disposition",
+        "reason": "Reason", "license_plate_number": "LPN",
+        "customer_comments": "Customer Comments",
+    }
+
+    rows = []
+    for doc in docs:
+        row = {}
+        for col in COLUMN_ORDER:
+            val = doc.get(col)
+            if isinstance(val, datetime):
+                val = val.strftime("%Y-%m-%d")
+            row[HEADER_MAP[col]] = val
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=[HEADER_MAP[c] for c in COLUMN_ORDER])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="FBA Returns")
+    buf.seek(0)
+
+    filename = f"fba_returns_{start_date}_to_{end_date}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Vendor Central Returns – upload XLSX + read endpoints
+# ---------------------------------------------------------------------------
+
+def _parse_vc_date(val: Any) -> Optional[datetime]:
+    """Parse DD/MM/YYYY dates from Vendor Central returns report."""
+    if not val or (isinstance(val, float) and pd.isna(val)):
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _num_or_none(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def normalize_vendor_central_return_row(row: Dict) -> Dict:
+    return {
+        "shipment_id": _str_or_none(row.get("Shipment ID")),
+        "return_id": _str_or_none(row.get("Return ID")),
+        "vendor_code": _str_or_none(row.get("Vendor Code")),
+        "return_date": _parse_vc_date(row.get("Return Date")),
+        "purchase_order": _str_or_none(row.get("Purchase Order")),
+        "warehouse": _str_or_none(row.get("Warehouse")),
+        "asin": _str_or_none(row.get("ASIN")),
+        "product": _str_or_none(row.get("Product")),
+        "quantity": _num_or_none(row.get("Quantity")),
+        "price_per_unit": _num_or_none(row.get("Price per unit")),
+        "net_amount": _num_or_none(row.get("Net Amount")),
+        "currency_code": _str_or_none(row.get("Currency Code")),
+        "ship_to_state": _str_or_none(row.get("Ship To State")),
+        "ship_from_state": _str_or_none(row.get("Ship From State")),
+        "system_ref_no": _str_or_none(row.get("System Ref No")),
+        "document_number": _str_or_none(row.get("Document Number")),
+        "document_date": _parse_vc_date(row.get("Document Date")),
+        "document_type": _str_or_none(row.get("Document Type")),
+        "original_document_number": _str_or_none(row.get("Original Document Number")),
+        "original_document_date": _parse_vc_date(row.get("Original Document Date")),
+        "hsn": _str_or_none(row.get("HSN")),
+        "vendor_invoice": _str_or_none(row.get("Vendor Invoice")),
+        "vendor_invoice_date": _parse_vc_date(row.get("Vendor Invoice Date")),
+        "igst_tax_rate": _num_or_none(row.get("IGST Tax Rate")),
+        "igst_tax_amount": _num_or_none(row.get("IGST Tax Amount")),
+        "cess_tax_rate": _num_or_none(row.get("CESS Tax Rate")),
+        "cess_tax_amount": _num_or_none(row.get("CESS Tax Amount")),
+        "cgst_tax_rate": _num_or_none(row.get("CGST Tax Rate")),
+        "cgst_tax_amount": _num_or_none(row.get("CGST Tax Amount")),
+        "sgst_tax_rate": _num_or_none(row.get("SGST Tax Rate")),
+        "sgst_tax_amount": _num_or_none(row.get("SGST Tax Amount")),
+        "total_amount": _num_or_none(row.get("Total Amount")),
+        "created_at": datetime.utcnow(),
+    }
+
+
+@router.get("/vendor-central-returns")
+async def get_vendor_central_returns(
+    start_date: str = Query(..., description="YYYY-MM-DD"),
+    end_date: str = Query(..., description="YYYY-MM-DD"),
+    db=Depends(get_database),
+):
+    """Return Vendor Central returns records for the given date range (filtered on return_date)."""
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    query = {"return_date": {"$gte": start, "$lte": end}}
+    collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
+    docs = await asyncio.to_thread(
+        lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("return_date", 1))
+    )
+    docs = [_clean_doc(d) for d in docs]
+    return JSONResponse(content={"records": docs, "total": len(docs)})
+
+
+@router.get("/vendor-central-returns/download")
+async def download_vendor_central_returns(
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    db=Depends(get_database),
+):
+    """Download Vendor Central returns records as an XLSX file."""
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    query = {"return_date": {"$gte": start, "$lte": end}}
+    collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
+    docs = await asyncio.to_thread(
+        lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("return_date", 1))
+    )
+
+    COLUMN_ORDER = [
+        "shipment_id", "return_id", "vendor_code", "return_date", "purchase_order",
+        "warehouse", "asin", "product", "quantity", "price_per_unit", "net_amount",
+        "currency_code", "ship_to_state", "ship_from_state", "system_ref_no",
+        "document_number", "document_date", "document_type", "original_document_number",
+        "original_document_date", "hsn", "vendor_invoice", "vendor_invoice_date",
+        "igst_tax_rate", "igst_tax_amount", "cess_tax_rate", "cess_tax_amount",
+        "cgst_tax_rate", "cgst_tax_amount", "sgst_tax_rate", "sgst_tax_amount",
+        "total_amount",
+    ]
+    HEADER_MAP = {
+        "shipment_id": "Shipment ID", "return_id": "Return ID",
+        "vendor_code": "Vendor Code", "return_date": "Return Date",
+        "purchase_order": "Purchase Order", "warehouse": "Warehouse",
+        "asin": "ASIN", "product": "Product", "quantity": "Quantity",
+        "price_per_unit": "Price per unit", "net_amount": "Net Amount",
+        "currency_code": "Currency Code", "ship_to_state": "Ship To State",
+        "ship_from_state": "Ship From State", "system_ref_no": "System Ref No",
+        "document_number": "Document Number", "document_date": "Document Date",
+        "document_type": "Document Type",
+        "original_document_number": "Original Document Number",
+        "original_document_date": "Original Document Date",
+        "hsn": "HSN", "vendor_invoice": "Vendor Invoice",
+        "vendor_invoice_date": "Vendor Invoice Date",
+        "igst_tax_rate": "IGST Tax Rate", "igst_tax_amount": "IGST Tax Amount",
+        "cess_tax_rate": "CESS Tax Rate", "cess_tax_amount": "CESS Tax Amount",
+        "cgst_tax_rate": "CGST Tax Rate", "cgst_tax_amount": "CGST Tax Amount",
+        "sgst_tax_rate": "SGST Tax Rate", "sgst_tax_amount": "SGST Tax Amount",
+        "total_amount": "Total Amount",
+    }
+
+    rows = []
+    for doc in docs:
+        row = {}
+        for col in COLUMN_ORDER:
+            val = doc.get(col)
+            if isinstance(val, datetime):
+                val = val.strftime("%Y-%m-%d")
+            row[HEADER_MAP[col]] = val
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=[HEADER_MAP[c] for c in COLUMN_ORDER])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Vendor Central Returns")
+    buf.seek(0)
+
+    filename = f"vendor_central_returns_{start_date}_to_{end_date}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/upload/vendor-central-returns")
+async def upload_vendor_central_returns(
+    file: UploadFile = File(...),
+    db=Depends(get_database),
+):
+    """
+    Upload a Vendor Central Returns XLSX (Invoice Report sheet).
+    Detects the date range from return_date, deletes existing records in that
+    range, then inserts the uploaded records.
+    """
+    if not file.filename.endswith((".xlsx", ".xls")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please upload an Excel file (.xlsx or .xls).",
+        )
+
+    try:
+        contents = await file.read()
+        df = pd.read_excel(BytesIO(contents), sheet_name="Invoice Report", dtype=str)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to parse Excel file: {e}",
+        )
+
+    if df.empty:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Excel file is empty.",
+        )
+
+    records = df.to_dict("records")
+    normalized: List[Dict] = [normalize_vendor_central_return_row(r) for r in records]
+
+    all_dates: List[datetime] = [r["return_date"] for r in normalized if r.get("return_date")]
+
+    if not all_dates:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid dates found in the file. Expected 'Return Date' column in DD/MM/YYYY format.",
+        )
+
+    range_start = min(all_dates)
+    range_end = max(all_dates)
+
+    collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
+
+    date_query = {"return_date": {"$gte": range_start, "$lte": range_end}}
+    existing_count = await asyncio.to_thread(collection.count_documents, date_query)
+
+    deleted_count = 0
+    if existing_count > 0:
+        delete_result = await asyncio.to_thread(collection.delete_many, date_query)
+        deleted_count = delete_result.deleted_count
+        logger.info(f"Deleted {deleted_count} existing vendor central returns for range {range_start} – {range_end}")
+
+    insert_result = await asyncio.to_thread(collection.insert_many, normalized)
+    inserted_count = len(insert_result.inserted_ids)
+    logger.info(f"Inserted {inserted_count} vendor central return records")
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "message": "Vendor Central returns uploaded successfully.",
             "date_range": {
                 "start": range_start.strftime("%Y-%m-%d"),
                 "end": range_end.strftime("%Y-%m-%d"),
