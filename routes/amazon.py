@@ -4,7 +4,7 @@ from bson import ObjectId
 from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta, timezone
-from pymongo import ASCENDING
+from pymongo import ASCENDING, UpdateOne
 from pymongo.errors import PyMongoError
 from ..database import get_database, serialize_mongo_document
 import os
@@ -4220,10 +4220,45 @@ async def get_vendor_central_returns(
     query = {"return_date": {"$gte": start, "$lte": end}}
     collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
     docs = await asyncio.to_thread(
-        lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("return_date", 1))
+        lambda: list(collection.find(query, {"created_at": 0}).sort("return_date", 1))
     )
-    docs = [_clean_doc(d) for d in docs]
-    return JSONResponse(content={"records": docs, "total": len(docs)})
+    cleaned = []
+    for d in docs:
+        cd = _clean_doc(d)
+        oid = d.get("_id")
+        if oid is not None:
+            cd["id"] = str(oid)
+        cd.pop("_id", None)
+        cleaned.append(cd)
+    # sent_to_accounts_team=False rows first, then others
+    cleaned.sort(key=lambda r: (0 if r.get("sent_to_accounts_team") is False else 1))
+    return JSONResponse(content={"records": cleaned, "total": len(cleaned)})
+
+
+@router.patch("/vendor-central-returns/{record_id}")
+async def patch_vendor_central_return(
+    record_id: str,
+    payload: Dict,
+    db=Depends(get_database),
+):
+    """Update the 3 editable fields on a Vendor Central return record."""
+    allowed = {"entry_in_zoho", "transfer_orders_inventory_adjustment", "sent_to_accounts_team"}
+    update_fields = {k: v for k, v in payload.items() if k in allowed}
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="No valid fields to update.")
+
+    try:
+        oid = ObjectId(record_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid record ID.")
+
+    collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
+    result = await asyncio.to_thread(
+        collection.update_one, {"_id": oid}, {"$set": update_fields}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Record not found.")
+    return JSONResponse(content={"updated": True})
 
 
 @router.get("/vendor-central-returns/download")
@@ -4244,6 +4279,7 @@ async def download_vendor_central_returns(
     docs = await asyncio.to_thread(
         lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("return_date", 1))
     )
+    docs.sort(key=lambda r: (0 if r.get("sent_to_accounts_team") is False else 1))
 
     COLUMN_ORDER = [
         "shipment_id", "return_id", "vendor_code", "return_date", "purchase_order",
@@ -4253,7 +4289,8 @@ async def download_vendor_central_returns(
         "original_document_date", "hsn", "vendor_invoice", "vendor_invoice_date",
         "igst_tax_rate", "igst_tax_amount", "cess_tax_rate", "cess_tax_amount",
         "cgst_tax_rate", "cgst_tax_amount", "sgst_tax_rate", "sgst_tax_amount",
-        "total_amount",
+        "total_amount", "entry_in_zoho", "transfer_orders_inventory_adjustment",
+        "sent_to_accounts_team",
     ]
     HEADER_MAP = {
         "shipment_id": "Shipment ID", "return_id": "Return ID",
@@ -4274,6 +4311,9 @@ async def download_vendor_central_returns(
         "cgst_tax_rate": "CGST Tax Rate", "cgst_tax_amount": "CGST Tax Amount",
         "sgst_tax_rate": "SGST Tax Rate", "sgst_tax_amount": "SGST Tax Amount",
         "total_amount": "Total Amount",
+        "entry_in_zoho": "Entry in Zoho",
+        "transfer_orders_inventory_adjustment": "Transfer Orders / Inventory Adjustment",
+        "sent_to_accounts_team": "Sent to Accounts Team",
     }
 
     rows = []
@@ -4347,18 +4387,38 @@ async def upload_vendor_central_returns(
 
     collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
 
-    date_query = {"return_date": {"$gte": range_start, "$lte": range_end}}
-    existing_count = await asyncio.to_thread(collection.count_documents, date_query)
+    EDITABLE_FIELDS = {"entry_in_zoho", "transfer_orders_inventory_adjustment", "sent_to_accounts_team"}
+    ops = []
+    for rec in normalized:
+        # Composite key: (return_id + asin) so multi-ASIN returns each get their own doc.
+        if rec.get("return_id") and rec.get("asin"):
+            filter_q = {"return_id": rec["return_id"], "asin": rec["asin"]}
+        elif rec.get("return_id"):
+            filter_q = {"return_id": rec["return_id"]}
+        elif rec.get("shipment_id") and rec.get("asin"):
+            filter_q = {"shipment_id": rec["shipment_id"], "asin": rec["asin"]}
+        else:
+            filter_q = {"shipment_id": rec["shipment_id"]}
+        data_fields = {k: v for k, v in rec.items() if k not in EDITABLE_FIELDS}
+        ops.append(UpdateOne(
+            filter_q,
+            {
+                "$set": data_fields,
+                "$setOnInsert": {
+                    "entry_in_zoho": None,
+                    "transfer_orders_inventory_adjustment": None,
+                    "sent_to_accounts_team": False,
+                },
+            },
+            upsert=True,
+        ))
 
-    deleted_count = 0
-    if existing_count > 0:
-        delete_result = await asyncio.to_thread(collection.delete_many, date_query)
-        deleted_count = delete_result.deleted_count
-        logger.info(f"Deleted {deleted_count} existing vendor central returns for range {range_start} – {range_end}")
+    def _bulk():
+        result = collection.bulk_write(ops, ordered=False)
+        return result.upserted_count, result.modified_count
 
-    insert_result = await asyncio.to_thread(collection.insert_many, normalized)
-    inserted_count = len(insert_result.inserted_ids)
-    logger.info(f"Inserted {inserted_count} vendor central return records")
+    upserted_count, modified_count = await asyncio.to_thread(_bulk)
+    logger.info(f"VC returns upsert: {upserted_count} inserted, {modified_count} updated")
 
     return JSONResponse(
         status_code=status.HTTP_200_OK,
@@ -4368,7 +4428,7 @@ async def upload_vendor_central_returns(
                 "start": range_start.strftime("%Y-%m-%d"),
                 "end": range_end.strftime("%Y-%m-%d"),
             },
-            "existing_deleted": deleted_count,
-            "records_inserted": inserted_count,
+            "existing_deleted": 0,
+            "records_inserted": upserted_count + modified_count,
         },
     )

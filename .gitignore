@@ -6,3 +6,5 @@ creds.json
 scripts/import_po_history.py
 .gitignore
 scripts/import_seller_flex_returns.py
+fix_po_stock_snapshot_dates.py
+import_vc_returns_sheet.py
