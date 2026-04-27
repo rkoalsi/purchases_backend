@@ -142,11 +142,14 @@ def _enrich_items(
     # --- batch load vendor margins (always fresh — editable after upload) ---
     margins_by_asin: dict[str, float] = {}
     cost_prices_by_asin: dict[str, float] = {}
-    for m in db[MARGINS_COLLECTION].find({"asin": {"$in": asins}}, {"asin": 1, "margin": 1, "cost_price_wo_tax": 1}):
+    etrade_asp_by_asin: dict[str, float] = {}
+    for m in db[MARGINS_COLLECTION].find({"asin": {"$in": asins}}, {"asin": 1, "margin": 1, "cost_price_wo_tax": 1, "etrade_asp": 1}):
         if m.get("margin") is not None:
             margins_by_asin[m["asin"]] = float(m["margin"])
         if m.get("cost_price_wo_tax") is not None:
             cost_prices_by_asin[m["asin"]] = float(m["cost_price_wo_tax"])
+        if m.get("etrade_asp") is not None:
+            etrade_asp_by_asin[m["asin"]] = float(m["etrade_asp"])
 
     # --- live stock/sales — only fetched at upload time (or for old-format items) ---
     zoho_latest: dict[str, int] = {}
@@ -281,6 +284,7 @@ def _enrich_items(
             "accepted_qty": accepted_qty,
             "received_qty": received_qty,
             "zoho_mrp": mrp,
+            "etrade_asp": etrade_asp_by_asin.get(asin),
             "gst": gst,
             "mrp_wo_gst": mrp_wo_gst,
             "margin": margin,
@@ -535,7 +539,7 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
         ("ASIN", True), ("Model Number", True), ("Title", True), ("Requested Qty", True),
         ("Supply Qty", False), ("Accepted Qty", False), ("Supply - Accepted", False),
         ("Received QTY", False), ("Mismatch QTY", False),
-        ("Zoho MRP", True), ("GST", True), ("MRP w/o GST", True), ("Margin (%)", True),
+        ("Zoho MRP", True), ("eTrade ASP", True), ("GST", True), ("MRP w/o GST", True), ("Margin (%)", True),
         ("Cost Price w/o Tax", True), ("Total Cost", True), ("Total Cost with GST", True),
         ("HSN", True), ("Etrade Unit Cost", True), ("Diff", True),
         ("Zoho Stock", True), ("Status", True),
@@ -565,6 +569,7 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
         received = item.get("received_qty")
 
         # Static values — sourced from PO / DB
+        # Col 15 = eTrade ASP inserted after Zoho MRP; all cols from old-15 shift +1
         static = {
             1:  po_date_str,                        # A  PO Date
             2:  po_number,                          # B  PO
@@ -578,35 +583,40 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
             10: accepted if accepted is not None else "",   # J  Accepted Qty
             12: received if received is not None else "",   # L  Received QTY
             14: item["zoho_mrp"],                   # N  Zoho MRP
-            15: item["gst"] / 100,                  # O  GST (as decimal for formula use)
-            17: item["margin"] if item["margin"] is not None else "",  # Q  Margin
-            21: item["hsn"],                        # U  HSN
-            22: item["etrade_unit_cost"],            # V  Etrade Unit Cost
-            24: item["zoho_stock"],                 # X  Zoho Stock
-            25: item["purchase_status"],            # Y  Status
-            26: item["current_stock"],              # Z  Current Stock
-            27: item["open_po"],                    # AA Open PO
-            29: item["last_30_sales"],              # AC Last 30 Days Sales
-            31: item["coverage_days"],              # AE Coverage Days
+            15: item.get("etrade_asp") if item.get("etrade_asp") is not None else "",  # O  eTrade ASP
+            16: item["gst"] / 100,                  # P  GST (as decimal for formula use)
+            18: item["margin"] if item["margin"] is not None else "",  # R  Margin
+            22: item["hsn"],                        # V  HSN
+            23: item["etrade_unit_cost"],            # W  Etrade Unit Cost
+            25: item["zoho_stock"],                 # Y  Zoho Stock
+            26: item["purchase_status"],            # Z  Status
+            27: item["current_stock"],              # AA Current Stock
+            28: item["open_po"],                    # AB Open PO
+            30: item["last_30_sales"],              # AD Last 30 Days Sales
+            32: item["coverage_days"],              # AF Coverage Days
         }
 
         # Formula values — reference other cells
+        # P=GST, Q=MRP w/o GST, R=Margin, S=Cost Price, T=Total Cost, U=Total Cost GST
+        # V=HSN, W=Etrade Unit Cost, X=Diff, Y=Zoho Stock, Z=Status
+        # AA=Current Stock, AB=Open PO, AC=Total Qty, AD=Sales, AE=ADS, AF=Coverage
+        # AG=Target Stock, AH=Max Allowed, AI=Final Supply
         formulas = {
             11: f"=IF(J{r}=\"\",\"\",I{r}-J{r})",                          # K  Supply - Accepted
             13: f"=IF(L{r}=\"\",\"\",J{r}-L{r})",                          # M  Mismatch QTY
-            16: f"=ROUND(N{r}/(1+O{r}),2)",                                 # P  MRP w/o GST
-            18: f"=IF(Q{r}=\"\",\"\",ROUND(P{r}*(1-Q{r}),2))",             # R  Cost Price w/o Tax
-            19: f"=IF(R{r}=\"\",\"\",ROUND(R{r}*I{r},2))",                 # S  Total Cost
-            20: f"=IF(S{r}=\"\",\"\",ROUND(S{r}*(1+O{r}),2))",             # T  Total Cost w/ GST
-            23: f"=IF(R{r}=\"\",\"\",V{r}-R{r})",                          # W  Diff
-            28: f"=Z{r}+AA{r}",                                             # AB Total Qty
-            30: f"=ROUND(AC{r}/30,2)",                                      # AD ADS
-            32: f"=ROUND(AD{r}*AE{r},0)",                                   # AF Target Stock
-            33: f"=AF{r}-AB{r}",                                            # AG Max Allowed Qty
-            34: f"=IF(AB{r}=0,H{r},ROUND(MAX(0,MIN(AB{r},AG{r})),0))",     # AH Final Supply Qty
+            17: f"=ROUND(N{r}/(1+P{r}),2)",                                 # Q  MRP w/o GST
+            19: f"=IF(R{r}=\"\",\"\",ROUND(Q{r}*(1-R{r}),2))",             # S  Cost Price w/o Tax
+            20: f"=IF(S{r}=\"\",\"\",ROUND(S{r}*I{r},2))",                 # T  Total Cost
+            21: f"=IF(T{r}=\"\",\"\",ROUND(T{r}*(1+P{r}),2))",             # U  Total Cost w/ GST
+            24: f"=IF(S{r}=\"\",\"\",W{r}-S{r})",                          # X  Diff
+            29: f"=AA{r}+AB{r}",                                            # AC Total Qty
+            31: f"=ROUND(AD{r}/30,2)",                                      # AE ADS
+            33: f"=ROUND(AE{r}*AF{r},0)",                                   # AG Target Stock
+            34: f"=AG{r}-AC{r}",                                            # AH Max Allowed Qty
+            35: f"=IF(AC{r}=0,H{r},ROUND(MAX(0,MIN(AC{r},AH{r})),0))",     # AI Final Supply Qty
         }
 
-        for col_idx in range(1, 35):
+        for col_idx in range(1, 36):
             if col_idx in formulas:
                 cell = ws.cell(row=r, column=col_idx, value=formulas[col_idx])
             else:
@@ -614,21 +624,21 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
             cell.border = thin_border
             cell.alignment = Alignment(vertical="center")
 
-            # Number formats
-            if col_idx in (14, 16, 18, 19, 20, 22):   # currency cols
+            # Number formats (eTrade ASP inserted at col 15; all old cols >=15 shifted +1)
+            if col_idx in (14, 15, 17, 19, 20, 21, 23):  # currency: Zoho MRP, eTrade ASP, MRP w/o GST, Cost Price, Total Cost, Total Cost GST, Etrade Unit Cost
                 cell.number_format = num_format
-            elif col_idx == 15:                         # GST as %
+            elif col_idx == 16:                           # GST as %
                 cell.number_format = pct_format
-            elif col_idx == 17:                         # Margin as %
+            elif col_idx == 18:                           # Margin as %
                 cell.number_format = pct_format
-            elif col_idx == 23:                         # Diff — colour via conditional format not available, plain num
+            elif col_idx == 24:                           # Diff
                 cell.number_format = num_format
-            elif col_idx in (8, 9, 10, 12, 24, 26, 27, 28, 29, 31, 32, 33, 34):
+            elif col_idx in (8, 9, 10, 12, 25, 27, 28, 29, 30, 32, 33, 34, 35):
                 cell.number_format = int_format
 
     for col_idx in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = 16
-    ws.column_dimensions["G"].width = 40
+    ws.column_dimensions["G"].width = 40  # Title column
     ws.row_dimensions[1].height = 40
 
     buf = io.BytesIO()
@@ -658,20 +668,25 @@ async def upsert_margin(
     asin: str,
     margin: Optional[float] = None,
     cost_price_wo_tax: Optional[float] = None,
+    etrade_asp: Optional[float] = None,
     db=Depends(get_database),
 ):
-    if margin is None and cost_price_wo_tax is None:
-        raise HTTPException(status_code=400, detail="At least one of margin or cost_price_wo_tax must be provided")
+    if margin is None and cost_price_wo_tax is None and etrade_asp is None:
+        raise HTTPException(status_code=400, detail="At least one of margin, cost_price_wo_tax, or etrade_asp must be provided")
     if margin is not None and not (0 <= margin <= 1):
         raise HTTPException(status_code=400, detail="margin must be between 0 and 1 (e.g. 0.35 for 35%)")
     if cost_price_wo_tax is not None and cost_price_wo_tax < 0:
         raise HTTPException(status_code=400, detail="cost_price_wo_tax must be >= 0")
+    if etrade_asp is not None and etrade_asp < 0:
+        raise HTTPException(status_code=400, detail="etrade_asp must be >= 0")
 
     fields: dict = {"asin": asin, "updated_at": datetime.now()}
     if margin is not None:
         fields["margin"] = margin
     if cost_price_wo_tax is not None:
         fields["cost_price_wo_tax"] = cost_price_wo_tax
+    if etrade_asp is not None:
+        fields["etrade_asp"] = etrade_asp
 
     def _upsert():
         db[MARGINS_COLLECTION].update_one(
@@ -681,7 +696,7 @@ async def upsert_margin(
         )
 
     await asyncio.to_thread(_upsert)
-    return {"asin": asin, "margin": margin, "cost_price_wo_tax": cost_price_wo_tax}
+    return {"asin": asin, "margin": margin, "cost_price_wo_tax": cost_price_wo_tax, "etrade_asp": etrade_asp}
 
 
 @router.get("/margins/bulk")
