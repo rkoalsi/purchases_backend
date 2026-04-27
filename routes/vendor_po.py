@@ -234,7 +234,10 @@ def _enrich_items(
 
         mrp = float(product.get("rate") or 0)
         gst = _extract_gst(product.get("item_tax_preferences") or [])
-        mrp_wo_gst = round(mrp / (1 + gst / 100), 2) if (mrp and gst) else mrp
+        etrade_asp = etrade_asp_by_asin.get(asin)
+        # MRP w/o GST is based on eTrade ASP if available, else falls back to Zoho MRP
+        asp_base = etrade_asp if etrade_asp is not None else mrp
+        mrp_wo_gst = round(asp_base / (1 + gst / 100), 2) if (asp_base and gst) else asp_base
         margin = margins_by_asin.get(asin, None)
         # Use directly stored cost_price_wo_tax if available, else compute from margin
         if asin in cost_prices_by_asin:
@@ -604,7 +607,7 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
         formulas = {
             11: f"=IF(J{r}=\"\",\"\",I{r}-J{r})",                          # K  Supply - Accepted
             13: f"=IF(L{r}=\"\",\"\",J{r}-L{r})",                          # M  Mismatch QTY
-            17: f"=ROUND(N{r}/(1+P{r}),2)",                                 # Q  MRP w/o GST
+            17: f"=IF(O{r}=\"\",ROUND(N{r}/(1+P{r}),2),ROUND(O{r}/(1+P{r}),2))",  # Q  MRP w/o GST (eTrade ASP if set, else Zoho MRP)
             19: f"=IF(R{r}=\"\",\"\",ROUND(Q{r}*(1-R{r}),2))",             # S  Cost Price w/o Tax
             20: f"=IF(S{r}=\"\",\"\",ROUND(S{r}*I{r},2))",                 # T  Total Cost
             21: f"=IF(T{r}=\"\",\"\",ROUND(T{r}*(1+P{r}),2))",             # U  Total Cost w/ GST

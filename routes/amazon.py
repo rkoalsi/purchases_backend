@@ -4,7 +4,7 @@ from bson import ObjectId
 from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta, timezone
-from pymongo import ASCENDING, UpdateOne
+from pymongo import ASCENDING
 from pymongo.errors import PyMongoError
 from ..database import get_database, serialize_mongo_document
 import os
@@ -4387,38 +4387,19 @@ async def upload_vendor_central_returns(
 
     collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
 
-    EDITABLE_FIELDS = {"entry_in_zoho", "transfer_orders_inventory_adjustment", "sent_to_accounts_team"}
-    ops = []
-    for rec in normalized:
-        # Composite key: (return_id + asin) so multi-ASIN returns each get their own doc.
-        if rec.get("return_id") and rec.get("asin"):
-            filter_q = {"return_id": rec["return_id"], "asin": rec["asin"]}
-        elif rec.get("return_id"):
-            filter_q = {"return_id": rec["return_id"]}
-        elif rec.get("shipment_id") and rec.get("asin"):
-            filter_q = {"shipment_id": rec["shipment_id"], "asin": rec["asin"]}
-        else:
-            filter_q = {"shipment_id": rec["shipment_id"]}
-        data_fields = {k: v for k, v in rec.items() if k not in EDITABLE_FIELDS}
-        ops.append(UpdateOne(
-            filter_q,
-            {
-                "$set": data_fields,
-                "$setOnInsert": {
-                    "entry_in_zoho": None,
-                    "transfer_orders_inventory_adjustment": None,
-                    "sent_to_accounts_team": False,
-                },
-            },
-            upsert=True,
-        ))
+    def _delete_and_insert():
+        delete_result = collection.delete_many(
+            {"return_date": {"$gte": range_start, "$lte": range_end.replace(hour=23, minute=59, second=59)}}
+        )
+        for rec in normalized:
+            rec.setdefault("entry_in_zoho", None)
+            rec.setdefault("transfer_orders_inventory_adjustment", None)
+            rec.setdefault("sent_to_accounts_team", False)
+        insert_result = collection.insert_many(normalized, ordered=False) if normalized else None
+        return delete_result.deleted_count, len(insert_result.inserted_ids) if insert_result else 0
 
-    def _bulk():
-        result = collection.bulk_write(ops, ordered=False)
-        return result.upserted_count, result.modified_count
-
-    upserted_count, modified_count = await asyncio.to_thread(_bulk)
-    logger.info(f"VC returns upsert: {upserted_count} inserted, {modified_count} updated")
+    deleted_count, inserted_count = await asyncio.to_thread(_delete_and_insert)
+    logger.info(f"VC returns upload: {deleted_count} deleted, {inserted_count} inserted")
 
     return JSONResponse(
         status_code=status.HTTP_200_OK,
@@ -4428,7 +4409,7 @@ async def upload_vendor_central_returns(
                 "start": range_start.strftime("%Y-%m-%d"),
                 "end": range_end.strftime("%Y-%m-%d"),
             },
-            "existing_deleted": 0,
-            "records_inserted": upserted_count + modified_count,
+            "existing_deleted": deleted_count,
+            "records_inserted": inserted_count,
         },
     )
