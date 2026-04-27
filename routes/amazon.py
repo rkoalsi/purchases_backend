@@ -2068,6 +2068,81 @@ async def upload_sku_mapping(
         )
 
 
+MARGINS_COLLECTION = "vendor_margins"
+
+
+@router.post("/upload-etrade-margins")
+async def upload_etrade_margins(
+    file: UploadFile = File(...), database=Depends(get_database)
+):
+    """
+    Upload Etrade margin & ASP data from an Excel file.
+    Expected columns: ASIN, ASP, New Margin, Cost Price w/o Tax.
+    Upserts into vendor_margins collection by ASIN.
+    """
+    if not file.filename.endswith((".xlsx", ".xls")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid file type. Please upload an Excel file (.xlsx or .xls).",
+        )
+
+    try:
+        file_content = await file.read()
+        df = pd.read_excel(BytesIO(file_content), sheet_name=0)
+
+        required_cols = ["ASIN", "ASP", "New Margin", "Cost Price w/o Tax"]
+        missing = [col for col in required_cols if col not in df.columns]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing required columns: {', '.join(missing)}",
+            )
+
+        collection = database.get_collection(MARGINS_COLLECTION)
+        upserted = 0
+        skipped = 0
+
+        for _, row in df.iterrows():
+            asin = str(row["ASIN"]).strip() if pd.notna(row["ASIN"]) else None
+            if not asin:
+                skipped += 1
+                continue
+
+            update_fields = {}
+            if pd.notna(row["ASP"]):
+                update_fields["etrade_asp"] = float(row["ASP"])
+            if pd.notna(row["New Margin"]):
+                update_fields["margin"] = float(row["New Margin"])
+            if pd.notna(row["Cost Price w/o Tax"]):
+                update_fields["cost_price_wo_tax"] = float(row["Cost Price w/o Tax"])
+
+            if not update_fields:
+                skipped += 1
+                continue
+
+            collection.update_one(
+                {"asin": asin},
+                {"$set": {"asin": asin, **update_fields}},
+                upsert=True,
+            )
+            upserted += 1
+
+        return {
+            "message": f"Successfully upserted {upserted} margin records.",
+            "upserted": upserted,
+            "skipped": skipped,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.info(f"Error uploading etrade margins: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred processing the file: {e}",
+        )
+
+
 SHEET_ID      = "1tn_Lj3KR0zXY8B-8ZUkSznZgE4YzyjtAkcpdHzBCgt4"
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 
