@@ -91,11 +91,15 @@ def _enrich_items(
     has_stored_stock = items and "zoho_stock" in items[0]
     effective_use_stored = use_stored_stock and has_stored_stock
 
-    # T-2: 2 days before PO date, used for both zoho and current stock snapshots
+    # zoho_cutoff = PO date (Zoho data is available same-day)
+    # stock_cutoff = T-2 from PO date (Amazon vendor inventory has a 2-day lag)
+    zoho_cutoff: datetime | None = None
     stock_cutoff: datetime | None = None
     if po_date_str and not effective_use_stored:
         try:
-            stock_cutoff = datetime.strptime(po_date_str, "%Y-%m-%d") - timedelta(days=2)
+            po_date_dt = datetime.strptime(po_date_str, "%Y-%m-%d")
+            zoho_cutoff = po_date_dt
+            stock_cutoff = po_date_dt - timedelta(days=2)
         except ValueError:
             pass
 
@@ -158,8 +162,8 @@ def _enrich_items(
         })
         if zoho_item_ids:
             zoho_match: dict = {"zoho_item_id": {"$in": zoho_item_ids}}
-            if stock_cutoff:
-                zoho_match["date"] = {"$lte": stock_cutoff}
+            if zoho_cutoff:
+                zoho_match["date"] = {"$lte": zoho_cutoff}
             for doc in db[ZOHO_STOCK_COLLECTION].aggregate([
                 {"$match": zoho_match},
                 {"$sort": {"date": -1}},
@@ -174,7 +178,8 @@ def _enrich_items(
 
         inv_match: dict = {"asin": {"$in": asins}}
         if stock_cutoff:
-            inv_match["date"] = {"$lte": stock_cutoff}
+            # use $lt next-day midnight so records stored at any time on T-2 are included
+            inv_match["date"] = {"$lt": stock_cutoff + timedelta(days=1)}
         latest_inv = db[INVENTORY_COLLECTION].find_one(
             inv_match, {"date": 1}, sort=[("date", -1)]
         )
@@ -203,12 +208,12 @@ def _enrich_items(
         ]):
             open_po_by_asin[doc["_id"]] = int(doc["total"])
 
-        # Sales: 30 days ending at po_date (or now if no po_date provided)
+        # Sales: window ending at T-2 (stock_cutoff), spanning 31 days so start = T-2 - 31
         if stock_cutoff:
-            sales_end = datetime.strptime(po_date_str, "%Y-%m-%d")
+            sales_end = stock_cutoff
         else:
             sales_end = datetime.now()
-        sales_start = sales_end - timedelta(days=30)
+        sales_start = sales_end - timedelta(days=31)
         for doc in db[SALES_COLLECTION].aggregate([
             {"$match": {"asin": {"$in": asins}, "date": {"$gte": sales_start, "$lte": sales_end}}},
             {"$group": {"_id": "$asin", "total_units": {"$sum": "$orderedUnits"}}}
@@ -378,8 +383,8 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
             return None, None, None, None
         items = doc.get("items", [])
         po_status = doc.get("po_status", "pending")
-        # frozen statuses: serve stored snapshot; pending/processing: re-fetch live (T-2 stock, sales ending at po_date)
-        use_stored = po_status in FROZEN_STATUSES
+        # frozen statuses + processing: serve stored snapshot; pending: re-fetch live with T-2 cutoff
+        use_stored = po_status in FREEZE_ON_STATUS
         enriched, inv_date, zoho_date = _enrich_items(items, po_number, db, use_stored_stock=use_stored, po_date_str=doc.get("po_date"))
         return doc, enriched, inv_date, zoho_date
 
@@ -408,6 +413,8 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
 
 VALID_STATUSES = {"pending", "processing", "packed", "closed", "intransit", "delivered", "completed"}
 FROZEN_STATUSES = {"packed", "closed", "intransit", "delivered", "completed"}
+# Processing also triggers a freeze — stock/sales are locked when PO moves to processing
+FREEZE_ON_STATUS = FROZEN_STATUSES | {"processing"}
 
 
 @router.patch("/{po_number}/status")
@@ -422,8 +429,8 @@ async def update_po_status(po_number: str, po_status: str, db=Depends(get_databa
 
         update_fields: dict = {"po_status": po_status, "updated_at": datetime.now()}
 
-        # Transitioning into a frozen status: re-enrich with live data and store permanently
-        if po_status in FROZEN_STATUSES and doc.get("po_status") not in FROZEN_STATUSES:
+        # Transitioning into processing or a frozen status: re-enrich with live T-2 data and freeze permanently
+        if po_status in FREEZE_ON_STATUS and doc.get("po_status") not in FREEZE_ON_STATUS:
             enriched, inv_date, zoho_date = _enrich_items(
                 doc.get("items", []), po_number, db,
                 use_stored_stock=False, po_date_str=doc.get("po_date")
@@ -431,6 +438,8 @@ async def update_po_status(po_number: str, po_status: str, db=Depends(get_databa
             update_fields["items"] = enriched
             update_fields["inventory_date"] = inv_date
             update_fields["zoho_stock_date"] = zoho_date
+            if po_status == "processing":
+                update_fields["po_update_date"] = datetime.now().strftime("%Y-%m-%d")
 
         db[PO_COLLECTION].update_one({"po_number": po_number}, {"$set": update_fields})
         return po_status
@@ -460,6 +469,37 @@ async def update_item_accepted_qty(po_number: str, asin: str, accepted_qty: int,
     return {"po_number": po_number, "asin": asin, "accepted_qty": accepted_qty}
 
 
+@router.patch("/{po_number}/items/{asin}/etrade_unit_cost")
+async def update_item_etrade_unit_cost(po_number: str, asin: str, etrade_unit_cost: float, db=Depends(get_database)):
+    """Update the eTrade unit cost for a specific item and recompute diff."""
+    if etrade_unit_cost < 0:
+        raise HTTPException(status_code=400, detail="etrade_unit_cost must be >= 0")
+
+    def _update():
+        doc = db[PO_COLLECTION].find_one(
+            {"po_number": po_number, "items.asin": asin},
+            {"items.$": 1}
+        )
+        if not doc or not doc.get("items"):
+            return False, None
+        cost = doc["items"][0].get("cost_price_wo_tax")
+        new_diff = round(etrade_unit_cost - cost, 2) if cost is not None else None
+        db[PO_COLLECTION].update_one(
+            {"po_number": po_number, "items.asin": asin},
+            {"$set": {
+                "items.$.etrade_unit_cost": etrade_unit_cost,
+                "items.$.diff": new_diff,
+                "updated_at": datetime.now(),
+            }}
+        )
+        return True, new_diff
+
+    found, new_diff = await asyncio.to_thread(_update)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} / ASIN {asin} not found")
+    return {"po_number": po_number, "asin": asin, "etrade_unit_cost": etrade_unit_cost, "diff": new_diff}
+
+
 @router.get("/{po_number}/download")
 async def download_po_report(po_number: str, db=Depends(get_database)):
     """Download enriched PO report as Excel."""
@@ -468,7 +508,7 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
         if not doc:
             return None, None
         po_status = doc.get("po_status", "pending")
-        use_stored = po_status in FROZEN_STATUSES
+        use_stored = po_status in FREEZE_ON_STATUS
         enriched, _, __ = _enrich_items(doc.get("items", []), po_number, db, use_stored_stock=use_stored, po_date_str=doc.get("po_date"))
         return doc, enriched
 
