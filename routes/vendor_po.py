@@ -5,6 +5,7 @@ from pymongo import UpdateOne
 from ..database import get_database, serialize_mongo_document
 import asyncio
 import io
+import zipfile
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -211,12 +212,12 @@ def _enrich_items(
         ]):
             open_po_by_asin[doc["_id"]] = int(doc["total"])
 
-        # Sales: window ending at T-2 (stock_cutoff), spanning 31 days so start = T-2 - 31
+        # Sales: strictly 30 days ending at T-2 (stock_cutoff). Inclusive window: [T-2-29, T-2] = 30 days.
         if stock_cutoff:
             sales_end = stock_cutoff
         else:
             sales_end = datetime.now()
-        sales_start = sales_end - timedelta(days=31)
+        sales_start = sales_end - timedelta(days=29)
         for doc in db[SALES_COLLECTION].aggregate([
             {"$match": {"asin": {"$in": asins}, "date": {"$gte": sales_start, "$lte": sales_end}}},
             {"$group": {"_id": "$asin", "total_units": {"$sum": "$orderedUnits"}}}
@@ -271,7 +272,7 @@ def _enrich_items(
             if total_qty_tmp == 0:
                 supply_qty = item["requested_qty"]
             else:
-                supply_qty = int(round(max(0, min(float(total_qty_tmp), float(max_allowed_tmp))), 0))
+                supply_qty = int(round(max(0, min(float(item["requested_qty"]), float(max_allowed_tmp))), 0))
 
         total_cost = round(cost_price_wo_tax * supply_qty, 2) if cost_price_wo_tax is not None else None
         total_cost_gst = round(total_cost * (1 + gst / 100), 2) if (total_cost is not None and gst) else total_cost
@@ -335,7 +336,34 @@ async def upload_vendor_po(
 
         existing = db[PO_COLLECTION].find_one({"po_number": po_number})
         if existing:
-            raise ValueError(f"PO {po_number} already exists")
+            current_status = existing.get("po_status", "pending")
+            if current_status not in {"pending", "processing", "packed", "closed"}:
+                raise ValueError(
+                    f"PO {po_number} already exists with status '{current_status}' which cannot be overwritten"
+                )
+            # Re-enrich with fresh data, then preserve accepted_qty/received_qty per item
+            enriched_items, inventory_date, zoho_stock_date = _enrich_items(
+                items, po_number, db, po_date_str=po_date
+            )
+            existing_by_asin = {it["asin"]: it for it in existing.get("items", [])}
+            for item in enriched_items:
+                prev = existing_by_asin.get(item["asin"], {})
+                item["accepted_qty"] = prev.get("accepted_qty", item.get("accepted_qty", 0))
+                item["received_qty"] = prev.get("received_qty", item.get("received_qty"))
+            db[PO_COLLECTION].update_one(
+                {"po_number": po_number},
+                {"$set": {
+                    "vendor": vendor,
+                    "po_date": po_date,
+                    "po_status": current_status,
+                    "inventory_date": inventory_date,
+                    "zoho_stock_date": zoho_stock_date,
+                    "item_count": len(items),
+                    "updated_at": datetime.now(),
+                    "items": enriched_items,
+                }}
+            )
+            return po_number, enriched_items, inventory_date, zoho_stock_date
 
         enriched_items, inventory_date, zoho_stock_date = _enrich_items(items, po_number, db, po_date_str=po_date)
 
@@ -369,13 +397,23 @@ async def upload_vendor_po(
 
 @router.get("/")
 async def list_vendor_pos(db=Depends(get_database)):
-    """List all purchase orders."""
+    """List all purchase orders with total requested/accepted/received qty sums."""
     def _fetch():
-        return list(db[PO_COLLECTION].find(
-            {},
-            {"po_number": 1, "vendor": 1, "po_date": 1, "po_status": 1,
-             "item_count": 1, "created_at": 1, "_id": 0}
-        ).sort("po_date", -1))
+        pipeline = [
+            {"$addFields": {
+                "total_requested_qty": {"$sum": "$items.requested_qty"},
+                "total_accepted_qty": {"$sum": "$items.accepted_qty"},
+                "total_received_qty": {"$ifNull": ["$received_qty", {"$sum": "$items.received_qty"}]},
+            }},
+            {"$project": {
+                "po_number": 1, "vendor": 1, "po_date": 1, "po_status": 1,
+                "item_count": 1, "created_at": 1,
+                "total_requested_qty": 1, "total_accepted_qty": 1, "total_received_qty": 1,
+                "_id": 0,
+            }},
+            {"$sort": {"po_date": -1}},
+        ]
+        return list(db[PO_COLLECTION].aggregate(pipeline))
 
     pos = await asyncio.to_thread(_fetch)
     return serialize_mongo_document(pos)
@@ -476,6 +514,44 @@ async def update_item_accepted_qty(po_number: str, asin: str, accepted_qty: int,
     return {"po_number": po_number, "asin": asin, "accepted_qty": accepted_qty}
 
 
+@router.patch("/{po_number}/items/{asin}/received_qty")
+async def update_item_received_qty(po_number: str, asin: str, received_qty: int, db=Depends(get_database)):
+    """Update the received quantity for a specific item in a PO."""
+    if received_qty < 0:
+        raise HTTPException(status_code=400, detail="received_qty must be >= 0")
+
+    def _update():
+        result = db[PO_COLLECTION].update_one(
+            {"po_number": po_number, "items.asin": asin},
+            {"$set": {"items.$.received_qty": received_qty, "updated_at": datetime.now()}}
+        )
+        return result.matched_count
+
+    matched = await asyncio.to_thread(_update)
+    if not matched:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} / ASIN {asin} not found")
+    return {"po_number": po_number, "asin": asin, "received_qty": received_qty}
+
+
+@router.patch("/{po_number}/received_qty")
+async def update_po_received_qty(po_number: str, received_qty: int, db=Depends(get_database)):
+    """Set total received quantity at the PO level (overrides per-item sum in list view)."""
+    if received_qty < 0:
+        raise HTTPException(status_code=400, detail="received_qty must be >= 0")
+
+    def _update():
+        result = db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {"$set": {"received_qty": received_qty, "updated_at": datetime.now()}}
+        )
+        return result.matched_count
+
+    matched = await asyncio.to_thread(_update)
+    if not matched:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    return {"po_number": po_number, "received_qty": received_qty}
+
+
 @router.patch("/{po_number}/items/{asin}/etrade_unit_cost")
 async def update_item_etrade_unit_cost(po_number: str, asin: str, etrade_unit_cost: float, db=Depends(get_database)):
     """Update the eTrade unit cost for a specific item and recompute diff."""
@@ -507,23 +583,8 @@ async def update_item_etrade_unit_cost(po_number: str, asin: str, etrade_unit_co
     return {"po_number": po_number, "asin": asin, "etrade_unit_cost": etrade_unit_cost, "diff": new_diff}
 
 
-@router.get("/{po_number}/download")
-async def download_po_report(po_number: str, db=Depends(get_database)):
-    """Download enriched PO report as Excel."""
-    def _build():
-        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
-        if not doc:
-            return None, None
-        po_status = doc.get("po_status", "pending")
-        use_stored = po_status in FREEZE_ON_STATUS
-        enriched, _, __ = _enrich_items(doc.get("items", []), po_number, db, use_stored_stock=use_stored, po_date_str=doc.get("po_date"))
-        return doc, enriched
-
-    result = await asyncio.to_thread(_build)
-    doc, enriched = result
-    if doc is None:
-        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
-
+def _build_po_excel(doc: dict, enriched: list) -> bytes:
+    """Build PO report Excel workbook and return bytes."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "PO Report"
@@ -564,15 +625,16 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
     num_format = "#,##0.00"
     int_format = "#,##0"
 
+    po_number = doc["po_number"]
     po_date_str = doc["po_date"]
     for row_idx, item in enumerate(enriched, 2):
         r = row_idx
-        supply = item.get("supply_qty") or item["requested_qty"]
         accepted = item.get("accepted_qty")
         received = item.get("received_qty")
 
         # Static values — sourced from PO / DB
         # Col 15 = eTrade ASP inserted after Zoho MRP; all cols from old-15 shift +1
+        # Col 9 (I = Supply Qty) is a formula =AI{r} so it stays in sync with Final Supply Qty
         static = {
             1:  po_date_str,                        # A  PO Date
             2:  po_number,                          # B  PO
@@ -582,7 +644,6 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
             6:  item["model_number"],               # F  Model Number
             7:  item["title"],                      # G  Title
             8:  item["requested_qty"],              # H  Requested Qty
-            9:  supply,                             # I  Supply Qty
             10: accepted if accepted is not None else "",   # J  Accepted Qty
             12: received if received is not None else "",   # L  Received QTY
             14: item["zoho_mrp"],                   # N  Zoho MRP
@@ -605,6 +666,7 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
         # AA=Current Stock, AB=Open PO, AC=Total Qty, AD=Sales, AE=ADS, AF=Coverage
         # AG=Target Stock, AH=Max Allowed, AI=Final Supply
         formulas = {
+            9:  f"=AI{r}",                                                  # I  Supply Qty = Final Supply Qty
             11: f"=IF(J{r}=\"\",\"\",I{r}-J{r})",                          # K  Supply - Accepted
             13: f"=IF(L{r}=\"\",\"\",J{r}-L{r})",                          # M  Mismatch QTY
             17: f"=IF(O{r}=\"\",ROUND(N{r}/(1+P{r}),2),ROUND(O{r}/(1+P{r}),2))",  # Q  MRP w/o GST (eTrade ASP if set, else Zoho MRP)
@@ -616,7 +678,7 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
             31: f"=ROUND(AD{r}/30,2)",                                      # AE ADS
             33: f"=ROUND(AE{r}*AF{r},0)",                                   # AG Target Stock
             34: f"=AG{r}-AC{r}",                                            # AH Max Allowed Qty
-            35: f"=IF(AC{r}=0,H{r},ROUND(MAX(0,MIN(AC{r},AH{r})),0))",     # AI Final Supply Qty
+            35: f"=IF(AC{r}=0,H{r},ROUND(MAX(0,MIN(H{r},AH{r})),0))",      # AI Final Supply Qty
         }
 
         for col_idx in range(1, 36):
@@ -636,7 +698,7 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
                 cell.number_format = pct_format
             elif col_idx == 24:                           # Diff
                 cell.number_format = num_format
-            elif col_idx in (8, 9, 10, 12, 25, 27, 28, 29, 30, 32, 33, 34, 35):
+            elif col_idx in (8, 10, 12, 25, 27, 28, 29, 30, 32, 33, 34, 35):
                 cell.number_format = int_format
 
     for col_idx in range(1, len(headers) + 1):
@@ -646,13 +708,68 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
 
     buf = io.BytesIO()
     wb.save(buf)
-    buf.seek(0)
+    return buf.getvalue()
 
+
+@router.get("/{po_number}/download")
+async def download_po_report(po_number: str, db=Depends(get_database)):
+    """Download enriched PO report as Excel."""
+    def _build():
+        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
+        if not doc:
+            return None, None
+        po_status = doc.get("po_status", "pending")
+        use_stored = po_status in FREEZE_ON_STATUS
+        enriched, _, __ = _enrich_items(doc.get("items", []), po_number, db, use_stored_stock=use_stored, po_date_str=doc.get("po_date"))
+        return doc, enriched
+
+    doc, enriched = await asyncio.to_thread(_build)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+
+    excel_bytes = _build_po_excel(doc, enriched)
+    po_date_str = doc.get("po_date", "unknown")
     filename = f"PO_Report_{po_number}_{po_date_str}.xlsx"
     return StreamingResponse(
-        buf,
+        io.BytesIO(excel_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/bulk_download")
+async def bulk_download_po_reports(po_numbers: list[str], db=Depends(get_database)):
+    """Download multiple PO reports as a single zip file."""
+    if not po_numbers:
+        raise HTTPException(status_code=400, detail="No PO numbers provided")
+
+    def _build_all():
+        results = []
+        for pn in po_numbers:
+            doc = db[PO_COLLECTION].find_one({"po_number": pn})
+            if not doc:
+                continue
+            po_status = doc.get("po_status", "pending")
+            use_stored = po_status in FREEZE_ON_STATUS
+            enriched, _, __ = _enrich_items(doc.get("items", []), pn, db, use_stored_stock=use_stored, po_date_str=doc.get("po_date"))
+            results.append((pn, doc.get("po_date", "unknown"), doc, enriched))
+        return results
+
+    results = await asyncio.to_thread(_build_all)
+    if not results:
+        raise HTTPException(status_code=404, detail="No matching POs found")
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for pn, po_date_str, doc, enriched in results:
+            excel_bytes = _build_po_excel(doc, enriched)
+            zf.writestr(f"PO_Report_{pn}_{po_date_str}.xlsx", excel_bytes)
+    zip_buf.seek(0)
+
+    return StreamingResponse(
+        zip_buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="PO_Reports.zip"'},
     )
 
 
@@ -700,6 +817,106 @@ async def upsert_margin(
 
     await asyncio.to_thread(_upsert)
     return {"asin": asin, "margin": margin, "cost_price_wo_tax": cost_price_wo_tax, "etrade_asp": etrade_asp}
+
+
+@router.post("/bulk_update")
+async def bulk_update_vendor_pos(
+    file: UploadFile = File(...),
+    db=Depends(get_database),
+):
+    """Bulk-update accepted_qty, received_qty, and po_status for existing POs.
+
+    Expected Excel columns (header row required):
+      A: PO Number | B: ASIN | C: Accepted Qty | D: Received Qty | E: PO Status
+
+    Only POs with status pending/processing/packed/closed will be updated.
+    PO Status in column E is optional per row; the first non-empty value wins for each PO.
+    """
+    file_bytes = await file.read()
+
+    def _process():
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if len(rows) < 2:
+            raise ValueError("File has no data rows")
+
+        # Group rows by PO number
+        updates: dict = {}
+        for row in rows[1:]:
+            if not row[0]:
+                continue
+            po_num = str(row[0]).strip()
+            asin = str(row[1]).strip() if row[1] else ""
+            accepted_qty = int(row[2]) if row[2] is not None else None
+            received_qty = int(row[3]) if row[3] is not None else None
+            po_status_raw = str(row[4]).strip().lower() if len(row) > 4 and row[4] else None
+
+            if po_num not in updates:
+                updates[po_num] = {"po_status": po_status_raw, "items": {}}
+            elif po_status_raw and updates[po_num]["po_status"] is None:
+                updates[po_num]["po_status"] = po_status_raw
+
+            if asin:
+                updates[po_num]["items"][asin] = {
+                    "accepted_qty": accepted_qty,
+                    "received_qty": received_qty,
+                }
+
+        updatable_statuses = {"pending", "processing", "packed", "closed"}
+        results = []
+
+        for po_num, update_data in updates.items():
+            doc = db[PO_COLLECTION].find_one({"po_number": po_num})
+            if not doc:
+                results.append({"po_number": po_num, "status": "not_found"})
+                continue
+
+            current_status = doc.get("po_status", "pending")
+            if current_status not in updatable_statuses:
+                results.append({
+                    "po_number": po_num,
+                    "status": "skipped",
+                    "reason": f"status '{current_status}' is not updatable",
+                })
+                continue
+
+            update_fields: dict = {"updated_at": datetime.now()}
+
+            new_status = update_data.get("po_status")
+            if new_status and new_status in VALID_STATUSES:
+                update_fields["po_status"] = new_status
+
+            items = doc.get("items", [])
+            item_changes = 0
+            for item in items:
+                asin = item["asin"]
+                if asin in update_data["items"]:
+                    item_update = update_data["items"][asin]
+                    if item_update["accepted_qty"] is not None:
+                        item["accepted_qty"] = item_update["accepted_qty"]
+                        item_changes += 1
+                    if item_update["received_qty"] is not None:
+                        item["received_qty"] = item_update["received_qty"]
+                        item_changes += 1
+
+            if item_changes:
+                update_fields["items"] = items
+
+            if len(update_fields) > 1:  # more than just updated_at
+                db[PO_COLLECTION].update_one({"po_number": po_num}, {"$set": update_fields})
+                results.append({"po_number": po_num, "status": "updated", "items_changed": item_changes})
+            else:
+                results.append({"po_number": po_num, "status": "no_changes"})
+
+        return results
+
+    try:
+        results = await asyncio.to_thread(_process)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return JSONResponse(status_code=200, content={"results": results})
 
 
 @router.get("/margins/bulk")
