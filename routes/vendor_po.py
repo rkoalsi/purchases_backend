@@ -258,7 +258,8 @@ def _enrich_items(
             current_stock = item.get("current_stock", 0)
             open_po = item.get("open_po", 0)
             last_30_sales = item.get("last_30_sales", 0)
-            supply_qty = item.get("supply_qty") or item["requested_qty"]
+            sv = item.get("supply_qty")
+            supply_qty = sv if sv is not None else item["requested_qty"]
         else:
             zoho_stock = zoho_latest.get(zoho_item_id, 0) if zoho_item_id else 0
             current_stock = current_stock_by_asin.get(asin, 0)
