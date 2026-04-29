@@ -683,7 +683,8 @@ async def refresh_amazon_token():
 @router.post("/report/{report_id}/insert")
 async def fetch_and_insert_report(report_id: str, db=Depends(get_database)):
     """
-    Fetch a completed report by ID and insert its salesByAsin records into the sales collection.
+    Fetch a completed report by ID and insert its records into the appropriate collection.
+    Supports GET_VENDOR_SALES_REPORT (salesByAsin) and GET_VENDOR_INVENTORY_REPORT (inventoryByAsin).
     """
     logger.info(f"📋 Fetching report {report_id} for insertion")
 
@@ -705,22 +706,33 @@ async def fetch_and_insert_report(report_id: str, db=Depends(get_database)):
         raise HTTPException(status_code=500, detail="Downloaded report data is empty")
 
     parsed = json.loads(report_data)
-    sales_by_asin = parsed.get("salesByAsin", [])
-
-    if not sales_by_asin:
-        return {"reportId": report_id, "inserted": 0, "detail": "No salesByAsin data in report"}
-
     spec = parsed.get("reportSpecification", {})
+    report_type = spec.get("reportType", "")
+
+    if report_type == "GET_VENDOR_INVENTORY_REPORT":
+        data_key = "inventoryByAsin"
+        collection_name = INVENTORY_COLLECTION
+        label = "inventory"
+    else:
+        data_key = "salesByAsin"
+        collection_name = SALES_COLLECTION
+        label = "sales"
+
+    records = parsed.get(data_key, [])
+
+    if not records:
+        return {"reportId": report_id, "inserted": 0, "detail": f"No {data_key} data in report"}
+
     date_str = spec.get("dataStartTime", "")
     date_obj = datetime.strptime(date_str, "%Y-%m-%d") if date_str else datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     current_time = datetime.now()
 
-    collection = db[SALES_COLLECTION]
+    collection = db[collection_name]
     existing_asins = set(collection.distinct("asin", {"date": date_obj}))
-    logger.info(f"📋 Found {len(existing_asins)} existing ASINs for {date_str}")
+    logger.info(f"📋 Found {len(existing_asins)} existing {label} ASINs for {date_str}")
 
     new_records = []
-    for asin_data in sales_by_asin:
+    for asin_data in records:
         if asin_data.get("asin") not in existing_asins:
             asin_data["date"] = date_obj
             asin_data["created_at"] = current_time
@@ -729,16 +741,17 @@ async def fetch_and_insert_report(report_id: str, db=Depends(get_database)):
     if new_records:
         result = collection.insert_many(new_records, ordered=False)
         inserted = len(result.inserted_ids)
-        logger.info(f"✅ Inserted {inserted} records for {date_str}")
+        logger.info(f"✅ Inserted {inserted} {label} records for {date_str}")
     else:
         inserted = 0
-        logger.info(f"ℹ️ No new records to insert for {date_str}")
+        logger.info(f"ℹ️ No new {label} records to insert for {date_str}")
 
     return {
         "reportId": report_id,
+        "reportType": report_type or "GET_VENDOR_SALES_REPORT",
         "date": date_str,
-        "total_in_report": len(sales_by_asin),
-        "skipped_existing": len(sales_by_asin) - len(new_records),
+        "total_in_report": len(records),
+        "skipped_existing": len(records) - len(new_records),
         "inserted": inserted,
     }
 
