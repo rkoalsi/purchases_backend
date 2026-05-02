@@ -137,7 +137,7 @@ def get_products(
 
         # Search functionality
         if search:
-            search_regex = {"$regex": search, "$options": "i"}
+            search_regex = {"$regex": re.escape(search), "$options": "i"}
             query_filter["$or"] = [
                 {"name": search_regex},
                 {"sku": search_regex},
@@ -1355,6 +1355,9 @@ async def fetch_stock_data_for_items_batch(
         overall_start = min(p[0] for p in periods)
         overall_end = max(p[1] for p in periods)
 
+        # zoho_item_id is always stored as string (backfill + cron both use str())
+        str_item_ids = [str(iid) for iid in item_ids]
+
         # Build period_index switch branches using datetime comparison
         period_branches = []
         for i, (p_start, p_end) in enumerate(periods):
@@ -1366,7 +1369,7 @@ async def fetch_stock_data_for_items_batch(
         pipeline = [
             {
                 "$match": {
-                    "zoho_item_id": {"$in": item_ids},
+                    "zoho_item_id": {"$in": str_item_ids},
                     "date": {"$gte": overall_start, "$lte": overall_end},
                 }
             },
@@ -1463,7 +1466,14 @@ async def fetch_zoho_lookback_sales_batch(
         overall_start_str = overall_start.strftime("%Y-%m-%d")
         overall_end_str = overall_end.strftime("%Y-%m-%d")
 
-        target_ids_set = [str(iid) for iid in target_item_ids]
+        # Include both string and int forms — invoices may store item_id as either type
+        target_ids_set = []
+        for iid in target_item_ids:
+            target_ids_set.append(str(iid))
+            try:
+                target_ids_set.append(int(iid))
+            except (ValueError, TypeError):
+                pass
 
         # Build custom pipeline that carries doc_date through composite expansion
         # so we can bucket results by period_index

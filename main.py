@@ -23,6 +23,7 @@ from .routes.amazon_listing_validation import router as amazon_listing_validatio
 from .routes.bb_code_generator import router as bb_code_generator_router
 from .routes.vendor_po import router as vendor_po_router
 from .routes.inventory_aging import router as inventory_aging_router
+from .routes.vendor import router as vendor_router
 from .database import connect_db, close_db
 from contextlib import asynccontextmanager
 from .helpers.scheduler import scheduler, api_scheduler, setup_scheduler
@@ -122,6 +123,7 @@ app.include_router(amazon_listing_validation_router, prefix="/amazon_listing_val
 app.include_router(bb_code_generator_router, prefix="/bb_code_generator", tags=["bb_code_generator"])
 app.include_router(vendor_po_router, prefix="/vendor_po", tags=["vendor_po"])
 app.include_router(inventory_aging_router, prefix="/inventory_aging", tags=["inventory_aging"])
+app.include_router(vendor_router, prefix="/vendors", tags=["vendors"])
 
 
 # --- Protected Swagger / ReDoc / OpenAPI schema ---

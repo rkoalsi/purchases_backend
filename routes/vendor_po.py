@@ -1,11 +1,11 @@
-from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta
-from pymongo import UpdateOne
 from ..database import get_database, serialize_mongo_document
 import asyncio
 import io
 import zipfile
+from decimal import Decimal, ROUND_HALF_UP
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -266,22 +266,25 @@ def _enrich_items(
             open_po = open_po_by_asin.get(asin, 0)
             last_30_sales = sales_by_asin.get(asin, 0)
             # compute final_supply_qty and use it as supply_qty
+            # Use round-half-up (math.floor(x+0.5)) to match Excel's ROUND() behaviour.
+            # Python's built-in round() uses banker's rounding (round-half-to-even) which
+            # diverges from Excel on .5 boundaries (e.g. 10.5 → Python=10, Excel=11).
             total_qty_tmp = current_stock + open_po
             ads_tmp = round(last_30_sales / 30, 2)
-            target_tmp = round(ads_tmp * COVERAGE_DAYS, 0)
-            max_allowed_tmp = round(target_tmp - total_qty_tmp, 0)
+            target_tmp = int((Decimal(str(ads_tmp)) * Decimal(COVERAGE_DAYS)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+            max_allowed_tmp = target_tmp - total_qty_tmp
             if total_qty_tmp == 0:
                 supply_qty = item["requested_qty"]
             else:
-                supply_qty = int(round(max(0, min(float(item["requested_qty"]), float(max_allowed_tmp))), 0))
+                supply_qty = max(0, min(int(item["requested_qty"]), int(max_allowed_tmp)))
 
         total_cost = round(cost_price_wo_tax * supply_qty, 2) if cost_price_wo_tax is not None else None
         total_cost_gst = round(total_cost * (1 + gst / 100), 2) if (total_cost is not None and gst) else total_cost
 
         total_qty = current_stock + open_po
         ads = round(last_30_sales / 30, 2)
-        target_stock = round(ads * COVERAGE_DAYS, 0)
-        max_allowed_qty = round(target_stock - total_qty, 0)
+        target_stock = int((Decimal(str(ads)) * Decimal(COVERAGE_DAYS)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+        max_allowed_qty = target_stock - total_qty
 
         enriched.append({
             **item,
