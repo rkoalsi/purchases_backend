@@ -28,6 +28,7 @@ ZOHO_BOOKS_BASE = "https://books.zoho.com/api/v3"
 
 PRODUCTS_COLLECTION = "products"
 PURCHASE_ORDERS_COLLECTION = "purchase_orders"
+DRAFT_PURCHASE_ORDERS_COLLECTION = "draft_purchase_orders"
 
 
 def _get_zoho_token() -> str:
@@ -73,6 +74,18 @@ class CreateDraftPORequest(BaseModel):
     contact_id: str
     date: str
     items: List[dict]
+    notes: Optional[str] = ""
+    reference_number: Optional[str] = ""
+    purchaseorder_number: Optional[str] = ""
+    description: Optional[str] = ""
+    draft_id: Optional[str] = None
+
+
+class SaveDraftOrderRequest(BaseModel):
+    description: Optional[str] = ""
+    items: List[dict]
+    detected_vendor: Optional[dict] = None
+    date: str
     notes: Optional[str] = ""
     reference_number: Optional[str] = ""
     purchaseorder_number: Optional[str] = ""
@@ -230,7 +243,7 @@ async def validate_draft_order(
 
         validated = []
         missing = []
-        brand_counts: dict[str, int] = {}
+        first_brand: str | None = None
         for it in items:
             product = None
             if it["bb_code"] and it["bb_code"] in products_by_bb:
@@ -240,8 +253,8 @@ async def validate_draft_order(
 
             if product:
                 brand = product.get("brand") or ""
-                if brand:
-                    brand_counts[brand] = brand_counts.get(brand, 0) + 1
+                if brand and first_brand is None:
+                    first_brand = brand
                 validated.append(
                     {
                         **it,
@@ -260,18 +273,17 @@ async def validate_draft_order(
                     }
                 )
 
-        # Detect vendor from the dominant brand
+        # Detect vendor from the first product's brand
         detected_vendor = None
-        if brand_counts:
-            top_brand = max(brand_counts, key=lambda b: brand_counts[b])
+        if first_brand:
             brand_doc = db.get_collection("brands").find_one(
-                {"name": {"$regex": f"^{re.escape(top_brand)}$", "$options": "i"}},
+                {"name": {"$regex": f"^{re.escape(first_brand)}$", "$options": "i"}},
                 {"vendor_id": 1},
             )
             if brand_doc and brand_doc.get("vendor_id"):
                 vendor_doc = db.get_collection("vendors").find_one(
-                    {"vendor_id": brand_doc["vendor_id"]},
-                    {"vendor_id": 1, "contact_name": 1, "currency_code": 1},
+                    {"contact_id": brand_doc["vendor_id"]},
+                    {"vendor_id": 1, "contact_id": 1, "contact_name": 1, "currency_code": 1},
                 )
                 if vendor_doc:
                     detected_vendor = {
@@ -307,6 +319,59 @@ async def validate_draft_order(
             "detected_vendor": detected_vendor,
         },
     )
+
+
+@router.get("/draft_orders")
+def list_draft_orders(db=Depends(get_database)):
+    """List all saved draft purchase orders (excluding items for brevity)."""
+    col = db.get_collection(DRAFT_PURCHASE_ORDERS_COLLECTION)
+    docs = list(col.find({}, {"items": 1, "description": 1, "detected_vendor": 1, "date": 1, "item_count": 1, "po_created": 1, "po_number": 1, "po_status": 1, "notes": 1, "reference_number": 1, "purchaseorder_number": 1, "created_at": 1}).sort("created_at", -1).limit(100))
+    return serialize_mongo_document(docs)
+
+
+@router.post("/draft_orders/save")
+async def save_draft_order(body: SaveDraftOrderRequest, db=Depends(get_database)):
+    """Persist a validated draft order to the draft_purchase_orders collection."""
+    def _insert():
+        col = db.get_collection(DRAFT_PURCHASE_ORDERS_COLLECTION)
+        doc = {
+            "description": body.description or "",
+            "items": body.items,
+            "detected_vendor": body.detected_vendor,
+            "date": body.date,
+            "item_count": len(body.items),
+            "po_created": False,
+            "notes": body.notes or "",
+            "reference_number": body.reference_number or "",
+            "purchaseorder_number": body.purchaseorder_number or "",
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+        }
+        result = col.insert_one(doc)
+        doc["_id"] = result.inserted_id
+        return doc
+
+    doc = await asyncio.to_thread(_insert)
+    return JSONResponse(status_code=201, content=serialize_mongo_document(doc))
+
+
+@router.delete("/draft_orders/{draft_id}")
+async def delete_draft_order(draft_id: str, db=Depends(get_database)):
+    """Delete a saved draft order by its MongoDB _id."""
+    from bson import ObjectId
+    try:
+        oid = ObjectId(draft_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid draft_id")
+
+    def _delete():
+        col = db.get_collection(DRAFT_PURCHASE_ORDERS_COLLECTION)
+        return col.delete_one({"_id": oid})
+
+    result = await asyncio.to_thread(_delete)
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Draft order not found")
+    return {"deleted": True}
 
 
 @router.post("/draft_orders/create_po")
@@ -411,9 +476,31 @@ async def create_draft_order_po(
             raise ValueError(f"Zoho error: {data.get('message', 'Unknown error')}")
 
         po_doc = data["purchaseorder"]
-        po_doc["created_at"] = datetime.now()
-        po_doc["updated_at"] = datetime.now()
-        db[PURCHASE_ORDERS_COLLECTION].insert_one(po_doc)
+        now = datetime.now()
+        db[PURCHASE_ORDERS_COLLECTION].update_one(
+            {"purchaseorder_id": po_doc.get("purchaseorder_id")},
+            {
+                "$set": {**po_doc, "updated_at": now},
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+
+        if body.draft_id:
+            try:
+                from bson import ObjectId
+                db.get_collection(DRAFT_PURCHASE_ORDERS_COLLECTION).update_one(
+                    {"_id": ObjectId(body.draft_id)},
+                    {"$set": {
+                        "po_created": True,
+                        "po_number": po_doc.get("purchaseorder_number"),
+                        "po_status": po_doc.get("status"),
+                        "updated_at": now,
+                    }},
+                )
+            except Exception:
+                pass
+
         return po_doc
 
     try:
