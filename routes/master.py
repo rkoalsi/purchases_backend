@@ -4101,14 +4101,24 @@ def import_product_logistics(
     db=Depends(get_database),
 ):
     """
-    Import Item Status (col A), Stock in Transit 1, Stock in Transit 2, CBM, and Case Pack
-    from the PSR Google Sheet Master tab, resolved by column header name.
-    Maps BBCode (col B) to cf_sku_code. purchase_status, cbm, case_pack, and transit values
-    are applied to ALL products sharing the same sku_code via update_many.
+    Import Status (Remark col), CBM, and Case Pack from two sheets in the product logistics
+    Google Sheet: "Master" and "Discontinued Items". Row 0 is skipped (not headers); headers
+    are on row 1. SKU matched via "SKU Code (Final)" column against products.cf_sku_code.
+
+    Master sheet:       Col A = Remark/Status, Col DG (110) = CBM, Col DH (111) = Case Pack
+    Discontinued sheet: Col A = Remark/Status, Col CY (102) = CBM, Col CZ (103) = Case Pack
     """
     import os
     import gspread
     from google.oauth2.service_account import Credentials
+
+    SHEET_KEY = "1tn_Lj3KR0zXY8B-8ZUkSznZgE4YzyjtAkcpdHzBCgt4"
+
+    # Sheet name -> (cbm_col_index, case_pack_col_index)
+    SHEET_CONFIG = {
+        "Master": (110, 111),
+        "Discontinued Items": (102, 103),
+    }
 
     def _map_status(raw: str) -> str:
         s = raw.strip().lower()
@@ -4120,6 +4130,12 @@ def import_product_logistics(
             return "discontinued until stock lasts"
         return ""
 
+    def _to_float(val: str) -> float:
+        try:
+            return float(val) if val else 0
+        except (ValueError, TypeError):
+            return 0
+
     try:
         backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         creds_path = os.path.join(backend_dir, "creds.json")
@@ -4128,76 +4144,67 @@ def import_product_logistics(
         credentials = Credentials.from_service_account_file(creds_path, scopes=scopes)
         gc = gspread.authorize(credentials)
 
-        sh = gc.open_by_key("1xjPO-M8MScP4gLVI04QCdz1594DIkXh2_odAxtKlMWY")
-        ws = sh.worksheet("Master")
-
-        # Fetch all rows at once and resolve columns by header name
-        all_rows = ws.get_all_values()
-
-        if not all_rows:
-            return JSONResponse(status_code=200, content={"message": "Sheet is empty", "updated": 0, "skipped": 0})
-
-        header = [h.strip() for h in all_rows[0]]
-
-        def _col(name: str) -> int:
-            try:
-                return header.index(name)
-            except ValueError:
-                return -1
-
-        sit1_idx = _col("Stock in Transit 1")
-        sit2_idx = _col("Stock in Transit 2")
-        cbm_idx = _col("CBM")
-        case_pack_idx = _col("Case Pack")
-
+        sh = gc.open_by_key(SHEET_KEY)
         products_collection = db.get_collection("products")
+
         updated_count = 0
         skipped_count = 0
 
-        for row in all_rows[1:]:  # skip header
-            if len(row) < 2:
+        for sheet_name, (cbm_col, case_pack_col) in SHEET_CONFIG.items():
+            ws = sh.worksheet(sheet_name)
+            all_rows = ws.get_all_values()
+
+            # Row 0 is skipped; row 1 is the header row
+            if len(all_rows) < 2:
                 continue
 
-            bbcode = row[1].strip() if len(row) > 1 else ""
-            if not bbcode:
-                continue
+            header = [h.strip() for h in all_rows[1]]
 
-            raw_status = row[0].strip() if len(row) > 0 else ""
-            sit1_raw = row[sit1_idx] if sit1_idx >= 0 and len(row) > sit1_idx else ""
-            sit2_raw = row[sit2_idx] if sit2_idx >= 0 and len(row) > sit2_idx else ""
-            cbm_raw = row[cbm_idx] if cbm_idx >= 0 and len(row) > cbm_idx else ""
-            case_pack_raw = row[case_pack_idx] if case_pack_idx >= 0 and len(row) > case_pack_idx else ""
-
-            def _to_float(val: str) -> float:
+            def _col(name: str) -> int:
                 try:
-                    return float(val) if val else 0
-                except (ValueError, TypeError):
-                    return 0
+                    return header.index(name)
+                except ValueError:
+                    return -1
 
-            update_doc: dict = {
-                "cbm": _to_float(cbm_raw),
-                "case_pack": _to_float(case_pack_raw),
-                "stock_in_transit_1": _to_float(sit1_raw),
-                "stock_in_transit_2": _to_float(sit2_raw),
-            }
-            mapped_status = _map_status(raw_status)
-            if mapped_status:
-                update_doc["purchase_status"] = mapped_status
+            sku_idx = _col("SKU Code (Final)")
+            if sku_idx == -1:
+                logger.warning(f"'SKU Code (Final)' column not found in sheet '{sheet_name}'")
+                continue
 
-            result = products_collection.update_many(
-                {"cf_sku_code": bbcode},
-                {"$set": update_doc},
-            )
+            for row in all_rows[2:]:  # skip row 0 (filler) and row 1 (header)
+                if len(row) <= sku_idx:
+                    continue
 
-            if result.modified_count > 0 or result.matched_count > 0:
-                updated_count += 1
-            else:
-                skipped_count += 1
+                sku_code = row[sku_idx].strip()
+                if not sku_code:
+                    continue
+
+                raw_status = row[0].strip() if len(row) > 0 else ""
+                cbm_raw = row[cbm_col] if len(row) > cbm_col else ""
+                case_pack_raw = row[case_pack_col] if len(row) > case_pack_col else ""
+
+                update_doc: dict = {
+                    "cbm": _to_float(cbm_raw),
+                    "case_pack": _to_float(case_pack_raw),
+                }
+                mapped_status = _map_status(raw_status)
+                if mapped_status:
+                    update_doc["purchase_status"] = mapped_status
+
+                result = products_collection.update_many(
+                    {"cf_sku_code": sku_code},
+                    {"$set": update_doc},
+                )
+
+                if result.modified_count > 0 or result.matched_count > 0:
+                    updated_count += 1
+                else:
+                    skipped_count += 1
 
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
-                "message": "Imported status, CBM, Case Pack and Stock in Transit from PSR Sheet",
+                "message": "Imported status, CBM and Case Pack from product logistics sheet",
                 "updated": updated_count,
                 "skipped": skipped_count,
             },
