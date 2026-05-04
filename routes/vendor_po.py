@@ -466,6 +466,18 @@ FROZEN_STATUSES = {"packed", "closed", "intransit", "delivered", "completed"}
 FREEZE_ON_STATUS = FROZEN_STATUSES | {"processing"}
 
 
+@router.delete("/{po_number}")
+async def delete_vendor_po(po_number: str, db=Depends(get_database)):
+    """Delete a purchase order by PO number."""
+    def _delete():
+        return db[PO_COLLECTION].delete_one({"po_number": po_number}).deleted_count
+
+    count = await asyncio.to_thread(_delete)
+    if not count:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    return {"po_number": po_number, "deleted": True}
+
+
 @router.patch("/{po_number}/status")
 async def update_po_status(po_number: str, po_status: str, db=Depends(get_database)):
     if po_status not in VALID_STATUSES:
