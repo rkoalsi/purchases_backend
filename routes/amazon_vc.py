@@ -23,6 +23,7 @@ load_dotenv()
 SKU_COLLECTION = "amazon_sku_mapping"
 SALES_COLLECTION = "amazon_vendor_sales"
 INVENTORY_COLLECTION = "amazon_vendor_inventory"
+PENDING_REPORTS_COLLECTION = "vc_pending_reports"
 
 router = APIRouter()
 
@@ -967,3 +968,233 @@ async def refetch_last_10_days_sales(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to start sales refetch: {str(e)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Two-phase cron helpers: initiate → store report IDs → collect hours later
+# ---------------------------------------------------------------------------
+
+def initiate_vc_reports(db) -> Dict:
+    """
+    Request VC sales (last 10 days) and inventory (2 days ago) reports from
+    Amazon and persist their report IDs in vc_pending_reports for later collection.
+    Returns {"initiated": [...], "failed": [...]}.
+    """
+    today = datetime.now().date()
+    target_date = today - timedelta(days=2)
+    target_date_str = target_date.strftime("%Y-%m-%d")
+
+    pending_coll = db[PENDING_REPORTS_COLLECTION]
+    initiated = []
+    failed = []
+
+    # --- Sales: single report for T-2 ---
+    try:
+        report_id = create_report(
+            report_type="GET_VENDOR_SALES_REPORT",
+            start_date=f"{target_date_str}T00:00:00Z",
+            end_date=f"{target_date_str}T23:59:59Z",
+            marketplace_ids=[MARKETPLACE_ID],
+            report_options={
+                "reportPeriod": "DAY",
+                "distributorView": "MANUFACTURING",
+                "sellingProgram": "RETAIL",
+            },
+        )
+        pending_coll.insert_one({
+            "report_id": report_id,
+            "report_type": "GET_VENDOR_SALES_REPORT",
+            "start_date": f"{target_date_str}T00:00:00Z",
+            "end_date": f"{target_date_str}T23:59:59Z",
+            "date": target_date_str,
+            "status": "pending",
+            "created_at": datetime.now(),
+        })
+        initiated.append({"report_id": report_id, "date": target_date_str, "type": "sales"})
+        logger.info(f"✅ Initiated sales report {report_id} for {target_date_str}")
+    except Exception as e:
+        logger.error(f"❌ Failed to initiate sales report for {target_date_str}: {e}")
+        failed.append({"date": target_date_str, "type": "sales", "error": str(e)[:300]})
+
+    # --- Inventory: single report for T-2 ---
+    try:
+        report_id = create_report(
+            report_type="GET_VENDOR_INVENTORY_REPORT",
+            start_date=f"{target_date_str}T00:00:00Z",
+            end_date=f"{target_date_str}T00:00:00Z",
+            marketplace_ids=[MARKETPLACE_ID],
+            report_options={
+                "reportPeriod": "DAY",
+                "distributorView": "MANUFACTURING",
+                "sellingProgram": "RETAIL",
+            },
+        )
+        pending_coll.insert_one({
+            "report_id": report_id,
+            "report_type": "GET_VENDOR_INVENTORY_REPORT",
+            "start_date": f"{target_date_str}T00:00:00Z",
+            "end_date": f"{target_date_str}T00:00:00Z",
+            "date": target_date_str,
+            "status": "pending",
+            "created_at": datetime.now(),
+        })
+        initiated.append({"report_id": report_id, "date": target_date_str, "type": "inventory"})
+        logger.info(f"✅ Initiated inventory report {report_id} for {target_date_str}")
+    except Exception as e:
+        logger.error(f"❌ Failed to initiate inventory report for {target_date_str}: {e}")
+        failed.append({"date": target_date_str, "type": "inventory", "error": str(e)[:300]})
+
+    return {"initiated": initiated, "failed": failed}
+
+
+def collect_pending_vc_reports(db) -> Dict:
+    """
+    Check every pending VC report. Download and insert data for completed ones.
+    Returns {"completed": [...], "still_pending": [...], "failed": [...], "total_inserted": {...}}.
+    """
+    pending_coll = db[PENDING_REPORTS_COLLECTION]
+    pending_docs = list(pending_coll.find({"status": "pending"}))
+    logger.info(f"📋 Found {len(pending_docs)} pending VC reports to check")
+
+    results: Dict = {"completed": [], "still_pending": [], "failed": []}
+    total_inserted = {"sales": 0, "inventory": 0}
+
+    for doc in pending_docs:
+        report_id = doc["report_id"]
+        report_type = doc["report_type"]
+        date_str = doc.get("date", "")
+
+        try:
+            report_status = get_report_status(report_id)
+            processing_status = report_status.get("processingStatus")
+            report_document_id = report_status.get("reportDocumentId")
+
+            logger.info(f"📊 Report {report_id} ({report_type}, {date_str}): {processing_status}")
+
+            if processing_status == "DONE":
+                if not report_document_id:
+                    raise ValueError("Report DONE but no document ID returned")
+
+                report_data = download_report_data(report_document_id, is_gzipped=True)
+                if not report_data:
+                    raise ValueError("Downloaded report data is empty")
+
+                parsed = json.loads(report_data)
+
+                if report_type == "GET_VENDOR_INVENTORY_REPORT":
+                    data_key = "inventoryByAsin"
+                    coll_name = INVENTORY_COLLECTION
+                    label = "inventory"
+                else:
+                    data_key = "salesByAsin"
+                    coll_name = SALES_COLLECTION
+                    label = "sales"
+
+                records = parsed.get(data_key, [])
+                date_obj = (
+                    datetime.strptime(date_str, "%Y-%m-%d")
+                    if date_str
+                    else datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+                )
+                current_time = datetime.now()
+
+                inserted = 0
+                if records:
+                    db_coll = db[coll_name]
+                    existing_asins = set(db_coll.distinct("asin", {"date": date_obj}))
+                    new_records = [
+                        {**r, "date": date_obj, "created_at": current_time}
+                        for r in records
+                        if r.get("asin") not in existing_asins
+                    ]
+                    if new_records:
+                        result = db_coll.insert_many(new_records, ordered=False)
+                        inserted = len(result.inserted_ids)
+
+                total_inserted[label] += inserted
+                pending_coll.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": {"status": "completed", "completed_at": datetime.now(), "inserted": inserted}},
+                )
+                results["completed"].append({
+                    "report_id": report_id, "type": label, "date": date_str, "inserted": inserted,
+                })
+                logger.info(f"✅ Report {report_id}: inserted {inserted} {label} records for {date_str}")
+
+            elif processing_status == "FATAL":
+                pending_coll.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": {"status": "failed", "failed_at": datetime.now(), "error": "FATAL status from Amazon"}},
+                )
+                results["failed"].append({
+                    "report_id": report_id, "type": report_type, "date": date_str, "error": "FATAL",
+                })
+                logger.error(f"❌ Report {report_id} returned FATAL status")
+
+            else:
+                results["still_pending"].append({
+                    "report_id": report_id, "type": report_type, "date": date_str, "status": processing_status,
+                })
+
+        except Exception as e:
+            logger.error(f"❌ Error processing report {report_id}: {e}")
+            pending_coll.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"status": "failed", "failed_at": datetime.now(), "error": str(e)[:500]}},
+            )
+            results["failed"].append({
+                "report_id": report_id, "type": report_type, "date": date_str, "error": str(e)[:200],
+            })
+
+    results["total_inserted"] = total_inserted
+    return results
+
+
+@router.post("/cron/initiate")
+async def cron_initiate_reports(db=Depends(get_database)):
+    """
+    Phase 1: Create VC sales (last 10 days) and inventory reports on Amazon SP API
+    and store the returned report IDs in vc_pending_reports.
+    Called by the scheduler at midnight; /cron/collect picks them up hours later.
+    """
+    logger.info("🚀 Cron initiate: creating VC sales and inventory reports")
+    try:
+        result = initiate_vc_reports(db)
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "message": "VC reports initiated",
+                "initiated_count": len(result["initiated"]),
+                "failed_count": len(result["failed"]),
+                "details": result,
+            },
+        )
+    except Exception as e:
+        logger.error(f"❌ Cron initiate failed: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.post("/cron/collect")
+async def cron_collect_reports(db=Depends(get_database)):
+    """
+    Phase 2: Check all pending VC reports. For each DONE report, download and
+    insert data into the appropriate collection.
+    Called by the scheduler ~5 hours after /cron/initiate.
+    """
+    logger.info("📥 Cron collect: processing pending VC reports")
+    try:
+        result = collect_pending_vc_reports(db)
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Pending VC reports processed",
+                "completed": len(result["completed"]),
+                "still_pending": len(result["still_pending"]),
+                "failed": len(result["failed"]),
+                "total_inserted": result["total_inserted"],
+                "details": result,
+            },
+        )
+    except Exception as e:
+        logger.error(f"❌ Cron collect failed: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

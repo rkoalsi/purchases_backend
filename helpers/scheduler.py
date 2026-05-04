@@ -150,31 +150,69 @@ class APIScheduler:
             logger.error(f"Inventory Ledger API call failed: {str(e)}")
             raise
 
-    async def get_vc_sales_traffic(self):
+    async def get_vc_initiate(self):
+        """Phase 1: request VC sales + inventory reports; report IDs stored in vc_pending_reports."""
         try:
-            logger.info("Executing Sales Traffic API call...")
-            response = await self.client.post(f"/amazon/vendor/sync/cron/sales")
+            logger.info("Executing VC Initiate Reports API call...")
+            response = await self.client.post("/amazon/vendor/cron/initiate", timeout=120.0)
             response.raise_for_status()
-            logger.info(f"Sales Traffic API call successful: {response.status_code}")
+            logger.info(f"VC Initiate Reports API call successful: {response.status_code}")
             return response.json()
         except Exception as e:
-            logger.error(f"Sales Traffic API call failed: {str(e)}")
+            logger.error(f"VC Initiate Reports API call failed: {str(e)}")
             raise
 
-    async def get_vc_inventory(self):
+    async def get_vc_collect(self):
+        """Phase 2: collect completed VC reports, insert data, send Slack notification."""
         try:
-            logger.info("Executing Inventory Ledger API call...")
-            start_date = (datetime.now().date() - timedelta(days=2)).strftime(
-                "%Y-%m-%d"
-            )
-            response = await self.client.post(
-                f"/amazon/vendor/sync/inventory?start_date={start_date}&end_date={start_date}"
-            )
+            logger.info("Executing VC Collect Reports API call...")
+            response = await self.client.post("/amazon/vendor/cron/collect", timeout=600.0)
             response.raise_for_status()
-            logger.info(f"Inventory Ledger API call successful: {response.status_code}")
-            return response.json()
+            data = response.json()
+            logger.info(f"VC Collect Reports API call successful: {response.status_code}")
+
+            completed = data.get("completed", 0)
+            still_pending = data.get("still_pending", 0)
+            failed = data.get("failed", 0)
+            total_inserted = data.get("total_inserted", {})
+            sales_inserted = total_inserted.get("sales", 0)
+            inv_inserted = total_inserted.get("inventory", 0)
+
+            lines = [
+                f":white_check_mark: *VC Collect Reports* — done",
+                f"  • Completed: {completed}  |  Still pending: {still_pending}  |  Failed: {failed}",
+                f"  • Sales inserted: {sales_inserted}  |  Inventory inserted: {inv_inserted}",
+            ]
+            if failed:
+                details = data.get("details", {})
+                for f_item in details.get("failed", []):
+                    lines.append(f"  :x: {f_item.get('type')} {f_item.get('date')}: `{f_item.get('error','')[:150]}`")
+
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"{'✅' if not failed else '⚠️'} VC Reports Collected",
+                        "emoji": True,
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n" + "\n".join(lines),
+                    },
+                },
+            ]
+            if SLACK_URL:
+                import requests as _requests
+                _requests.post(SLACK_URL, json={"blocks": blocks}, timeout=10)
+
+            return data
         except Exception as e:
-            logger.error(f"Inventory Ledger API call failed: {str(e)}")
+            logger.error(f"VC Collect Reports API call failed: {str(e)}")
+            send_slack_notification("VC Collect Reports", success=False, error_msg=str(e))
             raise
 
     async def get_returns(self):
@@ -346,8 +384,7 @@ class APIScheduler:
 
         tasks = [
             ("SC Inventory Ledger", self.get_sc_inventory),
-            ("VC Vendor Inventory", self.get_vc_inventory),
-            ("VC Vendor Sales", self.get_vc_sales_traffic),
+            ("VC Initiate Reports", self.get_vc_initiate),
             ("Amazon Returns", self.get_returns),
             ("Amazon Settlements", self.get_settlements),
             ("SC Sales Traffic", self.get_sc_sales_traffic),
@@ -431,6 +468,11 @@ async def scheduled_weekly_task():
 async def scheduled_composite_items_task():
     """Wrapper function for composite items sync - can be scheduled separately"""
     await api_scheduler.sync_composite_items(notify=True)
+
+
+async def scheduled_vc_collect_task():
+    """Collect completed VC reports ~5 hours after midnight initiation."""
+    await api_scheduler.get_vc_collect()
 
 
 async def generate_and_send_draft_order_slack_report():
@@ -560,6 +602,16 @@ def setup_scheduler():
         trigger=CronTrigger(hour="22", minute=0, second=0),
         id="composite_items_sync",
         name="Composite Items Sync",
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+
+    # VC collect: 5 hours after midnight initiation — reports are ready by then
+    scheduler.add_job(
+        scheduled_vc_collect_task,
+        trigger=CronTrigger(hour=5, minute=0, timezone="UTC"),
+        id="vc_collect_reports",
+        name="VC Collect Reports",
         replace_existing=True,
         misfire_grace_time=300,
     )
