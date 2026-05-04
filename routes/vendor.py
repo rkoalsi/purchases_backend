@@ -44,27 +44,36 @@ def _get_zoho_token() -> str:
 
 
 def _parse_draft_order_excel(file_bytes: bytes) -> list[dict]:
-    """Parse draft order Excel. Columns: Manufacturer Code, BBCode, Item Name, Qty, Unit Price, ..."""
+    """Parse draft order Excel. Columns: Manufacturer Code, BBCode, Item Name, Qty, Unit Price, ...
+    Reads cell number_format on the Unit Price column to detect per-row currency (USD vs CNY).
+    """
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    if len(rows) < 2:
+
+    header_row = next(ws.iter_rows(min_row=1, max_row=1), None)
+    if header_row is None:
         raise ValueError("Order file has no data rows")
 
     items = []
-    for row in rows[1:]:
-        if not row[0] and not row[1]:
+    for row in ws.iter_rows(min_row=2):
+        if not row[0].value and not row[1].value:
             continue
-        qty = row[3]
+        qty = row[3].value
         if not isinstance(qty, (int, float)) or qty <= 0:
             continue
+
+        price_cell = row[4]
+        fmt = price_cell.number_format or ""
+        currency = "CNY" if ("¥" in fmt or "\\¥" in fmt) else "USD"
+
         items.append(
             {
-                "manufacturer_code": str(row[0]).strip() if row[0] else "",
-                "bb_code": str(row[1]).strip() if row[1] else "",
-                "item_name": str(row[2]).strip() if row[2] else "",
+                "manufacturer_code": str(row[0].value).strip() if row[0].value else "",
+                "bb_code": str(row[1].value).strip() if row[1].value else "",
+                "item_name": str(row[2].value).strip() if row[2].value else "",
                 "qty": int(qty),
-                "unit_price": float(row[4]) if row[4] is not None else 0.0,
+                "unit_price": float(price_cell.value) if price_cell.value is not None else 0.0,
+                "currency": currency,
             }
         )
     return items
@@ -93,35 +102,57 @@ class SaveDraftOrderRequest(BaseModel):
 
 @router.get("/brands")
 def get_available_brands(db=Depends(get_database)):
-    """Get list of available brands with vendor contact_name"""
+    """Get list of available brands with their assigned vendors (supports multi-vendor)."""
     try:
         brands_collection = db.get_collection("brands")
 
         pipeline = [
             {
+                # Normalize: prefer vendor_ids array; fall back to wrapping legacy vendor_id
+                "$addFields": {
+                    "normalized_ids": {
+                        "$cond": {
+                            "if": {"$isArray": "$vendor_ids"},
+                            "then": "$vendor_ids",
+                            "else": {
+                                "$cond": {
+                                    "if": {"$gt": ["$vendor_id", None]},
+                                    "then": ["$vendor_id"],
+                                    "else": [],
+                                }
+                            },
+                        }
+                    }
+                }
+            },
+            {
                 "$lookup": {
                     "from": "vendors",
-                    "localField": "vendor_id",
-                    "foreignField": "vendor_id",  # adjust if your vendors use different field
+                    "localField": "normalized_ids",
+                    "foreignField": "contact_id",
                     "as": "vendor_data",
                 }
             },
-            {"$unwind": {"path": "$vendor_data", "preserveNullAndEmptyArrays": True}},
             {
                 "$addFields": {
-                    "vendor_name": "$vendor_data.contact_name",
-                    "vendor_currency_code": "$vendor_data.currency_code",
-                    "vendor_currency_symbol": "$vendor_data.currency_symbol",
-                    "vendor_billing_address": "$vendor_data.billing_address",
-                    "vendor_shipping_address": "$vendor_data.shipping_address",
+                    "vendors": {
+                        "$map": {
+                            "input": "$vendor_data",
+                            "as": "v",
+                            "in": {
+                                "contact_id": "$$v.contact_id",
+                                "contact_name": "$$v.contact_name",
+                                "currency_code": {"$ifNull": ["$$v.currency_code", ""]},
+                            },
+                        }
+                    }
                 }
             },
-            {"$project": {"vendor_data": 0}},  # remove joined object from response
+            {"$project": {"vendor_data": 0, "normalized_ids": 0}},
             {"$sort": {"name": 1}},
         ]
 
         brands = list(brands_collection.aggregate(pipeline))
-
         return {"brands": serialize_mongo_document(brands)}
 
     except Exception as e:
@@ -172,17 +203,18 @@ def get_vendors(
 @router.put("/brands/vendor")
 def update_brand_vendor(
     name: str = Body(..., embed=True),
-    vendor_id: str = Body(..., embed=True),
+    vendor_ids: List[str] = Body(..., embed=True),
     db=Depends(get_database),
 ):
-    """Update vendor_id in brands collection by brand name"""
+    """Update vendor_ids list for a brand (max 5 vendors)."""
+    if len(vendor_ids) > 5:
+        raise HTTPException(status_code=400, detail="Maximum 5 vendors allowed per brand")
+
     try:
         brands_collection = db.get_collection("brands")
 
-        # Case-insensitive search on name
         query = {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}
-
-        update = {"$set": {"vendor_id": vendor_id}}
+        update = {"$set": {"vendor_ids": vendor_ids}}
 
         result = brands_collection.update_many(query, update)
 
@@ -192,7 +224,7 @@ def update_brand_vendor(
             )
 
         return {
-            "message": "Vendor ID updated successfully",
+            "message": "Vendors updated successfully",
             "matched_count": result.matched_count,
             "modified_count": result.modified_count,
         }
@@ -273,29 +305,33 @@ async def validate_draft_order(
                     }
                 )
 
-        # Detect vendor from the first product's brand
-        detected_vendor = None
+        # Detect vendors from the first product's brand (supports multi-vendor)
+        detected_vendors = []
         if first_brand:
             brand_doc = db.get_collection("brands").find_one(
                 {"name": {"$regex": f"^{re.escape(first_brand)}$", "$options": "i"}},
-                {"vendor_id": 1},
+                {"vendor_id": 1, "vendor_ids": 1},
             )
-            if brand_doc and brand_doc.get("vendor_id"):
-                vendor_doc = db.get_collection("vendors").find_one(
-                    {"contact_id": brand_doc["vendor_id"]},
-                    {"vendor_id": 1, "contact_id": 1, "contact_name": 1, "currency_code": 1},
-                )
-                if vendor_doc:
-                    detected_vendor = {
-                        "contact_id": vendor_doc.get("contact_id", ""),
-                        "contact_name": vendor_doc.get("contact_name", ""),
-                        "currency_code": vendor_doc.get("currency_code", "USD"),
-                    }
+            if brand_doc:
+                ids = brand_doc.get("vendor_ids") or []
+                if not ids and brand_doc.get("vendor_id"):
+                    ids = [brand_doc["vendor_id"]]
+                for vid in ids:
+                    vendor_doc = db.get_collection("vendors").find_one(
+                        {"contact_id": vid},
+                        {"contact_id": 1, "contact_name": 1, "currency_code": 1},
+                    )
+                    if vendor_doc:
+                        detected_vendors.append({
+                            "contact_id": vendor_doc.get("contact_id", ""),
+                            "contact_name": vendor_doc.get("contact_name", ""),
+                            "currency_code": vendor_doc.get("currency_code", "USD"),
+                        })
 
-        return validated, missing, detected_vendor
+        return validated, missing, detected_vendors
 
     try:
-        validated, missing, detected_vendor = await asyncio.to_thread(_process)
+        validated, missing, detected_vendors = await asyncio.to_thread(_process)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -316,7 +352,7 @@ async def validate_draft_order(
             "valid": True,
             "items": serialize_mongo_document(validated),
             "total_items": len(validated),
-            "detected_vendor": detected_vendor,
+            "detected_vendors": detected_vendors,
         },
     )
 
