@@ -752,11 +752,13 @@ async def process_orders_file(file_content: bytes, database, config: dict) -> di
         # Batch query existing records
         existing_docs = set()
         if existing_queries:
-            cursor = collection.find(
-                {"$or": existing_queries},
-                {"item_id": 1, "city": 1, config["date_field_name"]: 1},
+            docs = await asyncio.to_thread(
+                lambda: list(collection.find(
+                    {"$or": existing_queries},
+                    {"item_id": 1, "city": 1, config["date_field_name"]: 1},
+                ))
             )
-            for doc in cursor:
+            for doc in docs:
                 key = (doc["item_id"], doc["city"], doc[config["date_field_name"]])
                 existing_docs.add(key)
 

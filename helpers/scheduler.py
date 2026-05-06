@@ -1,3 +1,4 @@
+import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import httpx
@@ -265,7 +266,7 @@ class APIScheduler:
                         components = item_data.get("composite_component_items", [])
                         db = get_database()
                         for c in components:
-                            product = db.products.find_one({"name": c["name"]})
+                            product = await asyncio.to_thread(db.products.find_one, {"name": c["name"]})
                             c["product_id"] = product.get("_id")
                             c["sku_code"] = product.get("cf_sku_code")
                         # Structure the data for MongoDB storage
@@ -319,19 +320,19 @@ class APIScheduler:
             collection = db.composite_products
 
             # Clear existing data and insert new data
-            result = collection.delete_many({})
+            result = await asyncio.to_thread(collection.delete_many, {})
             logger.info(
                 f"Deleted {result.deleted_count} existing composite product records"
             )
 
             # Insert new data
-            result = collection.insert_many(composite_items)
+            result = await asyncio.to_thread(collection.insert_many, composite_items)
             logger.info(
                 f"Inserted {len(result.inserted_ids)} new composite product records"
             )
 
             # Create index on composite_item_id for better performance
-            collection.create_index("composite_item_id", unique=True)
+            await asyncio.to_thread(lambda: collection.create_index("composite_item_id", unique=True))
             logger.info("Created index on composite_item_id")
 
         except Exception as e:
