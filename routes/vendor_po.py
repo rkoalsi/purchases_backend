@@ -256,14 +256,21 @@ def _enrich_items(
         if effective_use_stored:
             zoho_stock = item.get("zoho_stock", 0)
             current_stock = item.get("current_stock", 0)
-            open_po = item.get("open_po", 0)
+            open_po_override = item.get("open_po_override")
+            open_po = open_po_override if open_po_override is not None else item.get("open_po", 0)
             last_30_sales = item.get("last_30_sales", 0)
-            sv = item.get("supply_qty")
-            supply_qty = sv if sv is not None else item["requested_qty"]
+            supply_qty_override = item.get("supply_qty_override")
+            if supply_qty_override is not None:
+                supply_qty = supply_qty_override
+            else:
+                sv = item.get("supply_qty")
+                supply_qty = sv if sv is not None else item["requested_qty"]
         else:
             zoho_stock = zoho_latest.get(zoho_item_id, 0) if zoho_item_id else 0
             current_stock = current_stock_by_asin.get(asin, 0)
-            open_po = open_po_by_asin.get(asin, 0)
+            open_po_override = item.get("open_po_override")
+            open_po_computed = open_po_by_asin.get(asin, 0)
+            open_po = open_po_override if open_po_override is not None else open_po_computed
             last_30_sales = sales_by_asin.get(asin, 0)
             # compute final_supply_qty and use it as supply_qty
             # Use round-half-up (math.floor(x+0.5)) to match Excel's ROUND() behaviour.
@@ -273,7 +280,10 @@ def _enrich_items(
             ads_tmp = round(last_30_sales / 30, 2)
             target_tmp = int((Decimal(str(ads_tmp)) * Decimal(COVERAGE_DAYS)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
             max_allowed_tmp = target_tmp - total_qty_tmp
-            if total_qty_tmp == 0:
+            supply_qty_override = item.get("supply_qty_override")
+            if supply_qty_override is not None:
+                supply_qty = supply_qty_override
+            elif total_qty_tmp == 0:
                 supply_qty = item["requested_qty"]
             else:
                 supply_qty = max(0, min(int(item["requested_qty"]), int(max_allowed_tmp)))
@@ -305,6 +315,8 @@ def _enrich_items(
             "purchase_status": product.get("purchase_status") or "",
             "current_stock": current_stock,
             "open_po": open_po,
+            "open_po_override": item.get("open_po_override"),
+            "supply_qty_override": item.get("supply_qty_override"),
             "total_qty": total_qty,
             "last_30_sales": last_30_sales,
             "ads": ads,
@@ -566,6 +578,40 @@ async def update_po_received_qty(po_number: str, received_qty: int, db=Depends(g
     if not matched:
         raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
     return {"po_number": po_number, "received_qty": received_qty}
+
+
+@router.patch("/{po_number}/items/{asin}/open_qty")
+async def update_item_open_qty(po_number: str, asin: str, open_qty: int, db=Depends(get_database)):
+    """Override the open PO quantity for a specific item. Use -1 to clear the override and revert to auto-computed."""
+    def _update():
+        override_value = None if open_qty < 0 else open_qty
+        result = db[PO_COLLECTION].update_one(
+            {"po_number": po_number, "items.asin": asin},
+            {"$set": {"items.$.open_po_override": override_value, "updated_at": datetime.now()}}
+        )
+        return result.matched_count
+
+    matched = await asyncio.to_thread(_update)
+    if not matched:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} / ASIN {asin} not found")
+    return {"po_number": po_number, "asin": asin, "open_po_override": None if open_qty < 0 else open_qty}
+
+
+@router.patch("/{po_number}/items/{asin}/supply_qty")
+async def update_item_supply_qty(po_number: str, asin: str, supply_qty: int, db=Depends(get_database)):
+    """Override the supply quantity for a specific item. Use -1 to clear the override and revert to auto-computed."""
+    def _update():
+        override_value = None if supply_qty < 0 else supply_qty
+        result = db[PO_COLLECTION].update_one(
+            {"po_number": po_number, "items.asin": asin},
+            {"$set": {"items.$.supply_qty_override": override_value, "updated_at": datetime.now()}}
+        )
+        return result.matched_count
+
+    matched = await asyncio.to_thread(_update)
+    if not matched:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} / ASIN {asin} not found")
+    return {"po_number": po_number, "asin": asin, "supply_qty_override": None if supply_qty < 0 else supply_qty}
 
 
 @router.patch("/{po_number}/items/{asin}/etrade_unit_cost")
