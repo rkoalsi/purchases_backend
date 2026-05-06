@@ -727,6 +727,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
         # V=HSN, W=Etrade Unit Cost, X=Diff, Y=Zoho Stock, Z=Status
         # AA=Current Stock, AB=Open PO, AC=Total Qty, AD=Sales, AE=ADS, AF=Coverage
         # AG=Target Stock, AH=Max Allowed, AI=Final Supply
+        supply_qty_override = item.get("supply_qty_override")
         formulas = {
             9:  f"=AI{r}",                                                  # I  Supply Qty = Final Supply Qty
             11: f"=IF(J{r}=\"\",\"\",I{r}-J{r})",                          # K  Supply - Accepted
@@ -742,6 +743,14 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             34: f"=AG{r}-AC{r}",                                            # AH Max Allowed Qty
             35: f"=IF(AC{r}=0,H{r},ROUND(MAX(0,MIN(H{r},AH{r})),0))",      # AI Final Supply Qty
         }
+        # When the user has manually overridden supply_qty, pin cols 9 and 35 to the
+        # override value instead of using the auto-compute formulas, so the downloaded
+        # report reflects exactly what was entered.
+        if supply_qty_override is not None:
+            formulas.pop(9, None)
+            formulas.pop(35, None)
+            static[9] = supply_qty_override
+            static[35] = supply_qty_override
 
         for col_idx in range(1, 36):
             if col_idx in formulas:
