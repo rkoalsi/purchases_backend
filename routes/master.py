@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status, Depends, Query
+from fastapi import APIRouter, HTTPException, status, Depends, Query, UploadFile, File
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Set, Optional
@@ -714,7 +714,7 @@ class OptimizedMasterReportService:
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(valid_skus)}},
                     {"cf_sku_code": 1, "item_id": 1, "name": 1, "rate": 1, "brand": 1, "cbm": 1, "case_pack": 1,
-                     "cf_item_code": 1,
+                     "cf_item_code": 1, "purchase_price": 1, "currency": 1,
                      "purchase_status": 1, "stock_in_transit_1": 1, "stock_in_transit_2": 1,
                      "stock_in_transit_3": 1, "created_at": 1, "_id": 0},
                 ).sort("_id", 1))
@@ -744,6 +744,8 @@ class OptimizedMasterReportService:
                     "case_pack": self.safe_float(product.get("case_pack")),
                     "manufacturer_code": product.get("cf_item_code", "") or "",
                     "purchase_status": product.get("purchase_status", ""),
+                    "purchase_price": self.safe_float(product.get("purchase_price")),
+                    "currency": product.get("currency", "") or "",
                     "stock_in_transit_1": self.safe_float(product.get("stock_in_transit_1")),
                     "stock_in_transit_2": self.safe_float(product.get("stock_in_transit_2")),
                     "stock_in_transit_3": self.safe_float(product.get("stock_in_transit_3")),
@@ -2070,13 +2072,11 @@ async def _generate_master_report_data(
             # Fire off ALL independent DB queries in parallel:
             # 1. brand_logistics (for enrichment)
             # 2. transit_data (for enrichment)
-            # 3. po_unit_prices (latest purchase order rate per SKU)
-            # 4. sku_to_item_id (for DRR lookback, if needed)
-            # 5. extra_product_data (if new SKUs from composite expansion)
+            # 3. sku_to_item_id (for DRR lookback, if needed)
+            # 4. extra_product_data (if new SKUs from composite expansion)
             parallel_tasks = [
                 report_service.get_brand_logistics(),
                 report_service.get_stock_in_transit(),
-                report_service.fetch_latest_po_unit_prices(combined_sku_codes),
             ]
             if skus_needing_lookback_list:
                 parallel_tasks.append(report_service.fetch_sku_to_item_id_map(set(skus_needing_lookback_list)))
@@ -2087,8 +2087,7 @@ async def _generate_master_report_data(
 
             brand_logistics = parallel_results[0] if not isinstance(parallel_results[0], Exception) else {}
             transit_data = parallel_results[1] if not isinstance(parallel_results[1], Exception) else {}
-            po_unit_prices = parallel_results[2] if not isinstance(parallel_results[2], Exception) else {}
-            idx = 3
+            idx = 2
             sku_to_item_id = {}
             if skus_needing_lookback_list:
                 sku_to_item_id = parallel_results[idx] if not isinstance(parallel_results[idx], Exception) else {}
@@ -2447,9 +2446,9 @@ async def _generate_master_report_data(
                 item["latest_total_stock"] = round(lz + lf, 2)
                 item["prev_zoho_stock"] = round(prev_zoho_by_sku.get(sku, 0), 2)
                 item["prev_fba_stock"] = round(prev_fba_by_sku.get(sku, 0), 2)
-                po_price = po_unit_prices.get(sku, {})
-                item["unit_price"] = po_price.get("rate", 0)
-                item["unit_price_currency"] = po_price.get("currency_code", "")
+                _pdata = all_product_data.get(sku, {})
+                item["unit_price"] = _pdata.get("purchase_price", 0) or 0
+                item["unit_price_currency"] = _pdata.get("currency", "") or ""
                 item["manufacturer_code"] = all_product_data.get(sku, {}).get("manufacturer_code", "")
                 item["mrp"] = product_rates.get(sku)
                 item["brand"] = product_brands.get(sku, "")
@@ -3273,111 +3272,107 @@ async def download_master_report(
                     })
 
                 if draft_rows:
-                    # Build DataFrame without the internal _currency helper column
-                    draft_df = pd.DataFrame([{k: v for k, v in r.items() if k != "_currency"} for r in draft_rows])
-                    draft_df.to_excel(writer, sheet_name=_draft_sheet_name, index=False)
+                    from openpyxl.styles import Border, Side, Font as _Font
 
-                    ws_draft = writer.sheets[_draft_sheet_name]
-                    draft_cols = list(draft_df.columns)
+                    # Group rows by currency so each currency gets its own sheet
+                    _currency_groups: dict[str, list] = {}
+                    for _dr in draft_rows:
+                        _ckey = (_dr.get("_currency") or "").strip()
+                        _currency_groups.setdefault(_ckey, []).append(_dr)
 
-                    def _dcol(name):
-                        return get_column_letter(draft_cols.index(name) + 1)
-
-                    _dqty   = _dcol("Qty")
-                    _dbbcode = _dcol("BBCode")
-                    _dup   = _dcol("Unit Price")
-                    _dtot  = _dcol("Total")
-                    _dcp   = _dcol("Case Pack")
-                    _dcar  = _dcol("Cartons")
-                    _dcbm  = _dcol("CBM")
-                    _dtcbm = _dcol("Total CBM")
-
-                    # Escape single quotes in sheet name for cross-sheet formula reference
+                    _multi_currency = len(_currency_groups) > 1
                     _master_sheet_ref = _sheet_name.replace("'", "''")
                     _master_sku_col = _col("SKU Code")
 
-                    for r_idx, row in enumerate(draft_rows):
-                        r = r_idx + 2  # 1-based, skip header
-                        ws_draft[f"{_dqty}{r}"]  = (
-                            f"=_xlfn.XLOOKUP({_dbbcode}{r},"
-                            f"'{_master_sheet_ref}'!{_master_sku_col}:{_master_sku_col},"
-                            f"'{_master_sheet_ref}'!{_AT}:{_AT},0)"
-                        )
-                        ws_draft[f"{_dtot}{r}"]  = f"={_dqty}{r}*{_dup}{r}"
-                        ws_draft[f"{_dcar}{r}"]  = f"=IF({_dcp}{r}>0,{_dqty}{r}/{_dcp}{r},0)"
-                        ws_draft[f"{_dtcbm}{r}"] = f"={_dcbm}{r}*{_dcar}{r}"
+                    for _ckey, _group_rows in sorted(_currency_groups.items()):
+                        if _multi_currency and _ckey:
+                            _gs_name = f"Draft Order {_ckey} {_today_label}"[:31]
+                        else:
+                            _gs_name = _draft_sheet_name
 
-                        # Apply currency symbol number format to Unit Price and Total cells
-                        currency_code = row.get("_currency", "") or ""
-                        num_fmt = _CURRENCY_FORMATS.get(currency_code.upper(), _DEFAULT_NUMBER_FMT)
-                        ws_draft[f"{_dup}{r}"].number_format = num_fmt
-                        ws_draft[f"{_dtot}{r}"].number_format = num_fmt
+                        draft_df = pd.DataFrame([{k: v for k, v in r.items() if k != "_currency"} for r in _group_rows])
+                        draft_df.to_excel(writer, sheet_name=_gs_name, index=False)
 
-                    # ── Totals row ──────────────────────────────────────────
-                    from openpyxl.styles import Border, Side, Font
+                        ws_draft = writer.sheets[_gs_name]
+                        draft_cols = list(draft_df.columns)
 
-                    _last_data_row = len(draft_rows) + 1  # last data row (1-based)
-                    _total_row     = _last_data_row + 1   # totals row
+                        def _dcol(name, _dc=draft_cols):
+                            return get_column_letter(_dc.index(name) + 1)
 
-                    _thick_top = Border(
-                        top=Side(border_style="medium", color="000000")
-                    )
-                    _bold_font = Font(bold=True)
+                        _dqty    = _dcol("Qty")
+                        _dbbcode = _dcol("BBCode")
+                        _dup     = _dcol("Unit Price")
+                        _dtot    = _dcol("Total")
+                        _dcp     = _dcol("Case Pack")
+                        _dcar    = _dcol("Cartons")
+                        _dcbm    = _dcol("CBM")
+                        _dtcbm   = _dcol("Total CBM")
 
-                    # Label
-                    _item_col = _dcol("Item Name")
-                    _label_cell = ws_draft[f"{_item_col}{_total_row}"]
-                    _label_cell.value = "Total"
-                    _label_cell.font  = _bold_font
-                    _label_cell.border = _thick_top
+                        for r_idx, row in enumerate(_group_rows):
+                            r = r_idx + 2  # 1-based, skip header
+                            ws_draft[f"{_dqty}{r}"] = (
+                                f"=_xlfn.XLOOKUP({_dbbcode}{r},"
+                                f"'{_master_sheet_ref}'!{_master_sku_col}:{_master_sku_col},"
+                                f"'{_master_sheet_ref}'!{_AT}:{_AT},0)"
+                            )
+                            ws_draft[f"{_dtot}{r}"]  = f"={_dqty}{r}*{_dup}{r}"
+                            ws_draft[f"{_dcar}{r}"]  = f"=IF({_dcp}{r}>0,{_dqty}{r}/{_dcp}{r},0)"
+                            ws_draft[f"{_dtcbm}{r}"] = f"={_dcbm}{r}*{_dcar}{r}"
 
-                    # SUM formulas with units
-                    _totals: list[tuple[str, str, str]] = [
-                        # (col_letter, formula,  number_format)
-                        (_dqty,  f"=SUM({_dqty}{2}:{_dqty}{_last_data_row})",   "#,##0"),
-                        (_dtot,  f"=SUM({_dtot}{2}:{_dtot}{_last_data_row})",   None),   # currency set below
-                        (_dcar,  f"=SUM({_dcar}{2}:{_dcar}{_last_data_row})",   "#,##0.00"),
-                        (_dtcbm, f"=SUM({_dtcbm}{2}:{_dtcbm}{_last_data_row})", '#,##0.00 "m³"'),
-                    ]
+                            currency_code = row.get("_currency", "") or ""
+                            num_fmt = _CURRENCY_FORMATS.get(currency_code.upper(), _DEFAULT_NUMBER_FMT)
+                            ws_draft[f"{_dup}{r}"].number_format = num_fmt
+                            ws_draft[f"{_dtot}{r}"].number_format = num_fmt
 
-                    # Determine currency format for the Total sum cell
-                    _currencies = list({r.get("_currency", "") or "" for r in draft_rows})
-                    _sum_currency_fmt = _CURRENCY_FORMATS.get(
-                        _currencies[0].upper() if len(_currencies) == 1 else "",
-                        _DEFAULT_NUMBER_FMT,
-                    )
+                        # ── Totals row ──────────────────────────────────────────
+                        _last_data_row = len(_group_rows) + 1
+                        _total_row     = _last_data_row + 1
 
-                    for _col_ltr, _formula, _fmt in _totals:
-                        _c = ws_draft[f"{_col_ltr}{_total_row}"]
-                        _c.value  = _formula
-                        _c.font   = _bold_font
-                        _c.border = _thick_top
-                        if _col_ltr == _dtot:
-                            _c.number_format = _sum_currency_fmt
-                        elif _fmt:
-                            _c.number_format = _fmt
+                        _thick_top = Border(top=Side(border_style="medium", color="000000"))
+                        _bold_font = _Font(bold=True)
 
-                    # Apply the top border to all other columns in the totals row so the
-                    # divider spans the full width of the table.
-                    for _dc in draft_cols:
-                        _cl = _dcol(_dc)
-                        if _cl in {_item_col, _dqty, _dtot, _dcar, _dtcbm}:
-                            continue  # already handled
-                        _bc = ws_draft[f"{_cl}{_total_row}"]
-                        _bc.border = _thick_top
+                        _item_col = _dcol("Item Name")
+                        _label_cell = ws_draft[f"{_item_col}{_total_row}"]
+                        _label_cell.value = "Total"
+                        _label_cell.font  = _bold_font
+                        _label_cell.border = _thick_top
 
-                    # Auto-fit columns
-                    for col_cells in ws_draft.columns:
-                        col_letter = get_column_letter(col_cells[0].column)
-                        max_len = 0
-                        for cell in col_cells:
-                            if cell.value is None:
+                        _sum_currency_fmt = _CURRENCY_FORMATS.get(_ckey.upper(), _DEFAULT_NUMBER_FMT)
+
+                        _totals_spec: list[tuple[str, str, str]] = [
+                            (_dqty,  f"=SUM({_dqty}{2}:{_dqty}{_last_data_row})",    "#,##0"),
+                            (_dtot,  f"=SUM({_dtot}{2}:{_dtot}{_last_data_row})",    None),
+                            (_dcar,  f"=SUM({_dcar}{2}:{_dcar}{_last_data_row})",    "#,##0.00"),
+                            (_dtcbm, f"=SUM({_dtcbm}{2}:{_dtcbm}{_last_data_row})", '#,##0.00 "m³"'),
+                        ]
+                        for _col_ltr, _formula, _fmt in _totals_spec:
+                            _c = ws_draft[f"{_col_ltr}{_total_row}"]
+                            _c.value  = _formula
+                            _c.font   = _bold_font
+                            _c.border = _thick_top
+                            if _col_ltr == _dtot:
+                                _c.number_format = _sum_currency_fmt
+                            elif _fmt:
+                                _c.number_format = _fmt
+
+                        for _dc in draft_cols:
+                            _cl = _dcol(_dc)
+                            if _cl in {_item_col, _dqty, _dtot, _dcar, _dtcbm}:
                                 continue
-                            val = str(cell.value)
-                            if val.startswith("="):
-                                continue
-                            max_len = max(max_len, len(val))
-                        ws_draft.column_dimensions[col_letter].width = min(max_len + 3, 30)
+                            ws_draft[f"{_cl}{_total_row}"].border = _thick_top
+
+                        # Auto-fit columns
+                        for col_cells in ws_draft.columns:
+                            col_letter = get_column_letter(col_cells[0].column)
+                            max_len = 0
+                            for cell in col_cells:
+                                if cell.value is None:
+                                    continue
+                                val = str(cell.value)
+                                if val.startswith("="):
+                                    continue
+                                max_len = max(max_len, len(val))
+                            ws_draft.column_dimensions[col_letter].width = min(max_len + 3, 30)
 
         excel_buffer.seek(0)
         file_bytes = excel_buffer.read()
@@ -4326,7 +4321,8 @@ def get_product_logistics_list(
             products_collection.find(
                 query,
                 {"item_id": 1, "cf_sku_code": 1, "name": 1, "brand": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1,
-                 "stock_in_transit_1": 1, "stock_in_transit_2": 1, "stock_in_transit_3": 1, "_id": 0},
+                 "stock_in_transit_1": 1, "stock_in_transit_2": 1, "stock_in_transit_3": 1,
+                 "purchase_price": 1, "currency": 1, "_id": 0},
             )
             .skip(skip)
             .limit(page_size)
@@ -4347,6 +4343,8 @@ def get_product_logistics_list(
                 "stock_in_transit_1": p.get("stock_in_transit_1", 0) or 0,
                 "stock_in_transit_2": p.get("stock_in_transit_2", 0) or 0,
                 "stock_in_transit_3": p.get("stock_in_transit_3", 0) or 0,
+                "purchase_price": p.get("purchase_price", 0) or 0,
+                "currency": p.get("currency", "") or "",
             })
 
         return JSONResponse(
@@ -4400,7 +4398,7 @@ def download_product_logistics(
                 query,
                 {"item_id": 1, "cf_sku_code": 1, "name": 1, "brand": 1, "cbm": 1, "case_pack": 1,
                  "purchase_status": 1, "stock_in_transit_1": 1, "stock_in_transit_2": 1,
-                 "stock_in_transit_3": 1, "_id": 0},
+                 "stock_in_transit_3": 1, "purchase_price": 1, "currency": 1, "_id": 0},
             ).sort("cf_sku_code", 1)
         )
 
@@ -4413,6 +4411,8 @@ def download_product_logistics(
                 "Status": p.get("purchase_status", ""),
                 "CBM": p.get("cbm", 0) or 0,
                 "Case Pack": p.get("case_pack", 0) or 0,
+                "Currency": p.get("currency", "") or "",
+                "Purchase Price": p.get("purchase_price", 0) or 0,
                 "Stock in Transit 1": p.get("stock_in_transit_1", 0) or 0,
                 "Stock in Transit 2": p.get("stock_in_transit_2", 0) or 0,
                 "Stock in Transit 3": p.get("stock_in_transit_3", 0) or 0,
@@ -4445,9 +4445,8 @@ def update_product_logistics(
     cbm: float = Query(None),
     case_pack: float = Query(None),
     purchase_status: str = Query(None),
-    stock_in_transit_1: float = Query(None),
-    stock_in_transit_2: float = Query(None),
-    stock_in_transit_3: float = Query(None),
+    purchase_price: float = Query(None),
+    currency: str = Query(None),
     db=Depends(get_database),
 ):
     """Update product logistics fields. purchase_status is applied to all products sharing
@@ -4461,12 +4460,10 @@ def update_product_logistics(
             item_fields["cbm"] = cbm
         if case_pack is not None:
             item_fields["case_pack"] = case_pack
-        if stock_in_transit_1 is not None:
-            item_fields["stock_in_transit_1"] = stock_in_transit_1
-        if stock_in_transit_2 is not None:
-            item_fields["stock_in_transit_2"] = stock_in_transit_2
-        if stock_in_transit_3 is not None:
-            item_fields["stock_in_transit_3"] = stock_in_transit_3
+        if purchase_price is not None:
+            item_fields["purchase_price"] = purchase_price
+        if currency is not None:
+            item_fields["currency"] = currency
 
         if not item_fields and purchase_status is None:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -4498,3 +4495,83 @@ def update_product_logistics(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/product-logistics/bulk-upload")
+async def bulk_upload_product_logistics(
+    file: UploadFile = File(...),
+    db=Depends(get_database),
+):
+    """Accept an XLSX with columns 'SKU Code', 'Currency', 'Purchase Price' and bulk-update
+    those two fields for matched products. All other columns are ignored."""
+    try:
+        contents = await file.read()
+        buffer = io.BytesIO(contents)
+        try:
+            df = pd.read_excel(buffer, sheet_name=0, dtype=str)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not parse XLSX: {e}")
+
+        df.columns = [c.strip() for c in df.columns]
+        required = {"SKU Code", "Currency", "Purchase Price"}
+        missing = required - set(df.columns)
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required columns: {', '.join(sorted(missing))}. "
+                       "The file must contain 'SKU Code', 'Currency', and 'Purchase Price' columns.",
+            )
+
+        products_collection = db.get_collection("products")
+
+        updated = 0
+        skipped = 0
+        errors: list[str] = []
+
+        for _, row in df.iterrows():
+            sku = str(row.get("SKU Code", "") or "").strip()
+            if not sku:
+                skipped += 1
+                continue
+
+            currency_val = str(row.get("Currency", "") or "").strip()
+            price_raw = str(row.get("Purchase Price", "") or "").strip()
+
+            fields: Dict[str, Any] = {}
+            if currency_val and currency_val.lower() not in ("nan", "none"):
+                fields["currency"] = currency_val
+            try:
+                if price_raw not in ("", "nan", "None"):
+                    fields["purchase_price"] = float(price_raw)
+            except ValueError:
+                errors.append(f"SKU {sku}: invalid purchase price '{price_raw}'")
+                skipped += 1
+                continue
+
+            if not fields:
+                skipped += 1
+                continue
+
+            result = products_collection.update_many(
+                {"cf_sku_code": sku},
+                {"$set": fields},
+            )
+            if result.matched_count > 0:
+                updated += result.matched_count
+            else:
+                skipped += 1
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "message": f"Bulk upload complete: {updated} product(s) updated, {skipped} row(s) skipped.",
+                "updated": updated,
+                "skipped": skipped,
+                "errors": errors[:20],
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
