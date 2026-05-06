@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from ..database import get_database, serialize_mongo_document
 import asyncio
 import io
+import os
 import zipfile
 from decimal import Decimal, ROUND_HALF_UP
 import openpyxl
@@ -11,6 +12,11 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from typing import Optional
 import logging
+import boto3
+from botocore.config import Config as BotocoreConfig
+import xlrd
+import xlwt
+from xlutils.copy import copy as xl_copy
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -423,7 +429,7 @@ async def list_vendor_pos(db=Depends(get_database)):
             }},
             {"$project": {
                 "po_number": 1, "vendor": 1, "po_date": 1, "po_status": 1,
-                "item_count": 1, "created_at": 1,
+                "item_count": 1, "created_at": 1, "order_file_s3_key": 1,
                 "total_requested_qty": 1, "total_accepted_qty": 1, "total_received_qty": 1,
                 "_id": 0,
             }},
@@ -842,6 +848,195 @@ async def bulk_download_po_reports(po_numbers: list[str], db=Depends(get_databas
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="PO_Reports.zip"'},
     )
+
+
+# ─── upload order (POItemExport) ──────────────────────────────────────────────
+
+S3_BUCKET = os.getenv("S3_BUCKET", "pupscribe-purchases")
+AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
+
+AVAILABILITY_IN_STOCK = "AC - Accepted: In stock"
+AVAILABILITY_OUT_OF_STOCK = "OS - Cancelled: Out of stock"
+
+# Column indices in the POItemExport XLS (0-based)
+_COL_PO = 0
+_COL_ASIN = 5
+_COL_AVAILABILITY = 11
+_COL_ACCEPTED_QTY = 13
+
+
+def _validate_and_fill_order_xls(
+    file_bytes: bytes,
+    expected_po_number: str,
+    accepted_by_asin: dict[str, int],
+) -> bytes:
+    """Validate PO number in every data row, then fill Accepted quantity & Availability."""
+    rb = xlrd.open_workbook(file_contents=file_bytes, formatting_info=True)
+    rs = rb.sheet_by_index(0)
+
+    if rs.nrows < 2:
+        raise ValueError("File has no data rows")
+
+    mismatched = set()
+    for row_idx in range(1, rs.nrows):
+        po_cell = rs.cell_value(row_idx, _COL_PO)
+        po_in_file = str(po_cell).strip() if po_cell else ""
+        if po_in_file and po_in_file != expected_po_number:
+            mismatched.add(po_in_file)
+
+    if mismatched:
+        raise ValueError(
+            f"File contains PO number(s) {sorted(mismatched)} but expected {expected_po_number}. "
+            "Please upload the correct POItemExport file for this purchase order."
+        )
+
+    wb = xl_copy(rb)
+    ws = wb.get_sheet(0)
+
+    for row_idx in range(1, rs.nrows):
+        asin_cell = rs.cell_value(row_idx, _COL_ASIN)
+        asin = str(asin_cell).strip() if asin_cell else ""
+        if not asin or asin not in accepted_by_asin:
+            continue
+
+        qty = accepted_by_asin[asin]
+        ws.write(row_idx, _COL_ACCEPTED_QTY, qty)
+        availability = AVAILABILITY_OUT_OF_STOCK if qty == 0 else AVAILABILITY_IN_STOCK
+        ws.write(row_idx, _COL_AVAILABILITY, availability)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _upload_to_s3(file_bytes: bytes, s3_key: str) -> None:
+    """Upload bytes to S3 (private object)."""
+    client = boto3.client("s3", region_name=AWS_REGION)
+    client.put_object(
+        Bucket=S3_BUCKET,
+        Key=s3_key,
+        Body=file_bytes,
+        ContentType="application/vnd.ms-excel",
+    )
+
+
+def _presign_s3(s3_key: str, expires: int = 3600) -> str:
+    """Generate a presigned GET URL valid for `expires` seconds."""
+    client = boto3.client(
+        "s3",
+        region_name=AWS_REGION,
+        endpoint_url=f"https://s3.{AWS_REGION}.amazonaws.com",
+        config=BotocoreConfig(signature_version="s3v4"),
+    )
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": s3_key},
+        ExpiresIn=expires,
+    )
+
+
+@router.post("/{po_number}/upload_order")
+async def upload_order_file(
+    po_number: str,
+    file: UploadFile = File(...),
+    db=Depends(get_database),
+):
+    """Upload a POItemExport XLS, fill Accepted qty & Availability from DB, store in S3."""
+    if not file.filename or not file.filename.lower().endswith(".xls"):
+        raise HTTPException(status_code=400, detail="File must be a .xls POItemExport file")
+
+    file_bytes = await file.read()
+
+    class _NotFound(Exception): pass
+    class _BadFile(Exception): pass
+
+    def _process_safe():
+        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
+        if not doc:
+            raise _NotFound(f"PO {po_number} not found")
+        accepted_by_asin: dict[str, int] = {
+            item["asin"]: int(item.get("accepted_qty") or 0)
+            for item in doc.get("items", [])
+            if item.get("asin")
+        }
+        try:
+            filled_bytes = _validate_and_fill_order_xls(file_bytes, po_number, accepted_by_asin)
+        except ValueError as e:
+            raise _BadFile(str(e))
+        s3_key = f"vendor_purchase_orders/{po_number}/POItemExport_filled_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls"
+        _upload_to_s3(filled_bytes, s3_key)
+        db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {"$set": {"order_file_s3_key": s3_key, "updated_at": datetime.now()}}
+        )
+        return filled_bytes
+
+    try:
+        filled_bytes = await asyncio.to_thread(_process_safe)
+    except _NotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except _BadFile as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("upload_order failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    filename = f"POItemExport_{po_number}_filled.xls"
+    return StreamingResponse(
+        io.BytesIO(filled_bytes),
+        media_type="application/vnd.ms-excel",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{po_number}/order_file")
+async def get_order_file_url(po_number: str, db=Depends(get_database)):
+    """Return a short-lived presigned URL for the stored order file."""
+    def _fetch():
+        return db[PO_COLLECTION].find_one({"po_number": po_number}, {"order_file_s3_key": 1})
+
+    doc = await asyncio.to_thread(_fetch)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    s3_key = doc.get("order_file_s3_key")
+    if not s3_key:
+        raise HTTPException(status_code=404, detail="No order file uploaded for this PO")
+
+    try:
+        url = await asyncio.to_thread(_presign_s3, s3_key)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"url": url}
+
+
+@router.delete("/{po_number}/order_file")
+async def delete_order_file(po_number: str, db=Depends(get_database)):
+    """Delete the stored order file from S3 and clear the reference in DB."""
+    class _NotFound(Exception): pass
+
+    def _delete():
+        doc = db[PO_COLLECTION].find_one({"po_number": po_number}, {"order_file_s3_key": 1})
+        if not doc:
+            raise _NotFound(f"PO {po_number} not found")
+        s3_key = doc.get("order_file_s3_key")
+        if not s3_key:
+            raise _NotFound("No order file uploaded for this PO")
+        boto3.client("s3", region_name=AWS_REGION).delete_object(Bucket=S3_BUCKET, Key=s3_key)
+        db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {"$unset": {"order_file_s3_key": ""}, "$set": {"updated_at": datetime.now()}}
+        )
+
+    try:
+        await asyncio.to_thread(_delete)
+    except _NotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("delete_order_file failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"po_number": po_number, "deleted": True}
 
 
 # ─── margins ──────────────────────────────────────────────────────────────────
