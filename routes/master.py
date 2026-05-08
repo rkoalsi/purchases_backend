@@ -716,7 +716,8 @@ class OptimizedMasterReportService:
                     {"cf_sku_code": 1, "item_id": 1, "name": 1, "rate": 1, "brand": 1, "cbm": 1, "case_pack": 1,
                      "cf_item_code": 1, "purchase_price": 1, "currency": 1,
                      "purchase_status": 1, "stock_in_transit_1": 1, "stock_in_transit_2": 1,
-                     "stock_in_transit_3": 1, "created_at": 1, "_id": 0},
+                     "stock_in_transit_3": 1, "created_at": 1,
+                     "hsn_or_sac": 1, "is_combo_product": 1, "_id": 0},
                 ).sort("_id", 1))
 
             products = await asyncio.to_thread(_fetch_all)
@@ -750,6 +751,8 @@ class OptimizedMasterReportService:
                     "stock_in_transit_2": self.safe_float(product.get("stock_in_transit_2")),
                     "stock_in_transit_3": self.safe_float(product.get("stock_in_transit_3")),
                     "is_new": is_new,
+                    "hsn_or_sac": product.get("hsn_or_sac", ""),
+                    "is_combo_product": product.get("is_combo_product", False),
                 }
 
             logger.info(f"Batch loaded all product data for {len(result)} products")
@@ -1533,7 +1536,8 @@ class OptimizedMasterReportService:
                 return list(products_collection.find(
                     {"cf_sku_code": {"$in": list(sku_codes)}},
                     {"cf_sku_code": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1,
-                     "stock_in_transit_1": 1, "stock_in_transit_2": 1, "stock_in_transit_3": 1, "_id": 0}
+                     "stock_in_transit_1": 1, "stock_in_transit_2": 1, "stock_in_transit_3": 1,
+                     "hsn_or_sac": 1, "is_combo_product": 1, "_id": 0}
                 ).sort("_id", 1))
 
             products = await asyncio.to_thread(_fetch_logistics)
@@ -1549,6 +1553,8 @@ class OptimizedMasterReportService:
                         "stock_in_transit_1": self.safe_float(p.get("stock_in_transit_1")),
                         "stock_in_transit_2": self.safe_float(p.get("stock_in_transit_2")),
                         "stock_in_transit_3": self.safe_float(p.get("stock_in_transit_3")),
+                        "hsn_or_sac": p.get("hsn_or_sac", ""),
+                        "is_combo_product": p.get("is_combo_product", False),
                     }
 
             return result
@@ -1739,6 +1745,8 @@ class OptimizedMasterReportService:
             item["case_pack"] = case_pack
             item["purchase_status"] = purchase_status
             item["is_new"] = logistics.get("is_new", False)
+            item["hsn_or_sac"] = logistics.get("hsn_or_sac", "")
+            item["is_combo_product"] = logistics.get("is_combo_product", False)
 
             # Skip order quantity calculations for inactive / discontinued items
             if purchase_status in ("inactive", "discontinued until stock lasts"):
@@ -2256,6 +2264,8 @@ async def _generate_master_report_data(
                         "stock_in_transit_2": pdata.get("stock_in_transit_2", 0) or 0,
                         "stock_in_transit_3": pdata.get("stock_in_transit_3", 0) or 0,
                         "is_new": pdata.get("is_new", False),
+                        "hsn_or_sac": pdata.get("hsn_or_sac", ""),
+                        "is_combo_product": pdata.get("is_combo_product", False),
                     }
 
                 if brand:
@@ -2332,6 +2342,8 @@ async def _generate_master_report_data(
                             "stock_in_transit_2": 0,
                             "stock_in_transit_3": 0,
                             "is_new": pdata.get("is_new", False),
+                            "hsn_or_sac": pdata.get("hsn_or_sac", ""),
+                            "is_combo_product": pdata.get("is_combo_product", False),
                         }
                         stub = {
                             "sku_code": sku,
@@ -2394,6 +2406,8 @@ async def _generate_master_report_data(
                             "stock_in_transit_2": pdata.get("stock_in_transit_2", 0) or 0,
                             "stock_in_transit_3": pdata.get("stock_in_transit_3", 0) or 0,
                             "is_new": pdata.get("is_new", False),
+                            "hsn_or_sac": pdata.get("hsn_or_sac", ""),
+                            "is_combo_product": pdata.get("is_combo_product", False),
                         }
                         stub = {
                             "sku_code": sku,
@@ -3257,7 +3271,12 @@ async def download_master_report(
                 for item in combined_data:
                     if not isinstance(item, dict):
                         continue
+                    if item.get("purchase_status", "") != "active":
+                        continue
+                    if item.get("is_combo_product", False):
+                        continue
                     draft_rows.append({
+                        "HSN Code": item.get("hsn_or_sac", ""),
                         "Manufacturer Code": item.get("manufacturer_code", ""),
                         "BBCode": item.get("sku_code", ""),
                         "Item Name": item.get("item_name", ""),
