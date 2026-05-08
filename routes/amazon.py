@@ -5043,17 +5043,17 @@ async def get_vendor_central_returns(
     end_date: str = Query(..., description="YYYY-MM-DD"),
     db=Depends(get_database),
 ):
-    """Return Vendor Central returns records for the given date range (filtered on return_date)."""
+    """Return Vendor Central returns records for the given date range (filtered on document_date)."""
     try:
         start = datetime.strptime(start_date, "%Y-%m-%d")
         end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
-    query = {"return_date": {"$gte": start, "$lte": end}}
+    query = {"document_date": {"$gte": start, "$lte": end}}
     collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
     docs = await asyncio.to_thread(
-        lambda: list(collection.find(query, {"created_at": 0}).sort("return_date", 1))
+        lambda: list(collection.find(query, {"created_at": 0}).sort("document_date", 1))
     )
     cleaned = []
     for d in docs:
