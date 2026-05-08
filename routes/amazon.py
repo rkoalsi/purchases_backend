@@ -5250,7 +5250,7 @@ async def upload_vendor_central_returns(
     def _replace_records():
         # Delete all existing records in the detected date range, then insert fresh
         collection.delete_many({
-            "return_date": {"$gte": range_start, "$lte": range_end.replace(hour=23, minute=59, second=59)}
+            "document_date": {"$gte": range_start, "$lte": range_end.replace(hour=23, minute=59, second=59)}
         })
         for rec in normalized:
             rec.setdefault("entry_in_zoho", None)
