@@ -4962,13 +4962,31 @@ async def download_fba_returns(
 # ---------------------------------------------------------------------------
 
 def _parse_vc_date(val: Any) -> Optional[datetime]:
-    """Parse DD/MM/YYYY dates from Vendor Central returns report."""
-    if not val or (isinstance(val, float) and pd.isna(val)):
+    """Parse dates from Vendor Central returns report (DD/MM/YYYY or datetime objects)."""
+    if val is None:
         return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    # pandas may give a pd.Timestamp
+    try:
+        if hasattr(val, "to_pydatetime"):
+            return val.to_pydatetime()
+    except Exception:
+        pass
     s = str(val).strip()
     if not s:
         return None
-    for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+    # Strip trailing time component if present (e.g. "2025-03-15 00:00:00")
+    s_date_only = s[:10]
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s_date_only, fmt)
+        except ValueError:
+            continue
+    # Try full string as fallback
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
