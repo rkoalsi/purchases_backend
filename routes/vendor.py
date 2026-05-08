@@ -160,6 +160,22 @@ def get_available_brands(db=Depends(get_database)):
         raise HTTPException(status_code=500, detail="Error retrieving brands")
 
 
+class CreateBrandRequest(BaseModel):
+    name: str
+
+
+@router.post("/brands")
+def create_brand(body: CreateBrandRequest, db=Depends(get_database)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Brand name is required")
+    brands_collection = db.get_collection("brands")
+    if brands_collection.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}):
+        raise HTTPException(status_code=409, detail="Brand already exists")
+    result = brands_collection.insert_one({"name": name})
+    return {"_id": str(result.inserted_id), "name": name}
+
+
 @router.get("")
 def get_vendors(
     page: int = Query(1, ge=1),

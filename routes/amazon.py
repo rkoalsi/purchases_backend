@@ -2339,6 +2339,236 @@ def delete_item(item_id: str):
         )
 
 
+def _parse_daily_date(date_val):
+    """Parse a date from an ISO string or datetime to a date object (for DRR)."""
+    from datetime import date as date_type
+    if isinstance(date_val, date_type) and not isinstance(date_val, datetime):
+        return date_val
+    if isinstance(date_val, datetime):
+        return date_val.date()
+    if isinstance(date_val, str):
+        try:
+            return datetime.fromisoformat(date_val.replace("Z", "+00:00")).date()
+        except ValueError:
+            return datetime.strptime(date_val[:10], "%Y-%m-%d").date()
+    return None
+
+
+def compute_drr_v3(daily_data: list, total_returns: float):
+    """
+    DRR per Amazon_DRR_v7.xlsx:
+    - Select 30 most recent in-stock days (closing_stock > 0) from 90-day window
+    - Raw mean = total_gross / 30
+    - Spike threshold = 2x raw mean; spike days replaced with 2x raw mean
+    - Net units = max(0, cleaned_gross - total_returns)
+    - Final DRR = net_units / 30, rounded to 1 decimal
+    Returns: (drr, lookback_label, lookback_sales, drr_flag)
+    drr may be a string for error states.
+    """
+    if not daily_data:
+        msg = "Manual Input Required - No Sales History"
+        return msg, None, 0, msg
+
+    parsed = []
+    for d in daily_data:
+        dk = _parse_daily_date(d.get("date"))
+        if dk:
+            parsed.append({
+                "date": dk,
+                "closing_stock": d.get("closing_stock", 0) or 0,
+                "units_sold": d.get("units_sold", 0) or 0,
+            })
+
+    if not parsed:
+        msg = "Manual Input Required - No Sales History"
+        return msg, None, 0, msg
+
+    parsed.sort(key=lambda x: x["date"], reverse=True)
+
+    in_stock = [d for d in parsed if d["closing_stock"] > 0]
+    total_in_stock = len(in_stock)
+
+    if total_in_stock == 0:
+        msg = "Manual Input Required - No Sales History"
+        return msg, None, 0, msg
+
+    if total_in_stock < 30:
+        msg = f"Manual Input Required - Only {total_in_stock} Days Found"
+        flag = f"Manual Input Required - Only {total_in_stock} In-Stock Days Found"
+        return msg, None, 0, flag
+
+    selected = in_stock[:30]
+    oldest = min(d["date"] for d in selected)
+    newest = max(d["date"] for d in selected)
+    lookback_label = f"{oldest.strftime('%-d %b %Y')} – {newest.strftime('%-d %b %Y')}"
+
+    total_gross = sum(d["units_sold"] for d in selected)
+    lookback_sales = total_gross
+
+    raw_mean = round(total_gross / 30, 2)
+    spike_threshold = raw_mean * 2
+
+    # Replace spike days with 2x mean (spike threshold)
+    spike_excess = sum(
+        d["units_sold"] - spike_threshold
+        for d in selected
+        if d["units_sold"] > spike_threshold
+    )
+    cleaned_units = total_gross - spike_excess
+    spike_count = sum(1 for d in selected if d["units_sold"] > spike_threshold)
+
+    # Subtract total returns from cleaned gross units
+    total_ret = max(0, total_returns or 0)
+    net_units = max(0.0, cleaned_units - total_ret)
+
+    final_drr = round(net_units / 30, 1)
+
+    if spike_count > 0:
+        flag = f"OK - {spike_count} Spike Day(s) Replaced with 2x Mean"
+    else:
+        flag = "OK - Full Confidence"
+
+    return final_drr, lookback_label, lookback_sales, flag
+
+
+async def _fetch_vc_drr_daily(database, end: datetime, asins: list) -> dict:
+    """Fetch up to 90 days of {date, closing_stock, units_sold} from VC collections for DRR."""
+    drr_start = end - timedelta(days=89)
+    pipeline = [
+        {
+            "$match": {
+                "asin": {"$in": asins},
+                "date": {"$gte": drr_start, "$lte": end},
+            }
+        },
+        {
+            "$group": {
+                "_id": {"asin": "$asin", "date": "$date"},
+                "closing_stock": {"$sum": "$sellableOnHandInventoryUnits"},
+            }
+        },
+        {
+            "$lookup": {
+                "from": "amazon_vendor_sales",
+                "let": {"a": "$_id.asin", "d": "$_id.date"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$asin", "$$a"]},
+                                    {"$eq": ["$date", "$$d"]},
+                                ]
+                            }
+                        }
+                    },
+                    {"$group": {"_id": None, "units_sold": {"$sum": "$orderedUnits"}}},
+                ],
+                "as": "sales",
+            }
+        },
+        {
+            "$addFields": {
+                "units_sold": {"$ifNull": [{"$first": "$sales.units_sold"}, 0]}
+            }
+        },
+        {
+            "$group": {
+                "_id": "$_id.asin",
+                "daily_data": {
+                    "$push": {
+                        "date": "$_id.date",
+                        "closing_stock": "$closing_stock",
+                        "units_sold": "$units_sold",
+                    }
+                },
+            }
+        },
+    ]
+
+    def _run():
+        return list(
+            database.get_collection("amazon_vendor_inventory").aggregate(pipeline, allowDiskUse=True)
+        )
+
+    results = await asyncio.to_thread(_run)
+    return {doc["_id"]: serialize_mongo_document(doc["daily_data"]) for doc in results}
+
+
+async def _fetch_fba_drr_daily(database, end: datetime, asins: list, report_type: str) -> dict:
+    """Fetch up to 90 days of {date, closing_stock, units_sold} from FBA/ledger for DRR."""
+    drr_start = end - timedelta(days=89)
+    ledger_filter: dict = {
+        "asin": {"$in": asins},
+        "date": {"$gte": drr_start, "$lte": end},
+        "disposition": "SELLABLE",
+    }
+    if report_type == "fba":
+        ledger_filter["location"] = {"$ne": "VKSX"}
+    elif report_type == "seller_flex":
+        ledger_filter["location"] = "VKSX"
+
+    pipeline = [
+        {"$match": ledger_filter},
+        {
+            "$group": {
+                "_id": {"asin": "$asin", "date": "$date"},
+                "closing_stock": {"$sum": "$ending_warehouse_balance"},
+            }
+        },
+        {
+            "$lookup": {
+                "from": SALES_COLLECTION,
+                "let": {"a": "$_id.asin", "d": "$_id.date"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$parentAsin", "$$a"]},
+                                    {"$eq": ["$date", "$$d"]},
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": None,
+                            "units_sold": {"$sum": "$salesByAsin.unitsOrdered"},
+                        }
+                    },
+                ],
+                "as": "sales",
+            }
+        },
+        {
+            "$addFields": {
+                "units_sold": {"$ifNull": [{"$first": "$sales.units_sold"}, 0]}
+            }
+        },
+        {
+            "$group": {
+                "_id": "$_id.asin",
+                "daily_data": {
+                    "$push": {
+                        "date": "$_id.date",
+                        "closing_stock": "$closing_stock",
+                        "units_sold": "$units_sold",
+                    }
+                },
+            }
+        },
+    ]
+
+    def _run():
+        return list(
+            database.get_collection("amazon_ledger").aggregate(pipeline, allowDiskUse=True)
+        )
+
+    results = await asyncio.to_thread(_run)
+    return {doc["_id"]: serialize_mongo_document(doc["daily_data"]) for doc in results}
+
+
 async def generate_report_by_date_range(
     start_date: str, end_date: str, database: Any, report_type: str = "fba+seller_flex", any_last_90_days: bool = False
 ):
@@ -2352,17 +2582,16 @@ async def generate_report_by_date_range(
 
         # Handle the new "all" report type
         if report_type == "all":
-            # Get vendor_central data
-            vendor_data = await generate_vendor_central_data(start, end, database, any_last_90_days)
-
-            # Get fba+seller_flex data
-            fba_seller_flex_data = await generate_amazon_data(
-                start, end, database, "fba+seller_flex", any_last_90_days
+            vendor_data = await generate_vendor_central_data(
+                start, end, database, any_last_90_days, keep_daily_data=True
             )
-
-            # Combine the data
+            fba_seller_flex_data = await generate_amazon_data(
+                start, end, database, "fba+seller_flex", any_last_90_days, keep_daily_data=True
+            )
             combined_data = combine_report_data(vendor_data, fba_seller_flex_data)
-
+            # Strip internal daily data from final output
+            for item in combined_data:
+                item.pop("_daily_data", None)
             return combined_data
 
         elif report_type == "vendor_central":
@@ -2383,7 +2612,7 @@ async def generate_report_by_date_range(
         )
 
 
-async def generate_vendor_central_data(start, end, database, any_last_90_days: bool = False):
+async def generate_vendor_central_data(start, end, database, any_last_90_days: bool = False, keep_daily_data: bool = False):
     """Generate vendor central report data"""
     vendor_pipeline = [
         {
@@ -2435,13 +2664,42 @@ async def generate_vendor_central_data(start, end, database, any_last_90_days: b
             }
         },
         {"$addFields": {"item_info": {"$last": "$item_info"}}},
+        {
+            "$lookup": {
+                "from": VENDOR_CENTRAL_RETURNS_COLLECTION,
+                "let": {"sales_asin": "$_id.asin"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$asin", "$$sales_asin"]},
+                                    {"$gte": ["$return_date", start]},
+                                    {"$lte": ["$return_date", end]},
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": "$asin",
+                            "vc_returns": {"$sum": {"$ifNull": ["$quantity", 0]}},
+                        }
+                    },
+                ],
+                "as": "vc_returns_data",
+            }
+        },
+        {"$addFields": {"vc_returns_data": {"$first": "$vc_returns_data"}}},
         {"$sort": {"_id.date": -1}},
         {
             "$group": {
                 "_id": {"asin": "$_id.asin"},
                 "total_units_sold": {"$sum": "$units_sold"},
                 "total_amount": {"$sum": "$amount"},
-                "total_returns": {"$sum": "$customer_returns"},
+                "vc_returns_total": {
+                    "$last": {"$ifNull": ["$vc_returns_data.vc_returns", 0]}
+                },
                 "last_day_closing_stock": {
                     "$last": {"$ifNull": ["$inventory_data.closing_stock", 0]}
                 },
@@ -2454,7 +2712,6 @@ async def generate_vendor_central_data(start, end, database, any_last_90_days: b
                             "$ifNull": ["$inventory_data.closing_stock", 0]
                         },
                         "units_sold": "$units_sold",
-                        "returns": "$customer_returns",  # ADD THIS for debugging
                     }
                 },
             }
@@ -2500,27 +2757,6 @@ async def generate_vendor_central_data(start, end, database, any_last_90_days: b
             }
         },
         {
-            "$addFields": {
-                "drr": {
-                    "$cond": {
-                        "if": {"$gt": ["$total_days_in_stock", 0]},
-                        "then": {
-                            "$divide": [
-                                {
-                                    "$subtract": [
-                                        "$total_units_sold",
-                                        {"$ifNull": ["$total_returns", 0]},
-                                    ]
-                                },
-                                "$total_days_in_stock",
-                            ]
-                        },
-                        "else": 0,
-                    }
-                }
-            }
-        },
-        {
             "$project": {
                 "_id": 0,
                 "asin": "$_id.asin",
@@ -2531,10 +2767,8 @@ async def generate_vendor_central_data(start, end, database, any_last_90_days: b
                 "total_amount": {"$round": ["$total_amount", 2]},
                 "stock": "$last_day_closing_stock",
                 "total_days_in_stock": "$total_days_in_stock",
-                "drr": {"$round": ["$drr", 2]},
-                "total_returns": {
-                    "$ifNull": ["$total_returns", 0]
-                },  # Handle null returns
+                "vc_returns": {"$ifNull": ["$vc_returns_total", 0]},
+                "daily_data": "$daily_data",
                 "data_source": {"$literal": "vendor_central"},
             }
         },
@@ -2554,6 +2788,29 @@ async def generate_vendor_central_data(start, end, database, any_last_90_days: b
     cursor = await asyncio.to_thread(_run_vendor_aggregation)
     result = serialize_mongo_document(cursor)
 
+    # Fetch 90-day DRR daily data (separate from the report-range daily data)
+    asins_for_drr = [item["asin"] for item in result if item.get("asin")]
+    drr_daily_map: dict = {}
+    if asins_for_drr:
+        drr_daily_map = await _fetch_vc_drr_daily(database, end, asins_for_drr)
+
+    for item in result:
+        daily_data = item.pop("daily_data", [])
+        vc_ret = item.get("vc_returns", 0) or 0
+        item["total_returns"] = vc_ret
+        item["vc_units_sold"] = item.get("units_sold", 0)
+
+        drr_daily = drr_daily_map.get(item.get("asin"), [])
+        drr, lookback_label, lookback_sales, drr_flag = compute_drr_v3(drr_daily, vc_ret)
+        item["drr"] = drr
+        item["drr_lookback"] = lookback_label or ""
+        item["drr_lookback_sales"] = lookback_sales
+        item["drr_flag"] = drr_flag
+
+        if keep_daily_data:
+            item["_daily_data"] = daily_data
+            item["_drr_daily_data"] = drr_daily
+
     # Fetch last 90 days in stock if requested
     if any_last_90_days and result:
         asins = [item["asin"] for item in result if "asin" in item]
@@ -2561,7 +2818,6 @@ async def generate_vendor_central_data(start, end, database, any_last_90_days: b
             logger.info(f"Fetching last 90 days in stock for {len(asins)} ASINs (Vendor Central)")
             last_90_days_data = await fetch_last_n_days_vendor_inventory(database, end, asins, 90)
 
-            # Add the last 90 days data to each item in the result
             for item in result:
                 asin = item.get("asin")
                 if asin:
@@ -2570,7 +2826,7 @@ async def generate_vendor_central_data(start, end, database, any_last_90_days: b
     return result
 
 
-async def generate_amazon_data(start, end, database, report_type, any_last_90_days: bool = False):
+async def generate_amazon_data(start, end, database, report_type, any_last_90_days: bool = False, keep_daily_data: bool = False):
     """Generate FBA/Seller Flex report data with returns information (FBA only)"""
     ledger_match_conditions = [
         {"$eq": ["$asin", "$$sales_asin"]},
@@ -2669,10 +2925,10 @@ async def generate_amazon_data(start, end, database, report_type, any_last_90_da
             {"$addFields": {"fba_returns_data": {"$first": "$fba_returns_data"}}}
         )
 
-    # Add SC returns lookup for all report types
-    sc_returns_lookup_stage = {
+    # Add Seller Flex returns lookup for all report types
+    sf_returns_lookup_stage = {
         "$lookup": {
-            "from": SC_RETURNS_COLLECTION,
+            "from": SELLER_FLEX_RETURNS_COLLECTION,
             "let": {"sales_asin": "$_id.asin"},
             "pipeline": [
                 {
@@ -2680,8 +2936,9 @@ async def generate_amazon_data(start, end, database, report_type, any_last_90_da
                         "$expr": {
                             "$and": [
                                 {"$eq": ["$asin", "$$sales_asin"]},
-                                {"$gte": ["$order_date", start]},
-                                {"$lte": ["$order_date", end]},
+                                {"$gte": ["$pickup_date", start]},
+                                {"$lte": ["$pickup_date", end]},
+                                {"$ne": ["$units", None]},
                             ]
                         }
                     }
@@ -2689,18 +2946,16 @@ async def generate_amazon_data(start, end, database, report_type, any_last_90_da
                 {
                     "$group": {
                         "_id": "$asin",
-                        "sc_returns": {
-                            "$sum": {"$toInt": {"$ifNull": ["$return_quantity", 1]}}
-                        },
+                        "sf_returns": {"$sum": {"$ifNull": ["$units", 0]}},
                     }
                 },
             ],
-            "as": "sc_returns_data",
+            "as": "sf_returns_data",
         }
     }
-    base_pipeline.append(sc_returns_lookup_stage)
+    base_pipeline.append(sf_returns_lookup_stage)
     base_pipeline.append(
-        {"$addFields": {"sc_returns_data": {"$first": "$sc_returns_data"}}}
+        {"$addFields": {"sf_returns_data": {"$first": "$sf_returns_data"}}}
     )
 
     # Continue with the rest of the pipeline
@@ -2727,22 +2982,14 @@ async def generate_amazon_data(start, end, database, report_type, any_last_90_da
         }
     }
 
-    # Add combined returns field
+    # Track FBA and SF returns separately
     if report_type in ["fba", "fba+seller_flex"]:
-        # FBA reports: FBA returns + SC returns
-        group_stage["$group"]["total_returns"] = {
-            "$last": {
-                "$add": [
-                    {"$ifNull": ["$fba_returns_data.fba_returns", 0]},
-                    {"$ifNull": ["$sc_returns_data.sc_returns", 0]},
-                ]
-            }
+        group_stage["$group"]["fba_returns_total"] = {
+            "$last": {"$ifNull": ["$fba_returns_data.fba_returns", 0]}
         }
-    elif report_type == "seller_flex":
-        # Seller Flex reports: Only SC returns (no FBA returns)
-        group_stage["$group"]["total_returns"] = {
-            "$last": {"$ifNull": ["$sc_returns_data.sc_returns", 0]}
-        }
+    group_stage["$group"]["sf_returns_total"] = {
+        "$last": {"$ifNull": ["$sf_returns_data.sf_returns", 0]}
+    }
 
     base_pipeline.append(group_stage)
 
@@ -2793,31 +3040,10 @@ async def generate_amazon_data(start, end, database, report_type, any_last_90_da
                     },
                 }
             },
-            {
-                "$addFields": {
-                    "drr": {
-                        "$cond": {
-                            "if": {"$gt": ["$total_days_in_stock", 0]},
-                            "then": {
-                                "$divide": [
-                                    {
-                                        "$subtract": [
-                                            "$total_units_sold",
-                                            {"$ifNull": ["$total_returns", 0]},
-                                        ]
-                                    },
-                                    "$total_days_in_stock",
-                                ]
-                            },
-                            "else": 0,
-                        }
-                    }
-                }
-            },
         ]
     )
 
-    # Build project stage dynamically based on report type
+    # Build project stage — include daily_data for DRR v3, computed in Python
     project_stage = {
         "$project": {
             "_id": 0,
@@ -2829,9 +3055,10 @@ async def generate_amazon_data(start, end, database, report_type, any_last_90_da
             "total_amount": "$total_amount",
             "sessions": "$total_sessions",
             "closing_stock": "$total_closing_stock",
-            "total_returns": "$total_returns",  # Always include total_returns
+            "fba_returns": {"$ifNull": ["$fba_returns_total", 0]},
+            "seller_flex_returns": {"$ifNull": ["$sf_returns_total", 0]},
             "total_days_in_stock": "$total_days_in_stock",
-            "drr": {"$round": ["$drr", 2]},
+            "daily_data": "$daily_data",
             "data_source": {"$literal": report_type},
         }
     }
@@ -2856,6 +3083,30 @@ async def generate_amazon_data(start, end, database, report_type, any_last_90_da
     cursor = await asyncio.to_thread(_run_fba_aggregation)
     result = serialize_mongo_document(cursor)
 
+    # Fetch 90-day DRR daily data (separate from the report-range daily data)
+    asins_for_drr = [item["asin"] for item in result if item.get("asin")]
+    drr_daily_map: dict = {}
+    if asins_for_drr:
+        drr_daily_map = await _fetch_fba_drr_daily(database, end, asins_for_drr, report_type)
+
+    for item in result:
+        daily_data = item.pop("daily_data", [])
+        fba_ret = item.get("fba_returns", 0) or 0
+        sf_ret = item.get("seller_flex_returns", 0) or 0
+        item["total_returns"] = fba_ret + sf_ret
+        item["fba_units_sold"] = item.get("units_sold", 0)
+
+        drr_daily = drr_daily_map.get(item.get("asin"), [])
+        drr, lookback_label, lookback_sales, drr_flag = compute_drr_v3(drr_daily, item["total_returns"])
+        item["drr"] = drr
+        item["drr_lookback"] = lookback_label or ""
+        item["drr_lookback_sales"] = lookback_sales
+        item["drr_flag"] = drr_flag
+
+        if keep_daily_data:
+            item["_daily_data"] = daily_data
+            item["_drr_daily_data"] = drr_daily
+
     # Fetch last 90 days in stock if requested
     if any_last_90_days and result:
         asins = [item["asin"] for item in result if "asin" in item]
@@ -2863,7 +3114,6 @@ async def generate_amazon_data(start, end, database, report_type, any_last_90_da
             logger.info(f"Fetching last 90 days in stock for {len(asins)} ASINs (Amazon Ledger - {report_type})")
             last_90_days_data = await fetch_last_n_days_amazon_ledger(database, end, asins, 90, report_type)
 
-            # Add the last 90 days data to each item in the result
             for item in result:
                 asin = item.get("asin")
                 if asin:
@@ -2897,14 +3147,44 @@ def combine_report_data(vendor_data, fba_seller_flex_data):
             vendor_item = vendor_lookup[key]
             fba_item = fba_lookup[key]
 
+            def _merge_daily(a_list, b_list):
+                m: dict = {}
+                for d in a_list:
+                    key2 = d["date"]
+                    m[key2] = {"date": key2, "closing_stock": d.get("closing_stock", 0) or 0, "units_sold": d.get("units_sold", 0) or 0}
+                for d in b_list:
+                    key2 = d["date"]
+                    if key2 in m:
+                        m[key2]["closing_stock"] = max(m[key2]["closing_stock"], d.get("closing_stock", 0) or 0)
+                        m[key2]["units_sold"] += d.get("units_sold", 0) or 0
+                    else:
+                        m[key2] = {"date": key2, "closing_stock": d.get("closing_stock", 0) or 0, "units_sold": d.get("units_sold", 0) or 0}
+                return list(m.values())
+
+            vc_us = vendor_item.get("units_sold", 0) or 0
+            fba_us = fba_item.get("units_sold", 0) or 0
+
+            # Merge 90-day DRR daily data from both platforms
+            merged_drr = _merge_daily(
+                vendor_item.get("_drr_daily_data", []),
+                fba_item.get("_drr_daily_data", []),
+            )
+            drr, lookback_label, lookback_sales, drr_flag = compute_drr_v3(
+                merged_drr, (
+                    (fba_item.get("fba_returns", 0) or 0)
+                    + (fba_item.get("seller_flex_returns", 0) or 0)
+                    + (vendor_item.get("vc_returns", 0) or 0)
+                )
+            )
+
             combined_item = {
                 "asin": vendor_item.get("asin") or fba_item.get("asin"),
                 "sku_code": vendor_item.get("sku_code") or fba_item.get("sku_code"),
                 "item_name": vendor_item.get("item_name") or fba_item.get("item_name"),
-                "warehouses": fba_item.get("warehouses", []),  # Only from FBA data
-                "units_sold": (
-                    vendor_item.get("units_sold", 0) + fba_item.get("units_sold", 0)
-                ),
+                "warehouses": fba_item.get("warehouses", []),
+                "vc_units_sold": vc_us,
+                "fba_units_sold": fba_us,
+                "units_sold": vc_us + fba_us,
                 "total_amount": round(
                     (
                         vendor_item.get("total_amount", 0)
@@ -2912,35 +3192,41 @@ def combine_report_data(vendor_data, fba_seller_flex_data):
                     ),
                     2,
                 ),
-                "sessions": fba_item.get("sessions", 0),  # Only from FBA data
+                "sessions": fba_item.get("sessions", 0),
                 "closing_stock": (
                     vendor_item.get("closing_stock", 0)
                     + fba_item.get("closing_stock", 0)
                 ),
                 "stock": (
                     vendor_item.get("stock", 0) + fba_item.get("closing_stock", 0)
-                ),  # Combined stock
+                ),
                 "vendor_days_in_stock": vendor_item.get("total_days_in_stock", 0),
                 "fba_days_in_stock": fba_item.get("total_days_in_stock", 0),
                 "total_days_in_stock": max(
                     vendor_item.get("total_days_in_stock", 0),
                     fba_item.get("total_days_in_stock", 0),
                 ),
+                "vc_stock": vendor_item.get("closing_stock", 0),
+                "fba_stock": fba_item.get("closing_stock", 0),
+                "fba_returns": fba_item.get("fba_returns", 0) or 0,
+                "seller_flex_returns": fba_item.get("seller_flex_returns", 0) or 0,
+                "vc_returns": vendor_item.get("vc_returns", 0) or 0,
                 "total_returns": (
-                    vendor_item.get("total_returns", 0)
-                    + fba_item.get("total_returns", 0)
+                    (fba_item.get("fba_returns", 0) or 0)
+                    + (fba_item.get("seller_flex_returns", 0) or 0)
+                    + (vendor_item.get("vc_returns", 0) or 0)
                 ),
-                "drr": 0,  # Will be recalculated
+                "drr": drr,
+                "drr_lookback": lookback_label or "",
+                "drr_lookback_sales": lookback_sales,
+                "drr_flag": drr_flag,
                 "data_source": "combined",
+                # Keep merged report-range daily for calendar (will be stripped after download)
+                "_daily_data": _merge_daily(
+                    vendor_item.get("_daily_data", []),
+                    fba_item.get("_daily_data", []),
+                ),
             }
-
-            # Recalculate DRR
-            if combined_item["total_days_in_stock"] > 0:
-                net_units = combined_item["units_sold"] - combined_item.get("total_returns", 0)
-                combined_item["drr"] = round(
-                    net_units / combined_item["total_days_in_stock"],
-                    2,
-                )
 
             combined_results.append(combined_item)
             processed_keys.add(key)
@@ -2948,13 +3234,21 @@ def combine_report_data(vendor_data, fba_seller_flex_data):
     # Add vendor-only records
     for key, vendor_item in vendor_lookup.items():
         if key not in processed_keys:
-            # Add missing fields with default values
             vendor_item["warehouses"] = []
             vendor_item["sessions"] = 0
             if "stock" not in vendor_item:
                 vendor_item["stock"] = vendor_item.get("closing_stock", 0)
-            if "total_returns" not in vendor_item:
-                vendor_item["total_returns"] = 0
+            vendor_item["vc_stock"] = vendor_item.get("closing_stock", 0)
+            vendor_item["fba_stock"] = 0
+            vendor_item.setdefault("fba_returns", 0)
+            vendor_item.setdefault("seller_flex_returns", 0)
+            vendor_item.setdefault("vc_returns", 0)
+            vendor_item.setdefault("total_returns", vendor_item.get("vc_returns", 0))
+            vendor_item.setdefault("vc_units_sold", vendor_item.get("units_sold", 0))
+            vendor_item.setdefault("fba_units_sold", 0)
+            vendor_item.setdefault("drr_lookback", "")
+            vendor_item.setdefault("drr_lookback_sales", 0)
+            vendor_item.setdefault("drr_flag", "")
             vendor_item["vendor_days_in_stock"] = vendor_item.get("total_days_in_stock", 0)
             vendor_item["fba_days_in_stock"] = 0
             vendor_item["data_source"] = "vendor_only"
@@ -2963,8 +3257,15 @@ def combine_report_data(vendor_data, fba_seller_flex_data):
     # Add FBA-only records
     for key, fba_item in fba_lookup.items():
         if key not in processed_keys:
-            # Add missing fields with default values
             fba_item["stock"] = fba_item.get("closing_stock", 0)
+            fba_item["vc_stock"] = 0
+            fba_item["fba_stock"] = fba_item.get("closing_stock", 0)
+            fba_item.setdefault("vc_returns", 0)
+            fba_item.setdefault("vc_units_sold", 0)
+            fba_item.setdefault("fba_units_sold", fba_item.get("units_sold", 0))
+            fba_item.setdefault("drr_lookback", "")
+            fba_item.setdefault("drr_lookback_sales", 0)
+            fba_item.setdefault("drr_flag", "")
             fba_item["vendor_days_in_stock"] = 0
             fba_item["fba_days_in_stock"] = fba_item.get("total_days_in_stock", 0)
             fba_item["data_source"] = "fba_only"
@@ -3031,9 +3332,488 @@ def format_column_name(column_name):
         "Sessions": "Sessions",
         "Warehouses": "Warehouses",
         "Last 90 Days Dates": "Last 90 Days Dates",
+        "Drr": "DRR",
+        "Drr Flag": "DRR Flag",
+        "Drr Lookback": "DRR Lookback Period",
+        "Drr Lookback Sales": "DRR Lookback Sales",
     }
 
     return replacements.get(formatted, formatted)
+
+
+async def _get_last_stock_dates(database, start: datetime, end: datetime):
+    """
+    Query the actual latest date that has stock data in each inventory collection
+    within the given range. Returns (vc_date_label, fba_date_label) strings.
+    """
+    def _query_vc():
+        doc = database.get_collection("amazon_vendor_inventory").find_one(
+            {"date": {"$gte": start, "$lte": end}},
+            sort=[("date", -1)],
+            projection={"date": 1},
+        )
+        return doc["date"] if doc else None
+
+    def _query_fba():
+        doc = database.get_collection("amazon_ledger").find_one(
+            {"date": {"$gte": start, "$lte": end}, "disposition": "SELLABLE"},
+            sort=[("date", -1)],
+            projection={"date": 1},
+        )
+        return doc["date"] if doc else None
+
+    vc_dt, fba_dt = await asyncio.gather(
+        asyncio.to_thread(_query_vc),
+        asyncio.to_thread(_query_fba),
+    )
+    fmt = lambda dt: dt.strftime("%d %b %Y") if dt else None
+    return fmt(vc_dt), fmt(fba_dt)
+
+
+def _parse_date_str(date_val):
+    """Parse a date from an ISO string or datetime to a date object."""
+    if isinstance(date_val, datetime):
+        return date_val.date()
+    if isinstance(date_val, str):
+        try:
+            return datetime.fromisoformat(date_val.replace("Z", "+00:00")).date()
+        except ValueError:
+            return datetime.strptime(date_val[:10], "%Y-%m-%d").date()
+    return None
+
+
+def _build_active_days_df(vc_daily_by_asin: dict, fba_daily_by_asin: dict, report_data: list, all_dates: list) -> pd.DataFrame:
+    """
+    Active Days sheet: one row per product, columns = dates.
+    Cell = total units sold (VC + FBA) if sales > 0,
+           0 if in stock on any platform but no sale,
+           blank (None) if no stock at all.
+    """
+    asin_info = {
+        item["asin"]: {"sku_code": item.get("sku_code", ""), "item_name": item.get("item_name", "")}
+        for item in report_data
+        if item.get("asin")
+    }
+
+    all_asins = sorted(set(vc_daily_by_asin.keys()) | set(fba_daily_by_asin.keys()))
+    date_cols = [d.strftime("%d %b") for d in all_dates]
+    rows = []
+
+    for asin in all_asins:
+        vc_by_date = {_parse_date_str(d["date"]): d for d in vc_daily_by_asin.get(asin, []) if _parse_date_str(d.get("date"))}
+        fba_by_date = {_parse_date_str(d["date"]): d for d in fba_daily_by_asin.get(asin, []) if _parse_date_str(d.get("date"))}
+        info = asin_info.get(asin, {})
+
+        row = {"ASIN": asin, "SKU Code": info.get("sku_code", ""), "Item Name": info.get("item_name", "")}
+        days_in_stock = 0
+        for dt, col in zip(all_dates, date_cols):
+            vc_day = vc_by_date.get(dt) or {}
+            fba_day = fba_by_date.get(dt) or {}
+            vc_stock = vc_day.get("closing_stock", 0) or 0
+            fba_stock = fba_day.get("closing_stock", 0) or 0
+            vc_sold = vc_day.get("units_sold", 0) or 0
+            fba_sold = fba_day.get("units_sold", 0) or 0
+            total_sold = vc_sold + fba_sold
+            in_stock = vc_stock > 0 or fba_stock > 0
+
+            if total_sold > 0:
+                row[col] = total_sold
+                days_in_stock += 1
+            elif in_stock:
+                row[col] = 0
+                days_in_stock += 1
+            else:
+                row[col] = None  # blank
+
+        row["Total Days In Stock"] = days_in_stock
+        ordered = {k: row[k] for k in ["ASIN", "SKU Code", "Item Name", "Total Days In Stock"]}
+        ordered.update({col: row[col] for col in date_cols})
+        rows.append(ordered)
+
+    return pd.DataFrame(rows) if rows else None
+
+
+def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_daily_by_asin, drr_dates, report_type, end_date_label, purchase_status_map=None):
+    """
+    Build Active Days sheet matching reference layout.
+
+    Layout:
+      Row 1  – title with end date
+      Row 2  – section group headers
+      Row 3  – column labels (D1-D90, H1-H90, calc columns)
+      Row 4  – actual dates for D1-D90 and H1-H90
+      Row 5  – blank separator
+      Row 6+ – one data row per ASIN with values + Excel formulas
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    from openpyxl.formatting.rule import FormulaRule
+
+    if purchase_status_map is None:
+        purchase_status_map = {}
+
+    # ── Column index constants (1-based) ────────────────────────────────
+    COL_STATUS = 1    # Item Status (purchase_status from products)
+    COL_A   = 2    # SKU / Product
+    COL_B   = 3    # FBA Sales (incl. SF)
+    COL_C   = 4    # VC Sales
+    COL_D   = 5    # FBA Returns
+    COL_E   = 6    # SF Returns
+    COL_F   = 7    # VC Returns
+    COL_G   = 8    # Total Returns (=D+E+F)
+    COL_H   = 9    # blank spacer
+    COL_D1  = 10   # D1 – most recent day
+    COL_D90 = 99   # D90 – oldest day  (10 + 89)
+    COL_H1  = 100  # H1 – first helper
+    COL_H90 = 189  # H90 – last helper (100 + 89)
+    COL_GF  = 190  # Total Active Days (max 30)
+    COL_GG  = 191  # Selected Sum (30 days)
+    COL_GH  = 192  # Raw Mean (÷30)
+    COL_GI  = 193  # Spike Threshold (2× Mean)
+    COL_GJ  = 194  # Cleaned Units (spikes→threshold)
+    COL_GK  = 195  # Spike Days Found
+    COL_GL  = 196  # Net Units (after returns)
+    COL_GM  = 197  # blank spacer
+    COL_GN  = 198  # Final DRR (units/day)
+    COL_GO  = 199  # DRR Flag
+
+    R_TITLE      = 1
+    R_SECTION    = 2
+    R_HEADERS    = 3
+    R_DATES      = 4
+    R_DATA_START = 6  # row 5 left blank
+
+    L = get_column_letter  # shorthand
+
+    # ── Row 1: title ────────────────────────────────────────────────────
+    # ── Row 2: section group headers ────────────────────────────────────
+    ws.cell(row=R_SECTION, column=COL_A).value = "RAW INPUTS"
+    ws.cell(row=R_SECTION, column=COL_D1).value = (
+        f"90 DAILY COLUMNS [D1 = {end_date_label}]  —  Blank=OOS  |  0=In Stock No Sale  |"
+        "  Number=Units Sold  |  Day 1 = Most Recent"
+    )
+    ws.cell(row=R_SECTION, column=COL_H1).value = (
+        "HELPER ROW — Cumulative count of non-blank days. Selected if count ≤ 30."
+    )
+    ws.cell(row=R_SECTION, column=COL_GF).value = "CALCULATIONS"
+    ws.cell(row=R_SECTION, column=COL_GL).value = "NET UNITS"
+    ws.cell(row=R_SECTION, column=COL_GN).value = "FINAL DRR"
+    ws.cell(row=R_SECTION, column=COL_GO).value = "DRR FLAG"
+    ws.row_dimensions[R_SECTION].height = 30
+
+    # ── Row 3: column headers ────────────────────────────────────────────
+    fixed_headers = {
+        COL_STATUS: "Item Status",
+        COL_A:  "SKU / Product",
+        COL_B:  "FBA Sales\n(incl. SF)",
+        COL_C:  "VC Sales",
+        COL_D:  "FBA\nReturns",
+        COL_E:  "SF\nReturns",
+        COL_F:  "VC\nReturns",
+        COL_G:  "Total\nReturns",
+        COL_GF: "Total Active\nDays (max 30)",
+        COL_GG: "Selected Sum\n(30 days)",
+        COL_GH: "Raw Mean\n(÷30)",
+        COL_GI: "Spike Threshold\n(2× Mean)",
+        COL_GJ: "Cleaned Units\n(spikes→2× Mean)",
+        COL_GK: "Spike Days\nFound",
+        COL_GL: "Net Units\n(after returns)",
+        COL_GN: "Final DRR\n(units/day)",
+        COL_GO: "DRR Flag",
+    }
+    for k in range(90):
+        fixed_headers[COL_D1 + k] = f"D{k + 1}"
+        fixed_headers[COL_H1 + k] = f"H{k + 1}"
+    for col_idx, label in fixed_headers.items():
+        c = ws.cell(row=R_HEADERS, column=col_idx)
+        c.value = label
+        c.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
+
+    # ── Row 4: actual dates for D1-D90 and H1-H90 ──────────────────────
+    # drr_dates[89] = D1/H1 (most recent), drr_dates[0] = D90/H90 (oldest)
+    for k in range(90):
+        date_str = drr_dates[89 - k].strftime("%d %b %Y")
+        ws.cell(row=R_DATES, column=COL_D1 + k).value = date_str
+        ws.cell(row=R_DATES, column=COL_H1 + k).value = date_str
+
+    SPIKE_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+    # ── Data rows ────────────────────────────────────────────────────────
+    asin_to_item = {item["asin"]: item for item in report_data if item.get("asin")}
+    all_asins = sorted(set(drr_vc_daily_by_asin.keys()) | set(drr_fba_daily_by_asin.keys()))
+    if not all_asins:
+        all_asins = [item["asin"] for item in report_data if item.get("asin")]
+
+    for row_offset, asin in enumerate(all_asins):
+        r = R_DATA_START + row_offset
+        item = asin_to_item.get(asin, {})
+
+        # Item Status – from products collection
+        sku  = item.get("sku_code", "")
+        ws.cell(row=r, column=COL_STATUS).value = purchase_status_map.get(sku, "")
+
+        # A – product label
+        name = item.get("item_name", "")
+        ws.cell(row=r, column=COL_A).value = (
+            f"{sku} — {name}" if sku and name else (sku or name or asin)
+        )
+
+        # B – FBA Sales (incl. SF)
+        if report_type == "all":
+            fba_sales = item.get("fba_units_sold", 0) or 0
+        elif report_type == "vendor_central":
+            fba_sales = 0
+        else:
+            fba_sales = item.get("units_sold", 0) or 0
+        ws.cell(row=r, column=COL_B).value = fba_sales
+
+        # C – VC Sales
+        if report_type == "all":
+            vc_sales = item.get("vc_units_sold", 0) or 0
+        elif report_type == "vendor_central":
+            vc_sales = item.get("units_sold", 0) or 0
+        else:
+            vc_sales = 0
+        ws.cell(row=r, column=COL_C).value = vc_sales
+
+        # D – FBA Returns (excluding SF)
+        if report_type == "vendor_central":
+            fba_ret = 0
+        else:
+            fba_ret = item.get("fba_returns", 0) or 0
+        ws.cell(row=r, column=COL_D).value = fba_ret
+
+        # E – SF Returns
+        if report_type == "vendor_central":
+            sf_ret = 0
+        else:
+            sf_ret = item.get("seller_flex_returns", 0) or 0
+        ws.cell(row=r, column=COL_E).value = sf_ret
+
+        # F – VC Returns
+        ws.cell(row=r, column=COL_F).value = item.get("vc_returns", 0) or 0
+
+        # G – Total Returns formula
+        ws.cell(row=r, column=COL_G).value = f"={L(COL_D)}{r}+{L(COL_E)}{r}+{L(COL_F)}{r}"
+
+        # Build date-keyed daily lookups for this ASIN
+        vc_by_date  = {_parse_date_str(d.get("date")): d for d in drr_vc_daily_by_asin.get(asin, []) if _parse_date_str(d.get("date"))}
+        fba_by_date = {_parse_date_str(d.get("date")): d for d in drr_fba_daily_by_asin.get(asin, []) if _parse_date_str(d.get("date"))}
+
+        # D1-D90 – merged daily: blank=OOS, 0=in-stock-no-sale, N=units sold
+        for k in range(90):
+            dt = drr_dates[89 - k]  # D1 = most recent
+            vc_day  = vc_by_date.get(dt)  or {}
+            fba_day = fba_by_date.get(dt) or {}
+            vc_stock  = vc_day.get("closing_stock",  0) or 0
+            fba_stock = fba_day.get("closing_stock", 0) or 0
+            vc_sold   = vc_day.get("units_sold",  0) or 0
+            fba_sold  = fba_day.get("units_sold", 0) or 0
+            in_stock  = vc_stock > 0 or fba_stock > 0 or vc_sold > 0 or fba_sold > 0
+            if in_stock:
+                ws.cell(row=r, column=COL_D1 + k).value = vc_sold + fba_sold
+            # else: leave blank → OOS
+
+        # Highlight spike days (value > GI spike threshold) in yellow
+        gi_ltr = L(COL_GI)
+        d1_ltr = L(COL_D1)
+        d90_ltr = L(COL_D90)
+        spike_formula = f"AND(NOT(ISBLANK({d1_ltr}{r})),{d1_ltr}{r}>${gi_ltr}{r})"
+        ws.conditional_formatting.add(
+            f"{d1_ltr}{r}:{d90_ltr}{r}",
+            FormulaRule(formula=[spike_formula], fill=SPIKE_FILL),
+        )
+
+        # H1-H90 – cumulative count of non-blank day formulas
+        for k in range(90):
+            d_ltr = L(COL_D1 + k)
+            if k == 0:
+                formula = f"=IF(NOT(ISBLANK({d_ltr}{r})),1,0)"
+            else:
+                ph = L(COL_H1 + k - 1)
+                formula = f"=IF(NOT(ISBLANK({d_ltr}{r})),{ph}{r}+1,{ph}{r})"
+            ws.cell(row=r, column=COL_H1 + k).value = formula
+
+        # Calculation column formulas (GF-GO)
+        ge = L(COL_H90);  ct = L(COL_H1)
+        h  = L(COL_D1);   cs = L(COL_D90)
+        gf = L(COL_GF);   gg = L(COL_GG);  gh = L(COL_GH);  gi = L(COL_GI)
+        gj = L(COL_GJ);   gk = L(COL_GK);  gl = L(COL_GL);  f_ = L(COL_G)
+
+        ws.cell(row=r, column=COL_GF).value = f"=MIN({ge}{r},30)"
+
+        ws.cell(row=r, column=COL_GG).value = (
+            f"=IFERROR(SUMPRODUCT(({ct}{r}:{ge}{r}<=30)"
+            f"*(NOT(ISBLANK({h}{r}:{cs}{r})))"
+            f"*IF(ISBLANK({h}{r}:{cs}{r}),0,{h}{r}:{cs}{r})),0)"
+        )
+
+        ws.cell(row=r, column=COL_GH).value = (
+            f"=IFERROR(IF({gf}{r}<30,0,ROUND({gg}{r}/30,2)),0)"
+        )
+
+        ws.cell(row=r, column=COL_GI).value = f"=MAX({gh}{r}*2,5)"
+
+        ws.cell(row=r, column=COL_GJ).value = (
+            f"=IFERROR(ROUND({gg}{r}-SUMPRODUCT(({ct}{r}:{ge}{r}<=30)"
+            f"*(NOT(ISBLANK({h}{r}:{cs}{r})))"
+            f"*(IF(ISBLANK({h}{r}:{cs}{r}),0,{h}{r}:{cs}{r})>{gi}{r})"
+            f"*(IF(ISBLANK({h}{r}:{cs}{r}),0,{h}{r}:{cs}{r})-{gi}{r})),2)"
+            f',\"Check Inputs\")'
+        )
+
+        ws.cell(row=r, column=COL_GK).value = (
+            f"=IFERROR(SUMPRODUCT(({ct}{r}:{ge}{r}<=30)"
+            f"*(NOT(ISBLANK({h}{r}:{cs}{r})))"
+            f"*(IF(ISBLANK({h}{r}:{cs}{r}),0,{h}{r}:{cs}{r})>{gi}{r})*1),0)"
+        )
+
+        ws.cell(row=r, column=COL_GL).value = (
+            f'=IFERROR(MAX(0,{gj}{r}-{f_}{r}),"Check Inputs")'
+        )
+
+        ws.cell(row=r, column=COL_GN).value = (
+            f'=IFERROR(IF({gf}{r}=0,"Manual Input Required - No Sales History",'
+            f'IF({gf}{r}<30,"Manual Input Required - Only "&{gf}{r}&" In-Stock Days Found",'
+            f'ROUND({gl}{r}/30,2))),"Check Inputs")'
+        )
+
+        ws.cell(row=r, column=COL_GO).value = (
+            f'=IFERROR(IF({gf}{r}=0,"Manual Input Required - No Sales History",'
+            f'IF({gf}{r}<30,"Manual Input Required - Only "&{gf}{r}&" In-Stock Days Found",'
+            f'IF({gk}{r}>0,"OK - "&{gk}{r}&" Spike Day(s) Replaced with 2x Mean",'
+            f'"OK - Full Confidence"))),"Check Inputs")'
+        )
+
+    # ── Styling ──────────────────────────────────────────────────────────
+    C_BLUE_D   = "366092"  # dark blue  (raw inputs header)
+    C_GOLD_D   = "8B6914"  # dark gold  (daily cols header)
+    C_GRAY_D   = "595959"  # dark gray  (helper header)
+    C_GREEN_D  = "375623"  # dark green (calc header)
+    C_GOLD_S   = "BF9000"  # section gold
+    C_GRAY_S   = "808080"  # section gray
+    C_GREEN_S  = "1E4620"  # section green
+    C_DATE_BG  = "FFF8DC"  # date row background
+
+    # Row 1 – title
+    t = ws.cell(row=R_TITLE, column=COL_A)
+    t.value = f"Active Days — Report Ending {end_date_label}"
+    t.font  = Font(bold=True, size=13, color="FFFFFF")
+    t.fill  = PatternFill(start_color=C_BLUE_D, end_color=C_BLUE_D, fill_type="solid")
+    ws.row_dimensions[R_TITLE].height = 26
+
+    # Row 2 – section group headers
+    sec_map = {
+        COL_A:   (C_BLUE_D,  "FFFFFF"),
+        COL_D1:  (C_GOLD_S,  "FFFFFF"),
+        COL_H1:  (C_GRAY_S,  "FFFFFF"),
+        COL_GF:  (C_GREEN_S, "FFFFFF"),
+        COL_GL:  (C_GREEN_S, "FFFFFF"),
+        COL_GN:  (C_GREEN_S, "FFFFFF"),
+        COL_GO:  (C_GREEN_S, "FFFFFF"),
+    }
+    for col_idx, (bg, fg) in sec_map.items():
+        c = ws.cell(row=R_SECTION, column=col_idx)
+        c.font  = Font(bold=True, color=fg)
+        c.fill  = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
+        c.alignment = Alignment(wrap_text=True, vertical="center")
+
+    # Row 3 – column labels
+    yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+    for col_idx in range(1, COL_GO + 1):
+        c = ws.cell(row=R_HEADERS, column=col_idx)
+        if not c.value:
+            continue
+        if col_idx == COL_STATUS:
+            c.font  = Font(bold=True, color="000000")
+            c.fill  = yellow_fill
+        elif col_idx <= COL_G:
+            c.font  = Font(bold=True, color="FFFFFF")
+            c.fill  = PatternFill(start_color=C_BLUE_D, end_color=C_BLUE_D, fill_type="solid")
+        elif col_idx <= COL_D90:
+            c.font  = Font(bold=True, color="FFFFFF")
+            c.fill  = PatternFill(start_color=C_GOLD_D, end_color=C_GOLD_D, fill_type="solid")
+        elif col_idx <= COL_H90:
+            c.font  = Font(bold=True, color="FFFFFF")
+            c.fill  = PatternFill(start_color=C_GRAY_D, end_color=C_GRAY_D, fill_type="solid")
+        else:
+            c.font  = Font(bold=True, color="FFFFFF")
+            c.fill  = PatternFill(start_color=C_GREEN_D, end_color=C_GREEN_D, fill_type="solid")
+        c.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
+    ws.row_dimensions[R_HEADERS].height = 42
+
+    # Row 4 – date labels for D1-D90 and H1-H90 (italic, tinted background)
+    d_date_fill = PatternFill(start_color=C_DATE_BG,  end_color=C_DATE_BG,  fill_type="solid")
+    h_date_fill = PatternFill(start_color="E8E8E8",   end_color="E8E8E8",   fill_type="solid")
+    for k in range(90):
+        for col_base, fill in ((COL_D1, d_date_fill), (COL_H1, h_date_fill)):
+            c = ws.cell(row=R_DATES, column=col_base + k)
+            c.fill      = fill
+            c.font      = Font(size=8, italic=True)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[R_DATES].height = 18
+
+    # ── Column widths ────────────────────────────────────────────────────
+    ws.column_dimensions[L(COL_STATUS)].width = 18  # Item Status
+    ws.column_dimensions[L(COL_A)].width = 45       # SKU / Product
+    for ci in range(COL_B, COL_H):                  # FBA Sales–Total Returns
+        ws.column_dimensions[L(ci)].width = 10
+    ws.column_dimensions[L(COL_H)].width = 2        # spacer
+    for k in range(90):                             # D1-D90
+        ws.column_dimensions[L(COL_D1 + k)].width = 11
+    for k in range(90):                             # H1-H90 helpers
+        ws.column_dimensions[L(COL_H1 + k)].width = 4
+    for ci in [COL_GF, COL_GG, COL_GH, COL_GI, COL_GJ, COL_GK, COL_GL]:
+        ws.column_dimensions[L(ci)].width = 12
+    ws.column_dimensions[L(COL_GM)].width = 2       # spacer
+    ws.column_dimensions[L(COL_GN)].width = 15
+    ws.column_dimensions[L(COL_GO)].width = 38
+
+    # Freeze at J6: columns A-I + rows 1-5 always visible
+    ws.freeze_panes = "J6"
+
+
+def _style_sheet(worksheet, df, header_color="366092"):
+    """Apply standard header styling and auto-width to a worksheet."""
+    from openpyxl.styles import Font, PatternFill
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color=header_color, end_color=header_color, fill_type="solid")
+    for cell in worksheet[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+
+    for column in worksheet.columns:
+        max_length = max((len(str(cell.value)) for cell in column if cell.value), default=0)
+        worksheet.column_dimensions[column[0].column_letter].width = min(max_length + 2, 50)
+
+
+def _style_calendar_sheet(worksheet, df):
+    """Style a calendar sheet: header + alternating row colors for units/stock rows."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    _style_sheet(worksheet, df, header_color="366092")
+
+    units_fill = PatternFill(start_color="DDEEFF", end_color="DDEEFF", fill_type="solid")
+    stock_fill = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
+
+    metric_col_idx = None
+    for i, cell in enumerate(worksheet[1], 1):
+        if cell.value == "Metric":
+            metric_col_idx = i
+            break
+
+    for row_num in range(2, len(df) + 2):
+        if metric_col_idx:
+            metric_val = worksheet.cell(row=row_num, column=metric_col_idx).value or ""
+            fill = units_fill if "Units" in metric_val else stock_fill
+        else:
+            fill = units_fill if row_num % 2 == 0 else stock_fill
+        for col_num in range(1, len(df.columns) + 1):
+            cell = worksheet.cell(row=row_num, column=col_num)
+            cell.fill = fill
+            cell.alignment = Alignment(horizontal="center")
+
+    # Freeze the first 4 identifier columns
+    worksheet.freeze_panes = "E2"
 
 
 @router.get("/download_report_by_date_range")
@@ -3046,7 +3826,7 @@ async def download_report_by_date_range(
 ):
 
     try:
-        # Validate report_type parameter - Updated to include "all"
+        # Validate report_type parameter
         valid_types = ["fba+seller_flex", "fba", "seller_flex", "vendor_central", "all"]
         if report_type not in valid_types:
             raise HTTPException(
@@ -3054,14 +3834,65 @@ async def download_report_by_date_range(
                 detail=f"Invalid report_type. Must be one of: {', '.join(valid_types)}",
             )
 
-        # Generate the report data using existing function
-        report_data = await generate_report_by_date_range(
-            start_date=start_date,
-            end_date=end_date,
-            database=database,
-            report_type=report_type,
-            any_last_90_days=any_last_90_days,
+        start = datetime.strptime(start_date, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
         )
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+        )
+        end_label = datetime.strptime(end_date, "%Y-%m-%d").strftime("%d %b %Y")
+
+        # Resolve actual last-data dates from the inventory collections
+        vc_date_label, fba_date_label = await _get_last_stock_dates(database, start, end)
+        vc_date_label = vc_date_label or end_label
+        fba_date_label = fba_date_label or end_label
+
+        # All dates in the selected range (for calendar sheets)
+        all_dates = []
+        cur = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_d = datetime.strptime(end_date, "%Y-%m-%d").date()
+        while cur <= end_d:
+            all_dates.append(cur)
+            cur += timedelta(days=1)
+
+        # 90-day DRR window ending at end_date (for Active Days sheet)
+        drr_dates = [end_d - timedelta(days=i) for i in range(89, -1, -1)]
+
+        # --- Fetch data with daily detail retained ---
+        vc_daily_by_asin = {}
+        fba_daily_by_asin = {}
+        # DRR-window (90-day) daily data per platform for Active Days sheet
+        drr_vc_daily_by_asin: dict = {}
+        drr_fba_daily_by_asin: dict = {}
+
+        if report_type == "all":
+            vendor_raw = await generate_vendor_central_data(start, end, database, any_last_90_days, keep_daily_data=True)
+            fba_raw = await generate_amazon_data(start, end, database, "fba+seller_flex", any_last_90_days, keep_daily_data=True)
+            # Collect per-platform daily data before combining
+            for item in vendor_raw:
+                vc_daily_by_asin[item["asin"]] = item.get("_daily_data", [])
+                drr_vc_daily_by_asin[item["asin"]] = item.get("_drr_daily_data", [])
+            for item in fba_raw:
+                fba_daily_by_asin[item["asin"]] = item.get("_daily_data", [])
+                drr_fba_daily_by_asin[item["asin"]] = item.get("_drr_daily_data", [])
+            report_data = combine_report_data(vendor_raw, fba_raw)
+            for item in report_data:
+                item.pop("_daily_data", None)
+                item.pop("_drr_daily_data", None)
+
+        elif report_type == "vendor_central":
+            vendor_raw = await generate_vendor_central_data(start, end, database, any_last_90_days, keep_daily_data=True)
+            for item in vendor_raw:
+                vc_daily_by_asin[item["asin"]] = item.pop("_daily_data", [])
+                drr_vc_daily_by_asin[item["asin"]] = item.pop("_drr_daily_data", [])
+            report_data = vendor_raw
+
+        else:  # fba, seller_flex, fba+seller_flex
+            fba_raw = await generate_amazon_data(start, end, database, report_type, any_last_90_days, keep_daily_data=True)
+            for item in fba_raw:
+                fba_daily_by_asin[item["asin"]] = item.pop("_daily_data", [])
+                drr_fba_daily_by_asin[item["asin"]] = item.pop("_drr_daily_data", [])
+            report_data = fba_raw
 
         if not report_data:
             raise HTTPException(
@@ -3069,208 +3900,122 @@ async def download_report_by_date_range(
                 detail="No data found for the specified date range and report type",
             )
 
-        # Convert to DataFrame
+        # --- Build main DataFrame ---
         df = pd.DataFrame(report_data)
 
-        # Format column names
-        column_mapping = {}
-        for col in df.columns:
-            column_mapping[col] = format_column_name(col)
+        # Standard column rename
+        column_mapping = {col: format_column_name(col) for col in df.columns}
+
+        # Override stock columns with actual-last-data date labels
+        if report_type == "all":
+            vc_stock_col = f"VC Stock (as of {vc_date_label})"
+            fba_stock_col = f"FBA Stock (as of {fba_date_label})"
+            stock_col = f"Total Stock (as of {vc_date_label})"
+            column_mapping["vc_stock"] = vc_stock_col
+            column_mapping["fba_stock"] = fba_stock_col
+            column_mapping["closing_stock"] = stock_col
+        elif report_type == "vendor_central":
+            stock_col = f"VC Stock (as of {vc_date_label})"
+            column_mapping["closing_stock"] = stock_col
+        else:
+            stock_col = f"FBA Stock (as of {fba_date_label})"
+            column_mapping["closing_stock"] = stock_col
+
+        # Drop the raw duplicate 'stock' field
+        column_mapping.pop("stock", None)
 
         df = df.rename(columns=column_mapping)
+        if "Stock" in df.columns:
+            df = df.drop(columns=["Stock"])
 
-        # Handle the warehouses column (convert list to string) - only for non-vendor reports
+        # Warehouses: list → string
         if "Warehouses" in df.columns:
             df["Warehouses"] = df["Warehouses"].apply(
                 lambda x: ", ".join(x) if isinstance(x, list) else str(x)
             )
 
-        # Reorder columns for better presentation
-        # Different column orders for different report types
+        # --- Column order ---
         if report_type == "vendor_central":
             preferred_order = [
-                "ASIN",
-                "SKU Code",
-                "Item Name",
-                "Units Sold",
-                "Total Amount",
-                "Closing Stock",
-                "Stock",  # vendor_central includes both closing_stock and stock
-                "FBA Returns",
-                "Total Days In Stock",
-                "Drr",
+                "ASIN", "SKU Code", "Item Name",
+                "Total Units Sold", "Total Amount",
+                stock_col,
+                "VC Returns", "Total Returns",
+                "Total Days In Stock", "DRR", "DRR Flag", "DRR Lookback Period", "DRR Lookback Sales",
             ]
         elif report_type == "all":
-            # Combined report includes all fields from both vendor and FBA data
             preferred_order = [
-                "ASIN",
-                "SKU Code",
-                "Item Name",
-                "Warehouses",
-                "Units Sold",
-                "Total Amount",
-                "Sessions",
-                "Closing Stock",
-                "Stock",  # Combined reports include both closing_stock and stock
-                "FBA Returns",
-                "SF Days In Stock",
-                "VC Days In Stock",
-                "FBA Days In Stock",
-                "Total Days In Stock",
-                "Drr",
-                "Data Source",  # Show which source the data came from
+                "ASIN", "SKU Code", "Item Name", "Warehouses",
+                "VC Units Sold", "FBA/SF Units Sold", "Total Units Sold",
+                "Total Amount", "Sessions",
+                vc_stock_col, fba_stock_col, stock_col,
+                "FBA Returns", "SF Returns", "VC Returns", "Total Returns",
+                "VC Days In Stock", "FBA Days In Stock", "Total Days In Stock",
+                "DRR", "DRR Flag", "DRR Lookback Period", "DRR Lookback Sales",
+                "Data Source",
             ]
         else:
-            # FBA, Seller Flex, and FBA+Seller Flex reports
             preferred_order = [
-                "ASIN",
-                "SKU Code",
-                "Item Name",
-                "Warehouses",
-                "Units Sold",
-                "Total Amount",
-                "Sessions",
-                "Closing Stock",
-                "FBA Returns",
-                "Total Days In Stock",
-                "Drr",
+                "ASIN", "SKU Code", "Item Name", "Warehouses",
+                "Total Units Sold", "Total Amount", "Sessions",
+                stock_col,
+                "FBA Returns", "SF Returns", "Total Returns",
+                "Total Days In Stock", "DRR", "DRR Flag", "DRR Lookback Period", "DRR Lookback Sales",
             ]
 
-        # Add Last 90 Days column if requested
         if any_last_90_days:
             preferred_order.append("Last 90 Days Dates")
 
-        # Only include columns that exist in the DataFrame
         column_order = [col for col in preferred_order if col in df.columns]
-        # Add any remaining columns not in preferred order
         remaining_cols = [col for col in df.columns if col not in column_order]
-        final_column_order = column_order + remaining_cols
+        df = df[column_order + remaining_cols]
 
-        df = df[final_column_order]
+        # --- Fetch purchase_status from products collection ---
+        sku_codes = [item.get("sku_code", "") for item in report_data if item.get("sku_code")]
+        purchase_status_map = {}
+        if sku_codes:
+            products_col = database.get_collection("products")
+            docs = await asyncio.to_thread(
+                lambda: list(products_col.find(
+                    {"cf_sku_code": {"$in": sku_codes}},
+                    {"cf_sku_code": 1, "purchase_status": 1, "_id": 0}
+                ))
+            )
+            for doc in docs:
+                purchase_status_map[doc["cf_sku_code"]] = doc.get("purchase_status", "")
 
-        # Create Excel file in memory
+        # --- Write Excel (Active Days only) ---
         excel_buffer = io.BytesIO()
 
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="Report Data", index=False)
-
-            # Get the workbook and worksheet for formatting
-            workbook = writer.book
-            worksheet = writer.sheets["Report Data"]
-
-            # Auto-adjust column widths
-            for column in worksheet.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-
-                adjusted_width = min(max_length + 2, 50)  # Cap at 50 characters
-                worksheet.column_dimensions[column_letter].width = adjusted_width
-
-            # Style the header row
-            from openpyxl.styles import Font, PatternFill
-
-            header_font = Font(bold=True, color="FFFFFF")
-            header_fill = PatternFill(
-                start_color="366092", end_color="366092", fill_type="solid"
-            )
-
-            for cell in worksheet[1]:
-                cell.font = header_font
-                cell.fill = header_fill
-
-            # Build a header → column letter map for formula references
-            col_letter_map = {}
-            for cell in worksheet[1]:
-                if cell.value:
-                    col_letter_map[str(cell.value)] = cell.column_letter
-
-            # Write Excel formulas for DRR and (for "all") Total Days In Stock
-            units_col = col_letter_map.get("Units Sold")
-            returns_col = col_letter_map.get("FBA Returns")
-            days_col = col_letter_map.get("Total Days In Stock")
-            drr_col = col_letter_map.get("DRR")
-            vc_days_col = col_letter_map.get("VC Days In Stock")
-            fba_days_col = col_letter_map.get("FBA Days In Stock")
-
-            for row_num in range(2, len(df) + 2):
-                # Total Days In Stock = MAX(VC, FBA) for "all" report
-                if report_type == "all" and vc_days_col and fba_days_col and days_col:
-                    worksheet[f"{days_col}{row_num}"] = (
-                        f"=MAX({vc_days_col}{row_num},{fba_days_col}{row_num})"
-                    )
-
-                # DRR = (Units Sold - Returns) / Days In Stock
-                if drr_col and units_col and days_col:
-                    if returns_col:
-                        worksheet[f"{drr_col}{row_num}"] = (
-                            f"=IF({days_col}{row_num}>0,"
-                            f"({units_col}{row_num}-IFERROR({returns_col}{row_num},0))"
-                            f"/{days_col}{row_num},0)"
-                        )
-                    else:
-                        worksheet[f"{drr_col}{row_num}"] = (
-                            f"=IF({days_col}{row_num}>0,"
-                            f"{units_col}{row_num}/{days_col}{row_num},0)"
-                        )
-
-            # Special formatting for "all" report type - color code rows by data source
-            if report_type == "all" and "Data Source" in df.columns:
-                from openpyxl.styles import PatternFill
-
-                # Define colors for different data sources
-                color_mapping = {
-                    "combined": PatternFill(
-                        start_color="E8F5E8", end_color="E8F5E8", fill_type="solid"
-                    ),  # Light green
-                    "vendor_only": PatternFill(
-                        start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"
-                    ),  # Light yellow
-                    "fba_only": PatternFill(
-                        start_color="E1F5FE", end_color="E1F5FE", fill_type="solid"
-                    ),  # Light blue
-                }
-
-                # Apply color coding to rows based on data source
-                data_source_col_index = (
-                    df.columns.get_loc("Data Source") + 1
-                )  # +1 because Excel is 1-indexed
-
-                for row_num in range(2, len(df) + 2):  # Start from row 2 (after header)
-                    data_source_value = worksheet.cell(
-                        row=row_num, column=data_source_col_index
-                    ).value
-                    row_fill = color_mapping.get(data_source_value)
-
-                    if row_fill:
-                        for col_num in range(1, len(df.columns) + 1):
-                            worksheet.cell(row=row_num, column=col_num).fill = row_fill
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Active Days"
+        _build_drr_calculator_sheet(
+            ws,
+            report_data,
+            drr_vc_daily_by_asin,
+            drr_fba_daily_by_asin,
+            drr_dates,
+            report_type,
+            end_label,
+            purchase_status_map,
+        )
+        wb.save(excel_buffer)
 
         excel_buffer.seek(0)
 
-        # Generate filename with timestamp and report type
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         type_suffix = f"_{report_type}" if report_type != "fba+seller_flex" else ""
-        filename = (
-            f"inventory_report_{start_date}_to_{end_date}{type_suffix}_{timestamp}.xlsx"
-        )
+        filename = f"inventory_report_{start_date}_to_{end_date}{type_suffix}_{timestamp}.xlsx"
 
-        # Create streaming response
         response = StreamingResponse(
             io.BytesIO(excel_buffer.read()),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
-        logger.info(
-            f"Generated Excel report for report_type: {report_type}, rows: {len(df)}"
-        )
+        logger.info(f"Generated Excel report for report_type: {report_type}, rows: {len(df)}")
         return response
 
     except HTTPException as e:
@@ -3278,9 +4023,7 @@ async def download_report_by_date_range(
         raise e
     except Exception as e:
         logger.info(f"Error generating Excel report: {e}")
-        logger.info(str(e))
         import traceback
-
         traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3288,18 +4031,16 @@ async def download_report_by_date_range(
         )
 
 
-# Updated format_column_name function to handle the new "Data Source" column
 def format_column_name(column_name):
     """Convert snake_case column names to proper formatted names"""
-    # Replace underscores with spaces and title case
     formatted = column_name.replace("_", " ").title()
-
-    # Handle specific cases for better formatting
     replacements = {
         "Asin": "ASIN",
         "Sku Code": "SKU Code",
         "Item Name": "Item Name",
-        "Units Sold": "Units Sold",
+        "Units Sold": "Total Units Sold",
+        "Vc Units Sold": "VC Units Sold",
+        "Fba Units Sold": "FBA/SF Units Sold",
         "Total Amount": "Total Amount",
         "Closing Stock": "Closing Stock",
         "Sessions": "Sessions",
@@ -3307,12 +4048,17 @@ def format_column_name(column_name):
         "Data Source": "Data Source",
         "Total Days In Stock": "Total Days In Stock",
         "Drr": "DRR",
-        "FBA Returns": "FBA Returns",
+        "Drr Lookback": "DRR Lookback Period",
+        "Drr Lookback Sales": "DRR Lookback Sales",
+        "Fba Returns": "FBA Returns",
+        "Seller Flex Returns": "SF Returns",
+        "Vc Returns": "VC Returns",
+        "Total Returns": "Total Returns",
         "Stock": "Stock",
         "Vendor Days In Stock": "VC Days In Stock",
         "Fba Days In Stock": "FBA Days In Stock",
+        "Last 90 Days Dates": "Last 90 Days Dates",
     }
-
     return replacements.get(formatted, formatted)
 
 @router.post("/sync/settlements")
@@ -4222,7 +4968,7 @@ def _parse_vc_date(val: Any) -> Optional[datetime]:
     s = str(val).strip()
     if not s:
         return None
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y"):
+    for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d", "%d-%m-%Y"):
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
@@ -4241,40 +4987,52 @@ def _num_or_none(val: Any) -> Optional[float]:
         return None
 
 
+def _ci_get(row: Dict, *keys: str) -> Any:
+    """Case-insensitive dict lookup, tries each key in order."""
+    lower = {k.lower(): v for k, v in row.items()}
+    for key in keys:
+        val = lower.get(key.lower())
+        if val is not None:
+            return val
+    return None
+
+
 def normalize_vendor_central_return_row(row: Dict) -> Dict:
     return {
-        "shipment_id": _str_or_none(row.get("Shipment ID")),
-        "return_id": _str_or_none(row.get("Return ID")),
-        "vendor_code": _str_or_none(row.get("Vendor Code")),
-        "return_date": _parse_vc_date(row.get("Return Date")),
-        "purchase_order": _str_or_none(row.get("Purchase Order")),
-        "warehouse": _str_or_none(row.get("Warehouse")),
-        "asin": _str_or_none(row.get("ASIN")),
-        "product": _str_or_none(row.get("Product")),
-        "quantity": _num_or_none(row.get("Quantity")),
-        "price_per_unit": _num_or_none(row.get("Price per unit")),
-        "net_amount": _num_or_none(row.get("Net Amount")),
-        "currency_code": _str_or_none(row.get("Currency Code")),
-        "ship_to_state": _str_or_none(row.get("Ship To State")),
-        "ship_from_state": _str_or_none(row.get("Ship From State")),
-        "system_ref_no": _str_or_none(row.get("System Ref No")),
-        "document_number": _str_or_none(row.get("Document Number")),
-        "document_date": _parse_vc_date(row.get("Document Date")),
-        "document_type": _str_or_none(row.get("Document Type")),
-        "original_document_number": _str_or_none(row.get("Original Document Number")),
-        "original_document_date": _parse_vc_date(row.get("Original Document Date")),
-        "hsn": _str_or_none(row.get("HSN")),
-        "vendor_invoice": _str_or_none(row.get("Vendor Invoice")),
-        "vendor_invoice_date": _parse_vc_date(row.get("Vendor Invoice Date")),
-        "igst_tax_rate": _num_or_none(row.get("IGST Tax Rate")),
-        "igst_tax_amount": _num_or_none(row.get("IGST Tax Amount")),
-        "cess_tax_rate": _num_or_none(row.get("CESS Tax Rate")),
-        "cess_tax_amount": _num_or_none(row.get("CESS Tax Amount")),
-        "cgst_tax_rate": _num_or_none(row.get("CGST Tax Rate")),
-        "cgst_tax_amount": _num_or_none(row.get("CGST Tax Amount")),
-        "sgst_tax_rate": _num_or_none(row.get("SGST Tax Rate")),
-        "sgst_tax_amount": _num_or_none(row.get("SGST Tax Amount")),
-        "total_amount": _num_or_none(row.get("Total Amount")),
+        "shipment_id": _str_or_none(_ci_get(row, "Shipment ID")),
+        "return_id": _str_or_none(_ci_get(row, "Return ID")),
+        "vendor_code": _str_or_none(_ci_get(row, "Vendor Code", "Vendor code")),
+        "return_date": _parse_vc_date(_ci_get(row, "Return Date", "Return date")),
+        "purchase_order": _str_or_none(_ci_get(row, "Purchase Order", "Purchase order")),
+        "warehouse": _str_or_none(_ci_get(row, "Warehouse")),
+        "asin": _str_or_none(_ci_get(row, "ASIN")),
+        "product": _str_or_none(_ci_get(row, "Product")),
+        "quantity": _num_or_none(_ci_get(row, "Quantity")),
+        # CSV export uses "Cost per unit"; XLSX uses "Price per unit"
+        "price_per_unit": _num_or_none(_ci_get(row, "Price per unit", "Cost per unit")),
+        # CSV export uses "Total cost"; XLSX uses "Net Amount"
+        "net_amount": _num_or_none(_ci_get(row, "Net Amount", "Total cost")),
+        "currency_code": _str_or_none(_ci_get(row, "Currency Code", "Currency code")),
+        "ship_to_state": _str_or_none(_ci_get(row, "Ship To State", "Ship to state")),
+        "ship_from_state": _str_or_none(_ci_get(row, "Ship From State", "Ship from state")),
+        "system_ref_no": _str_or_none(_ci_get(row, "System Ref No")),
+        "document_number": _str_or_none(_ci_get(row, "Document Number")),
+        "document_date": _parse_vc_date(_ci_get(row, "Document Date")),
+        "document_type": _str_or_none(_ci_get(row, "Document Type")),
+        "original_document_number": _str_or_none(_ci_get(row, "Original Document Number")),
+        "original_document_date": _parse_vc_date(_ci_get(row, "Original Document Date")),
+        "hsn": _str_or_none(_ci_get(row, "HSN")),
+        "vendor_invoice": _str_or_none(_ci_get(row, "Vendor Invoice")),
+        "vendor_invoice_date": _parse_vc_date(_ci_get(row, "Vendor Invoice Date")),
+        "igst_tax_rate": _num_or_none(_ci_get(row, "IGST Tax Rate")),
+        "igst_tax_amount": _num_or_none(_ci_get(row, "IGST Tax Amount")),
+        "cess_tax_rate": _num_or_none(_ci_get(row, "CESS Tax Rate")),
+        "cess_tax_amount": _num_or_none(_ci_get(row, "CESS Tax Amount")),
+        "cgst_tax_rate": _num_or_none(_ci_get(row, "CGST Tax Rate")),
+        "cgst_tax_amount": _num_or_none(_ci_get(row, "CGST Tax Amount")),
+        "sgst_tax_rate": _num_or_none(_ci_get(row, "SGST Tax Rate")),
+        "sgst_tax_amount": _num_or_none(_ci_get(row, "SGST Tax Amount")),
+        "total_amount": _num_or_none(_ci_get(row, "Total Amount", "Total amount")),
         "created_at": datetime.utcnow(),
     }
 
@@ -4425,7 +5183,7 @@ async def upload_vendor_central_returns(
     Detects the date range from return_date, deletes existing records in that
     range, then inserts the uploaded records.
     """
-    if not file.filename.endswith((".xlsx", ".xls")):
+    if not (file.filename or "").lower().endswith((".xlsx", ".xls")):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Please upload an Excel file (.xlsx or .xls).",
@@ -4433,7 +5191,16 @@ async def upload_vendor_central_returns(
 
     try:
         contents = await file.read()
-        df = pd.read_excel(BytesIO(contents), sheet_name="Invoice Report", dtype=str)
+        xf = pd.ExcelFile(BytesIO(contents))
+        sheet_map = {s.strip().lower(): s for s in xf.sheet_names}
+        matched_sheet = sheet_map.get("invoice report")
+        if matched_sheet is None:
+            raise ValueError(
+                f"Worksheet named 'Invoice Report' not found. Available sheets: {xf.sheet_names}"
+            )
+        df = pd.read_excel(xf, sheet_name=matched_sheet, dtype=str)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -4454,7 +5221,7 @@ async def upload_vendor_central_returns(
     if not all_dates:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No valid dates found in the file. Expected 'Return Date' column in DD/MM/YYYY format.",
+            detail="No valid dates found in the file. Expected a 'Return Date' or 'Return date' column.",
         )
 
     range_start = min(all_dates)
@@ -4462,19 +5229,38 @@ async def upload_vendor_central_returns(
 
     collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
 
-    def _delete_and_insert():
-        delete_result = collection.delete_many(
-            {"return_date": {"$gte": range_start, "$lte": range_end.replace(hour=23, minute=59, second=59)}}
-        )
+    def _upsert_records():
+        upserted = 0
+        inserted = 0
         for rec in normalized:
+            # Build a unique filter — prefer return_id, fall back to document_number + asin
+            if rec.get("return_id"):
+                filt = {"return_id": rec["return_id"]}
+            elif rec.get("document_number") and rec.get("asin"):
+                filt = {"document_number": rec["document_number"], "asin": rec["asin"]}
+            else:
+                filt = None
+
+            if filt:
+                existing = collection.find_one(filt, {"_id": 0, "entry_in_zoho": 1, "transfer_orders_inventory_adjustment": 1, "sent_to_accounts_team": 1})
+                if existing:
+                    # Preserve fields already filled in by the accounts team
+                    rec.setdefault("entry_in_zoho", existing.get("entry_in_zoho"))
+                    rec.setdefault("transfer_orders_inventory_adjustment", existing.get("transfer_orders_inventory_adjustment"))
+                    rec.setdefault("sent_to_accounts_team", existing.get("sent_to_accounts_team", False))
+                    collection.replace_one(filt, rec)
+                    upserted += 1
+                    continue
+
             rec.setdefault("entry_in_zoho", None)
             rec.setdefault("transfer_orders_inventory_adjustment", None)
             rec.setdefault("sent_to_accounts_team", False)
-        insert_result = collection.insert_many(normalized, ordered=False) if normalized else None
-        return delete_result.deleted_count, len(insert_result.inserted_ids) if insert_result else 0
+            collection.insert_one(rec)
+            inserted += 1
+        return upserted, inserted
 
-    deleted_count, inserted_count = await asyncio.to_thread(_delete_and_insert)
-    logger.info(f"VC returns upload: {deleted_count} deleted, {inserted_count} inserted")
+    upserted_count, inserted_count = await asyncio.to_thread(_upsert_records)
+    logger.info(f"VC returns upload: {upserted_count} updated, {inserted_count} inserted")
 
     return JSONResponse(
         status_code=status.HTTP_200_OK,
@@ -4484,7 +5270,80 @@ async def upload_vendor_central_returns(
                 "start": range_start.strftime("%Y-%m-%d"),
                 "end": range_end.strftime("%Y-%m-%d"),
             },
-            "existing_deleted": deleted_count,
+            "records_updated": upserted_count,
             "records_inserted": inserted_count,
+        },
+    )
+
+
+@router.post("/upload/vendor-central-returns-bulk-update")
+async def bulk_update_vendor_central_returns(
+    file: UploadFile = File(...),
+    db=Depends(get_database),
+):
+    """
+    Upload the downloaded Vendor Central Returns XLSX to bulk-update only the
+    three editable columns: Entry in Zoho, Transfer Orders / Inventory Adjustment,
+    Sent to Accounts Team. All other columns are ignored.
+    Matches rows by Return ID (falls back to Document Number + ASIN).
+    """
+    if not (file.filename or "").lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Please upload an Excel file (.xlsx or .xls).")
+
+    try:
+        contents = await file.read()
+        xf = pd.ExcelFile(BytesIO(contents))
+        sheet_map = {s.strip().lower(): s for s in xf.sheet_names}
+        matched_sheet = sheet_map.get("vendor central returns") or xf.sheet_names[0]
+        df = pd.read_excel(xf, sheet_name=matched_sheet, dtype=str)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse Excel file: {e}")
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Excel file is empty.")
+
+    collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
+
+    def _bulk_update():
+        updated = 0
+        skipped = 0
+        for _, row in df.iterrows():
+            return_id = _str_or_none(row.get("Return ID"))
+            doc_number = _str_or_none(row.get("Document Number"))
+            asin = _str_or_none(row.get("ASIN"))
+
+            if return_id:
+                filt = {"return_id": return_id}
+            elif doc_number and asin:
+                filt = {"document_number": doc_number, "asin": asin}
+            else:
+                skipped += 1
+                continue
+
+            sent_raw = str(row.get("Sent to Accounts Team") or "").strip().lower()
+            sent = True if sent_raw in ("true", "yes", "1") else (False if sent_raw in ("false", "no", "0", "") else None)
+
+            patch = {
+                "entry_in_zoho": _str_or_none(row.get("Entry in Zoho")),
+                "transfer_orders_inventory_adjustment": _str_or_none(row.get("Transfer Orders / Inventory Adjustment")),
+                "sent_to_accounts_team": sent if sent is not None else False,
+            }
+
+            result = collection.update_one(filt, {"$set": patch})
+            if result.matched_count:
+                updated += 1
+            else:
+                skipped += 1
+        return updated, skipped
+
+    updated_count, skipped_count = await asyncio.to_thread(_bulk_update)
+    logger.info(f"VC returns bulk update: {updated_count} updated, {skipped_count} skipped")
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "message": "Bulk update completed.",
+            "records_updated": updated_count,
+            "records_skipped": skipped_count,
         },
     )

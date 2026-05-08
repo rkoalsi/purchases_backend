@@ -24,6 +24,7 @@ from .routes.bb_code_generator import router as bb_code_generator_router
 from .routes.vendor_po import router as vendor_po_router
 from .routes.inventory_aging import router as inventory_aging_router
 from .routes.vendor import router as vendor_router
+from .routes.brand_orders import router as brand_orders_router
 from .database import connect_db, close_db
 from contextlib import asynccontextmanager
 from .helpers.scheduler import scheduler, api_scheduler, setup_scheduler
@@ -124,6 +125,7 @@ app.include_router(bb_code_generator_router, prefix="/bb_code_generator", tags=[
 app.include_router(vendor_po_router, prefix="/vendor_po", tags=["vendor_po"])
 app.include_router(inventory_aging_router, prefix="/inventory_aging", tags=["inventory_aging"])
 app.include_router(vendor_router, prefix="/vendors", tags=["vendors"])
+app.include_router(brand_orders_router, prefix="/brand_orders", tags=["brand_orders"])
 
 
 # --- Protected Swagger / ReDoc / OpenAPI schema ---
