@@ -5125,10 +5125,10 @@ async def download_vendor_central_returns(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
-    query = {"return_date": {"$gte": start, "$lte": end}}
+    query = {"document_date": {"$gte": start, "$lte": end}}
     collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
     docs = await asyncio.to_thread(
-        lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("return_date", 1))
+        lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("document_date", 1))
     )
     docs.sort(key=lambda r: (0 if r.get("sent_to_accounts_team") is False else 1))
 
@@ -5234,7 +5234,7 @@ async def upload_vendor_central_returns(
     records = df.to_dict("records")
     normalized: List[Dict] = [normalize_vendor_central_return_row(r) for r in records]
 
-    all_dates: List[datetime] = [r["return_date"] for r in normalized if r.get("return_date")]
+    all_dates: List[datetime] = [r["document_date"] for r in normalized if r.get("document_date")]
 
     if not all_dates:
         raise HTTPException(
@@ -5329,9 +5329,9 @@ async def bulk_update_vendor_central_returns(
                 "sent_to_accounts_team": sent if sent is not None else False,
             }
 
-            result = collection.update_one(filt, {"$set": patch})
+            result = collection.update_many(filt, {"$set": patch})
             if result.matched_count:
-                updated += 1
+                updated += result.matched_count
             else:
                 skipped += 1
         return updated, skipped
