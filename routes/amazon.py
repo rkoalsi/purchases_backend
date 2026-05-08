@@ -5247,38 +5247,21 @@ async def upload_vendor_central_returns(
 
     collection = db[VENDOR_CENTRAL_RETURNS_COLLECTION]
 
-    def _upsert_records():
-        upserted = 0
-        inserted = 0
+    def _replace_records():
+        # Delete all existing records in the detected date range, then insert fresh
+        collection.delete_many({
+            "return_date": {"$gte": range_start, "$lte": range_end.replace(hour=23, minute=59, second=59)}
+        })
         for rec in normalized:
-            # Build a unique filter — prefer return_id, fall back to document_number + asin
-            if rec.get("return_id"):
-                filt = {"return_id": rec["return_id"]}
-            elif rec.get("document_number") and rec.get("asin"):
-                filt = {"document_number": rec["document_number"], "asin": rec["asin"]}
-            else:
-                filt = None
-
-            if filt:
-                existing = collection.find_one(filt, {"_id": 0, "entry_in_zoho": 1, "transfer_orders_inventory_adjustment": 1, "sent_to_accounts_team": 1})
-                if existing:
-                    # Preserve fields already filled in by the accounts team
-                    rec.setdefault("entry_in_zoho", existing.get("entry_in_zoho"))
-                    rec.setdefault("transfer_orders_inventory_adjustment", existing.get("transfer_orders_inventory_adjustment"))
-                    rec.setdefault("sent_to_accounts_team", existing.get("sent_to_accounts_team", False))
-                    collection.replace_one(filt, rec)
-                    upserted += 1
-                    continue
-
             rec.setdefault("entry_in_zoho", None)
             rec.setdefault("transfer_orders_inventory_adjustment", None)
             rec.setdefault("sent_to_accounts_team", False)
-            collection.insert_one(rec)
-            inserted += 1
-        return upserted, inserted
+        if normalized:
+            collection.insert_many(normalized)
+        return len(normalized)
 
-    upserted_count, inserted_count = await asyncio.to_thread(_upsert_records)
-    logger.info(f"VC returns upload: {upserted_count} updated, {inserted_count} inserted")
+    inserted_count = await asyncio.to_thread(_replace_records)
+    logger.info(f"VC returns upload: {inserted_count} inserted")
 
     return JSONResponse(
         status_code=status.HTTP_200_OK,
@@ -5288,7 +5271,6 @@ async def upload_vendor_central_returns(
                 "start": range_start.strftime("%Y-%m-%d"),
                 "end": range_end.strftime("%Y-%m-%d"),
             },
-            "records_updated": upserted_count,
             "records_inserted": inserted_count,
         },
     )
