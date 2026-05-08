@@ -1441,9 +1441,9 @@ async def fetch_zoho_lookback_sales_batch(
     db,
     periods: list,
     target_item_ids: list,
-) -> Dict[int, Dict[str, int]]:
+) -> Dict[int, Dict[str, dict]]:
     """
-    Fetch Zoho sales for ALL lookback periods in a SINGLE aggregation.
+    Fetch Zoho sales + returns for ALL lookback periods in a SINGLE aggregation.
     Covers the full date range (earliest period start → most recent period end),
     then uses $switch to bucket each document into its period index.
 
@@ -1452,7 +1452,7 @@ async def fetch_zoho_lookback_sales_batch(
         target_item_ids: List of item_ids to filter for
 
     Returns:
-        Dict[period_index, Dict[item_id_str, units_sold]]
+        Dict[period_index, Dict[item_id_str, {"units_sold": int, "returns": int}]]
     """
     if not periods or not target_item_ids:
         return {}
@@ -1611,6 +1611,15 @@ async def fetch_zoho_lookback_sales_batch(
                             ]
                         }
                     },
+                    "total_returns": {
+                        "$sum": {
+                            "$cond": [
+                                {"$eq": ["$doc_type", "credit_note"]},
+                                "$quantity",
+                                0,
+                            ]
+                        }
+                    },
                 }
             },
         ]
@@ -1625,7 +1634,10 @@ async def fetch_zoho_lookback_sales_batch(
                 item_id = str(doc["_id"]["item_id"])
                 if period_idx not in results:
                     results[period_idx] = {}
-                results[period_idx][item_id] = doc.get("total_units_sold", 0)
+                results[period_idx][item_id] = {
+                    "units_sold": doc.get("total_units_sold", 0),
+                    "returns": doc.get("total_returns", 0),
+                }
             return results
 
         sales_data = await asyncio.to_thread(_run)

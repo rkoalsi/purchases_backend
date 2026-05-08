@@ -402,7 +402,6 @@ class OptimizedMasterReportService:
                 pipeline = [
                     {"$match": {
                         "date": {"$gte": start_dt, "$lte": end_dt},
-                        "customer_name": {"$not": {"$regex": "ETRADE", "$options": "i"}},
                     }},
                     {
                         "$group": {
@@ -1300,13 +1299,18 @@ class OptimizedMasterReportService:
                 days_in_stock = stock_info.get("total_days_in_stock", 0)
 
                 if days_in_stock >= 60:
-                    units_sold = sales_data.get(str(item_id), 0)
-                    drr = round(units_sold / days_in_stock, 2) if days_in_stock > 0 else 0
+                    item_sales = sales_data.get(str(item_id), {})
+                    units_sold = item_sales.get("units_sold", 0) if isinstance(item_sales, dict) else int(item_sales)
+                    returns = item_sales.get("returns", 0) if isinstance(item_sales, dict) else 0
+                    net_units_sold = max(0, units_sold - returns)
+                    drr = round(net_units_sold / days_in_stock, 2) if days_in_stock > 0 else 0
                     results[sku] = {
                         "drr": drr,
                         "lookback_period": f"{p_start_str} to {p_end_str}",
                         "days_in_stock": days_in_stock,
                         "units_sold": units_sold,
+                        "returns": returns,
+                        "net_units_sold": net_units_sold,
                         "found": True,
                     }
                     resolved_skus.add(sku)
@@ -1323,6 +1327,9 @@ class OptimizedMasterReportService:
                     "drr": 0,
                     "lookback_period": "",
                     "days_in_stock": 0,
+                    "units_sold": 0,
+                    "returns": 0,
+                    "net_units_sold": 0,
                     "found": False,
                 }
 
@@ -1362,8 +1369,11 @@ class OptimizedMasterReportService:
             for sku, item_id in sku_to_item_id.items():
                 stock_info = stock_data.get(item_id, {})
                 days_in_stock = stock_info.get("total_days_in_stock", 0)
-                units_sold = sales_data.get(str(item_id), 0)
-                result[sku] = round(units_sold / days_in_stock, 4) if days_in_stock > 0 else 0.0
+                item_sales = sales_data.get(str(item_id), {})
+                units_sold = item_sales.get("units_sold", 0) if isinstance(item_sales, dict) else int(item_sales)
+                returns = item_sales.get("returns", 0) if isinstance(item_sales, dict) else 0
+                net_units_sold = max(0, units_sold - returns)
+                result[sku] = round(net_units_sold / days_in_stock, 4) if days_in_stock > 0 else 0.0
 
             logger.info(f"Fetched past 90d DRR for {len(result)} SKUs")
             return result
@@ -1762,7 +1772,7 @@ class OptimizedMasterReportService:
             # Order quantity
             order_qty = max(0, net_target_days * drr)
 
-            # Demand-based override: when current-period sales exceed lookback sales,
+            # Demand-based override: when current-period net sales exceed lookback net sales,
             # use current-period sales as the order qty instead of DRR × target days
             if item.get("order_qty_demand_override"):
                 order_qty = round(item.get("current_period_sales_for_override", 0), 2)
@@ -1770,33 +1780,32 @@ class OptimizedMasterReportService:
             else:
                 item["order_qty_basis"] = ""
 
-            # Confidence tier dampening for red (insufficient_stock) items.
-            # These products have < 60 days in stock across all lookback windows,
-            # so their DRR is unreliable. Scale back the order qty based on how
-            # much data we have and the product's movement classification.
-            # Tiers are calibrated for a 90-day reporting period.
+            # DRR Flag: confidence tier dampening for items with insufficient stock data.
+            # Applies to insufficient_stock items based on days in stock in the current period.
+            # Tiers: 0–29d → manual (order=0), 30–44d → 0.5×, 45–59d → 0.75×, 60+d → 1.0×
             if item.get("drr_source") == "insufficient_stock":
                 days_in_stock = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
-                movement = item.get("movement", "Slow Mover")
 
-                if days_in_stock < 15:
-                    base_multiplier = 0.25
-                elif days_in_stock < 30:
-                    base_multiplier = 0.5
+                if days_in_stock < 30:
+                    confidence_multiplier = 0.0
+                    drr_flag_label = "Manual buyer input required (0%)"
+                elif days_in_stock < 45:
+                    confidence_multiplier = 0.5
+                    drr_flag_label = "System order, dampened (50%)"
                 elif days_in_stock < 60:
-                    base_multiplier = 0.75
+                    confidence_multiplier = 0.75
+                    drr_flag_label = "System order, near-normal (75%)"
                 else:
-                    base_multiplier = 1.0
+                    confidence_multiplier = 1.0
+                    drr_flag_label = ""
 
-                confidence_multiplier = min(1.0, max(0.1, base_multiplier))
                 order_qty = order_qty * confidence_multiplier
                 item["confidence_multiplier"] = confidence_multiplier
 
-                dampener_label = f"Dampened {int(round(confidence_multiplier * 100))}% ({days_in_stock}d, {movement})"
                 if item.get("order_qty_demand_override"):
-                    item["order_qty_basis"] = f"Current Period Sales · {dampener_label}"
+                    item["order_qty_basis"] = f"Current Period Sales · {drr_flag_label}" if drr_flag_label else "Current Period Sales"
                 else:
-                    item["order_qty_basis"] = dampener_label
+                    item["order_qty_basis"] = drr_flag_label
             else:
                 item["confidence_multiplier"] = 1.0
 
@@ -2155,11 +2164,25 @@ async def _generate_master_report_data(
                                     item["drr_lookback_period"] = lb["lookback_period"]
                                     item["drr_lookback_days_in_stock"] = lb["days_in_stock"]
                                     item["drr_lookback_sales"] = lb["units_sold"]
-                                    item["highlight"] = "yellow"
-                                    # If current-period sales exceed lookback sales, flag for
+                                    item["drr_lookback_returns"] = lb.get("returns", 0)
+                                    item["drr_net_lookback_sales"] = lb.get("net_units_sold", 0)
+                                    # Flag if lookback period is > 180 days before report start
+                                    lb_period = lb["lookback_period"]
+                                    gt_180 = False
+                                    if lb_period and " to " in lb_period:
+                                        lb_start_str = lb_period.split(" to ")[0].strip()
+                                        try:
+                                            lb_start_dt = datetime.strptime(lb_start_str, "%Y-%m-%d")
+                                            report_start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                                            gt_180 = (report_start_dt - lb_start_dt).days > 180
+                                        except ValueError:
+                                            pass
+                                    item["drr_lookback_gt_180"] = gt_180
+                                    item["highlight"] = "orange" if gt_180 else "yellow"
+                                    # If current-period sales exceed lookback net sales, flag for
                                     # demand-based order qty override (order qty = current sales)
                                     current_net_sales = metrics.get("total_sales", 0)
-                                    if lb["units_sold"] < current_net_sales:
+                                    if lb.get("net_units_sold", lb["units_sold"]) < current_net_sales:
                                         item["order_qty_demand_override"] = True
                                         item["current_period_sales_for_override"] = current_net_sales
                                 else:
@@ -2167,6 +2190,9 @@ async def _generate_master_report_data(
                                     item["drr_lookback_period"] = ""
                                     item["drr_lookback_days_in_stock"] = 0
                                     item["drr_lookback_sales"] = 0
+                                    item["drr_lookback_returns"] = 0
+                                    item["drr_net_lookback_sales"] = 0
+                                    item["drr_lookback_gt_180"] = False
                                     item["highlight"] = "red"
                             else:
                                 item["drr_source"] = "current_period"
@@ -2220,17 +2246,26 @@ async def _generate_master_report_data(
                             days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
                             item["drr_source"] = "current_period" if days >= 60 else "insufficient_stock"
                             item["drr_lookback_period"] = ""
+                            item["drr_lookback_returns"] = 0
+                            item["drr_net_lookback_sales"] = 0
+                            item["drr_lookback_gt_180"] = False
                             item["highlight"] = "red" if days < 60 else None
                 elif not skus_needing_lookback_list:
                     for item in combined_data:
                         item["drr_source"] = "current_period"
                         item["drr_lookback_period"] = ""
+                        item["drr_lookback_returns"] = 0
+                        item["drr_net_lookback_sales"] = 0
+                        item["drr_lookback_gt_180"] = False
                         item["highlight"] = None
                 else:
                     for item in combined_data:
                         days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
                         item["drr_source"] = "current_period" if days >= 60 else "insufficient_stock"
                         item["drr_lookback_period"] = ""
+                        item["drr_lookback_returns"] = 0
+                        item["drr_net_lookback_sales"] = 0
+                        item["drr_lookback_gt_180"] = False
                         item["highlight"] = "red" if days < 60 else None
 
             except Exception as e:
@@ -2240,6 +2275,9 @@ async def _generate_master_report_data(
                 for item in combined_data:
                     item.setdefault("drr_source", "current_period")
                     item.setdefault("drr_lookback_period", "")
+                    item.setdefault("drr_lookback_returns", 0)
+                    item.setdefault("drr_net_lookback_sales", 0)
+                    item.setdefault("drr_lookback_gt_180", False)
                     item.setdefault("highlight", None)
 
             # Enrichment (uses brand_logistics + transit_data fetched in parallel above)
@@ -2742,14 +2780,27 @@ async def get_master_report(
     previous 90-day windows to find a period where the SKU had ≥ 90 days
     in stock. If found:
     - DRR is replaced with the historical value (`drr_source = "previous_period"`, `highlight = "yellow"`)
-    - Missed sales are also re-fetched from that same lookback window for consistency
-    - **Demand override (green):** if current-period net sales exceed lookback-period sales,
-      `order_qty` is set to current-period sales, `extra_qty` uses current-period missed sales,
-      and `order_qty_demand_override = True` is set on the item (`highlight` remains `"yellow"` in
-      the JSON but the row is coloured **green** in the Excel download to distinguish it from
-      plain yellow lookback rows)
+    - Missed sales for that SKU are re-fetched from **the same lookback date window** so that
+      missed-sales figures are consistent with the DRR being used.
+    - **Demand override (green):** if current-period net sales exceed lookback-period net sales,
+      `order_qty` is set to current-period net sales, missed sales use the **current-period**
+      window (not the lookback window), and `order_qty_demand_override = True` is set on the
+      item. The lookback DRR is still used for all coverage / order-quantity calculations.
+      (`highlight` remains `"yellow"` in the JSON but the row is coloured **green** in the
+      Excel download.)
     - If no valid lookback period is found, the SKU is marked `drr_source = "insufficient_stock"`
       (`highlight = "red"`)
+
+    ### 5a. Missed Sales Sourcing Rules (summary)
+    | Row colour | DRR source | Missed Sales period |
+    |---|---|---|
+    | White (no fill) | `current_period` | Current period |
+    | Yellow | `previous_period` (lookback ≤ 180 days back) | **Lookback period** |
+    | Orange | `previous_period` (lookback > 180 days back) | **Lookback period** |
+    | Red | `insufficient_stock` | Current period |
+    | Green | `previous_period` + demand override | **Current period** (override takes precedence) |
+
+    All customers are included in the missed-sales aggregation (no customer-name exclusions).
 
     ### 6. Brand Logistics Enrichment
     Lead time, safety days, and movement-class thresholds are loaded per brand
@@ -2772,6 +2823,19 @@ async def get_master_report(
     - `extra_qty` = missed_sales_drr × lead_time (capped at 50 % of DRR to prevent spikes)
     - `order_qty_plus_extra_qty_rounded` = rounded down to nearest case pack multiple
     - `total_cbm` = (rounded_qty ÷ case_pack) × CBM per case
+
+    **Confidence-tier dampening** (applies only to `insufficient_stock` items):
+
+    | Days in stock (current period) | Multiplier | `order_qty_basis` label |
+    |---|---|---|
+    | < 30 | 0 × (order = 0) | `"Manual buyer input required (0%)"` |
+    | 30 – 44 | 0.5 × | `"System order, dampened (50%)"` |
+    | 45 – 59 | 0.75 × | `"System order, near-normal (75%)"` |
+    | ≥ 60 | 1.0 × (no dampening) | `""` (blank) |
+
+    For green (demand-override) items that are also `insufficient_stock`, both labels are
+    combined: e.g. `"Current Period Sales · System order, dampened (50%)"`.
+    For demand-override items without dampening the label is simply `"Current Period Sales"`.
 
     ### 9. Latest Stock Injection
     Real-time stock (latest record in DB, regardless of report period) is attached
@@ -2804,15 +2868,20 @@ async def get_master_report(
     | `drr_source` | `current_period` / `previous_period` / `insufficient_stock` |
     | `drr_lookback_period` | Date range used for lookback DRR (if applicable) |
     | `drr_lookback_days_in_stock` | Days in stock during the lookback period (if applicable) |
-    | `drr_lookback_sales` | Units sold during the lookback period (if applicable) |
-    | `highlight` | Row highlight hint: `null` (normal) / `"yellow"` (lookback DRR) / `"red"` (insufficient stock) |
-    | `order_qty_demand_override` | `true` when current-period net sales exceed lookback sales — order qty is overridden to current-period sales; these rows are coloured **green** in the Excel download |
+    | `drr_lookback_sales` | Gross units sold during the lookback period (if applicable) |
+    | `drr_lookback_returns` | Credit note units during the lookback period (if applicable) |
+    | `drr_net_lookback_sales` | Net units (sales − returns) used for lookback DRR calculation |
+    | `drr_lookback_gt_180` | `true` when the lookback period start is > 180 days before the report start |
+    | `highlight` | Row highlight hint: `null` (normal) / `"yellow"` (lookback DRR ≤ 180d) / `"orange"` (lookback DRR > 180d) / `"red"` (insufficient stock) |
+    | `order_qty_demand_override` | `true` when current-period net sales exceed lookback net sales — order qty is overridden to current-period net sales; these rows are coloured **green** in the Excel download |
     | `current_period_sales_for_override` | Net sales used as order qty when demand override is active |
     | `total_closing_stock` | Zoho Pupscribe Warehouse stock + FBA stock as of `end_date` |
     | `latest_total_stock` | Zoho Pupscribe Warehouse stock + FBA stock as of latest DB record |
     | `current_days_coverage` | Days of inventory on hand at current DRR |
     | `order_qty_plus_extra_qty_rounded` | Final suggested order quantity (case-pack rounded) |
-    | `missed_sales` | Unfulfilled demand units for the period |
+    | `missed_sales` | Unfulfilled demand units — sourced from the current period for white/red/green rows, and from the lookback window for yellow/orange rows |
+    | `order_qty_basis` | Explanation of any non-standard order qty treatment (demand override label, dampening tier with %, or blank for normal rows) |
+    | `confidence_multiplier` | Dampening factor applied to order_qty for `insufficient_stock` items (0.0 / 0.5 / 0.75 / 1.0) |
     | `movement` | `Fast Mover` / `Medium Mover` / `Slow Mover` |
     | `excess_or_order` | `ORDER` / `EXCESS` / `NO MOVEMENT` |
     """
@@ -2900,28 +2969,44 @@ async def download_master_report(
     - `Current Days Coverage` – (latest stock + transit) ÷ DRR
 
     **Missed Sales**
-    - `Missed Sales` – unfulfilled demand units for the period (or lookback period if demand-override)
-    - `Missed Sales DRR` – missed units ÷ period days (capped at 50 % of DRR)
+    - `Missed Sales` – unfulfilled demand units. Sourced from the **current period** for white,
+      red, and green rows; sourced from the **lookback period** (same window as the DRR) for
+      yellow and orange rows. All customers are included.
+    - `Missed Sales DRR` – missed units ÷ period days, capped at 50 % of the item's DRR to
+      prevent over-ordering from short-term stockout spikes
     - `Extra Qty` – additional buffer = missed_sales_drr × lead_time
 
     **Order Quantities**
     - `Net Target Days` – target_days − current_days_coverage
     - `Excess / Order` – ORDER / EXCESS / NO MOVEMENT
-    - `Order Qty` – net_target_days × DRR (or current-period sales for demand-override rows)
+    - `Order Qty` – net_target_days × DRR (or current-period net sales for demand-override rows),
+      then multiplied by the confidence multiplier for `insufficient_stock` items
     - `Order Qty + Extra Qty` – order_qty + extra_qty
     - `CBM`, `Case Pack`
-    - `Order Qty + Extra Qty (Rounded)` – floored to nearest case pack multiple (row highlighted green when demand override was applied)
+    - `Order Qty + Extra Qty (Rounded)` – floored to nearest case pack multiple (green fill when
+      demand override was applied)
     - `Total CBM` – (rounded_qty ÷ case_pack) × CBM per case
     - `Days Current Order Lasts` – rounded_qty ÷ DRR
     - `Days Total Inventory Lasts` – current_days_coverage + days_current_order_lasts
+    - `Order Qty Basis` (col AW) – human-readable label explaining any non-standard treatment:
+
+      | Label | Meaning |
+      |---|---|
+      | `"Current Period Sales"` | Green demand-override row; order qty = current-period net sales |
+      | `"Manual buyer input required (0%)"` | Red row, < 30 days in stock; order qty set to 0 |
+      | `"System order, dampened (50%)"` | Red row, 30–44 days in stock; order qty halved |
+      | `"System order, near-normal (75%)"` | Red row, 45–59 days in stock; order qty at 75 % |
+      | `"Current Period Sales · <tier>"` | Green row that is also dampened (combined label) |
+      | *(blank)* | Normal row — no special treatment needed |
 
     ## Conditional Row Formatting
-    | Colour | Condition | Meaning |
-    |---|---|---|
-    | Green | `order_qty_demand_override = true` (takes precedence over yellow) | Lookback DRR is used **and** current-period net sales exceed lookback-period sales — order qty is overridden to current-period net sales (`order_qty_basis = "Current Period Sales"`) |
-    | Yellow | `drr_source = "previous_period"` and no demand override | DRR is sourced from a previous lookback period due to insufficient stock days (< 60) in the current period |
-    | Red | `drr_source = "insufficient_stock"` | Fewer than 60 days in stock in both the current period and all 6 lookback windows — DRR cannot be reliably estimated |
-    | (no fill) | `drr_source = "current_period"` | DRR uses the current-period data (≥ 60 days in stock) |
+    | Colour | Condition | Missed Sales source | Meaning |
+    |---|---|---|---|
+    | Green | `order_qty_demand_override = true` (takes precedence) | Current period | Lookback DRR used but current-period net sales exceed lookback net sales — order qty overridden to current-period net sales |
+    | Orange | `drr_source = "previous_period"` and lookback period start > 180 days before report start | Lookback period | DRR from a stale lookback window (> 180 days in the past) |
+    | Yellow | `drr_source = "previous_period"` and lookback ≤ 180 days back | Lookback period | DRR from a recent lookback period; SKU had < 60 days in stock in the current period |
+    | Red | `drr_source = "insufficient_stock"` | Current period | No reliable DRR — fewer than 60 days in stock across the current period and all 6 lookback windows; order qty dampened by confidence tier |
+    | (no fill) | `drr_source = "current_period"` | Current period | Normal row — ≥ 60 days in stock, DRR derived from current period |
 
     ## Excel Formulas
     Several columns are written as live Excel formulas rather than static values
@@ -2993,6 +3078,7 @@ async def download_master_report(
 
         # Track which Excel data rows (0-based) are demand-override (green) rows
         demand_override_row_indices: set = set()
+        lookback_gt_180_row_indices: set = set()
 
         # currency_code → Excel number format using symbol prefix (shared by master + draft sheets)
         _CURRENCY_FORMATS: Dict[str, str] = {
@@ -3013,6 +3099,8 @@ async def download_master_report(
                     continue
                 if item.get("order_qty_demand_override"):
                     demand_override_row_indices.add(len(combined_df_data))
+                if item.get("drr_lookback_gt_180"):
+                    lookback_gt_180_row_indices.add(len(combined_df_data))
 
                 metrics = item.get("combined_metrics", {})
                 _master_unit_price_currencies.append(item.get("unit_price_currency", "") or "")
@@ -3035,6 +3123,8 @@ async def download_master_report(
                         "Days in Stock": metrics.get("total_days_in_stock", 0),
                         "Lookback Days in Stock": item.get("drr_lookback_days_in_stock", 0),
                         "Lookback Sales": item.get("drr_lookback_sales", 0),
+                        "Lookback Returns": item.get("drr_lookback_returns", 0),
+                        "Net Lookback Sales": item.get("drr_net_lookback_sales", 0),
                         "Avg Daily Run Rate": metrics.get("avg_daily_run_rate", 0),
                         "Growth Rate (%)": item.get("growth_rate"),
                         "DRR Source": item.get("drr_source", "current_period"),
@@ -3064,7 +3154,7 @@ async def download_master_report(
                         "Confidence Multiplier": item.get("confidence_multiplier", 1.0),
                         "Excess / Order": item.get("excess_or_order", ""),
                         "Order Qty": item.get("order_qty", 0),
-                        "Order Qty Basis": item.get("order_qty_basis", ""),
+                        "DRR Flag": item.get("order_qty_basis", ""),
                         "Order Qty + Extra Qty": item.get("order_qty_plus_extra_qty", 0),
                         "CBM": item.get("cbm", 0),
                         "Case Pack": item.get("case_pack", 0),
@@ -3146,6 +3236,7 @@ async def download_master_report(
 
                 drr_source_col_idx = cols_list.index("DRR Source") + 1  # 1-based
                 yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+                orange_fill = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
                 red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
                 green_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
 
@@ -3230,8 +3321,11 @@ async def download_master_report(
                         for col_idx in range(1, len(combined_df.columns) + 1):
                             ws.cell(row=r, column=col_idx).fill = green_fill
                     elif drr_source_val == "previous_period":
+                        # Orange: lookback period is > 180 days back (stale reference)
+                        # Yellow: normal lookback (within 180 days)
+                        fill = orange_fill if data_row_idx in lookback_gt_180_row_indices else yellow_fill
                         for col_idx in range(1, len(combined_df.columns) + 1):
-                            ws.cell(row=r, column=col_idx).fill = yellow_fill
+                            ws.cell(row=r, column=col_idx).fill = fill
                     elif drr_source_val == "insufficient_stock":
                         for col_idx in range(1, len(combined_df.columns) + 1):
                             ws.cell(row=r, column=col_idx).fill = red_fill
