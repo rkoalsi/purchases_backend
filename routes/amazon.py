@@ -5130,6 +5130,406 @@ async def download_fba_returns(
 
 
 # ---------------------------------------------------------------------------
+# FBA Warehouse Returns – CSV upload + editable tracking
+# ---------------------------------------------------------------------------
+
+FBA_WAREHOUSE_RETURNS_COLLECTION = "amazon_fba_warehouse_returns"
+
+FBA_WAREHOUSE_EDITABLE_FIELDS = {
+    "received_date", "condition", "qty_received_wh", "gdrive_link",
+    "entry_in_zoho", "transfer_orders_inventory_adj", "safe_t_claim_raise",
+}
+
+
+def _parse_fba_wh_date(val: Any) -> Optional[datetime]:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    try:
+        if hasattr(val, "to_pydatetime"):
+            return val.to_pydatetime()
+    except Exception:
+        pass
+    s = str(val).strip()
+    if not s:
+        return None
+    # ISO timestamps from Amazon e.g. "2026-03-04T05:11:34+01:00"
+    try:
+        from dateutil import parser as dateutil_parser
+        return dateutil_parser.parse(s).replace(tzinfo=None)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s[:10], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _num_or_none_wh(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    try:
+        return float(str(val).strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def normalize_fba_warehouse_return(row: Dict) -> Dict:
+    return {
+        "request_date": _parse_fba_wh_date(row.get("request-date")),
+        "order_id": _str_or_none(row.get("order-id")),
+        "order_source": _str_or_none(row.get("order-source")),
+        "order_type": _str_or_none(row.get("order-type")),
+        "service_speed": _str_or_none(row.get("service-speed")),
+        "order_status": _str_or_none(row.get("order-status")),
+        "last_updated_date": _parse_fba_wh_date(row.get("last-updated-date")),
+        "sku": _str_or_none(row.get("sku")),
+        "fnsku": _str_or_none(row.get("fnsku")),
+        "disposition": _str_or_none(row.get("disposition")),
+        "requested_quantity": _num_or_none_wh(row.get("requested-quantity")),
+        "cancelled_quantity": _num_or_none_wh(row.get("cancelled-quantity")),
+        "disposed_quantity": _num_or_none_wh(row.get("disposed-quantity")),
+        "shipped_quantity": _num_or_none_wh(row.get("shipped-quantity")),
+        "in_process_quantity": _num_or_none_wh(row.get("in-process-quantity")),
+        "removal_fee": _num_or_none_wh(row.get("removal-fee")),
+        "currency": _str_or_none(row.get("currency")),
+        "created_at": datetime.utcnow(),
+    }
+
+
+def _clean_fba_wh_doc(doc: Dict) -> Dict:
+    import math
+    out = {}
+    for k, v in doc.items():
+        if k == "_id":
+            out["_id"] = str(v)
+        elif isinstance(v, datetime):
+            out[k] = v.strftime("%Y-%m-%d")
+        elif isinstance(v, float) and math.isnan(v):
+            out[k] = None
+        else:
+            out[k] = v
+    return out
+
+
+async def _enrich_fba_wh_with_product_names(docs: List[Dict], db) -> List[Dict]:
+    """Look up product names from 'products' collection by cf_sku_code."""
+    skus = {d.get("sku") for d in docs if d.get("sku")}
+    if not skus:
+        for doc in docs:
+            doc["product_name"] = ""
+        return docs
+
+    products_col = db["products"]
+    product_docs = await asyncio.to_thread(
+        lambda: list(products_col.find(
+            {"cf_sku_code": {"$in": list(skus)}},
+            {"cf_sku_code": 1, "name": 1, "_id": 0}
+        ))
+    )
+    sku_to_name = {d["cf_sku_code"]: d.get("name", "") for d in product_docs}
+
+    for doc in docs:
+        doc["product_name"] = sku_to_name.get(doc.get("sku"), "")
+
+    return docs
+
+
+FBA_WAREHOUSE_COLUMN_ORDER = [
+    "request_date", "order_id", "order_source", "order_type", "service_speed",
+    "order_status", "last_updated_date", "sku", "fnsku", "product_name",
+    "disposition", "requested_quantity", "cancelled_quantity", "disposed_quantity",
+    "shipped_quantity", "in_process_quantity", "removal_fee", "currency",
+    # editable columns
+    "received_date", "condition", "qty_received_wh", "gdrive_link",
+    "entry_in_zoho", "transfer_orders_inventory_adj", "safe_t_claim_raise",
+]
+
+FBA_WAREHOUSE_HEADER_MAP = {
+    "request_date": "Request Date",
+    "order_id": "Order ID",
+    "order_source": "Order Source",
+    "order_type": "Order Type",
+    "service_speed": "Service Speed",
+    "order_status": "Order Status",
+    "last_updated_date": "Last Updated Date",
+    "sku": "SKU",
+    "fnsku": "FNSKU",
+    "product_name": "Product Name",
+    "disposition": "Disposition",
+    "requested_quantity": "Requested Qty",
+    "cancelled_quantity": "Cancelled Qty",
+    "disposed_quantity": "Disposed Qty",
+    "shipped_quantity": "Shipped Qty",
+    "in_process_quantity": "In-Process Qty",
+    "removal_fee": "Removal Fee",
+    "currency": "Currency",
+    "received_date": "Received Date of Return",
+    "condition": "Condition of Product",
+    "qty_received_wh": "Qty Received in WH",
+    "gdrive_link": "GDrive Link (Images/CCTV)",
+    "entry_in_zoho": "Entry in Zoho",
+    "transfer_orders_inventory_adj": "Transfer Orders / Inventory Adjustment",
+    "safe_t_claim_raise": "Safe-t Claim Raise",
+}
+
+
+@router.post("/upload/fba-warehouse-returns")
+async def upload_fba_warehouse_returns(
+    file: UploadFile = File(...),
+    db=Depends(get_database),
+):
+    """Upload an Amazon FBA removal/return order CSV."""
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a CSV file.")
+
+    try:
+        contents = await file.read()
+        df = pd.read_csv(BytesIO(contents), low_memory=False, dtype=str)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {e}")
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail="CSV file is empty.")
+
+    records = df.to_dict("records")
+    normalized: List[Dict] = [normalize_fba_warehouse_return(r) for r in records]
+
+    all_dates: List[datetime] = [r["request_date"] for r in normalized if r.get("request_date")]
+    if not all_dates:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid dates found in 'request-date' column.",
+        )
+
+    range_start = min(all_dates)
+    range_end = max(all_dates)
+
+    collection = db[FBA_WAREHOUSE_RETURNS_COLLECTION]
+    date_query = {"request_date": {"$gte": range_start, "$lte": range_end}}
+    existing_count = await asyncio.to_thread(collection.count_documents, date_query)
+
+    deleted_count = 0
+    if existing_count > 0:
+        delete_result = await asyncio.to_thread(collection.delete_many, date_query)
+        deleted_count = delete_result.deleted_count
+
+    insert_result = await asyncio.to_thread(collection.insert_many, normalized)
+    inserted_count = len(insert_result.inserted_ids)
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "message": "FBA warehouse returns uploaded successfully.",
+            "date_range": {
+                "start": range_start.strftime("%Y-%m-%d"),
+                "end": range_end.strftime("%Y-%m-%d"),
+            },
+            "existing_deleted": deleted_count,
+            "records_inserted": inserted_count,
+        },
+    )
+
+
+@router.get("/fba-warehouse-returns")
+async def get_fba_warehouse_returns(
+    start_date: str = Query(..., description="YYYY-MM-DD"),
+    end_date: str = Query(..., description="YYYY-MM-DD"),
+    db=Depends(get_database),
+):
+    """Return FBA warehouse return records filtered by request_date."""
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    collection = db[FBA_WAREHOUSE_RETURNS_COLLECTION]
+    docs = await asyncio.to_thread(
+        lambda: list(collection.find(
+            {"request_date": {"$gte": start, "$lte": end}},
+            {"created_at": 0}
+        ).sort("request_date", 1))
+    )
+    docs = [_clean_fba_wh_doc(d) for d in docs]
+    docs = await _enrich_fba_wh_with_product_names(docs, db)
+    return JSONResponse(content={"records": docs, "total": len(docs)})
+
+
+@router.get("/fba-warehouse-returns/download")
+async def download_fba_warehouse_returns(
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    db=Depends(get_database),
+):
+    """Download FBA warehouse returns as XLSX with editable columns included."""
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    collection = db[FBA_WAREHOUSE_RETURNS_COLLECTION]
+    docs = await asyncio.to_thread(
+        lambda: list(collection.find(
+            {"request_date": {"$gte": start, "$lte": end}},
+            {"created_at": 0}
+        ).sort("request_date", 1))
+    )
+    docs = [_clean_fba_wh_doc(d) for d in docs]
+    docs = await _enrich_fba_wh_with_product_names(docs, db)
+
+    rows = []
+    for doc in docs:
+        row = {}
+        for col in FBA_WAREHOUSE_COLUMN_ORDER:
+            val = doc.get(col)
+            if isinstance(val, datetime):
+                val = val.strftime("%Y-%m-%d")
+            row[FBA_WAREHOUSE_HEADER_MAP[col]] = val
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=[FBA_WAREHOUSE_HEADER_MAP[c] for c in FBA_WAREHOUSE_COLUMN_ORDER])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="FBA Warehouse Returns")
+    buf.seek(0)
+
+    filename = f"fba_warehouse_returns_{start_date}_to_{end_date}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.patch("/fba-warehouse-returns/{record_id}")
+async def update_fba_warehouse_return(
+    record_id: str,
+    payload: Dict[str, Any],
+    db=Depends(get_database),
+):
+    """Update editable fields on a single FBA warehouse return record."""
+    try:
+        oid = ObjectId(record_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid record ID")
+
+    update_data = {k: v for k, v in payload.items() if k in FBA_WAREHOUSE_EDITABLE_FIELDS}
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No valid editable fields provided")
+
+    if "received_date" in update_data and update_data["received_date"]:
+        raw = str(update_data["received_date"]).split(".")[0]
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            raise HTTPException(status_code=400, detail="received_date must be YYYY-MM-DD")
+        update_data["received_date"] = parsed
+
+    collection = db[FBA_WAREHOUSE_RETURNS_COLLECTION]
+    result = await asyncio.to_thread(
+        collection.update_one, {"_id": oid}, {"$set": update_data}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    return JSONResponse(content={"message": "Record updated", "modified": result.modified_count})
+
+
+@router.post("/fba-warehouse-returns/bulk-update")
+async def bulk_update_fba_warehouse_returns(
+    file: UploadFile = File(...),
+    db=Depends(get_database),
+):
+    """
+    Upload the downloaded XLSX and bulk-update editable columns.
+    Rows are matched by Order ID + SKU.
+    """
+    if not (file.filename.endswith(".xlsx") or file.filename.endswith(".xls")):
+        raise HTTPException(status_code=400, detail="Please upload an XLSX file.")
+
+    try:
+        contents = await file.read()
+        df = pd.read_excel(BytesIO(contents), dtype=str)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse file: {e}")
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail="File is empty.")
+
+    header_to_field = {v: k for k, v in FBA_WAREHOUSE_HEADER_MAP.items()}
+    df.rename(columns=header_to_field, inplace=True)
+
+    required = {"order_id", "sku"}
+    missing = required - set(df.columns)
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required columns: {missing}")
+
+    editable_present = [f for f in FBA_WAREHOUSE_EDITABLE_FIELDS if f in df.columns]
+    if not editable_present:
+        raise HTTPException(status_code=400, detail="No editable columns found in the file.")
+
+    collection = db[FBA_WAREHOUSE_RETURNS_COLLECTION]
+    updated = 0
+    for _, row in df.iterrows():
+        order_id = str(row.get("order_id") or "").strip()
+        sku = str(row.get("sku") or "").strip()
+        if not order_id or not sku or order_id == "nan" or sku == "nan":
+            continue
+
+        update_data = {}
+        for field in editable_present:
+            val = row.get(field)
+            if pd.isna(val) if isinstance(val, float) else (val is None or str(val).strip() == "nan"):
+                continue
+            val = str(val).strip()
+            if not val:
+                continue
+            if field == "received_date":
+                parsed = None
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y"):
+                    try:
+                        parsed = datetime.strptime(val.split(".")[0], fmt)
+                        break
+                    except ValueError:
+                        continue
+                if parsed is None:
+                    continue
+                val = parsed
+            elif field == "qty_received_wh":
+                try:
+                    val = int(float(val))
+                except (ValueError, TypeError):
+                    continue
+            update_data[field] = val
+
+        if not update_data:
+            continue
+
+        result = await asyncio.to_thread(
+            collection.update_many,
+            {"order_id": order_id, "sku": sku},
+            {"$set": update_data},
+        )
+        updated += result.modified_count
+
+    return JSONResponse(content={"message": "Bulk update complete", "records_updated": updated})
+
+
+# ---------------------------------------------------------------------------
 # Vendor Central Returns – upload XLSX + read endpoints
 # ---------------------------------------------------------------------------
 

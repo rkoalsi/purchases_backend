@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, Body
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta
 from ..database import get_database, serialize_mongo_document
@@ -11,6 +11,7 @@ import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from typing import Optional
+from pydantic import BaseModel
 import logging
 import boto3
 from botocore.config import Config as BotocoreConfig
@@ -1037,6 +1038,71 @@ async def delete_order_file(po_number: str, db=Depends(get_database)):
         raise HTTPException(status_code=500, detail=str(e))
 
     return {"po_number": po_number, "deleted": True}
+
+
+# ─── shipment summary ─────────────────────────────────────────────────────────
+
+class ShipmentUpdate(BaseModel):
+    reason_for_short_supply: Optional[str] = None
+    box_count: Optional[int] = None
+    appointment_initiated_date: Optional[str] = None
+    appointment_id: Optional[str] = None
+    appointment_date: Optional[str] = None
+    dispatched_date: Optional[str] = None
+    delivery_date: Optional[str] = None
+
+
+@router.get("/shipment_summary")
+async def get_shipment_summary(db=Depends(get_database)):
+    """Return one row per PO with shipment summary columns for the Etrade Shipment Summary page."""
+    def _fetch():
+        pipeline = [
+            {"$addFields": {
+                "total_requested_qty": {"$sum": "$items.requested_qty"},
+                "total_supply_qty": {"$sum": "$items.supply_qty"},
+                "total_accepted_qty": {"$sum": "$items.accepted_qty"},
+                "location": {"$arrayElemAt": ["$items.ship_to_location", 0]},
+            }},
+            {"$project": {
+                "po_number": 1, "po_date": 1, "po_status": 1,
+                "location": 1,
+                "total_requested_qty": 1,
+                "total_supply_qty": 1,
+                "total_accepted_qty": 1,
+                "reason_for_short_supply": 1,
+                "box_count": 1,
+                "appointment_initiated_date": 1,
+                "appointment_id": 1,
+                "appointment_date": 1,
+                "dispatched_date": 1,
+                "delivery_date": 1,
+                "_id": 0,
+            }},
+            {"$sort": {"po_date": -1}},
+        ]
+        return list(db[PO_COLLECTION].aggregate(pipeline))
+
+    rows = await asyncio.to_thread(_fetch)
+    return serialize_mongo_document(rows)
+
+
+@router.patch("/{po_number}/shipment")
+async def update_shipment_fields(po_number: str, body: ShipmentUpdate, db=Depends(get_database)):
+    """Update editable shipment tracking fields on a PO."""
+    update: dict = {"updated_at": datetime.now()}
+    for field, value in body.model_dump(exclude_none=True).items():
+        update[field] = value
+
+    if len(update) == 1:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    def _update():
+        return db[PO_COLLECTION].update_one({"po_number": po_number}, {"$set": update}).matched_count
+
+    matched = await asyncio.to_thread(_update)
+    if not matched:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    return {"po_number": po_number, "updated": True}
 
 
 # ─── margins ──────────────────────────────────────────────────────────────────
