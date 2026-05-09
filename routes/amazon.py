@@ -4697,37 +4697,24 @@ def _clean_flex_doc(doc: Dict) -> Dict:
 
 
 async def _enrich_flex_with_product_names(docs: List[Dict], db) -> List[Dict]:
-    """Add product_name to each record via amazon_sku_mapping → products lookup."""
-    mskus = {d.get("msku") for d in docs if d.get("msku")}
-    if not mskus:
+    """Add product_name via amazon_sku_mapping.item_id (= ASIN) → item_name."""
+    asins = {d.get("asin") for d in docs if d.get("asin")}
+    if not asins:
+        for doc in docs:
+            doc["product_name"] = ""
         return docs
 
     sku_map_col = db[SKU_COLLECTION]
     sku_docs = await asyncio.to_thread(
         lambda: list(sku_map_col.find(
-            {"item_id": {"$in": list(mskus)}},
-            {"item_id": 1, "sku_code": 1, "_id": 0}
+            {"item_id": {"$in": list(asins)}},
+            {"item_id": 1, "item_name": 1, "_id": 0}
         ))
     )
-    msku_to_sku = {d["item_id"]: d["sku_code"] for d in sku_docs if d.get("sku_code")}
-
-    sku_codes = list(set(msku_to_sku.values()))
-    products_col = db["products"]
-    if sku_codes:
-        product_docs = await asyncio.to_thread(
-            lambda: list(products_col.find(
-                {"cf_sku_code": {"$in": sku_codes}},
-                {"cf_sku_code": 1, "name": 1, "_id": 0}
-            ))
-        )
-        sku_to_name = {d["cf_sku_code"]: d.get("name", "") for d in product_docs}
-    else:
-        sku_to_name = {}
+    asin_to_name = {d["item_id"]: d.get("item_name", "") for d in sku_docs}
 
     for doc in docs:
-        msku = doc.get("msku")
-        sku_code = msku_to_sku.get(msku)
-        doc["product_name"] = sku_to_name.get(sku_code, "") if sku_code else ""
+        doc["product_name"] = asin_to_name.get(doc.get("asin"), "")
 
     return docs
 
