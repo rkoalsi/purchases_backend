@@ -4675,40 +4675,121 @@ def normalize_seller_flex_recon_row(row: Dict) -> Dict:
     }
 
 
+SELLER_FLEX_EDITABLE_FIELDS = {
+    "received_date", "condition", "qty_received_wh", "gdrive_link",
+    "entry_in_zoho", "transfer_orders_inventory_adj", "safe_t_claim_raise",
+}
+
+
+def _clean_flex_doc(doc: Dict) -> Dict:
+    import math
+    out = {}
+    for k, v in doc.items():
+        if k == "_id":
+            out["_id"] = str(v)
+        elif isinstance(v, datetime):
+            out[k] = v.strftime("%Y-%m-%d")
+        elif isinstance(v, float) and math.isnan(v):
+            out[k] = None
+        else:
+            out[k] = v
+    return out
+
+
+async def _enrich_flex_with_product_names(docs: List[Dict], db) -> List[Dict]:
+    """Add product_name to each record via amazon_sku_mapping → products lookup."""
+    mskus = {d.get("msku") for d in docs if d.get("msku")}
+    if not mskus:
+        return docs
+
+    sku_map_col = db[SKU_COLLECTION]
+    sku_docs = await asyncio.to_thread(
+        lambda: list(sku_map_col.find(
+            {"item_id": {"$in": list(mskus)}},
+            {"item_id": 1, "sku_code": 1, "_id": 0}
+        ))
+    )
+    msku_to_sku = {d["item_id"]: d["sku_code"] for d in sku_docs if d.get("sku_code")}
+
+    sku_codes = list(set(msku_to_sku.values()))
+    products_col = db["products"]
+    if sku_codes:
+        product_docs = await asyncio.to_thread(
+            lambda: list(products_col.find(
+                {"cf_sku_code": {"$in": sku_codes}},
+                {"cf_sku_code": 1, "name": 1, "_id": 0}
+            ))
+        )
+        sku_to_name = {d["cf_sku_code"]: d.get("name", "") for d in product_docs}
+    else:
+        sku_to_name = {}
+
+    for doc in docs:
+        msku = doc.get("msku")
+        sku_code = msku_to_sku.get(msku)
+        doc["product_name"] = sku_to_name.get(sku_code, "") if sku_code else ""
+
+    return docs
+
+
 @router.get("/seller-flex-returns")
 async def get_seller_flex_returns(
     start_date: str = Query(..., description="YYYY-MM-DD"),
     end_date: str = Query(..., description="YYYY-MM-DD"),
     db=Depends(get_database),
 ):
-    """Return seller flex recon records for the given date range (filtered on last_updated_on)."""
+    """Return seller flex recon records filtered by pickup_date range."""
     try:
         start = datetime.strptime(start_date, "%Y-%m-%d")
         end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
-    query = {"last_updated_on": {"$gte": start, "$lte": end}}
+    query = {"pickup_date": {"$gte": start, "$lte": end}}
     collection = db[SELLER_FLEX_RETURNS_COLLECTION]
     docs = await asyncio.to_thread(
-        lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("last_updated_on", 1))
+        lambda: list(collection.find(query, {"created_at": 0}).sort("pickup_date", 1))
     )
 
-    import math
-
-    def _clean_doc(doc: Dict) -> Dict:
-        out = {}
-        for k, v in doc.items():
-            if isinstance(v, datetime):
-                out[k] = v.strftime("%Y-%m-%d")
-            elif isinstance(v, float) and math.isnan(v):
-                out[k] = None
-            else:
-                out[k] = v
-        return out
-
-    docs = [_clean_doc(d) for d in docs]
+    docs = [_clean_flex_doc(d) for d in docs]
+    docs = await _enrich_flex_with_product_names(docs, db)
     return JSONResponse(content={"records": docs, "total": len(docs)})
+
+
+SELLER_FLEX_COLUMN_ORDER = [
+    "return_type", "customer_order_id", "shipment_id", "sku", "msku", "asin",
+    "product_name",
+    "external_id1", "external_id2", "external_id3", "units",
+    "forward_leg_tracking_id", "reverse_leg_tracking_id", "rma_id",
+    "return_status", "carrier", "pickup_date", "last_updated_on",
+    "returned_with_otp", "days_in_transit", "days_since_return_complete",
+    "return_reason", "lpn",
+    # editable columns
+    "received_date", "condition", "qty_received_wh", "gdrive_link",
+    "entry_in_zoho", "transfer_orders_inventory_adj", "safe_t_claim_raise",
+]
+
+SELLER_FLEX_HEADER_MAP = {
+    "return_type": "Return Type", "customer_order_id": "Customer Order ID",
+    "shipment_id": "Shipment ID", "sku": "SKU", "msku": "mSKU", "asin": "ASIN",
+    "product_name": "Product Name",
+    "external_id1": "External ID1", "external_id2": "External ID2",
+    "external_id3": "External ID3", "units": "Units",
+    "forward_leg_tracking_id": "Forward Leg Tracking ID",
+    "reverse_leg_tracking_id": "Reverse Leg Tracking ID",
+    "rma_id": "RMA ID", "return_status": "Return Status", "carrier": "Carrier",
+    "pickup_date": "Pick-up Date", "last_updated_on": "Last Updated On",
+    "returned_with_otp": "Returned with OTP", "days_in_transit": "Days In-transit",
+    "days_since_return_complete": "Days Since Return Complete",
+    "return_reason": "Return Reason", "lpn": "LPN",
+    "received_date": "Received Date of Return",
+    "condition": "Condition of Product",
+    "qty_received_wh": "Qty Received in WH",
+    "gdrive_link": "GDrive Link (Images/CCTV)",
+    "entry_in_zoho": "Entry in Zoho",
+    "transfer_orders_inventory_adj": "Transfer Orders / Inventory Adjustment",
+    "safe_t_claim_raise": "Safe-t Claim Raise",
+}
 
 
 @router.get("/seller-flex-returns/download")
@@ -4717,52 +4798,33 @@ async def download_seller_flex_returns(
     end_date: str = Query(...),
     db=Depends(get_database),
 ):
-    """Download seller flex recon records as an XLSX file."""
+    """Download seller flex recon records as an XLSX file (filtered by pickup_date)."""
     try:
         start = datetime.strptime(start_date, "%Y-%m-%d")
         end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
-    query = {"last_updated_on": {"$gte": start, "$lte": end}}
+    query = {"pickup_date": {"$gte": start, "$lte": end}}
     collection = db[SELLER_FLEX_RETURNS_COLLECTION]
     docs = await asyncio.to_thread(
-        lambda: list(collection.find(query, {"_id": 0, "created_at": 0}).sort("last_updated_on", 1))
+        lambda: list(collection.find(query, {"created_at": 0}).sort("pickup_date", 1))
     )
 
-    COLUMN_ORDER = [
-        "return_type", "customer_order_id", "shipment_id", "sku", "msku", "asin",
-        "external_id1", "external_id2", "external_id3", "units",
-        "forward_leg_tracking_id", "reverse_leg_tracking_id", "rma_id",
-        "return_status", "carrier", "pickup_date", "last_updated_on",
-        "returned_with_otp", "days_in_transit", "days_since_return_complete",
-        "return_reason", "lpn",
-    ]
-    HEADER_MAP = {
-        "return_type": "Return Type", "customer_order_id": "Customer Order ID",
-        "shipment_id": "Shipment ID", "sku": "SKU", "msku": "mSKU", "asin": "ASIN",
-        "external_id1": "External ID1", "external_id2": "External ID2",
-        "external_id3": "External ID3", "units": "Units",
-        "forward_leg_tracking_id": "Forward Leg Tracking ID",
-        "reverse_leg_tracking_id": "Reverse Leg Tracking ID",
-        "rma_id": "RMA ID", "return_status": "Return Status", "carrier": "Carrier",
-        "pickup_date": "Pick-up Date", "last_updated_on": "Last Updated On",
-        "returned_with_otp": "Returned with OTP", "days_in_transit": "Days In-transit",
-        "days_since_return_complete": "Days Since Return Complete",
-        "return_reason": "Return Reason", "lpn": "LPN",
-    }
+    docs = [_clean_flex_doc(d) for d in docs]
+    docs = await _enrich_flex_with_product_names(docs, db)
 
     rows = []
     for doc in docs:
         row = {}
-        for col in COLUMN_ORDER:
+        for col in SELLER_FLEX_COLUMN_ORDER:
             val = doc.get(col)
             if isinstance(val, datetime):
                 val = val.strftime("%Y-%m-%d")
-            row[HEADER_MAP[col]] = val
+            row[SELLER_FLEX_HEADER_MAP[col]] = val
         rows.append(row)
 
-    df = pd.DataFrame(rows, columns=[HEADER_MAP[c] for c in COLUMN_ORDER])
+    df = pd.DataFrame(rows, columns=[SELLER_FLEX_HEADER_MAP[c] for c in SELLER_FLEX_COLUMN_ORDER])
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Seller Flex Returns")
@@ -4859,6 +4921,129 @@ async def upload_seller_flex_returns(
             "records_inserted": inserted_count,
         },
     )
+
+
+@router.patch("/seller-flex-returns/{record_id}")
+async def update_seller_flex_return(
+    record_id: str,
+    payload: Dict[str, Any],
+    db=Depends(get_database),
+):
+    """Update editable fields on a single seller flex return record."""
+    try:
+        oid = ObjectId(record_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid record ID")
+
+    update_data = {k: v for k, v in payload.items() if k in SELLER_FLEX_EDITABLE_FIELDS}
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No valid editable fields provided")
+
+    # Parse received_date string → datetime if provided
+    if "received_date" in update_data and update_data["received_date"]:
+        raw = str(update_data["received_date"]).split(".")[0]
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            raise HTTPException(status_code=400, detail="received_date must be YYYY-MM-DD")
+        update_data["received_date"] = parsed
+
+    collection = db[SELLER_FLEX_RETURNS_COLLECTION]
+    result = await asyncio.to_thread(
+        collection.update_one, {"_id": oid}, {"$set": update_data}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    return JSONResponse(content={"message": "Record updated", "modified": result.modified_count})
+
+
+@router.post("/seller-flex-returns/bulk-update")
+async def bulk_update_seller_flex_returns(
+    file: UploadFile = File(...),
+    db=Depends(get_database),
+):
+    """
+    Upload an XLSX exported from the seller flex returns download to bulk-update
+    the editable columns (Received Date, Condition, Qty Received, GDrive Link,
+    Entry in Zoho, Transfer Orders, Safe-t Claim). Rows are matched by
+    Customer Order ID + SKU.
+    """
+    if not (file.filename.endswith(".xlsx") or file.filename.endswith(".xls")):
+        raise HTTPException(status_code=400, detail="Please upload an XLSX file.")
+
+    try:
+        contents = await file.read()
+        df = pd.read_excel(BytesIO(contents), dtype=str)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse file: {e}")
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail="File is empty.")
+
+    # Reverse-map header → field
+    header_to_field = {v: k for k, v in SELLER_FLEX_HEADER_MAP.items()}
+    df.rename(columns=header_to_field, inplace=True)
+
+    required = {"customer_order_id", "sku"}
+    missing = required - set(df.columns)
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required columns: {missing}")
+
+    editable_present = [f for f in SELLER_FLEX_EDITABLE_FIELDS if f in df.columns]
+    if not editable_present:
+        raise HTTPException(status_code=400, detail="No editable columns found in the file.")
+
+    collection = db[SELLER_FLEX_RETURNS_COLLECTION]
+    updated = 0
+    for _, row in df.iterrows():
+        order_id = str(row.get("customer_order_id") or "").strip()
+        sku = str(row.get("sku") or "").strip()
+        if not order_id or not sku or order_id == "nan" or sku == "nan":
+            continue
+
+        update_data = {}
+        for field in editable_present:
+            val = row.get(field)
+            if pd.isna(val) if isinstance(val, float) else (val is None or str(val).strip() == "nan"):
+                continue
+            val = str(val).strip()
+            if not val:
+                continue
+            if field == "received_date":
+                parsed = None
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y"):
+                    try:
+                        parsed = datetime.strptime(val.split(".")[0], fmt)
+                        break
+                    except ValueError:
+                        continue
+                if parsed is None:
+                    continue
+                val = parsed
+            elif field == "qty_received_wh":
+                try:
+                    val = int(float(val))
+                except (ValueError, TypeError):
+                    continue
+            update_data[field] = val
+
+        if not update_data:
+            continue
+
+        result = await asyncio.to_thread(
+            collection.update_many,
+            {"customer_order_id": order_id, "sku": sku},
+            {"$set": update_data},
+        )
+        updated += result.modified_count
+
+    return JSONResponse(content={"message": "Bulk update complete", "records_updated": updated})
 
 
 # ---------------------------------------------------------------------------
