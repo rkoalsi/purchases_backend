@@ -442,6 +442,235 @@ async def list_vendor_pos(db=Depends(get_database)):
     return serialize_mongo_document(pos)
 
 
+# ─── shipment summary download / upload (must precede /{po_number}/... routes) ─
+
+SHIPMENT_DATE_FIELDS = {
+    "appointment_initiated_date",
+    "appointment_date",
+    "dispatched_date",
+    "delivery_date",
+}
+
+SHIPMENT_COLUMNS = [
+    ("PO Date",                      "po_date",                     False),
+    ("PO Number",                    "po_number",                   False),
+    ("Location",                     "location",                    False),
+    ("Requested Qty",                "total_requested_qty",         False),
+    ("Supply Qty (After Overstock)", "total_supply_qty",            False),
+    ("Accepted / Dispatched Qty",    "total_accepted_qty",          False),
+    ("Short Supply (Qty)",           "short_supply_qty",            False),
+    ("Short Supply (%)",             "short_supply_pct",            False),
+    ("Reason for Short Supply",      "reason_for_short_supply",     True),
+    ("Box Count",                    "box_count",                   True),
+    ("Appointment Initiated Date",   "appointment_initiated_date",  True),
+    ("Appointment ID",               "appointment_id",              True),
+    ("Appointment Date",             "appointment_date",            True),
+    ("Dispatched Date",              "dispatched_date",             True),
+    ("Status",                       "po_status",                   False),
+    ("Delivery Date",                "delivery_date",               True),
+]
+
+_DATE_FMT_IN = ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"]
+
+EDITABLE_FIELDS = {
+    "Reason for Short Supply":    "reason_for_short_supply",
+    "Box Count":                  "box_count",
+    "Appointment Initiated Date": "appointment_initiated_date",
+    "Appointment ID":             "appointment_id",
+    "Appointment Date":           "appointment_date",
+    "Dispatched Date":            "dispatched_date",
+    "Delivery Date":              "delivery_date",
+}
+
+
+def _to_ddmmyyyy(val: str | None) -> str:
+    if not val:
+        return ""
+    for fmt in _DATE_FMT_IN:
+        try:
+            return datetime.strptime(val, fmt).strftime("%d/%m/%Y")
+        except ValueError:
+            pass
+    return val
+
+
+def _parse_date_field(val: str | None) -> str | None:
+    """Normalise date strings from an uploaded file to yyyy-mm-dd for DB storage."""
+    if not val:
+        return None
+    val = str(val).strip()
+    for fmt in _DATE_FMT_IN:
+        try:
+            return datetime.strptime(val, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return val
+
+
+@router.get("/shipment_summary/download")
+async def download_shipment_summary(db=Depends(get_database)):
+    """Download the Etrade Shipment Summary as an XLSX file."""
+    def _fetch():
+        pipeline = [
+            {"$addFields": {
+                "total_requested_qty": {"$sum": "$items.requested_qty"},
+                "total_supply_qty": {"$sum": "$items.supply_qty"},
+                "total_accepted_qty": {"$sum": "$items.accepted_qty"},
+                "location": {"$arrayElemAt": ["$items.ship_to_location", 0]},
+            }},
+            {"$project": {
+                "po_number": 1, "po_date": 1, "po_status": 1,
+                "location": 1,
+                "total_requested_qty": 1,
+                "total_supply_qty": 1,
+                "total_accepted_qty": 1,
+                "reason_for_short_supply": 1,
+                "box_count": 1,
+                "appointment_initiated_date": 1,
+                "appointment_id": 1,
+                "appointment_date": 1,
+                "dispatched_date": 1,
+                "delivery_date": 1,
+                "_id": 0,
+            }},
+            {"$sort": {"po_date": -1}},
+        ]
+        return list(db[PO_COLLECTION].aggregate(pipeline))
+
+    raw_rows = await asyncio.to_thread(_fetch)
+    rows = serialize_mongo_document(raw_rows)
+
+    for r in rows:
+        supply = r.get("total_supply_qty") or 0
+        accepted = r.get("total_accepted_qty") or 0
+        r["short_supply_qty"] = accepted - supply
+        r["short_supply_pct"] = (
+            f"{((accepted - supply) / supply * 100):.2f}%" if supply else ""
+        )
+        for field in ["po_date"] + list(SHIPMENT_DATE_FIELDS):
+            r[field] = _to_ddmmyyyy(r.get(field))
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Shipment Summary"
+
+    header_fill_ro = PatternFill("solid", fgColor="D9E1F2")
+    header_fill_ed = PatternFill("solid", fgColor="FFF2CC")
+    cell_fill_ed   = PatternFill("solid", fgColor="FFFCE5")
+    header_font    = Font(bold=True)
+    center         = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for col_idx, (label, _, editable) in enumerate(SHIPMENT_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=label)
+        cell.font = header_font
+        cell.fill = header_fill_ed if editable else header_fill_ro
+        cell.alignment = center
+
+    ws.row_dimensions[1].height = 30
+
+    for row_idx, r in enumerate(rows, start=2):
+        for col_idx, (_, field, editable) in enumerate(SHIPMENT_COLUMNS, start=1):
+            val = r.get(field)
+            cell = ws.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
+            cell.alignment = Alignment(vertical="center")
+            if editable:
+                cell.fill = cell_fill_ed
+
+    for col_idx, (label, _, _) in enumerate(SHIPMENT_COLUMNS, start=1):
+        col_letter = get_column_letter(col_idx)
+        max_len = max(len(label), *(
+            len(str(ws.cell(row=r, column=col_idx).value or ""))
+            for r in range(1, len(rows) + 2)
+        ))
+        ws.column_dimensions[col_letter].width = min(max_len + 4, 40)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=etrade_shipment_summary.xlsx"},
+    )
+
+
+@router.post("/shipment_summary/upload")
+async def upload_shipment_summary(file: UploadFile = File(...), db=Depends(get_database)):
+    """Upload an edited Etrade Shipment Summary XLSX to bulk-update editable fields."""
+    content = await file.read()
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not parse uploaded file as XLSX")
+
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        header_row = next(rows_iter)
+    except StopIteration:
+        raise HTTPException(status_code=400, detail="File is empty")
+
+    header = [str(h).strip() if h is not None else "" for h in header_row]
+
+    try:
+        po_col = header.index("PO Number")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="'PO Number' column not found in uploaded file")
+
+    field_col_map: dict[str, int] = {}
+    for label, field in EDITABLE_FIELDS.items():
+        try:
+            field_col_map[field] = header.index(label)
+        except ValueError:
+            pass
+
+    errors: list[str] = []
+
+    def _bulk_update(updates: list[tuple[str, dict]]):
+        from pymongo import UpdateOne
+        ops = [
+            UpdateOne({"po_number": po}, {"$set": {**fields, "updated_at": datetime.now()}})
+            for po, fields in updates
+        ]
+        if ops:
+            db[PO_COLLECTION].bulk_write(ops, ordered=False)
+        return len(ops)
+
+    batch: list[tuple[str, dict]] = []
+    for data_row in rows_iter:
+        po_number = data_row[po_col]
+        if not po_number:
+            continue
+        po_number = str(po_number).strip()
+
+        fields: dict = {}
+        for field, col_idx in field_col_map.items():
+            raw = data_row[col_idx] if col_idx < len(data_row) else None
+            if raw is None or str(raw).strip() == "":
+                fields[field] = None
+            elif field == "box_count":
+                try:
+                    fields[field] = int(float(str(raw).strip()))
+                except (ValueError, TypeError):
+                    errors.append(f"PO {po_number}: invalid box_count '{raw}'")
+                    continue
+            elif field in SHIPMENT_DATE_FIELDS:
+                fields[field] = _parse_date_field(str(raw).strip())
+            else:
+                fields[field] = str(raw).strip() or None
+
+        if fields:
+            batch.append((po_number, fields))
+
+    updated = await asyncio.to_thread(_bulk_update, batch) if batch else 0
+
+    result: dict = {"updated": updated}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
 @router.get("/{po_number}/report")
 async def get_po_report(po_number: str, db=Depends(get_database)):
     """Generate enriched report for a PO."""
@@ -1090,7 +1319,7 @@ async def get_shipment_summary(db=Depends(get_database)):
 async def update_shipment_fields(po_number: str, body: ShipmentUpdate, db=Depends(get_database)):
     """Update editable shipment tracking fields on a PO."""
     update: dict = {"updated_at": datetime.now()}
-    for field, value in body.model_dump(exclude_none=True).items():
+    for field, value in body.model_dump(exclude_unset=True).items():
         update[field] = value
 
     if len(update) == 1:
