@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta
 from bson import ObjectId
@@ -12,6 +12,10 @@ import boto3
 from botocore.config import Config as BotocoreConfig
 from typing import Optional
 import logging
+from jose import jwt, JWTError
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -207,6 +211,51 @@ async def list_orders(brand: Optional[str] = None, db=Depends(get_database)):
 
     orders = await asyncio.to_thread(_fetch)
     return serialize_mongo_document(orders)
+
+
+@router.get("/lead-time-report")
+async def download_lead_time_report(
+    request: Request,
+    brand: Optional[str] = None,
+    db=Depends(get_database),
+):
+    """Generate Lead Time report Excel for all orders (admin only)."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = auth_header.split(" ", 1)[1]
+    try:
+        secret = os.getenv("SECRET_KEY") or ""
+        algo = os.getenv("ALGORITHM") or "HS256"
+        payload = jwt.decode(token, secret, algorithms=[algo], options={"verify_aud": False, "verify_exp": False})
+        email = payload.get("sub")
+    except Exception as exc:
+        logger.warning("lead-time-report token decode failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    def _fetch(email, brand_filter):
+        user = db["purchase_users"].find_one({"email": email}, {"role": 1})
+        if not user or user.get("role") != "admin":
+            return None
+        query = {"brand": brand_filter} if brand_filter else {}
+        return list(db[COLLECTION].find(query, {
+            "brand": 1, "name": 1, "purchaseorder_number": 1,
+            "initiation_date": 1, "proforma_date": 1, "ready_date": 1,
+            "etd_date": 1, "eta_port_date": 1, "duty_payment_date": 1,
+            "inward_date": 1,
+        }).sort([("brand", 1), ("name", 1)]))
+
+    orders = await asyncio.to_thread(_fetch, email, brand)
+    if orders is None:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    buf = await asyncio.to_thread(_build_lead_time_excel, orders)
+    filename = f"Lead_Time_Report_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/{order_id}")
@@ -629,6 +678,227 @@ async def get_document_url(order_id: str, doc_id: str, db=Depends(get_database))
         raise HTTPException(status_code=500, detail=str(e))
 
     return {"url": url}
+
+
+def _days_between(a: Optional[str], b: Optional[str]) -> Optional[int]:
+    if not a or not b:
+        return None
+    try:
+        da = datetime.strptime(a, "%Y-%m-%d")
+        db_ = datetime.strptime(b, "%Y-%m-%d")
+        return (db_ - da).days
+    except ValueError:
+        return None
+
+
+def _build_lead_time_excel(orders: list) -> io.BytesIO:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Lead Time Report"
+
+    # ── Styles ──────────────────────────────────────────────────────────────────
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF", size=9)
+    brand_fill = PatternFill("solid", fgColor="D9E1F2")
+    brand_font = Font(bold=True, size=9)
+    data_font = Font(size=9)
+    avg_fill = PatternFill("solid", fgColor="E2EFDA")
+    avg_font = Font(bold=True, size=9)
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+    green_fill = PatternFill("solid", fgColor="C6EFCE")
+    yellow_fill = PatternFill("solid", fgColor="FFEB9C")
+    orange_fill = PatternFill("solid", fgColor="FFCC99")
+    red_fill = PatternFill("solid", fgColor="FFC7CE")
+
+    def improvement_fill(days_over: Optional[int]) -> Optional[PatternFill]:
+        if days_over is None:
+            return None
+        if days_over <= 0:
+            return green_fill
+        if days_over <= 3:
+            return yellow_fill
+        if days_over <= 6:
+            return orange_fill
+        return red_fill
+
+    # ── Headers ──────────────────────────────────────────────────────────────────
+    headers = [
+        "Sr. No", "Supplier Name", "Order No",
+        "Date of Initiation", "Proforma Invoice Date",
+        "Order Processing Days\n(G = F-E)",
+        "Order Ready Date",
+        "Order Preparing Days\n(I = H-F)",
+        "Manufacturer Lead Time\n(J = G+I)",
+        "ETD / Sailing Date",
+        "Actual Mfg. Lead Time\n(N = G+I)",
+        "Ready→ETD Days\n(O = M-H, Target 7-10)",
+        "Ready→ETD %\n(P = O/N)",
+        "Ready→ETD Over Target\n(Q = O-7)",
+        "Total Days\n(R = O+N)",
+        "Port / ETA Date",
+        "Sail Days\n(T = S-M)",
+        "Inward Date",
+        "Port→WH Days\n(V = U-S, Target 7)",
+        "Port→WH %\n(W = V/N)",
+        "Port→WH Over Target\n(X = V-7)",
+        "Duty Payment Date",
+        "Lead Time\n(AA = Z-F)",
+        "Brand",
+        "Avg. Lead Time",
+    ]
+    ws.append(headers)
+    for col_idx, cell in enumerate(ws[1], 1):
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+        cell.border = border
+
+    ws.row_dimensions[1].height = 36
+
+    # ── Group by brand ────────────────────────────────────────────────────────────
+    from itertools import groupby
+    grouped = {}
+    for o in orders:
+        grouped.setdefault(o.get("brand", "Unknown"), []).append(o)
+
+    sr = 1
+    for brand_name, brand_orders in sorted(grouped.items()):
+        lead_times = []
+        data_rows = []
+
+        for order in brand_orders:
+            init = order.get("initiation_date")
+            pf = order.get("proforma_date")
+            ready = order.get("ready_date")
+            etd = order.get("etd_date")
+            port = order.get("eta_port_date")
+            inward = order.get("inward_date")
+            duty = order.get("duty_payment_date")
+
+            G = _days_between(init, pf)
+            I_ = _days_between(pf, ready)
+            J = (G + I_) if G is not None and I_ is not None else None
+            O_ = _days_between(ready, etd)
+            P = round(O_ / J, 4) if O_ is not None and J else None
+            Q = (O_ - 7) if O_ is not None else None
+            R = (O_ + J) if O_ is not None and J is not None else None
+            T_ = _days_between(etd, port)
+            V = _days_between(port, inward)
+            W = round(V / J, 4) if V is not None and J else None
+            X = (V - 7) if V is not None else None
+            AA = _days_between(pf, inward)
+
+            if AA is not None:
+                lead_times.append(AA)
+
+            po_num = order.get("purchaseorder_number") or order.get("name", "")
+            data_rows.append({
+                "sr": sr, "brand": brand_name, "po_num": po_num,
+                "init": init, "pf": pf, "G": G,
+                "ready": ready, "I": I_, "J": J,
+                "etd": etd, "N": J, "O": O_, "P": P, "Q": Q, "R": R,
+                "port": port, "T": T_,
+                "inward": inward, "V": V, "W": W, "X": X,
+                "duty": duty, "AA": AA,
+            })
+            sr += 1
+
+        avg_lt = round(sum(lead_times) / len(lead_times), 1) if lead_times else None
+
+        for i, row_data in enumerate(data_rows):
+            is_last = (i == len(data_rows) - 1)
+
+            def fmt_date(d):
+                if not d:
+                    return None
+                try:
+                    return datetime.strptime(d, "%Y-%m-%d")
+                except Exception:
+                    return None
+
+            row = [
+                row_data["sr"],
+                row_data["brand"],
+                row_data["po_num"],
+                fmt_date(row_data["init"]),
+                fmt_date(row_data["pf"]),
+                row_data["G"],
+                fmt_date(row_data["ready"]),
+                row_data["I"],
+                row_data["J"],
+                fmt_date(row_data["etd"]),
+                row_data["N"],
+                row_data["O"],
+                row_data["P"],
+                row_data["Q"],
+                row_data["R"],
+                fmt_date(row_data["port"]),
+                row_data["T"],
+                fmt_date(row_data["inward"]),
+                row_data["V"],
+                row_data["W"],
+                row_data["X"],
+                fmt_date(row_data["duty"]),
+                row_data["AA"],
+                brand_name if is_last else None,
+                avg_lt if is_last else None,
+            ]
+            ws.append(row)
+            excel_row = ws.max_row
+
+            for col_idx, cell in enumerate(ws[excel_row], 1):
+                cell.font = brand_font if col_idx <= 2 else data_font
+                cell.border = border
+
+                # Date columns: format as date
+                if col_idx in (4, 5, 7, 10, 16, 18, 22, 23):
+                    if cell.value:
+                        cell.number_format = "DD-MMM-YYYY"
+                    cell.alignment = center
+                # Percentage columns
+                elif col_idx in (13, 20):
+                    if cell.value is not None:
+                        cell.number_format = "0.0%"
+                    cell.alignment = center
+                # Numeric columns
+                elif col_idx in (6, 8, 9, 11, 12, 14, 15, 17, 19, 21, 24):
+                    cell.alignment = center
+                # Brand / avg
+                elif col_idx in (25, 26):
+                    cell.font = avg_font
+                    cell.fill = avg_fill
+                    cell.alignment = center
+                else:
+                    cell.alignment = left
+
+                # Color coding for Q (col 14) and X (col 21)
+                if col_idx == 14:
+                    f = improvement_fill(row_data["Q"])
+                    if f:
+                        cell.fill = f
+                elif col_idx == 21:
+                    f = improvement_fill(row_data["X"])
+                    if f:
+                        cell.fill = f
+
+        # Blank separator row between brand groups
+        ws.append([None] * len(headers))
+
+    # ── Column widths ─────────────────────────────────────────────────────────────
+    col_widths = [6, 22, 16, 14, 14, 12, 14, 12, 14, 14, 12, 12, 10, 12, 10, 14, 10, 14, 12, 10, 12, 14, 14, 12, 20, 12]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 
 @router.delete("/{order_id}/documents/{doc_id}")
