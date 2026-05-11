@@ -607,10 +607,10 @@ def setup_scheduler():
         misfire_grace_time=300,
     )
 
-    # VC collect: 5 hours after midnight initiation — reports are ready by then
+    # VC collect: 3 hours after midnight initiation — reports are ready by then
     scheduler.add_job(
         scheduled_vc_collect_task,
-        trigger=CronTrigger(hour=5, minute=0, timezone="UTC"),
+        trigger=CronTrigger(hour=3, minute=0, timezone="UTC"),
         id="vc_collect_reports",
         name="VC Collect Reports",
         replace_existing=True,

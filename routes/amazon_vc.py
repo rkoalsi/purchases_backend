@@ -976,7 +976,7 @@ async def refetch_last_10_days_sales(
 
 def initiate_vc_reports(db) -> Dict:
     """
-    Request VC sales (last 10 days) and inventory (2 days ago) reports from
+    Request VC sales and inventory (2 days ago) reports from
     Amazon and persist their report IDs in vc_pending_reports for later collection.
     Returns {"initiated": [...], "failed": [...]}.
     """
@@ -1153,7 +1153,7 @@ def collect_pending_vc_reports(db) -> Dict:
 @router.post("/cron/initiate")
 async def cron_initiate_reports(db=Depends(get_database)):
     """
-    Phase 1: Create VC sales (last 10 days) and inventory reports on Amazon SP API
+    Phase 1: Create VC sales and inventory reports on Amazon SP API
     and store the returned report IDs in vc_pending_reports.
     Called by the scheduler at midnight; /cron/collect picks them up hours later.
     """
