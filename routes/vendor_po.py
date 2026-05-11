@@ -19,6 +19,8 @@ import xlrd
 import xlwt
 from xlutils.copy import copy as xl_copy
 
+from .amazon import compute_drr_v3
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -31,6 +33,31 @@ INVENTORY_COLLECTION = "amazon_vendor_inventory"
 SALES_COLLECTION = "amazon_vendor_sales"
 
 COVERAGE_DAYS = 35
+
+
+def _fetch_vc_drr_daily_sync(db, end: datetime, asins: list) -> dict:
+    """Fetch 90 days of {date, closing_stock, units_sold} from VC collections for DRR (sync)."""
+    drr_start = end - timedelta(days=89)
+    pipeline = [
+        {"$match": {"asin": {"$in": asins}, "date": {"$gte": drr_start, "$lte": end}}},
+        {"$group": {"_id": {"asin": "$asin", "date": "$date"}, "closing_stock": {"$sum": "$sellableOnHandInventoryUnits"}}},
+        {"$lookup": {
+            "from": "amazon_vendor_sales",
+            "let": {"a": "$_id.asin", "d": "$_id.date"},
+            "pipeline": [
+                {"$match": {"$expr": {"$and": [{"$eq": ["$asin", "$$a"]}, {"$eq": ["$date", "$$d"]}]}}},
+                {"$group": {"_id": None, "units_sold": {"$sum": "$orderedUnits"}}},
+            ],
+            "as": "sales",
+        }},
+        {"$addFields": {"units_sold": {"$ifNull": [{"$first": "$sales.units_sold"}, 0]}}},
+        {"$group": {
+            "_id": "$_id.asin",
+            "daily_data": {"$push": {"date": "$_id.date", "closing_stock": "$closing_stock", "units_sold": "$units_sold"}},
+        }},
+    ]
+    results = list(db["amazon_vendor_inventory"].aggregate(pipeline, allowDiskUse=True))
+    return {doc["_id"]: doc["daily_data"] for doc in results}
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
@@ -101,15 +128,17 @@ def _enrich_items(
 
     # zoho_cutoff = PO date (Zoho data is available same-day)
     # stock_cutoff = T-2 from PO date (Amazon vendor inventory has a 2-day lag)
+    po_date_dt: datetime | None = None
     zoho_cutoff: datetime | None = None
     stock_cutoff: datetime | None = None
-    if po_date_str and not effective_use_stored:
+    if po_date_str:
         try:
             po_date_dt = datetime.strptime(po_date_str, "%Y-%m-%d")
-            zoho_cutoff = po_date_dt
-            stock_cutoff = po_date_dt - timedelta(days=2)
         except ValueError:
             pass
+    if po_date_dt and not effective_use_stored:
+        zoho_cutoff = po_date_dt
+        stock_cutoff = po_date_dt - timedelta(days=2)
 
     # --- batch load products by cf_sku_code (always fresh — MRP/GST/HSN can change) ---
     products_by_model: dict[str, dict] = {}
@@ -231,6 +260,13 @@ def _enrich_items(
         ]):
             sales_by_asin[doc["_id"]] = int(doc["total_units"])
 
+    # --- fetch DRR daily data (90-day window ending at PO date) ---
+    # Run for all POs — DRR is historical and needed even for frozen POs that predate this feature.
+    drr_daily_map: dict = {}
+    if asins:
+        drr_end = po_date_dt if po_date_dt else datetime.now()
+        drr_daily_map = _fetch_vc_drr_daily_sync(db, drr_end, asins)
+
     # --- enrich each item ---
     enriched = []
     for item in items:
@@ -272,6 +308,15 @@ def _enrich_items(
             else:
                 sv = item.get("supply_qty")
                 supply_qty = sv if sv is not None else item["requested_qty"]
+            stored_drr = item.get("final_drr")
+            stored_drr_flag = item.get("final_drr_flag")
+            if stored_drr is not None:
+                final_drr = stored_drr
+                final_drr_flag = stored_drr_flag or ""
+            else:
+                drr_result, _, _, drr_flag = compute_drr_v3(drr_daily_map.get(asin, []), 0)
+                final_drr = drr_result if isinstance(drr_result, (int, float)) else None
+                final_drr_flag = drr_flag if not isinstance(drr_result, (int, float)) else ""
         else:
             zoho_stock = zoho_latest.get(zoho_item_id, 0) if zoho_item_id else 0
             current_stock = current_stock_by_asin.get(asin, 0)
@@ -294,6 +339,9 @@ def _enrich_items(
                 supply_qty = item["requested_qty"]
             else:
                 supply_qty = max(0, min(int(item["requested_qty"]), int(max_allowed_tmp)))
+            drr_result, _, _, drr_flag = compute_drr_v3(drr_daily_map.get(asin, []), 0)
+            final_drr = drr_result if isinstance(drr_result, (int, float)) else None
+            final_drr_flag = drr_flag if not isinstance(drr_result, (int, float)) else ""
 
         total_cost = round(cost_price_wo_tax * supply_qty, 2) if cost_price_wo_tax is not None else None
         total_cost_gst = round(total_cost * (1 + gst / 100), 2) if (total_cost is not None and gst) else total_cost
@@ -331,6 +379,8 @@ def _enrich_items(
             "target_stock": int(target_stock),
             "max_allowed_qty": int(max_allowed_qty),
             "final_supply_qty": supply_qty,   # final = supply (they are always equal)
+            "final_drr": final_drr,
+            "final_drr_flag": final_drr_flag,
         })
 
     return enriched, inventory_date_str, zoho_stock_date_str
@@ -896,6 +946,13 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
     )
 
     inv_date_label = doc.get("inventory_date") or "Latest"
+    po_date_str_raw = doc.get("po_date", "")
+    try:
+        _po_dt = datetime.strptime(po_date_str_raw, "%Y-%m-%d")
+        _drr_start_dt = _po_dt - timedelta(days=30)
+        _drr_range = f"{_drr_start_dt.strftime('%-d %b %Y')} – {_po_dt.strftime('%-d %b %Y')}"
+    except (ValueError, TypeError):
+        _drr_range = po_date_str_raw
     headers = [
         ("PO Date", False), ("PO", False), ("PO Status", False), ("Ship to location", False),
         ("ASIN", True), ("Model Number", True), ("Title", True), ("Requested Qty", True),
@@ -909,6 +966,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
         ("Open PO", True), ("Total Qty", True), ("Last 30 Days Sales", True),
         ("ADS", True), ("Coverage Days", True), ("Target Stock", True),
         ("Max Allowed Qty", True), ("Final Supply Qty", True),
+        (f"Final DRR ({_drr_range})", True),
     ]
 
     for col_idx, (label, highlight) in enumerate(headers, 1):
@@ -956,6 +1014,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             28: item["open_po"],                    # AB Open PO
             30: item["last_30_sales"],              # AD Last 30 Days Sales
             32: item["coverage_days"],              # AF Coverage Days
+            36: item.get("final_drr") if item.get("final_drr") is not None else (item.get("final_drr_flag") or ""),  # AJ Final DRR
         }
 
         # Formula values — reference other cells
@@ -988,7 +1047,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             static[9] = supply_qty_override
             static[35] = supply_qty_override
 
-        for col_idx in range(1, 36):
+        for col_idx in range(1, 37):
             if col_idx in formulas:
                 cell = ws.cell(row=r, column=col_idx, value=formulas[col_idx])
             else:
@@ -1007,10 +1066,13 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
                 cell.number_format = num_format
             elif col_idx in (8, 10, 12, 25, 27, 28, 29, 30, 32, 33, 34, 35):
                 cell.number_format = int_format
+            elif col_idx == 36:                           # Final DRR
+                cell.number_format = "0.0"
 
     for col_idx in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = 16
-    ws.column_dimensions["G"].width = 40  # Title column
+    ws.column_dimensions["G"].width = 40   # Title column
+    ws.column_dimensions["AJ"].width = 24  # Final DRR (with date range in header)
     ws.row_dimensions[1].height = 40
 
     buf = io.BytesIO()
