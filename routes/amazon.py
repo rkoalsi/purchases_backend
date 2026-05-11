@@ -3816,6 +3816,180 @@ def _style_calendar_sheet(worksheet, df):
     worksheet.freeze_panes = "E2"
 
 
+def _build_inventory_sheet(ws, daily_by_asin, report_data, all_dates, title, platform, purchase_status_map=None):
+    """
+    Calendar-style inventory sheet: one row per ASIN, one column per day in the selected range.
+    Cell = units sold (green), 0 if in-stock/no-sale (blue), blank if OOS.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    if purchase_status_map is None:
+        purchase_status_map = {}
+    if not all_dates:
+        return
+
+    is_vc = platform == "VC"
+    C_TITLE_BG  = "1F3864" if is_vc else "1E4620"
+    C_HDR_BG    = "2E75B6" if is_vc else "375623"
+    C_DATE_BG   = "4472C4" if is_vc else "548235"
+    C_INFO_BG   = "D6E4F7" if is_vc else "E2EFDA"
+    C_SOLD_BG   = "C6EFCE"
+    C_STOCK_BG  = "DEEBF7"
+    C_ALT_ROW   = "F7F7F7"
+
+    R_TITLE = 1
+    R_INFO  = 2
+    R_HDR   = 3
+    R_DATA  = 4
+
+    COL_ASIN  = 1
+    COL_SKU   = 2
+    COL_NAME  = 3
+    COL_TOTAL = 4
+    COL_DIS   = 5
+    COL_STOCK = 6
+    COL_DATE1 = 7
+
+    L = get_column_letter
+    date_col_count = len(all_dates)
+    last_col = COL_DATE1 + date_col_count - 1
+
+    # ── Row 1: title ────────────────────────────────────────────────────
+    ws.merge_cells(start_row=R_TITLE, start_column=1, end_row=R_TITLE, end_column=last_col)
+    tc = ws.cell(row=R_TITLE, column=1)
+    tc.value = title
+    tc.font  = Font(bold=True, size=13, color="FFFFFF")
+    tc.fill  = PatternFill(start_color=C_TITLE_BG, end_color=C_TITLE_BG, fill_type="solid")
+    tc.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[R_TITLE].height = 26
+
+    # ── Row 2: info / legend ─────────────────────────────────────────────
+    date_range_str = f"{all_dates[0].strftime('%d %b %Y')} — {all_dates[-1].strftime('%d %b %Y')}"
+    ws.merge_cells(start_row=R_INFO, start_column=1, end_row=R_INFO, end_column=last_col)
+    ic = ws.cell(row=R_INFO, column=1)
+    ic.value = (
+        f"Date Range: {date_range_str}     "
+        "Green = Units Sold     Blue = In Stock / No Sale     Blank = Out of Stock"
+    )
+    ic.font  = Font(italic=True, size=10, color=C_TITLE_BG)
+    ic.fill  = PatternFill(start_color=C_INFO_BG, end_color=C_INFO_BG, fill_type="solid")
+    ic.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[R_INFO].height = 20
+
+    # ── Row 3: column headers ────────────────────────────────────────────
+    hdr_font  = Font(bold=True, color="FFFFFF")
+    hdr_fill  = PatternFill(start_color=C_HDR_BG, end_color=C_HDR_BG, fill_type="solid")
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    date_fill = PatternFill(start_color=C_DATE_BG, end_color=C_DATE_BG, fill_type="solid")
+
+    fixed_hdrs = {
+        COL_ASIN:  "ASIN",
+        COL_SKU:   "SKU Code",
+        COL_NAME:  "Item Name",
+        COL_TOTAL: "Total Units\nSold",
+        COL_DIS:   "Days In\nStock",
+        COL_STOCK: f"Closing Stock\n({all_dates[-1].strftime('%d %b %Y')})",
+    }
+    for ci, label in fixed_hdrs.items():
+        c = ws.cell(row=R_HDR, column=ci)
+        c.value = label
+        c.font  = hdr_font
+        c.fill  = hdr_fill
+        c.alignment = hdr_align
+
+    for i, dt in enumerate(all_dates):
+        c = ws.cell(row=R_HDR, column=COL_DATE1 + i)
+        c.value = dt.strftime("%d %b")
+        c.font  = Font(bold=True, color="FFFFFF", size=9)
+        c.fill  = date_fill
+        c.alignment = Alignment(horizontal="center", vertical="bottom", text_rotation=45)
+    ws.row_dimensions[R_HDR].height = 52
+
+    # ── Data rows ────────────────────────────────────────────────────────
+    asin_info = {
+        item["asin"]: {"sku_code": item.get("sku_code", ""), "item_name": item.get("item_name", "")}
+        for item in report_data if item.get("asin")
+    }
+    all_asins = sorted(set(daily_by_asin.keys()))
+    if not all_asins:
+        all_asins = [item["asin"] for item in report_data if item.get("asin")]
+
+    sold_fill  = PatternFill(start_color=C_SOLD_BG,  end_color=C_SOLD_BG,  fill_type="solid")
+    stock_fill = PatternFill(start_color=C_STOCK_BG, end_color=C_STOCK_BG, fill_type="solid")
+    alt_fill   = PatternFill(start_color=C_ALT_ROW,  end_color=C_ALT_ROW,  fill_type="solid")
+    no_fill    = PatternFill(fill_type=None)
+
+    for row_offset, asin in enumerate(all_asins):
+        r = R_DATA + row_offset
+        row_bg = alt_fill if row_offset % 2 == 1 else no_fill
+        info   = asin_info.get(asin, {})
+        sku    = info.get("sku_code", "")
+        name   = info.get("item_name", "")
+
+        by_date = {
+            _parse_date_str(d.get("date")): d
+            for d in daily_by_asin.get(asin, [])
+            if _parse_date_str(d.get("date"))
+        }
+
+        total_sold    = 0
+        days_in_stock = 0
+        latest_stock  = 0
+
+        for i, dt in enumerate(all_dates):
+            day   = by_date.get(dt) or {}
+            sold  = day.get("units_sold",    0) or 0
+            stock = day.get("closing_stock", 0) or 0
+            in_stock = stock > 0 or sold > 0
+            total_sold    += sold
+            days_in_stock += 1 if in_stock else 0
+            if i == len(all_dates) - 1:
+                latest_stock = stock
+
+            c = ws.cell(row=r, column=COL_DATE1 + i)
+            if sold > 0:
+                c.value     = sold
+                c.fill      = sold_fill
+                c.font      = Font(bold=True, size=9)
+                c.alignment = Alignment(horizontal="center", vertical="center")
+            elif in_stock:
+                c.value     = 0
+                c.fill      = stock_fill
+                c.font      = Font(size=9, color="888888")
+                c.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                c.fill = row_bg
+
+        def _set(col, val, bold=False, align="left", color="000000", size=10):
+            c = ws.cell(row=r, column=col)
+            c.value     = val
+            c.font      = Font(bold=bold, size=size, color=color)
+            c.alignment = Alignment(horizontal=align, vertical="center")
+            c.fill      = row_bg
+
+        _set(COL_ASIN,  asin,          size=9,  color="595959")
+        _set(COL_SKU,   sku,           bold=True)
+        _set(COL_NAME,  name)
+        _set(COL_TOTAL, total_sold,    bold=True, align="center")
+        _set(COL_DIS,   days_in_stock, align="center")
+        _set(COL_STOCK, latest_stock,  align="center")
+        ws.row_dimensions[r].height = 18
+
+    # ── Column widths ────────────────────────────────────────────────────
+    ws.column_dimensions[L(COL_ASIN)].width  = 14
+    ws.column_dimensions[L(COL_SKU)].width   = 16
+    ws.column_dimensions[L(COL_NAME)].width  = 36
+    ws.column_dimensions[L(COL_TOTAL)].width = 11
+    ws.column_dimensions[L(COL_DIS)].width   = 9
+    ws.column_dimensions[L(COL_STOCK)].width = 16
+    for i in range(date_col_count):
+        ws.column_dimensions[L(COL_DATE1 + i)].width = 7
+
+    # Freeze identifier columns + header rows
+    ws.freeze_panes = f"{L(COL_DATE1)}{R_DATA}"
+
+
 @router.get("/download_report_by_date_range")
 async def download_report_by_date_range(
     start_date: str,
@@ -3984,7 +4158,7 @@ async def download_report_by_date_range(
             for doc in docs:
                 purchase_status_map[doc["cf_sku_code"]] = doc.get("purchase_status", "")
 
-        # --- Write Excel (Active Days only) ---
+        # --- Write Excel ---
         excel_buffer = io.BytesIO()
 
         from openpyxl import Workbook
@@ -4001,6 +4175,33 @@ async def download_report_by_date_range(
             end_label,
             purchase_status_map,
         )
+
+        # VC Inventory sheet (selected date range, ASIN-level calendar)
+        if vc_daily_by_asin:
+            ws_vc = wb.create_sheet("VC Inventory")
+            _build_inventory_sheet(
+                ws_vc,
+                vc_daily_by_asin,
+                report_data,
+                all_dates,
+                f"Vendor Central — Inventory Report  ({start_date} to {end_date})",
+                "VC",
+                purchase_status_map,
+            )
+
+        # FBA Inventory sheet (selected date range, ASIN-level calendar)
+        if fba_daily_by_asin:
+            ws_fba = wb.create_sheet("FBA Inventory")
+            _build_inventory_sheet(
+                ws_fba,
+                fba_daily_by_asin,
+                report_data,
+                all_dates,
+                f"FBA — Inventory Report  ({start_date} to {end_date})",
+                "FBA",
+                purchase_status_map,
+            )
+
         wb.save(excel_buffer)
 
         excel_buffer.seek(0)
