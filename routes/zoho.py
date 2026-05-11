@@ -60,25 +60,20 @@ PURCHASE_ORDER_COLLECTION = "purchase_orders"
 
 # Standardized excluded customers list - used across multiple endpoints
 EXCLUDED_CUSTOMERS_LIST = [
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (KA)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (MH)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (TL)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (TN)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (WB)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (HY)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (DL)",
-    # "Pupscribe Enterprises Private Limited (Blinkit Maharashtra)",
-    # "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
-    # "Pupscribe Enterprises Private Limited (Blinkit Telangana)",
-    # "Pupscribe Enterprises Private Limited (Blinkit Tamil Nadu)",
-    # "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
-    # "Pupscribe Enterprises Private Limited (Blinkit West Bengal)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (UP)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (GJ)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (KL)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (AD)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (GA)",
-    # "(amzb2b) Pupscribe Enterprises Pvt Ltd (PB)",
+    "(amzb2b) Pupscribe Enterprises Pvt Ltd",
+    "Pupscribe Enterprises Private Limited",
+    "(OSAMP) Office samples",
+    "(PUPEV) PUPSCRIBE EVENTS",
+    "(SSAM) Sales samples",
+    "(RS) Retail samples",
+    "(MKT) Marketing Campaign",
+    "(DON) Donations",
+    "KIRANAKART (Hyderabad)",
+    "KIRANAKART (Gurugram)",
+    "KIRANAKART (Chennai)",
+    "KIRANAKART (Bhiwandi)",
+    "KIRANAKART (Bangalore)",
+    "Pupscribe Enterprises Private Limited (Blinkit)",
 ]
 
 router = APIRouter()
@@ -730,36 +725,19 @@ def query_invoices_for_item_names(
     try:
         invoices_collection = db.get_collection(INVOICES_COLLECTION)
 
-        match_statement = (
-            {
-                "$match": {
-                    "$expr": {
-                        "$and": [
-                            {"$gte": [{"$toDate": "$created_date"}, start_date]},
-                            {"$lte": [{"$toDate": "$created_date"}, end_date]},
-                        ]
-                    },
-                    "status": {"$nin": ["draft", "void"]},
-                    # "customer_name": {"$nin": EXCLUDED_CUSTOMERS_LIST},
-                    # Much simpler - just match item names directly
-                    "line_items": {"$elemMatch": {"name": {"$in": item_names}}},
-                }
-            }
-            if exclude_customers
-            else {
-                "$match": {
-                    "$expr": {
-                        "$and": [
-                            {"$gte": [{"$toDate": "$created_date"}, start_date]},
-                            {"$lte": [{"$toDate": "$created_date"}, end_date]},
-                        ]
-                    },
-                    "status": {"$nin": ["draft", "void"]},
-                    # Just match item names
-                    "line_items": {"$elemMatch": {"name": {"$in": item_names}}},
-                }
-            }
-        )
+        base_match: dict = {
+            "$expr": {
+                "$and": [
+                    {"$gte": [{"$toDate": "$created_date"}, start_date]},
+                    {"$lte": [{"$toDate": "$created_date"}, end_date]},
+                ]
+            },
+            "status": {"$nin": ["draft", "void"]},
+            "line_items": {"$elemMatch": {"name": {"$in": item_names}}},
+        }
+        if exclude_customers:
+            base_match["customer_name"] = {"$nin": EXCLUDED_CUSTOMERS_LIST}
+        match_statement = {"$match": base_match}
 
         # Simplified aggregation pipeline
         pipeline = [
