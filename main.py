@@ -25,18 +25,21 @@ from .routes.vendor_po import router as vendor_po_router
 from .routes.inventory_aging import router as inventory_aging_router
 from .routes.vendor import router as vendor_router
 from .routes.brand_orders import router as brand_orders_router
-from .database import connect_db, close_db
+from .routes.design import router as design_router
+from .database import connect_db, close_db, get_database
 from contextlib import asynccontextmanager
 from .helpers.scheduler import scheduler, api_scheduler, setup_scheduler
 import logging
+
 logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle"""
     # Startup
     logger.info("Starting up application...")
-    
+
     # Initialize database
     connect_db()
     
@@ -126,6 +129,7 @@ app.include_router(vendor_po_router, prefix="/vendor_po", tags=["vendor_po"])
 app.include_router(inventory_aging_router, prefix="/inventory_aging", tags=["inventory_aging"])
 app.include_router(vendor_router, prefix="/vendors", tags=["vendors"])
 app.include_router(brand_orders_router, prefix="/brand_orders", tags=["brand_orders"])
+app.include_router(design_router, prefix="/design", tags=["design"])
 
 
 # --- Protected Swagger / ReDoc / OpenAPI schema ---
