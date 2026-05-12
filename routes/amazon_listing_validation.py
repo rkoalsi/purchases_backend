@@ -2,6 +2,7 @@ import csv as _csv
 import io
 import logging
 import asyncio
+import re
 from typing import Optional
 
 import requests
@@ -39,8 +40,8 @@ COMBO_COL_GST  = "GST %"
 COMBO_COL_NAME = "Item Amazon Name"
 
 
-# Seller Central Template column letters
-SC_COLS = {
+# Fallback column letters used when dynamic detection fails (older template formats)
+SC_COLS_FALLBACK = {
     "sku": "A",
     "hsn": "DD",
     "tax_code": "EJ",
@@ -48,8 +49,7 @@ SC_COLS = {
     "sp": "FK",
 }
 
-# Vendor Central Template column letters
-VC_COLS = {
+VC_COLS_FALLBACK = {
     "sku": "B",
     "hsn": "DI",
     "mrp": "EQ",
@@ -84,57 +84,209 @@ def _col_idx(letter: str) -> int:
     return column_index_from_string(letter)
 
 
+def _parse_template_meta(ws) -> dict:
+    """
+    Read row 1 settings string (if present) to extract labelRow, attributeRow, dataRow.
+    Falls back to (4, 5, 7) which matches the current Amazon template format.
+    """
+    defaults = {"labelRow": 4, "attributeRow": 5, "dataRow": 7}
+    try:
+        rows = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+        if rows and rows[0]:
+            s = str(rows[0][0] or "")
+            for key in defaults:
+                m = re.search(rf"{key}=(\d+)", s)
+                if m:
+                    defaults[key] = int(m.group(1))
+    except Exception:
+        pass
+    return defaults
+
+
+def _detect_sc_columns(ws, label_row: int, attr_row: int) -> dict:
+    """
+    Dynamically detect Seller Central column indices (1-based) from the template header rows.
+    Falls back to hardcoded positions when a column is not found.
+    """
+    label_cells: dict[int, str] = {}
+    attr_cells: dict[int, str] = {}
+
+    for row in ws.iter_rows(min_row=label_row, max_row=label_row, values_only=True):
+        for j, val in enumerate(row):
+            if val:
+                label_cells[j + 1] = str(val).strip()
+
+    for row in ws.iter_rows(min_row=attr_row, max_row=attr_row, values_only=True):
+        for j, val in enumerate(row):
+            if val:
+                attr_cells[j + 1] = str(val).strip()
+
+    def by_label(*patterns) -> Optional[int]:
+        for pat in patterns:
+            pl = pat.lower()
+            # exact match first
+            for idx, v in label_cells.items():
+                if v.lower() == pl:
+                    return idx
+            # contains match
+            for idx, v in label_cells.items():
+                if pl in v.lower():
+                    return idx
+        return None
+
+    def by_attr(*patterns) -> Optional[int]:
+        for pat in patterns:
+            pl = pat.lower()
+            for idx, v in attr_cells.items():
+                if pl in v.lower():
+                    return idx
+        return None
+
+    # SKU: label "SKU" or fallback col A
+    sku_col = by_label("sku") or _col_idx(SC_COLS_FALLBACK["sku"])
+
+    # HSN: label contains "HSN" — may not exist in newer templates
+    hsn_col = by_label("hsn")
+
+    # Tax code: attribute contains "product_tax_code" or label "Product Tax Code"
+    tax_col = (
+        by_attr("product_tax_code")
+        or by_label("product tax code")
+        or _col_idx(SC_COLS_FALLBACK["tax_code"])
+    )
+
+    # MRP: label "Maximum Retail Price" — prefer non-B2B occurrence
+    mrp_candidates = [
+        idx for idx, v in label_cells.items()
+        if "maximum retail price" in v.lower() and "b2b" not in v.lower()
+    ]
+    mrp_col = mrp_candidates[0] if mrp_candidates else (
+        by_label("maximum retail price") or _col_idx(SC_COLS_FALLBACK["mrp"])
+    )
+
+    # SP (our price): attribute contains "audience=all" and "our_price"
+    sp_col = (
+        by_attr("audience=all]#1.our_price")
+        or by_attr("our_price")
+        or _col_idx(SC_COLS_FALLBACK["sp"])
+    )
+
+    return {
+        "sku": sku_col,
+        "hsn": hsn_col,
+        "tax_code": tax_col,
+        "mrp": mrp_col,
+        "sp": sp_col,
+    }
+
+
+def _detect_vc_columns(ws, label_row: int, attr_row: int) -> dict:
+    """
+    Dynamically detect Vendor Central column indices (1-based) from the template header rows.
+    Falls back to hardcoded positions when a column is not found.
+    """
+    label_cells: dict[int, str] = {}
+    attr_cells: dict[int, str] = {}
+
+    for row in ws.iter_rows(min_row=label_row, max_row=label_row, values_only=True):
+        for j, val in enumerate(row):
+            if val:
+                label_cells[j + 1] = str(val).strip()
+
+    for row in ws.iter_rows(min_row=attr_row, max_row=attr_row, values_only=True):
+        for j, val in enumerate(row):
+            if val:
+                attr_cells[j + 1] = str(val).strip()
+
+    def by_label(*patterns) -> Optional[int]:
+        for pat in patterns:
+            pl = pat.lower()
+            for idx, v in label_cells.items():
+                if v.lower() == pl:
+                    return idx
+            for idx, v in label_cells.items():
+                if pl in v.lower():
+                    return idx
+        return None
+
+    def by_attr(*patterns) -> Optional[int]:
+        for pat in patterns:
+            pl = pat.lower()
+            for idx, v in attr_cells.items():
+                if pl in v.lower():
+                    return idx
+        return None
+
+    sku_col = by_label("sku") or _col_idx(VC_COLS_FALLBACK["sku"])
+    hsn_col = by_label("hsn")
+    mrp_candidates = [
+        idx for idx, v in label_cells.items()
+        if "maximum retail price" in v.lower() and "b2b" not in v.lower()
+    ]
+    mrp_col = mrp_candidates[0] if mrp_candidates else (
+        by_label("maximum retail price") or _col_idx(VC_COLS_FALLBACK["mrp"])
+    )
+
+    return {"sku": sku_col, "hsn": hsn_col, "mrp": mrp_col}
+
+
+def _safe_get(row: tuple, idx: Optional[int]) -> str:
+    """Return cleaned cell value at 1-based index, or '' if index is None/out-of-range."""
+    if idx is None:
+        return ""
+    i = idx - 1
+    return _clean(row[i]) if i < len(row) else ""
+
+
 def _parse_seller_central(file_bytes: bytes) -> list[dict]:
     """
     Parse the Seller Central xlsm file.
-    Header is on row 4, data starts on row 6.
+    Detects column positions and data start row dynamically from the template header rows.
     Returns list of dicts with keys: sku, hsn, tax_code, mrp, sp.
     """
-    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, keep_vba=True)
+    wb = load_workbook(io.BytesIO(file_bytes), keep_vba=True)
     ws = _find_template_sheet(wb)
 
-    col_map = {k: _col_idx(v) for k, v in SC_COLS.items()}
-    rows = []
+    meta = _parse_template_meta(ws)
+    col_map = _detect_sc_columns(ws, meta["labelRow"], meta["attributeRow"])
 
-    for row in ws.iter_rows(min_row=6, values_only=True):
-        sku = _clean(row[col_map["sku"] - 1])
+    rows = []
+    for row in ws.iter_rows(min_row=meta["dataRow"], values_only=True):
+        sku = _safe_get(row, col_map["sku"])
         if not sku:
             continue
-        rows.append(
-            {
-                "sku": sku,
-                "hsn": _clean(row[col_map["hsn"] - 1]),
-                "tax_code": _clean(row[col_map["tax_code"] - 1]),
-                "mrp": _clean(row[col_map["mrp"] - 1]),
-                "sp": _clean(row[col_map["sp"] - 1]),
-            }
-        )
+        rows.append({
+            "sku": sku,
+            "hsn": _safe_get(row, col_map["hsn"]),
+            "tax_code": _safe_get(row, col_map["tax_code"]),
+            "mrp": _safe_get(row, col_map["mrp"]),
+            "sp": _safe_get(row, col_map["sp"]),
+        })
     return rows
 
 
 def _parse_vendor_central(file_bytes: bytes) -> list[dict]:
     """
     Parse the Vendor Central xlsm file.
-    Header is on row 3, data starts on row 6.
+    Detects column positions and data start row dynamically from the template header rows.
     Returns list of dicts with keys: sku, hsn, mrp.
     """
-    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, keep_vba=True)
+    wb = load_workbook(io.BytesIO(file_bytes), keep_vba=True)
     ws = _find_template_sheet(wb)
 
-    col_map = {k: _col_idx(v) for k, v in VC_COLS.items()}
-    rows = []
+    meta = _parse_template_meta(ws)
+    col_map = _detect_vc_columns(ws, meta["labelRow"], meta["attributeRow"])
 
-    for row in ws.iter_rows(min_row=6, values_only=True):
-        sku = _clean(row[col_map["sku"] - 1])
+    rows = []
+    for row in ws.iter_rows(min_row=meta["dataRow"], values_only=True):
+        sku = _safe_get(row, col_map["sku"])
         if not sku:
             continue
-        rows.append(
-            {
-                "sku": sku,
-                "hsn": _clean(row[col_map["hsn"] - 1]),
-                "mrp": _clean(row[col_map["mrp"] - 1]),
-            }
-        )
+        rows.append({
+            "sku": sku,
+            "hsn": _safe_get(row, col_map["hsn"]),
+            "mrp": _safe_get(row, col_map["mrp"]),
+        })
     return rows
 
 
