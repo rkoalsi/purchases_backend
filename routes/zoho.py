@@ -100,6 +100,7 @@ def get_products(
     search: str = Query(None, description="Search term for product name or SKU"),
     category: str = Query(None, description="Filter by category"),
     status: str = Query(None, description="Filter by status (active/inactive)"),
+    purchase_status: str = Query(None, description="Filter by purchase_status"),
     brand: str = Query(None, description="Filter by brand"),
     sort_by: str = Query(
         "name", description="Sort by field (name, price, stock, created_date)"
@@ -165,12 +166,16 @@ def get_products(
                     {"is_active": {"$ne": True}},
                 ]
 
+        # Purchase status filter
+        if purchase_status:
+            query_filter["purchase_status"] = purchase_status
+
         # Sort configuration
         sort_field_mapping = {
             "name": "name",
             "price": "rate",
             "stock": "stock_on_hand",
-            "created_date": "created_time",
+            "created_date": "created_at",
         }
 
         actual_sort_field = sort_field_mapping.get(sort_by, "name")
