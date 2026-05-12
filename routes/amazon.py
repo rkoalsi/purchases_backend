@@ -2212,7 +2212,7 @@ def _fetch_sp_listings() -> list:
     if doc_info.get("compressionAlgorithm") == "GZIP":
         raw = gzip.decompress(raw)
     text = None
-    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+    for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
         try:
             text = raw.decode(enc)
             break
@@ -2256,14 +2256,19 @@ async def sync_sku_mapping(database=Depends(get_database)):
                 sheet = sheet_by_asin.get(listing["asin"])
                 # Prefer sheet sku_code; fall back to seller_sku from SP-API
                 sku_code = sheet["sku_code"] if sheet else listing["seller_sku"]
+                set_fields = {
+                    "item_id":    listing["asin"],
+                    "seller_sku": listing["seller_sku"],
+                    "sku_code":   sku_code,
+                }
+                # Only overwrite item_name if SP-API returned a non-empty value;
+                # otherwise preserve whatever is already stored in the DB.
+                item_name = listing["item_name"] or (sheet and sheet.get("sheet_name")) or ""
+                if item_name:
+                    set_fields["item_name"] = item_name
                 result = collection.update_one(
                     {"item_id": listing["asin"]},
-                    {"$set": {
-                        "item_id":    listing["asin"],
-                        "seller_sku": listing["seller_sku"],
-                        "item_name":  listing["item_name"],
-                        "sku_code":   sku_code,
-                    }},
+                    {"$set": set_fields},
                     upsert=True,
                 )
                 if result.upserted_id:
