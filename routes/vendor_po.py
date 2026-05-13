@@ -21,7 +21,7 @@ import xlrd
 import xlwt
 from xlutils.copy import copy as xl_copy
 
-from .amazon import compute_drr_v3
+from .amazon import compute_drr_for_asins_sync
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -67,59 +67,6 @@ def _parse_addresses(raw) -> list[dict]:
         return ast.literal_eval(raw)
     except (ValueError, SyntaxError):
         return []
-
-
-def _fetch_vc_drr_daily_sync(db, end: datetime, asins: list) -> dict:
-    """Fetch 90 days of {date, closing_stock, units_sold} from VC collections for DRR (sync)."""
-    drr_start = end - timedelta(days=89)
-    pipeline = [
-        {"$match": {"asin": {"$in": asins}, "date": {"$gte": drr_start, "$lte": end}}},
-        {
-            "$group": {
-                "_id": {"asin": "$asin", "date": "$date"},
-                "closing_stock": {"$sum": "$sellableOnHandInventoryUnits"},
-            }
-        },
-        {
-            "$lookup": {
-                "from": "amazon_vendor_sales",
-                "let": {"a": "$_id.asin", "d": "$_id.date"},
-                "pipeline": [
-                    {
-                        "$match": {
-                            "$expr": {
-                                "$and": [
-                                    {"$eq": ["$asin", "$$a"]},
-                                    {"$eq": ["$date", "$$d"]},
-                                ]
-                            }
-                        }
-                    },
-                    {"$group": {"_id": None, "units_sold": {"$sum": "$orderedUnits"}}},
-                ],
-                "as": "sales",
-            }
-        },
-        {
-            "$addFields": {
-                "units_sold": {"$ifNull": [{"$first": "$sales.units_sold"}, 0]}
-            }
-        },
-        {
-            "$group": {
-                "_id": "$_id.asin",
-                "daily_data": {
-                    "$push": {
-                        "date": "$_id.date",
-                        "closing_stock": "$closing_stock",
-                        "units_sold": "$units_sold",
-                    }
-                },
-            }
-        },
-    ]
-    results = list(db["amazon_vendor_inventory"].aggregate(pipeline, allowDiskUse=True))
-    return {doc["_id"]: doc["daily_data"] for doc in results}
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
@@ -186,6 +133,14 @@ def _enrich_items(
     """
     asins = [it["asin"] for it in items if it["asin"]]
     model_numbers = [it["model_number"] for it in items if it["model_number"]]
+
+    # Some VC PO exports put the ASIN in the Model Number (SKU) column — detect and include them
+    def _looks_like_asin(s: str) -> bool:
+        return bool(s) and len(s) == 10 and s[:2].upper() == "B0"
+
+    asin_like_models = [m for m in model_numbers if _looks_like_asin(m) and m not in asins]
+    if asin_like_models:
+        asins = list(set(asins + asin_like_models))
 
     # detect old-format items that predate stock snapshotting — fall back to live fetch
     has_stored_stock = items and "zoho_stock" in items[0]
@@ -386,12 +341,11 @@ def _enrich_items(
         ):
             sales_by_asin[doc["_id"]] = int(doc["total_units"])
 
-    # --- fetch DRR daily data (90-day window ending at PO date) ---
-    # Run for all POs — DRR is historical and needed even for frozen POs that predate this feature.
-    drr_daily_map: dict = {}
+    # --- fetch DRR (90-day window ending at PO date, same logic as Amazon 'all' report) ---
+    drr_map: dict = {}
     if asins:
         drr_end = po_date_dt if po_date_dt else datetime.now()
-        drr_daily_map = _fetch_vc_drr_daily_sync(db, drr_end, asins)
+        drr_map = compute_drr_for_asins_sync(db, drr_end, asins)
 
     # --- enrich each item ---
     enriched = []
@@ -399,7 +353,19 @@ def _enrich_items(
         asin = item["asin"]
         model = item["model_number"]
 
-        product = products_by_asin.get(asin) or products_by_model.get(model) or {}
+        # When VC PO has ASIN in the SKU column, also try sku_map lookup via model_number
+        model_as_asin_sku = (
+            sku_map_by_asin.get(model)
+            if _looks_like_asin(model)
+            else None
+        )
+        product = (
+            products_by_asin.get(asin)
+            or products_by_model.get(model)
+            or (products_by_model.get(model_as_asin_sku) if model_as_asin_sku else None)
+            or products_by_asin.get(model)
+            or {}
+        )
         zoho_item_id = product.get("item_id", "")
 
         mrp = float(product.get("rate") or 0)
@@ -444,19 +410,11 @@ def _enrich_items(
             else:
                 sv = item.get("supply_qty")
                 supply_qty = sv if sv is not None else item["requested_qty"]
-            stored_drr = item.get("final_drr")
-            stored_drr_flag = item.get("final_drr_flag")
-            if stored_drr is not None:
-                final_drr = stored_drr
-                final_drr_flag = stored_drr_flag or ""
-            else:
-                drr_result, _, _, drr_flag = compute_drr_v3(
-                    drr_daily_map.get(asin, []), 0
-                )
-                final_drr = drr_result if isinstance(drr_result, (int, float)) else None
-                final_drr_flag = (
-                    drr_flag if not isinstance(drr_result, (int, float)) else ""
-                )
+            asin_drr = drr_map.get(asin, {})
+            drr_result = asin_drr.get("drr")
+            drr_flag = asin_drr.get("drr_flag", "")
+            final_drr = drr_result if isinstance(drr_result, (int, float)) else None
+            final_drr_flag = drr_flag if not isinstance(drr_result, (int, float)) else ""
         else:
             zoho_stock = zoho_latest.get(zoho_item_id, 0) if zoho_item_id else 0
             current_stock = current_stock_by_asin.get(asin, 0)
@@ -487,11 +445,11 @@ def _enrich_items(
                 supply_qty = max(
                     0, min(int(item["requested_qty"]), int(max_allowed_tmp))
                 )
-            drr_result, _, _, drr_flag = compute_drr_v3(drr_daily_map.get(asin, []), 0)
+            asin_drr = drr_map.get(asin, {})
+            drr_result = asin_drr.get("drr")
+            drr_flag = asin_drr.get("drr_flag", "")
             final_drr = drr_result if isinstance(drr_result, (int, float)) else None
-            final_drr_flag = (
-                drr_flag if not isinstance(drr_result, (int, float)) else ""
-            )
+            final_drr_flag = drr_flag if not isinstance(drr_result, (int, float)) else ""
 
         total_cost = (
             round(cost_price_wo_tax * supply_qty, 2)
@@ -1411,7 +1369,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             elif col_idx in (8, 10, 12, 25, 27, 28, 29, 30, 32, 33, 34, 35):
                 cell.number_format = int_format
             elif col_idx == 31:  # Final DRR
-                cell.number_format = "0.0"
+                cell.number_format = "0.000"
 
     for col_idx in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = 16

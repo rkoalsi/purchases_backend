@@ -2381,7 +2381,7 @@ def compute_drr_v3(daily_data: list, total_returns: float):
             parsed.append({
                 "date": dk,
                 "closing_stock": d.get("closing_stock", 0) or 0,
-                "units_sold": d.get("units_sold", 0) or 0,
+                "units_sold": max(0, d.get("units_sold", 0) or 0),
             })
 
     if not parsed:
@@ -2411,7 +2411,7 @@ def compute_drr_v3(daily_data: list, total_returns: float):
     lookback_sales = total_gross
 
     raw_mean = round(total_gross / 30, 2)
-    spike_threshold = raw_mean * 2
+    spike_threshold = max(raw_mean * 2, 5)
 
     # Replace spike days with 2x mean (spike threshold)
     spike_excess = sum(
@@ -2426,7 +2426,7 @@ def compute_drr_v3(daily_data: list, total_returns: float):
     total_ret = max(0, total_returns or 0)
     net_units = max(0.0, cleaned_units - total_ret)
 
-    final_drr = round(net_units / 30, 1)
+    final_drr = net_units / 30
 
     if spike_count > 0:
         flag = f"OK - {spike_count} Spike Day(s) Replaced with 2x Mean"
@@ -2574,6 +2574,92 @@ async def _fetch_fba_drr_daily(database, end: datetime, asins: list, report_type
     return {doc["_id"]: serialize_mongo_document(doc["daily_data"]) for doc in results}
 
 
+def compute_drr_for_asins_sync(db, end: datetime, asins: list) -> dict:
+    """
+    Compute DRR for a list of ASINs exactly as the Amazon 'all' report does:
+    merges VC + FBA daily data (90-day window) and subtracts combined returns.
+    Returns {asin: {"drr": value_or_str, "drr_flag": str}}.
+    """
+    drr_start = end - timedelta(days=89)
+
+    # VC daily
+    vc_pipeline = [
+        {"$match": {"asin": {"$in": asins}, "date": {"$gte": drr_start, "$lte": end}}},
+        {"$group": {"_id": {"asin": "$asin", "date": "$date"}, "closing_stock": {"$sum": "$sellableOnHandInventoryUnits"}}},
+        {
+            "$lookup": {
+                "from": "amazon_vendor_sales",
+                "let": {"a": "$_id.asin", "d": "$_id.date"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$and": [{"$eq": ["$asin", "$$a"]}, {"$eq": ["$date", "$$d"]}]}}},
+                    {"$group": {"_id": None, "units_sold": {"$sum": "$orderedUnits"}}},
+                ],
+                "as": "sales",
+            }
+        },
+        {"$addFields": {"units_sold": {"$ifNull": [{"$first": "$sales.units_sold"}, 0]}}},
+        {"$group": {"_id": "$_id.asin", "daily_data": {"$push": {"date": "$_id.date", "closing_stock": "$closing_stock", "units_sold": "$units_sold"}}}},
+    ]
+    vc_results = list(db.get_collection("amazon_vendor_inventory").aggregate(vc_pipeline, allowDiskUse=True))
+    vc_daily = {doc["_id"]: doc["daily_data"] for doc in vc_results}
+
+    # FBA daily (all dispositions — fba+seller_flex combined, same as 'all' report)
+    fba_pipeline = [
+        {"$match": {"asin": {"$in": asins}, "date": {"$gte": drr_start, "$lte": end}, "disposition": "SELLABLE"}},
+        {"$group": {"_id": {"asin": "$asin", "date": "$date"}, "closing_stock": {"$sum": "$ending_warehouse_balance"}}},
+        {
+            "$lookup": {
+                "from": SALES_COLLECTION,
+                "let": {"a": "$_id.asin", "d": "$_id.date"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$and": [{"$eq": ["$parentAsin", "$$a"]}, {"$eq": ["$date", "$$d"]}]}}},
+                    {"$group": {"_id": None, "units_sold": {"$sum": "$salesByAsin.unitsOrdered"}}},
+                ],
+                "as": "sales",
+            }
+        },
+        {"$addFields": {"units_sold": {"$ifNull": [{"$first": "$sales.units_sold"}, 0]}}},
+        {"$group": {"_id": "$_id.asin", "daily_data": {"$push": {"date": "$_id.date", "closing_stock": "$closing_stock", "units_sold": "$units_sold"}}}},
+    ]
+    fba_results = list(db.get_collection("amazon_ledger").aggregate(fba_pipeline, allowDiskUse=True))
+    fba_daily = {doc["_id"]: doc["daily_data"] for doc in fba_results}
+
+    # Returns: VC customer returns from amazon_vendor_sales + FBA over the same 90-day window
+    vc_ret_results = list(db.get_collection("amazon_vendor_sales").aggregate([
+        {"$match": {"asin": {"$in": asins}, "date": {"$gte": drr_start, "$lte": end}}},
+        {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$customerReturns", 0]}}}},
+    ]))
+    vc_returns = {doc["_id"]: doc["total"] for doc in vc_ret_results}
+
+    fba_ret_results = list(db.get_collection(FBA_RETURNS_COLLECTION).aggregate([
+        {"$match": {"asin": {"$in": asins}, "return_date": {"$gte": drr_start, "$lte": end}}},
+        {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$quantity", 0]}}}},
+    ]))
+    fba_returns = {doc["_id"]: doc["total"] for doc in fba_ret_results}
+
+    def _merge(a_list, b_list):
+        m = {}
+        for d in a_list:
+            k = d["date"]
+            m[k] = {"date": k, "closing_stock": d.get("closing_stock", 0) or 0, "units_sold": d.get("units_sold", 0) or 0}
+        for d in b_list:
+            k = d["date"]
+            if k in m:
+                m[k]["closing_stock"] = max(m[k]["closing_stock"], d.get("closing_stock", 0) or 0)
+                m[k]["units_sold"] += d.get("units_sold", 0) or 0
+            else:
+                m[k] = {"date": k, "closing_stock": d.get("closing_stock", 0) or 0, "units_sold": d.get("units_sold", 0) or 0}
+        return list(m.values())
+
+    result = {}
+    for asin in set(vc_daily.keys()) | set(fba_daily.keys()):
+        merged = _merge(vc_daily.get(asin, []), fba_daily.get(asin, []))
+        total_ret = (vc_returns.get(asin, 0) or 0) + (fba_returns.get(asin, 0) or 0)
+        drr, _, _, flag = compute_drr_v3(merged, total_ret)
+        result[asin] = {"drr": drr, "drr_flag": flag}
+    return result
+
+
 async def generate_report_by_date_range(
     start_date: str, end_date: str, database: Any, report_type: str = "fba+seller_flex", any_last_90_days: bool = False
 ):
@@ -2669,42 +2755,13 @@ async def generate_vendor_central_data(start, end, database, any_last_90_days: b
             }
         },
         {"$addFields": {"item_info": {"$last": "$item_info"}}},
-        {
-            "$lookup": {
-                "from": VENDOR_CENTRAL_RETURNS_COLLECTION,
-                "let": {"sales_asin": "$_id.asin"},
-                "pipeline": [
-                    {
-                        "$match": {
-                            "$expr": {
-                                "$and": [
-                                    {"$eq": ["$asin", "$$sales_asin"]},
-                                    {"$gte": ["$return_date", start]},
-                                    {"$lte": ["$return_date", end]},
-                                ]
-                            }
-                        }
-                    },
-                    {
-                        "$group": {
-                            "_id": "$asin",
-                            "vc_returns": {"$sum": {"$ifNull": ["$quantity", 0]}},
-                        }
-                    },
-                ],
-                "as": "vc_returns_data",
-            }
-        },
-        {"$addFields": {"vc_returns_data": {"$first": "$vc_returns_data"}}},
         {"$sort": {"_id.date": -1}},
         {
             "$group": {
                 "_id": {"asin": "$_id.asin"},
                 "total_units_sold": {"$sum": "$units_sold"},
                 "total_amount": {"$sum": "$amount"},
-                "vc_returns_total": {
-                    "$last": {"$ifNull": ["$vc_returns_data.vc_returns", 0]}
-                },
+                "vc_returns_total": {"$sum": "$customer_returns"},
                 "last_day_closing_stock": {
                     "$last": {"$ifNull": ["$inventory_data.closing_stock", 0]}
                 },
@@ -3459,28 +3516,30 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
 
     # ── Column index constants (1-based) ────────────────────────────────
     COL_STATUS = 1    # Item Status (purchase_status from products)
-    COL_A   = 2    # SKU / Product
-    COL_B   = 3    # FBA Sales (incl. SF)
-    COL_C   = 4    # VC Sales
-    COL_D   = 5    # FBA Returns
-    COL_E   = 6    # SF Returns
-    COL_F   = 7    # VC Returns
-    COL_G   = 8    # Total Returns (=D+E+F)
-    COL_H   = 9    # blank spacer
-    COL_D1  = 10   # D1 – most recent day
-    COL_D90 = 99   # D90 – oldest day  (10 + 89)
-    COL_H1  = 100  # H1 – first helper
-    COL_H90 = 189  # H90 – last helper (100 + 89)
-    COL_GF  = 190  # Total Active Days (max 30)
-    COL_GG  = 191  # Selected Sum (30 days)
-    COL_GH  = 192  # Raw Mean (÷30)
-    COL_GI  = 193  # Spike Threshold (2× Mean)
-    COL_GJ  = 194  # Cleaned Units (spikes→threshold)
-    COL_GK  = 195  # Spike Days Found
-    COL_GL  = 196  # Net Units (after returns)
-    COL_GM  = 197  # blank spacer
-    COL_GN  = 198  # Final DRR (units/day)
-    COL_GO  = 199  # DRR Flag
+    COL_ASIN = 2    # ASIN
+    COL_SKU  = 3    # SKU Code
+    COL_NAME = 4    # Item Name
+    COL_B   = 5    # FBA Sales (incl. SF)
+    COL_C   = 6    # VC Sales
+    COL_D   = 7    # FBA Returns
+    COL_E   = 8    # SF Returns
+    COL_F   = 9    # VC Returns
+    COL_G   = 10   # Total Returns (=D+E+F)
+    COL_H   = 11   # blank spacer
+    COL_D1  = 12   # D1 – most recent day
+    COL_D90 = 101  # D90 – oldest day  (12 + 89)
+    COL_H1  = 102  # H1 – first helper
+    COL_H90 = 191  # H90 – last helper (102 + 89)
+    COL_GF  = 192  # Total Active Days (max 30)
+    COL_GG  = 193  # Selected Sum (30 days)
+    COL_GH  = 194  # Raw Mean (÷30)
+    COL_GI  = 195  # Spike Threshold (2× Mean)
+    COL_GJ  = 196  # Cleaned Units (spikes→threshold)
+    COL_GK  = 197  # Spike Days Found
+    COL_GL  = 198  # Net Units (after returns)
+    COL_GM  = 199  # blank spacer
+    COL_GN  = 200  # Final DRR (units/day)
+    COL_GO  = 201  # DRR Flag
 
     R_TITLE      = 1
     R_SECTION    = 2
@@ -3492,7 +3551,7 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
 
     # ── Row 1: title ────────────────────────────────────────────────────
     # ── Row 2: section group headers ────────────────────────────────────
-    ws.cell(row=R_SECTION, column=COL_A).value = "RAW INPUTS"
+    ws.cell(row=R_SECTION, column=COL_ASIN).value = "RAW INPUTS"
     ws.cell(row=R_SECTION, column=COL_D1).value = (
         f"90 DAILY COLUMNS [D1 = {end_date_label}]  —  Blank=OOS  |  0=In Stock No Sale  |"
         "  Number=Units Sold  |  Day 1 = Most Recent"
@@ -3509,7 +3568,9 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
     # ── Row 3: column headers ────────────────────────────────────────────
     fixed_headers = {
         COL_STATUS: "Item Status",
-        COL_A:  "SKU / Product",
+        COL_ASIN: "ASIN",
+        COL_SKU:  "SKU Code",
+        COL_NAME: "Item Name",
         COL_B:  "FBA Sales\n(incl. SF)",
         COL_C:  "VC Sales",
         COL_D:  "FBA\nReturns",
@@ -3545,9 +3606,9 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
 
     # ── Data rows ────────────────────────────────────────────────────────
     asin_to_item = {item["asin"]: item for item in report_data if item.get("asin")}
-    all_asins = sorted(set(drr_vc_daily_by_asin.keys()) | set(drr_fba_daily_by_asin.keys()))
-    if not all_asins:
-        all_asins = [item["asin"] for item in report_data if item.get("asin")]
+    # Include all products from report_data, not just those with DRR daily data
+    report_asins = {item["asin"] for item in report_data if item.get("asin")}
+    all_asins = sorted(report_asins | set(drr_vc_daily_by_asin.keys()) | set(drr_fba_daily_by_asin.keys()))
 
     for row_offset, asin in enumerate(all_asins):
         r = R_DATA_START + row_offset
@@ -3557,11 +3618,11 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
         sku  = item.get("sku_code", "")
         ws.cell(row=r, column=COL_STATUS).value = purchase_status_map.get(sku, "")
 
-        # A – product label
+        # ASIN / SKU / Item Name – separate columns
         name = item.get("item_name", "")
-        ws.cell(row=r, column=COL_A).value = (
-            f"{sku} — {name}" if sku and name else (sku or name or asin)
-        )
+        ws.cell(row=r, column=COL_ASIN).value = asin
+        ws.cell(row=r, column=COL_SKU).value = sku
+        ws.cell(row=r, column=COL_NAME).value = name
 
         # B – FBA Sales (incl. SF)
         if report_type == "all":
@@ -3612,8 +3673,8 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
             fba_day = fba_by_date.get(dt) or {}
             vc_stock  = vc_day.get("closing_stock",  0) or 0
             fba_stock = fba_day.get("closing_stock", 0) or 0
-            vc_sold   = vc_day.get("units_sold",  0) or 0
-            fba_sold  = fba_day.get("units_sold", 0) or 0
+            vc_sold   = max(0, vc_day.get("units_sold",  0) or 0)
+            fba_sold  = max(0, fba_day.get("units_sold", 0) or 0)
             in_stock  = vc_stock > 0 or fba_stock > 0 or vc_sold > 0 or fba_sold > 0
             if in_stock:
                 ws.cell(row=r, column=COL_D1 + k).value = vc_sold + fba_sold
@@ -3701,7 +3762,7 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
     C_DATE_BG  = "FFF8DC"  # date row background
 
     # Row 1 – title
-    t = ws.cell(row=R_TITLE, column=COL_A)
+    t = ws.cell(row=R_TITLE, column=COL_ASIN)
     t.value = f"Active Days — Report Ending {end_date_label}"
     t.font  = Font(bold=True, size=13, color="FFFFFF")
     t.fill  = PatternFill(start_color=C_BLUE_D, end_color=C_BLUE_D, fill_type="solid")
@@ -3709,8 +3770,8 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
 
     # Row 2 – section group headers
     sec_map = {
-        COL_A:   (C_BLUE_D,  "FFFFFF"),
-        COL_D1:  (C_GOLD_S,  "FFFFFF"),
+        COL_ASIN: (C_BLUE_D,  "FFFFFF"),
+        COL_D1:   (C_GOLD_S,  "FFFFFF"),
         COL_H1:  (C_GRAY_S,  "FFFFFF"),
         COL_GF:  (C_GREEN_S, "FFFFFF"),
         COL_GL:  (C_GREEN_S, "FFFFFF"),
@@ -3760,7 +3821,9 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
 
     # ── Column widths ────────────────────────────────────────────────────
     ws.column_dimensions[L(COL_STATUS)].width = 18  # Item Status
-    ws.column_dimensions[L(COL_A)].width = 45       # SKU / Product
+    ws.column_dimensions[L(COL_ASIN)].width = 16   # ASIN
+    ws.column_dimensions[L(COL_SKU)].width = 18    # SKU Code
+    ws.column_dimensions[L(COL_NAME)].width = 40   # Item Name
     for ci in range(COL_B, COL_H):                  # FBA Sales–Total Returns
         ws.column_dimensions[L(ci)].width = 10
     ws.column_dimensions[L(COL_H)].width = 2        # spacer
@@ -3774,8 +3837,8 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
     ws.column_dimensions[L(COL_GN)].width = 15
     ws.column_dimensions[L(COL_GO)].width = 38
 
-    # Freeze at J6: columns A-I + rows 1-5 always visible
-    ws.freeze_panes = "J6"
+    # Freeze at L6: columns A-K + rows 1-5 always visible
+    ws.freeze_panes = "L6"
 
 
 def _style_sheet(worksheet, df, header_color="366092"):
@@ -4072,6 +4135,47 @@ async def download_report_by_date_range(
                 fba_daily_by_asin[item["asin"]] = item.pop("_daily_data", [])
                 drr_fba_daily_by_asin[item["asin"]] = item.pop("_drr_daily_data", [])
             report_data = fba_raw
+
+        # --- Include all ASINs from sku_mapping even if no sales in the selected range ---
+        known_asins = {item["asin"] for item in report_data if item.get("asin")}
+
+        def _fetch_all_sku_mapping():
+            return list(database.get_collection("amazon_sku_mapping").find(
+                {}, {"item_id": 1, "sku_code": 1, "item_name": 1, "_id": 0}
+            ))
+
+        all_sku_docs = await asyncio.to_thread(_fetch_all_sku_mapping)
+        missing_asin_ids = []
+        for doc in all_sku_docs:
+            asin = doc.get("item_id", "")
+            if not asin or asin in known_asins:
+                continue
+            missing_asin_ids.append(asin)
+            report_data.append({
+                "asin": asin,
+                "sku_code": doc.get("sku_code", ""),
+                "item_name": doc.get("item_name", ""),
+                "units_sold": 0,
+                "vc_units_sold": 0,
+                "fba_units_sold": 0,
+                "fba_returns": 0,
+                "seller_flex_returns": 0,
+                "vc_returns": 0,
+                "total_returns": 0,
+                "closing_stock": 0,
+                "total_amount": 0,
+                "drr": None,
+                "drr_flag": "no_data",
+            })
+
+        if missing_asin_ids:
+            if report_type in ("vendor_central", "all"):
+                missing_vc_drr = await _fetch_vc_drr_daily(database, end, missing_asin_ids)
+                drr_vc_daily_by_asin.update(missing_vc_drr)
+            if report_type != "vendor_central":
+                fba_type = "fba+seller_flex" if report_type == "all" else report_type
+                missing_fba_drr = await _fetch_fba_drr_daily(database, end, missing_asin_ids, fba_type)
+                drr_fba_daily_by_asin.update(missing_fba_drr)
 
         if not report_data:
             raise HTTPException(
