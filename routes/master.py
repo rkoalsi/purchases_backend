@@ -3821,9 +3821,11 @@ async def get_dashboard_kpi(
             sku: float(pdata.get("rate") or 0) for sku, pdata in product_data_map.items()
         }
 
-        # Group by brand — skip products with no brand set
+        # Group by brand — skip products with no brand set or not active
         brand_groups: Dict[str, list] = defaultdict(list)
         for item in combined_data:
+            if (item.get("purchase_status") or "").strip() != "active":
+                continue
             brand = (item.get("brand") or "").strip()
             if not brand:
                 continue
@@ -4035,6 +4037,8 @@ async def download_dashboard_kpi(
             if breakdown == "product":
                 rows = []
                 for item in combined_data:
+                    if (item.get("purchase_status") or "").strip() != "active":
+                        continue
                     m = item.get("combined_metrics", {})
                     sku = item.get("sku_code", "")
                     rate = rate_map.get(sku, 0)
@@ -4085,9 +4089,11 @@ async def download_dashboard_kpi(
                     pd.DataFrame(rows).to_excel(writer, sheet_name="Product KPI", index=False)
 
             else:
-                # Brand aggregation — skip products with no brand set
+                # Brand aggregation — skip products with no brand set or not active
                 brand_groups: Dict[str, list] = defaultdict(list)
                 for item in combined_data:
+                    if (item.get("purchase_status") or "").strip() != "active":
+                        continue
                     brand = (item.get("brand") or "").strip()
                     if not brand:
                         continue
