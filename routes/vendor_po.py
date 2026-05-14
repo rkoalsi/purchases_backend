@@ -138,7 +138,9 @@ def _enrich_items(
     def _looks_like_asin(s: str) -> bool:
         return bool(s) and len(s) == 10 and s[:2].upper() == "B0"
 
-    asin_like_models = [m for m in model_numbers if _looks_like_asin(m) and m not in asins]
+    asin_like_models = [
+        m for m in model_numbers if _looks_like_asin(m) and m not in asins
+    ]
     if asin_like_models:
         asins = list(set(asins + asin_like_models))
 
@@ -355,9 +357,7 @@ def _enrich_items(
 
         # When VC PO has ASIN in the SKU column, also try sku_map lookup via model_number
         model_as_asin_sku = (
-            sku_map_by_asin.get(model)
-            if _looks_like_asin(model)
-            else None
+            sku_map_by_asin.get(model) if _looks_like_asin(model) else None
         )
         product = (
             products_by_asin.get(asin)
@@ -414,7 +414,9 @@ def _enrich_items(
             drr_result = asin_drr.get("drr")
             drr_flag = asin_drr.get("drr_flag", "")
             final_drr = drr_result if isinstance(drr_result, (int, float)) else None
-            final_drr_flag = drr_flag if not isinstance(drr_result, (int, float)) else ""
+            final_drr_flag = (
+                drr_flag if not isinstance(drr_result, (int, float)) else ""
+            )
         else:
             zoho_stock = zoho_latest.get(zoho_item_id, 0) if zoho_item_id else 0
             current_stock = current_stock_by_asin.get(asin, 0)
@@ -449,7 +451,9 @@ def _enrich_items(
             drr_result = asin_drr.get("drr")
             drr_flag = asin_drr.get("drr_flag", "")
             final_drr = drr_result if isinstance(drr_result, (int, float)) else None
-            final_drr_flag = drr_flag if not isinstance(drr_result, (int, float)) else ""
+            final_drr_flag = (
+                drr_flag if not isinstance(drr_result, (int, float)) else ""
+            )
 
         total_cost = (
             round(cost_price_wo_tax * supply_qty, 2)
@@ -617,6 +621,9 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "total_received_qty": {
                         "$ifNull": ["$received_qty", {"$sum": "$items.received_qty"}]
                     },
+                    "total_supply_qty": {"$sum": "$items.supply_qty"},
+                    "total_cost": {"$sum": "$items.total_cost"},
+                    "total_cost_gst": {"$sum": "$items.total_cost_gst"},
                 }
             },
             {
@@ -631,6 +638,9 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "total_requested_qty": 1,
                     "total_accepted_qty": 1,
                     "total_received_qty": 1,
+                    "total_supply_qty": 1,
+                    "total_cost": 1,
+                    "total_cost_gst": 1,
                     "estimate_number": 1,
                     "zoho_estimate_id": 1,
                     "_id": 0,
@@ -2026,12 +2036,13 @@ async def create_zoho_estimate(
                 skipped.append(it.get("model_number", it.get("asin", "?")))
                 continue
             margin = it.get("margin")
+            discount = round(margin * 100, 2) if margin is not None else 0
             line_items.append(
                 {
                     "item_id": zoho_item_id,
                     "quantity": it["final_supply_qty"],
                     "rate": round(it.get("mrp_wo_gst") or 0, 2),
-                    "discount": round(margin * 100, 2) if margin is not None else 0,
+                    "discount": f"{discount}%",
                     "unit": "pcs",
                     "hsn_or_sac": it.get("hsn", ""),
                 }
@@ -2112,6 +2123,18 @@ async def create_zoho_estimate(
             "shipping_address_id": body.shipping_address_id,
             "is_inclusive_tax": False,
             "line_items": line_items,
+            "salesperson_id": "3220178000000692003",
+            "dispatch_from_address": {
+                "zip": "401208",
+                "country": "India",
+                "address": "Gala No. 5 & 7, 1st Floor, Survey No 68, Building No 3",
+                "city": "Palghar",
+                "address_id": "3220178000541133001",
+                "attention": "Mr Akshay Mayekar",
+                "street2": "Near Meenakshi Inds. Estate, Naik Pada, Waliv Naka, Vasai E",
+                "state": "Maharashtra",
+                "state_code": "MH",
+            },
         }
 
         logger.info("Zoho estimate payload: %s", payload)
