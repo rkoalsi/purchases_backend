@@ -455,11 +455,16 @@ def _enrich_items(
                 drr_flag if not isinstance(drr_result, (int, float)) else ""
             )
 
-        total_cost = (
-            round(cost_price_wo_tax * supply_qty, 2)
-            if cost_price_wo_tax is not None
-            else None
-        )
+        # Match Zoho estimate formula: round(mrp_wo_gst, 2) * qty * (1 - round(margin*100, 2)%)
+        # Using cost_price_wo_tax directly introduces per-unit rounding that diverges from Zoho totals.
+        if mrp_wo_gst is not None and margin is not None:
+            _rate = round(mrp_wo_gst, 2)
+            _discount_factor = 1 - round(margin * 100, 2) / 100
+            total_cost = round(_rate * supply_qty * _discount_factor, 2)
+        elif cost_price_wo_tax is not None:
+            total_cost = round(cost_price_wo_tax * supply_qty, 2)
+        else:
+            total_cost = None
         total_cost_gst = (
             round(total_cost * (1 + gst / 100), 2)
             if (total_cost is not None and gst)
@@ -622,8 +627,33 @@ async def list_vendor_pos(db=Depends(get_database)):
                         "$ifNull": ["$received_qty", {"$sum": "$items.received_qty"}]
                     },
                     "total_supply_qty": {"$sum": "$items.supply_qty"},
-                    "total_cost": {"$sum": "$items.total_cost"},
-                    "total_cost_gst": {"$sum": "$items.total_cost_gst"},
+                    "_items_cost": {"$sum": "$items.total_cost"},
+                    "_items_cost_gst": {"$sum": "$items.total_cost_gst"},
+                }
+            },
+            # Join estimate to get authoritative sub_total / total when linked
+            {
+                "$lookup": {
+                    "from": ESTIMATES_COLLECTION,
+                    "localField": "zoho_estimate_id",
+                    "foreignField": "estimate_id",
+                    "as": "_est",
+                }
+            },
+            {
+                "$addFields": {
+                    "_est": {"$arrayElemAt": ["$_est", 0]},
+                }
+            },
+            {
+                "$addFields": {
+                    # Use estimate sub_total/total when available, else fall back to item sums
+                    "total_cost": {
+                        "$ifNull": ["$_est.sub_total", "$_items_cost"]
+                    },
+                    "total_cost_gst": {
+                        "$ifNull": ["$_est.total", "$_items_cost_gst"]
+                    },
                 }
             },
             {
@@ -951,6 +981,112 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
         "estimate_number": doc.get("estimate_number"),
         "zoho_estimate_id": doc.get("zoho_estimate_id"),
         "items": serialize_mongo_document(enriched),
+    }
+
+
+@router.get("/{po_number}/estimate_diff")
+async def get_estimate_diff(po_number: str, db=Depends(get_database)):
+    """Compare PO items against linked estimate line items."""
+
+    def _fetch():
+        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
+        if not doc:
+            return None, None
+        est = None
+        if doc.get("zoho_estimate_id"):
+            est = db[ESTIMATES_COLLECTION].find_one({"estimate_id": doc["zoho_estimate_id"]})
+        if not est and doc.get("estimate_number"):
+            est = db[ESTIMATES_COLLECTION].find_one({"estimate_number": doc["estimate_number"]})
+        return doc, est
+
+    doc, est = await asyncio.to_thread(_fetch)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    if est is None:
+        raise HTTPException(status_code=404, detail="No estimate linked to this PO")
+
+    def _cf_sku(li: dict) -> str:
+        for cf in li.get("item_custom_fields", []):
+            if cf.get("api_name") == "cf_sku_code":
+                return cf.get("value") or ""
+        return ""
+
+    # Build estimate lookup by cf_sku_code
+    est_by_sku: dict = {}
+    for li in est.get("line_items", []):
+        sku = _cf_sku(li)
+        if sku:
+            est_by_sku[sku] = li
+
+    # Compute PO item totals using the estimate formula
+    po_items = [it for it in doc.get("items", []) if (it.get("status") or "").lower() != "inactive"]
+    rows = []
+    for it in po_items:
+        model = it.get("model_number") or ""
+        supply = it.get("supply_qty_override") if it.get("supply_qty_override") is not None else (it.get("supply_qty") or 0)
+        mrp_wo_gst = it.get("mrp_wo_gst")
+        margin = it.get("margin")
+        gst = it.get("gst") or 0
+
+        if mrp_wo_gst is not None and margin is not None:
+            rate = round(mrp_wo_gst, 2)
+            disc = round(margin * 100, 2) / 100
+            po_item_total = round(rate * supply * (1 - disc), 2)
+        elif it.get("cost_price_wo_tax") is not None:
+            rate = it["cost_price_wo_tax"]
+            po_item_total = round(rate * supply, 2)
+        else:
+            rate = None
+            po_item_total = None
+
+        eli = est_by_sku.get(model)
+        in_estimate = eli is not None
+        est_qty = eli.get("quantity") if eli else None
+        est_rate = eli.get("rate") if eli else None
+        est_item_total = eli.get("item_total") if eli else None
+
+        rows.append({
+            "model_number": model,
+            "title": it.get("title") or "",
+            "asin": it.get("asin") or "",
+            "supply_qty": supply,
+            "mrp_wo_gst": mrp_wo_gst,
+            "margin": margin,
+            "gst": gst,
+            "po_rate": rate,
+            "po_item_total": po_item_total,
+            "in_estimate": in_estimate,
+            "estimate_qty": est_qty,
+            "estimate_rate": est_rate,
+            "estimate_item_total": est_item_total,
+            "qty_diff": (supply - est_qty) if (in_estimate and est_qty is not None) else None,
+            "rate_diff": round(rate - est_rate, 4) if (in_estimate and rate is not None and est_rate is not None) else None,
+            "total_diff": round(po_item_total - est_item_total, 2) if (in_estimate and po_item_total is not None and est_item_total is not None) else None,
+        })
+
+    # Items in estimate but not in PO
+    po_skus = {it.get("model_number") for it in po_items}
+    only_in_estimate = [
+        {"sku": _cf_sku(li), "name": li.get("name", ""), "quantity": li.get("quantity"), "rate": li.get("rate"), "item_total": li.get("item_total")}
+        for li in est.get("line_items", [])
+        if _cf_sku(li) and _cf_sku(li) not in po_skus
+    ]
+
+    po_total = round(sum(r["po_item_total"] for r in rows if r["po_item_total"] is not None), 2)
+    po_total_gst = round(sum(
+        round(r["po_item_total"] * (1 + r["gst"] / 100), 2) if r["gst"] else r["po_item_total"]
+        for r in rows if r["po_item_total"] is not None
+    ), 2)
+
+    return {
+        "po_number": po_number,
+        "estimate_number": est.get("estimate_number"),
+        "estimate_sub_total": est.get("sub_total"),
+        "estimate_total": est.get("total"),
+        "po_computed_total": po_total,
+        "po_computed_total_gst": po_total_gst,
+        "items": serialize_mongo_document(rows),
+        "only_in_estimate": serialize_mongo_document(only_in_estimate),
     }
 
 

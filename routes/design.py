@@ -13,6 +13,7 @@ from botocore.config import Config as BotocoreConfig
 from bson import ObjectId
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 from pymongo.errors import PyMongoError
 
 from ..database import get_database, serialize_mongo_document
@@ -22,9 +23,16 @@ logger = logging.getLogger(__name__)
 
 PRODUCTS_COLLECTION = "products"
 BRAND_ORDERS_COLLECTION = "brand_orders"
+CATEGORIES_COLLECTION = "designer_upload_categories"
+PO_COLLECTION = "purchase_orders"
 S3_BUCKET = os.getenv("S3_BUCKET", "pupscribe-purchases")
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 DESIGNER_URL_EXPIRY = 7 * 24 * 3600  # 1 week
+DEFAULT_CATEGORIES = ["products", "catalogue"]
+
+
+class AddCategoryRequest(BaseModel):
+    name: str
 
 
 def _slugify(text: str) -> str:
@@ -186,16 +194,73 @@ async def list_designer_orders(db=Depends(get_database)):
     return serialize_mongo_document(orders)
 
 
+@router.get("/categories")
+async def get_designer_categories(db=Depends(get_database)):
+    def _fetch():
+        cats = list(db[CATEGORIES_COLLECTION].find({}, {"name": 1, "_id": 0}))
+        if not cats:
+            db[CATEGORIES_COLLECTION].insert_many([{"name": n} for n in DEFAULT_CATEGORIES])
+            return DEFAULT_CATEGORIES
+        return [c["name"] for c in cats]
+    return await asyncio.to_thread(_fetch)
+
+
+@router.post("/categories")
+async def add_designer_category(request: AddCategoryRequest, db=Depends(get_database)):
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Category name required")
+    def _add():
+        if not db[CATEGORIES_COLLECTION].find_one({"name": name}):
+            db[CATEGORIES_COLLECTION].insert_one({"name": name})
+    await asyncio.to_thread(_add)
+    return {"name": name}
+
+
+@router.delete("/categories/{name}")
+async def delete_designer_category(name: str, db=Depends(get_database)):
+    def _delete():
+        result = db[CATEGORIES_COLLECTION].delete_one({"name": name})
+        return result.deleted_count
+    deleted = await asyncio.to_thread(_delete)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Category not found")
+    return {"name": name, "deleted": True}
+
+
+@router.get("/{order_id}/line-items")
+async def get_order_line_items(order_id: str, db=Depends(get_database)):
+    def _fetch():
+        order = db[BRAND_ORDERS_COLLECTION].find_one(
+            {"_id": ObjectId(order_id)}, {"purchaseorder_number": 1}
+        )
+        if not order or not order.get("purchaseorder_number"):
+            return []
+        po = db[PO_COLLECTION].find_one(
+            {"purchaseorder_number": order["purchaseorder_number"]},
+            {"line_items": 1}
+        )
+        if not po:
+            return []
+        return po.get("line_items", [])
+    items = await asyncio.to_thread(_fetch)
+    return serialize_mongo_document(items)
+
+
 @router.post("/{order_id}/designer-documents")
 async def upload_designer_document(
     order_id: str,
     file: UploadFile = File(...),
     relative_path: Optional[str] = Form(None),
+    category: Optional[str] = Form(None),
+    item_id: Optional[str] = Form(None),
+    item_name: Optional[str] = Form(None),
     db=Depends(get_database),
 ):
     file_bytes = await file.read()
     filename = file.filename or "file"
     content_type = file.content_type or "application/octet-stream"
+    cat = (category or "general").strip()
 
     def _process():
         doc = db[BRAND_ORDERS_COLLECTION].find_one(
@@ -206,26 +271,32 @@ async def upload_designer_document(
 
         brand_slug = _slugify(doc["brand"])
         name_slug = _slugify(doc["name"])
+        cat_slug = _slugify(cat)
 
         if relative_path:
             parts = relative_path.replace("\\", "/").strip("/").split("/")
             safe_parts = [re.sub(r"[^\w.\-]", "_", p) for p in parts if p]
-            s3_key = f"designer_uploads/{brand_slug}/{name_slug}/{'/'.join(safe_parts)}"
+            s3_key = f"designer_uploads/{brand_slug}/{name_slug}/{cat_slug}/{'/'.join(safe_parts)}"
         else:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             safe_filename = re.sub(r"[^\w.\-]", "_", filename)
-            s3_key = f"designer_uploads/{brand_slug}/{name_slug}/{ts}_{safe_filename}"
+            s3_key = f"designer_uploads/{brand_slug}/{name_slug}/{cat_slug}/{ts}_{safe_filename}"
 
         _upload_to_s3(file_bytes, s3_key, content_type)
 
-        doc_entry = {
+        doc_entry: dict = {
             "doc_id": str(ObjectId()),
             "filename": filename,
             "s3_key": s3_key,
             "content_type": content_type,
             "size": len(file_bytes),
             "uploaded_at": datetime.now(),
+            "category": cat,
         }
+        if item_id:
+            doc_entry["item_id"] = item_id
+        if item_name:
+            doc_entry["item_name"] = item_name
 
         db[BRAND_ORDERS_COLLECTION].update_one(
             {"_id": ObjectId(order_id)},
@@ -248,7 +319,11 @@ async def upload_designer_document(
 
 
 @router.get("/{order_id}/designer-documents/zip")
-async def download_designer_documents_zip(order_id: str, db=Depends(get_database)):
+async def download_designer_documents_zip(
+    order_id: str,
+    item_id: Optional[str] = Query(None),
+    db=Depends(get_database),
+):
     def _fetch_docs():
         doc = db[BRAND_ORDERS_COLLECTION].find_one(
             {"_id": ObjectId(order_id)},
@@ -264,6 +339,8 @@ async def download_designer_documents_zip(order_id: str, db=Depends(get_database
         raise HTTPException(status_code=404, detail=str(e))
 
     documents = order_doc.get("designer_documents", [])
+    if item_id:
+        documents = [d for d in documents if d.get("item_id") == item_id]
     if not documents:
         raise HTTPException(status_code=404, detail="No designer documents to download")
 
@@ -292,6 +369,23 @@ async def download_designer_documents_zip(order_id: str, db=Depends(get_database
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{safe_name}_designer.zip"'},
     )
+
+
+@router.patch("/{order_id}/designer-documents/{doc_id}")
+async def update_designer_document(order_id: str, doc_id: str, body: dict, db=Depends(get_database)):
+    category = (body.get("category") or "").strip()
+    if not category:
+        raise HTTPException(status_code=400, detail="category is required")
+    def _update():
+        result = db[BRAND_ORDERS_COLLECTION].update_one(
+            {"_id": ObjectId(order_id), "designer_documents.doc_id": doc_id},
+            {"$set": {"designer_documents.$.category": category, "updated_at": datetime.now()}},
+        )
+        return result.matched_count
+    matched = await asyncio.to_thread(_update)
+    if not matched:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"doc_id": doc_id, "category": category}
 
 
 @router.get("/{order_id}/designer-documents/{doc_id}/url")
