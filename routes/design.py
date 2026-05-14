@@ -139,6 +139,27 @@ def get_new_items(
 
 # ─── designer orders ──────────────────────────────────────────────────────────
 
+@router.get("/documents/search")
+async def search_designer_documents(q: str, db=Depends(get_database)):
+    """Search designer_documents filenames across all brand orders."""
+    def _search():
+        pipeline = [
+            {"$unwind": "$designer_documents"},
+            {"$match": {"designer_documents.filename": {"$regex": re.escape(q.strip()), "$options": "i"}}},
+            {"$project": {
+                "order_id": {"$toString": "$_id"},
+                "order_name": "$name",
+                "brand": "$brand",
+                "doc": "$designer_documents",
+            }},
+            {"$limit": 25},
+        ]
+        return list(db[BRAND_ORDERS_COLLECTION].aggregate(pipeline))
+
+    results = await asyncio.to_thread(_search)
+    return serialize_mongo_document(results)
+
+
 @router.get("/orders")
 async def list_designer_orders(db=Depends(get_database)):
     """Return all brand orders with designer_documents, omitting purchase team documents."""
