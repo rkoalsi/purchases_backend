@@ -35,6 +35,7 @@ INVENTORY_COLLECTION = "amazon_vendor_inventory"
 SALES_COLLECTION = "amazon_vendor_sales"
 CUSTOMERS_COLLECTION = "customers"
 ESTIMATES_COLLECTION = "estimates"
+PACKAGES_COLLECTION = "packages"
 
 ZOHO_BOOKS_BASE = "https://books.zoho.com/api/v3"
 ORGANIZATION_ID = os.getenv("ORGANIZATION_ID", "776755316")
@@ -79,6 +80,81 @@ def _extract_gst(item_tax_preferences: list) -> float:
         if pref.get("tax_specification") == "intra":
             return float(pref.get("tax_percentage", 0))
     return float(item_tax_preferences[0].get("tax_percentage", 0))
+
+
+def _compute_package_accepted_costs(
+    package_number: str, db
+) -> tuple[float | None, float | None]:
+    """Compute accepted_total_cost and accepted_total_cost_gst from a linked package.
+
+    For each package line item, looks up etrade_asp via SKU→ASIN mapping,
+    strips GST for the cost-ex-GST column, and sums across all items.
+    Returns (accepted_total_cost, accepted_total_cost_gst) or (None, None) if not computable.
+    """
+    pkg = db[PACKAGES_COLLECTION].find_one({"package_number": package_number})
+    if not pkg:
+        raise ValueError(f"Package {package_number!r} not found in packages collection")
+
+    line_items = pkg.get("line_items") or []
+
+    # Extract SKUs from item_custom_fields
+    sku_qty_pairs: list[tuple[str, float]] = []
+    for li in line_items:
+        sku = None
+        for cf in li.get("item_custom_fields") or []:
+            if cf.get("api_name") == "cf_sku_code":
+                sku = cf.get("value")
+                break
+        if sku:
+            sku_qty_pairs.append((sku, float(li.get("quantity") or 0)))
+
+    if not sku_qty_pairs:
+        return None, None
+
+    skus = [s for s, _ in sku_qty_pairs]
+
+    # SKU → ASIN
+    sku_to_asin: dict[str, str] = {}
+    for m in db[SKU_MAPPING_COLLECTION].find({"sku_code": {"$in": skus}}, {"sku_code": 1, "item_id": 1}):
+        sku_to_asin[m["sku_code"]] = m["item_id"]
+
+    asins = list(sku_to_asin.values())
+
+    # ASIN → etrade_asp
+    asin_to_etrade: dict[str, float] = {}
+    if asins:
+        for m in db[MARGINS_COLLECTION].find({"asin": {"$in": asins}}, {"asin": 1, "etrade_asp": 1}):
+            if m.get("etrade_asp") is not None:
+                asin_to_etrade[m["asin"]] = float(m["etrade_asp"])
+
+    # SKU → GST (via products)
+    sku_to_gst: dict[str, float] = {}
+    for p in db[PRODUCTS_COLLECTION].find(
+        {"cf_sku_code": {"$in": skus}},
+        {"cf_sku_code": 1, "item_tax_preferences": 1},
+    ):
+        sku_to_gst[p["cf_sku_code"]] = _extract_gst(p.get("item_tax_preferences") or [])
+
+    accepted_total_cost = 0.0
+    accepted_total_cost_gst = 0.0
+    has_any = False
+    for sku, qty in sku_qty_pairs:
+        asin = sku_to_asin.get(sku)
+        if not asin:
+            continue
+        etrade_asp = asin_to_etrade.get(asin)
+        if etrade_asp is None:
+            continue
+        gst = sku_to_gst.get(sku, 0.0)
+        asp_wo_gst = round(etrade_asp / (1 + gst / 100), 2) if gst else etrade_asp
+        accepted_total_cost += round(asp_wo_gst * qty, 2)
+        accepted_total_cost_gst += round(etrade_asp * qty, 2)
+        has_any = True
+
+    if not has_any:
+        return None, None
+
+    return round(accepted_total_cost, 2), round(accepted_total_cost_gst, 2)
 
 
 def _parse_po_excel(file_bytes: bytes) -> tuple[str, str, list[dict]]:
@@ -673,6 +749,9 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "total_cost_gst": 1,
                     "estimate_number": 1,
                     "zoho_estimate_id": 1,
+                    "package_number": 1,
+                    "accepted_total_cost": 1,
+                    "accepted_total_cost_gst": 1,
                     "_id": 0,
                 }
             },
@@ -2380,6 +2459,70 @@ async def unlink_zoho_estimate(po_number: str, db=Depends(get_database)):
             {"po_number": po_number},
             {
                 "$unset": {"zoho_estimate_id": "", "estimate_number": ""},
+                "$set": {"updated_at": datetime.now()},
+            },
+        )
+        return result.matched_count
+
+    count = await asyncio.to_thread(_unlink)
+    if not count:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    return {"po_number": po_number, "unlinked": True}
+
+
+class PackageLinkRequest(BaseModel):
+    package_number: str
+
+
+@router.patch("/{po_number}/package")
+async def link_package(
+    po_number: str, body: PackageLinkRequest, db=Depends(get_database)
+):
+    """Link a Zoho package to a PO by package_number. Computes accepted costs from package line items."""
+
+    def _link():
+        if not db[PO_COLLECTION].find_one({"po_number": po_number}):
+            raise ValueError(f"PO {po_number} not found")
+        accepted_total_cost, accepted_total_cost_gst = _compute_package_accepted_costs(
+            body.package_number, db
+        )
+        update: dict = {
+            "package_number": body.package_number,
+            "updated_at": datetime.now(),
+        }
+        if accepted_total_cost is not None:
+            update["accepted_total_cost"] = accepted_total_cost
+        if accepted_total_cost_gst is not None:
+            update["accepted_total_cost_gst"] = accepted_total_cost_gst
+        db[PO_COLLECTION].update_one({"po_number": po_number}, {"$set": update})
+        return accepted_total_cost, accepted_total_cost_gst
+
+    try:
+        accepted_total_cost, accepted_total_cost_gst = await asyncio.to_thread(_link)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "po_number": po_number,
+        "package_number": body.package_number,
+        "accepted_total_cost": accepted_total_cost,
+        "accepted_total_cost_gst": accepted_total_cost_gst,
+    }
+
+
+@router.delete("/{po_number}/package")
+async def unlink_package(po_number: str, db=Depends(get_database)):
+    """Remove the package link and accepted cost fields from a PO."""
+
+    def _unlink():
+        result = db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {
+                "$unset": {
+                    "package_number": "",
+                    "accepted_total_cost": "",
+                    "accepted_total_cost_gst": "",
+                },
                 "$set": {"updated_at": datetime.now()},
             },
         )
