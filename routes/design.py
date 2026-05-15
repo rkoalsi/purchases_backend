@@ -25,6 +25,8 @@ PRODUCTS_COLLECTION = "products"
 BRAND_ORDERS_COLLECTION = "brand_orders"
 CATEGORIES_COLLECTION = "designer_upload_categories"
 PO_COLLECTION = "purchase_orders"
+VENDORS_COLLECTION = "vendors"
+BRANDS_COLLECTION = "brands"
 S3_BUCKET = os.getenv("S3_BUCKET", "pupscribe-purchases")
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 DESIGNER_URL_EXPIRY = 7 * 24 * 3600  # 1 week
@@ -168,6 +170,25 @@ async def search_designer_documents(q: str, db=Depends(get_database)):
     return serialize_mongo_document(results)
 
 
+@router.get("/vendor-brands")
+async def get_vendor_brands(db=Depends(get_database)):
+    """Return a map of vendor_id → [brand names] from the brands collection."""
+    def _fetch():
+        result: dict[str, list[str]] = {}
+        for brand in db[BRANDS_COLLECTION].find({"vendor_id": {"$exists": True, "$ne": None}}, {"name": 1, "vendor_id": 1}):
+            vid = brand.get("vendor_id")
+            name = brand.get("name")
+            if not vid or not name:
+                continue
+            result.setdefault(vid, [])
+            if name not in result[vid]:
+                result[vid].append(name)
+        for vid in result:
+            result[vid].sort()
+        return result
+    return await asyncio.to_thread(_fetch)
+
+
 @router.get("/orders")
 async def list_designer_orders(db=Depends(get_database)):
     """Return all brand orders with designer_documents, omitting purchase team documents."""
@@ -175,6 +196,16 @@ async def list_designer_orders(db=Depends(get_database)):
         pipeline = [
             {"$addFields": {"doc_count": {"$size": {"$ifNull": ["$designer_documents", []]}}}},
             {"$project": {"documents": 0}},
+            {"$lookup": {
+                "from": VENDORS_COLLECTION,
+                "localField": "vendor_id",
+                "foreignField": "contact_id",
+                "as": "_vendor",
+            }},
+            {"$addFields": {
+                "vendor_name": {"$arrayElemAt": ["$_vendor.contact_name", 0]},
+            }},
+            {"$project": {"_vendor": 0}},
             {"$addFields": {
                 "_sort_num": {
                     "$convert": {
