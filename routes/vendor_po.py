@@ -139,7 +139,7 @@ def _compute_package_accepted_costs(
     # SKU → GST (via products)
     sku_to_gst: dict[str, float] = {}
     for p in db[PRODUCTS_COLLECTION].find(
-        {"cf_sku_code": {"$in": skus}},
+        {"cf_sku_code": {"$in": skus}, "status": "active"},
         {"cf_sku_code": 1, "item_tax_preferences": 1},
     ):
         sku_to_gst[p["cf_sku_code"]] = _extract_gst(p.get("item_tax_preferences") or [])
@@ -268,7 +268,7 @@ def _enrich_items(
     # --- batch load products by cf_sku_code (always fresh — MRP/GST/HSN can change) ---
     products_by_model: dict[str, dict] = {}
     for p in db[PRODUCTS_COLLECTION].find(
-        {"cf_sku_code": {"$in": model_numbers}},
+        {"cf_sku_code": {"$in": model_numbers}, "status": "active"},
         {
             "cf_sku_code": 1,
             "item_id": 1,
@@ -294,7 +294,7 @@ def _enrich_items(
     ]
     if extra_skus:
         for p in db[PRODUCTS_COLLECTION].find(
-            {"cf_sku_code": {"$in": extra_skus}},
+            {"cf_sku_code": {"$in": extra_skus}, "status": "active"},
             {
                 "cf_sku_code": 1,
                 "item_id": 1,
@@ -563,9 +563,9 @@ def _enrich_items(
         if mrp_wo_gst is not None and margin is not None:
             _rate = round(mrp_wo_gst, 2)
             _discount_factor = 1 - round(margin * 100, 2) / 100
-            total_cost = round(_rate * supply_qty * _discount_factor, 2)
+            total_cost = round(_rate * accepted_qty * _discount_factor, 2)
         elif cost_price_wo_tax is not None:
-            total_cost = round(cost_price_wo_tax * supply_qty, 2)
+            total_cost = round(cost_price_wo_tax * accepted_qty, 2)
         else:
             total_cost = None
         total_cost_gst = (
@@ -1265,7 +1265,7 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
                     asin_to_cost_price[m["asin"]] = float(m["cost_price_wo_tax"])
         sku_to_gst: dict[str, float] = {}
         for p in db[PRODUCTS_COLLECTION].find(
-            {"cf_sku_code": {"$in": skus}},
+            {"cf_sku_code": {"$in": skus}, "status": "active"},
             {"cf_sku_code": 1, "item_tax_preferences": 1},
         ):
             sku_to_gst[p["cf_sku_code"]] = _extract_gst(p.get("item_tax_preferences") or [])
@@ -1706,7 +1706,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             13: f'=IF(L{r}="","",J{r}-L{r})',  # M  Mismatch QTY
             17: f'=IF(O{r}="",ROUND(N{r}/(1+P{r}),2),ROUND(O{r}/(1+P{r}),2))',  # Q  MRP w/o GST (eTrade ASP if set, else Zoho MRP)
             19: f'=IF(R{r}="","",ROUND(Q{r}*(1-R{r}),2))',  # S  Cost Price w/o Tax
-            20: f'=IF(S{r}="","",ROUND(S{r}*I{r},2))',  # T  Total Cost
+            20: f'=IF(S{r}="","",ROUND(S{r}*J{r},2))',  # T  Total Cost (uses Accepted Qty)
             21: f'=IF(T{r}="","",ROUND(T{r}*(1+P{r}),2))',  # U  Total Cost w/ GST
             24: f'=IF(S{r}="","",W{r}-S{r})',  # X  Diff
             29: f"=AA{r}+AB{r}",  # AC Total Qty
