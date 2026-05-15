@@ -87,8 +87,8 @@ def _compute_package_accepted_costs(
 ) -> tuple[float | None, float | None]:
     """Compute accepted_total_cost and accepted_total_cost_gst from a linked package.
 
-    For each package line item, looks up etrade_asp via SKU→ASIN mapping,
-    strips GST for the cost-ex-GST column, and sums across all items.
+    Uses the same formula as total_cost / total_cost_gst (ASP as base rate, margin discount),
+    but with each package line item's quantity as the accepted qty.
     Returns (accepted_total_cost, accepted_total_cost_gst) or (None, None) if not computable.
     """
     pkg = db[PACKAGES_COLLECTION].find_one({"package_number": package_number})
@@ -120,12 +120,21 @@ def _compute_package_accepted_costs(
 
     asins = list(sku_to_asin.values())
 
-    # ASIN → etrade_asp
+    # ASIN → etrade_asp, margin, cost_price_wo_tax
+    asin_to_margin: dict[str, float] = {}
+    asin_to_cost_price: dict[str, float] = {}
     asin_to_etrade: dict[str, float] = {}
     if asins:
-        for m in db[MARGINS_COLLECTION].find({"asin": {"$in": asins}}, {"asin": 1, "etrade_asp": 1}):
+        for m in db[MARGINS_COLLECTION].find(
+            {"asin": {"$in": asins}},
+            {"asin": 1, "etrade_asp": 1, "margin": 1, "cost_price_wo_tax": 1},
+        ):
             if m.get("etrade_asp") is not None:
                 asin_to_etrade[m["asin"]] = float(m["etrade_asp"])
+            if m.get("margin") is not None:
+                asin_to_margin[m["asin"]] = float(m["margin"])
+            if m.get("cost_price_wo_tax") is not None:
+                asin_to_cost_price[m["asin"]] = float(m["cost_price_wo_tax"])
 
     # SKU → GST (via products)
     sku_to_gst: dict[str, float] = {}
@@ -142,13 +151,31 @@ def _compute_package_accepted_costs(
         asin = sku_to_asin.get(sku)
         if not asin:
             continue
-        etrade_asp = asin_to_etrade.get(asin)
-        if etrade_asp is None:
-            continue
         gst = sku_to_gst.get(sku, 0.0)
-        asp_wo_gst = round(etrade_asp / (1 + gst / 100), 2) if gst else etrade_asp
-        accepted_total_cost += round(asp_wo_gst * qty, 2)
-        accepted_total_cost_gst += round(etrade_asp * qty, 2)
+        etrade_asp = asin_to_etrade.get(asin)
+        margin = asin_to_margin.get(asin)
+
+        # Use etrade_asp as the base rate (same as _enrich_items: asp_base → mrp_wo_gst)
+        asp_base = etrade_asp
+        mrp_wo_gst = (
+            round(asp_base / (1 + gst / 100), 2) if (asp_base and gst) else asp_base
+        ) if asp_base is not None else None
+
+        # Mirror the total_cost formula exactly
+        if mrp_wo_gst is not None and margin is not None:
+            _rate = round(mrp_wo_gst, 2)
+            _discount_factor = 1 - round(margin * 100, 2) / 100
+            item_cost = round(_rate * qty * _discount_factor, 2)
+        elif asin in asin_to_cost_price:
+            item_cost = round(asin_to_cost_price[asin] * qty, 2)
+        else:
+            continue
+
+        item_cost_gst = (
+            round(item_cost * (1 + gst / 100), 2) if gst else item_cost
+        )
+        accepted_total_cost += item_cost
+        accepted_total_cost_gst += item_cost_gst
         has_any = True
 
     if not has_any:
@@ -1166,6 +1193,136 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
         "po_computed_total_gst": po_total_gst,
         "items": serialize_mongo_document(rows),
         "only_in_estimate": serialize_mongo_document(only_in_estimate),
+    }
+
+
+@router.get("/{po_number}/package_breakdown")
+async def get_package_breakdown(po_number: str, db=Depends(get_database)):
+    """Return per-item accepted cost breakdown for the linked package."""
+
+    def _fetch():
+        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
+        if not doc:
+            return None, None
+        pkg_number = doc.get("package_number")
+        if not pkg_number:
+            return doc, None
+        pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_number})
+        return doc, pkg
+
+    doc, pkg = await asyncio.to_thread(_fetch)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    if pkg is None:
+        raise HTTPException(status_code=404, detail="No package linked to this PO")
+
+    package_number = doc["package_number"]
+    line_items = pkg.get("line_items") or []
+
+    # Extract SKU, qty, name per line item
+    sku_rows: list[dict] = []
+    for li in line_items:
+        sku = None
+        for cf in li.get("item_custom_fields") or []:
+            if cf.get("api_name") == "cf_sku_code":
+                sku = cf.get("value")
+                break
+        if sku:
+            sku_rows.append({
+                "sku": sku,
+                "name": li.get("name") or "",
+                "qty": float(li.get("quantity") or 0),
+            })
+
+    if not sku_rows:
+        return {
+            "po_number": po_number,
+            "package_number": package_number,
+            "accepted_total_cost": None,
+            "accepted_total_cost_gst": None,
+            "items": [],
+        }
+
+    def _enrich():
+        skus = [r["sku"] for r in sku_rows]
+        sku_to_asin: dict[str, str] = {}
+        for m in db[SKU_MAPPING_COLLECTION].find({"sku_code": {"$in": skus}}, {"sku_code": 1, "item_id": 1}):
+            sku_to_asin[m["sku_code"]] = m["item_id"]
+        asins = list(sku_to_asin.values())
+        asin_to_margin: dict[str, float] = {}
+        asin_to_cost_price: dict[str, float] = {}
+        asin_to_etrade: dict[str, float] = {}
+        if asins:
+            for m in db[MARGINS_COLLECTION].find(
+                {"asin": {"$in": asins}},
+                {"asin": 1, "etrade_asp": 1, "margin": 1, "cost_price_wo_tax": 1},
+            ):
+                if m.get("etrade_asp") is not None:
+                    asin_to_etrade[m["asin"]] = float(m["etrade_asp"])
+                if m.get("margin") is not None:
+                    asin_to_margin[m["asin"]] = float(m["margin"])
+                if m.get("cost_price_wo_tax") is not None:
+                    asin_to_cost_price[m["asin"]] = float(m["cost_price_wo_tax"])
+        sku_to_gst: dict[str, float] = {}
+        for p in db[PRODUCTS_COLLECTION].find(
+            {"cf_sku_code": {"$in": skus}},
+            {"cf_sku_code": 1, "item_tax_preferences": 1},
+        ):
+            sku_to_gst[p["cf_sku_code"]] = _extract_gst(p.get("item_tax_preferences") or [])
+        return sku_to_asin, asin_to_etrade, asin_to_margin, asin_to_cost_price, sku_to_gst
+
+    sku_to_asin, asin_to_etrade, asin_to_margin, asin_to_cost_price, sku_to_gst = await asyncio.to_thread(_enrich)
+
+    items = []
+    total_cost = 0.0
+    total_cost_gst = 0.0
+    for r in sku_rows:
+        sku = r["sku"]
+        qty = r["qty"]
+        asin = sku_to_asin.get(sku)
+        gst = sku_to_gst.get(sku, 0.0)
+        etrade_asp = asin_to_etrade.get(asin) if asin else None
+        margin = asin_to_margin.get(asin) if asin else None
+
+        mrp_wo_gst = None
+        if etrade_asp is not None:
+            mrp_wo_gst = round(etrade_asp / (1 + gst / 100), 2) if gst else etrade_asp
+
+        item_cost: float | None = None
+        unit_cost: float | None = None
+        if mrp_wo_gst is not None and margin is not None:
+            unit_cost = round(round(mrp_wo_gst, 2) * (1 - round(margin * 100, 2) / 100), 4)
+            item_cost = round(unit_cost * qty, 2)
+        elif asin and asin in asin_to_cost_price:
+            unit_cost = asin_to_cost_price[asin]
+            item_cost = round(unit_cost * qty, 2)
+
+        item_cost_gst = round(item_cost * (1 + gst / 100), 2) if (item_cost is not None and gst) else item_cost
+
+        if item_cost is not None:
+            total_cost += item_cost
+            total_cost_gst += item_cost_gst or item_cost
+
+        items.append({
+            "sku": sku,
+            "name": r["name"],
+            "qty": qty,
+            "asin": asin,
+            "etrade_asp": etrade_asp,
+            "gst": gst,
+            "mrp_wo_gst": mrp_wo_gst,
+            "margin": round(margin * 100, 2) if margin is not None else None,  # as percentage
+            "unit_cost": unit_cost,
+            "item_total": item_cost,
+            "item_total_gst": item_cost_gst,
+        })
+
+    return {
+        "po_number": po_number,
+        "package_number": package_number,
+        "accepted_total_cost": round(total_cost, 2),
+        "accepted_total_cost_gst": round(total_cost_gst, 2),
+        "items": serialize_mongo_document(items),
     }
 
 
