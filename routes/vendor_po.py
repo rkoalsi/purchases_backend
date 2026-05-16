@@ -192,7 +192,7 @@ def _get_dispatched_costs_by_asin(package_number: str, db) -> dict:
         if m.get("cost_price_wo_tax") is not None:
             asin_to_cost_price[m["asin"]] = float(m["cost_price_wo_tax"])
     sku_to_gst: dict[str, float] = {}
-    for p in db[PRODUCTS_COLLECTION].find({"cf_sku_code": {"$in": skus}, "status": "active"}, {"cf_sku_code": 1, "item_tax_preferences": 1}):
+    for p in db[PRODUCTS_COLLECTION].find({"cf_sku_code": {"$in": skus}}, {"cf_sku_code": 1, "item_tax_preferences": 1}):
         sku_to_gst[p["cf_sku_code"]] = _extract_gst(p.get("item_tax_preferences") or [])
     missing = [s for s in skus if s not in sku_to_gst]
     if missing:
@@ -285,7 +285,7 @@ def _compute_package_accepted_costs(
     # SKU → GST (via products)
     sku_to_gst: dict[str, float] = {}
     for p in db[PRODUCTS_COLLECTION].find(
-        {"cf_sku_code": {"$in": skus}, "status": "active"},
+        {"cf_sku_code": {"$in": skus}},
         {"cf_sku_code": 1, "item_tax_preferences": 1},
     ):
         sku_to_gst[p["cf_sku_code"]] = _extract_gst(p.get("item_tax_preferences") or [])
@@ -414,7 +414,7 @@ def _enrich_items(
     # --- batch load products by cf_sku_code (always fresh — MRP/GST/HSN can change) ---
     products_by_model: dict[str, dict] = {}
     for p in db[PRODUCTS_COLLECTION].find(
-        {"cf_sku_code": {"$in": model_numbers}, "status": "active"},
+        {"cf_sku_code": {"$in": model_numbers}},
         {
             "cf_sku_code": 1,
             "item_id": 1,
@@ -440,7 +440,7 @@ def _enrich_items(
     ]
     if extra_skus:
         for p in db[PRODUCTS_COLLECTION].find(
-            {"cf_sku_code": {"$in": extra_skus}, "status": "active"},
+            {"cf_sku_code": {"$in": extra_skus}},
             {
                 "cf_sku_code": 1,
                 "item_id": 1,
