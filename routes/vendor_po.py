@@ -735,8 +735,8 @@ def _enrich_items(
         )
         max_allowed_qty = target_stock - total_qty
 
-        lead_time = item.get("lead_time_override", 10)
-        coverage_days_item = item.get("coverage_days_override", COVERAGE_DAYS)
+        lead_time = item.get("lead_time_override") or 10
+        coverage_days_item = item.get("coverage_days_override") or COVERAGE_DAYS
         total_target_days = lead_time + coverage_days_item
         net_total_days = round(total_qty / final_drr, 1) if final_drr else None
         monthly_sales = monthly_sales_by_asin.get(asin, [0] * 5)
