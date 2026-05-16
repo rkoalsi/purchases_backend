@@ -2143,6 +2143,66 @@ async def upload_etrade_margins(
         )
 
 
+@router.get("/download-etrade-margins-template")
+def download_etrade_margins_template(database=Depends(get_database)):
+    """
+    Download an Excel template pre-filled with existing SKU names and margin data.
+    Columns: ASIN, Item Name, ASP, New Margin, Cost Price w/o Tax.
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+
+        sku_collection = database.get_collection(SKU_COLLECTION)
+        margins_collection = database.get_collection(MARGINS_COLLECTION)
+
+        skus = list(sku_collection.find({}, {"item_id": 1, "item_name": 1, "_id": 0}))
+        margins_list = list(margins_collection.find({}, {"asin": 1, "etrade_asp": 1, "margin": 1, "cost_price_wo_tax": 1, "_id": 0}))
+        margins_by_asin = {m["asin"]: m for m in margins_list}
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "eTrade Margins"
+
+        headers = ["ASIN", "Item Name", "ASP", "New Margin", "Cost Price w/o Tax"]
+        header_fill = PatternFill("solid", fgColor="1E3A5F")
+        header_font = Font(bold=True, color="FFFFFF")
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+
+        for row_idx, sku in enumerate(skus, 2):
+            asin = sku.get("item_id", "")
+            m = margins_by_asin.get(asin, {})
+            ws.cell(row=row_idx, column=1, value=asin)
+            ws.cell(row=row_idx, column=2, value=sku.get("item_name", ""))
+            ws.cell(row=row_idx, column=3, value=m.get("etrade_asp"))
+            ws.cell(row=row_idx, column=4, value=m.get("margin"))
+            ws.cell(row=row_idx, column=5, value=m.get("cost_price_wo_tax"))
+
+        for col in ws.columns:
+            max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=etrade_margins_template.xlsx"},
+        )
+    except Exception as e:
+        logger.info(f"Error generating etrade margins template: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred generating the template: {e}",
+        )
+
+
 SHEET_ID      = "1tn_Lj3KR0zXY8B-8ZUkSznZgE4YzyjtAkcpdHzBCgt4"
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 
