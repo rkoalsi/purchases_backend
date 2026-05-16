@@ -715,15 +715,23 @@ def _enrich_items(
         if mrp_wo_gst is not None and margin is not None:
             _rate = round(mrp_wo_gst, 2)
             _discount_factor = 1 - round(margin * 100, 2) / 100
-            total_cost = round(_rate * accepted_qty * _discount_factor, 2)
+            total_cost = round(_rate * supply_qty * _discount_factor, 2)
+            total_cost_accepted = round(_rate * accepted_qty * _discount_factor, 2) if accepted_qty else None
         elif cost_price_wo_tax is not None:
-            total_cost = round(cost_price_wo_tax * accepted_qty, 2)
+            total_cost = round(cost_price_wo_tax * supply_qty, 2)
+            total_cost_accepted = round(cost_price_wo_tax * accepted_qty, 2) if accepted_qty else None
         else:
             total_cost = None
+            total_cost_accepted = None
         total_cost_gst = (
             round(total_cost * (1 + gst / 100), 2)
             if (total_cost is not None and gst)
             else total_cost
+        )
+        total_cost_accepted_gst = (
+            round(total_cost_accepted * (1 + gst / 100), 2)
+            if (total_cost_accepted is not None and gst)
+            else total_cost_accepted
         )
 
         total_qty = current_stock + open_po
@@ -788,6 +796,8 @@ def _enrich_items(
                 "cost_price_wo_tax": cost_price_wo_tax,
                 "total_cost": total_cost,
                 "total_cost_gst": total_cost_gst,
+                "total_cost_accepted": total_cost_accepted,
+                "total_cost_accepted_gst": total_cost_accepted_gst,
                 "hsn": str(product.get("hsn_or_sac") or ""),
                 "diff": diff,
                 "zoho_stock": zoho_stock,
