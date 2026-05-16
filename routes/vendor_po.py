@@ -746,7 +746,7 @@ def _enrich_items(
         lead_time = item.get("lead_time_override") or 10
         coverage_days_item = item.get("coverage_days_override") or COVERAGE_DAYS
         total_target_days = lead_time + coverage_days_item
-        net_total_days = round(total_qty / final_drr, 1) if final_drr else None
+        net_total_days = round(total_qty / final_drr, 2) if final_drr else None
         monthly_sales = monthly_sales_by_asin.get(asin, [0] * 5)
 
         # Final Units (for under-ordering): formula per overstock sheet
@@ -1984,7 +1984,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
     pct_format = "0.00%"
     num_format = "#,##0.00"
     int_format = "#,##0"
-    days_format = "0.0"
+    days_format = "0.00"
 
     po_number = doc["po_number"]
     po_date_str = doc["po_date"]
@@ -2038,7 +2038,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             23: f'=IF(V{r}="","",ROUND(V{r}*(1+P{r}),2))',                             # W   Total cost w/o GST (Accepted Qty)
             26: f'=IF(S{r}="","",Y{r}-S{r})',                                          # Z   Diff
             31: f"=AC{r}+AD{r}",                                                        # AE  Total Qty
-            33: f'=IF(AF{r}=0,"",ROUND(AE{r}/AF{r},1))',                               # AG  Net Total Days
+            33: f'=IF(AF{r}=0,"",ROUND(AE{r}/AF{r},2))',                               # AG  Net Total Days
             36: f"=AH{r}+AI{r}",                                                        # AJ  Total Target Days
             37: f"=ROUND(AF{r}*AJ{r},0)",                                               # AK  Target Stock = DRR * Total Target Days
             38: f'=IF(AF{r}=0,"",IF(AG{r}<AH{r},ROUND(AF{r}*AJ{r},0),IF(AG{r}>AJ{r},0,ROUND((AJ{r}-AG{r})*AF{r},0))))',  # AL  Final Units (For Under-ordering)
