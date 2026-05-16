@@ -2486,7 +2486,7 @@ def compute_drr_v3(daily_data: list, total_returns: float):
     total_ret = max(0, total_returns or 0)
     net_units = max(0.0, cleaned_units - total_ret)
 
-    final_drr = net_units / 30
+    final_drr = round(net_units / 30, 2)
 
     if spike_count > 0:
         flag = f"OK - {spike_count} Spike Day(s) Replaced with 2x Mean"
