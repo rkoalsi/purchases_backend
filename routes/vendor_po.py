@@ -1926,15 +1926,14 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
     _month_headers = [lbl for (_, _, lbl) in _month_labels] if _month_labels else [f"Month {i+1} Sales" for i in range(5)]
 
     # Column layout (41 cols + 5 monthly = 46 total):
-    # A-H: meta+qty, I=Supply(formula=AO), J=Accepted, K=ShortSupply, L=Received, M=Mismatch
+    # A-H: meta+qty, I=Supply(formula=AM), J=Accepted, K=ShortSupply, L=Received, M=Mismatch
     # N=ZohoMRP, O=eTrade ASP, P=GST, Q=MRPwoGST, R=Margin, S=CostPrice
-    # T=TotalCost(Accepted), U=TotalCostGST(Accepted), V=TotalCost(Dispatched), W=TotalCostGST(Dispatched)
+    # T=TotalCost(SupplyQty), U=TotalCostwoGST(SupplyQty), V=TotalCost(AcceptedQty), W=TotalCostwoGST(AcceptedQty)
     # X=HSN, Y=EtradeUnitCost, Z=Diff, AA=ZohoStock, AB=Status, AC=CurrentStock, AD=OpenPO
-    # AE=TotalQty, AF=Sales30, AG=FinalDRR
-    # AH=NetTotalDays, AI=LeadTime, AJ=CoverageDays, AK=TotalTargetDays, AL=TargetStock
-    # AM=MaxAllowedQty
-    # AN=FinalUnits(For Under-ordering), AO=FinalSupplyQty(For Over-ordering)
-    # AP-AT=5 months Amazon sales
+    # AE=TotalQty, AF=FinalDRR, AG=NetTotalDays, AH=LeadTime, AI=CoverageDays
+    # AJ=TotalTargetDays, AK=TargetStock
+    # AL=FinalUnits(For Under-ordering), AM=FinalSupplyQty(For Over-ordering)
+    # AN-AR=5 months Amazon sales
     headers = [
         ("PO Date", False), ("PO", False), ("PO Status", False), ("Ship to location", False),
         ("ASIN", True), ("Model Number", True), ("Title", True), ("Requested Qty", True),
@@ -1942,14 +1941,14 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
         ("Received QTY", False), ("Mismatch QTY", False),
         ("Zoho MRP", True), ("eTrade ASP", True), ("GST", True), ("MRP w/o GST", True),
         ("Margin (%)", True), ("Cost Price w/o Tax", True),
-        ("Total Cost\n(Accepted)", True), ("Total Cost w/ GST\n(Accepted)", True),
-        ("Total Cost\n(Dispatched)", True), ("Total Cost w/ GST\n(Dispatched)", True),
+        ("Total Cost\n(Supply Qty)", True), ("Total cost w/o GST\n(Supply Qty)", True),
+        ("Total Cost\n(Accepted Qty)", True), ("Total cost w/o GST\n(Accepted Qty)", True),
         ("HSN", True), ("Etrade Unit Cost", True), ("Diff", True),
         ("Zoho Stock", True), ("Status", True), (f"Current Stock\n({inv_date_label})", True),
-        ("Open PO", True), ("Total Qty", True), ("Last 30 Days Sales", True),
+        ("Open PO", True), ("Total Qty", True),
         (f"Final DRR\n({_drr_range})", True),
         ("Net Total Days", True), ("Lead Time", True), ("Coverage Days", True),
-        ("Total Target Days", True), ("Target Stock", True), ("Max Allowed Qty", True),
+        ("Total Target Days", True), ("Target Stock", True),
         ("Final Units\n(For Under-ordering)", True), ("Final Supply Qty\n(For Over-ordering)", True),
     ] + [(lbl, True) for lbl in _month_headers]
 
@@ -1989,56 +1988,54 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             15: item.get("etrade_asp") if item.get("etrade_asp") is not None else "",  # O  eTrade ASP
             16: item["gst"] / 100,   # P  GST
             18: item["margin"] if item["margin"] is not None else "",  # R  Margin
-            22: item.get("total_cost_dispatched") if item.get("total_cost_dispatched") is not None else "",  # V
-            23: item.get("total_cost_dispatched_gst") if item.get("total_cost_dispatched_gst") is not None else "",  # W
             24: item["hsn"],         # X  HSN
             25: item["etrade_unit_cost"],  # Y  Etrade Unit Cost
             27: item["zoho_stock"],  # AA Zoho Stock
             28: item["purchase_status"],  # AB Status
             29: item["current_stock"],  # AC Current Stock
             30: item["open_po"],     # AD Open PO
-            32: item["last_30_sales"],  # AF Last 30 Days Sales
-            33: (item.get("final_drr") if item.get("final_drr") is not None else (item.get("final_drr_flag") or "")),  # AG Final DRR
-            35: item.get("lead_time", 10),   # AI Lead Time
-            36: item.get("coverage_days", COVERAGE_DAYS),  # AJ Coverage Days
+            32: (item.get("final_drr") if item.get("final_drr") is not None else (item.get("final_drr_flag") or "")),  # AF Final DRR
+            34: item.get("lead_time", 10),   # AH Lead Time
+            35: item.get("coverage_days", COVERAGE_DAYS),  # AI Coverage Days
         }
-        # Monthly sales cols 42-46 (AP-AT)
+        # Monthly sales cols 40-44 (AN-AR)
         for mi, units in enumerate(monthly_sales[:5]):
-            static[42 + mi] = units
+            static[40 + mi] = units
 
         supply_qty_override = item.get("supply_qty_override")
         final_units_override = item.get("final_units_override")
         final_supply_fo_override = item.get("final_supply_fo_override")
         formulas = {
-            9:  f"=AO{r}",                                                              # I   Supply Qty = Final Supply Qty (For Over-ordering)
+            9:  f"=AM{r}",                                                              # I   Supply Qty = Final Supply Qty (For Over-ordering)
             11: f'=IF(J{r}="","",J{r}-I{r})',                                          # K   Short Supply
             13: f'=IF(L{r}="","",J{r}-L{r})',                                          # M   Mismatch
             17: f'=IF(O{r}="",ROUND(N{r}/(1+P{r}),2),ROUND(O{r}/(1+P{r}),2))',        # Q   MRP w/o GST
             19: f'=IF(R{r}="","",ROUND(Q{r}*(1-R{r}),2))',                             # S   Cost Price w/o Tax
-            20: f'=IF(S{r}="","",ROUND(S{r}*J{r},2))',                                 # T   Total Cost (Accepted)
-            21: f'=IF(T{r}="","",ROUND(T{r}*(1+P{r}),2))',                             # U   Total Cost w/ GST (Accepted)
+            20: f'=IF(S{r}="","",ROUND(S{r}*I{r},2))',                                 # T   Total Cost (Supply Qty)
+            21: f'=IF(T{r}="","",ROUND(T{r}*(1+P{r}),2))',                             # U   Total cost w/o GST (Supply Qty)
+            22: f'=IF(S{r}="","",ROUND(S{r}*J{r},2))',                                 # V   Total Cost (Accepted Qty)
+            23: f'=IF(V{r}="","",ROUND(V{r}*(1+P{r}),2))',                             # W   Total cost w/o GST (Accepted Qty)
             26: f'=IF(S{r}="","",Y{r}-S{r})',                                          # Z   Diff
             31: f"=AC{r}+AD{r}",                                                        # AE  Total Qty
-            34: f'=IF(AG{r}=0,"",ROUND(AE{r}/AG{r},1))',                               # AH  Net Total Days
-            37: f"=AI{r}+AJ{r}",                                                        # AK  Total Target Days
-            38: f"=ROUND(ROUND(AF{r}/30,2)*AK{r},0)",                                  # AL  Target Stock
-            39: f"=AL{r}-AE{r}",                                                        # AM  Max Allowed Qty
-            40: f'=IF(AG{r}=0,"",IF(AH{r}<AI{r},ROUND(AG{r}*AK{r},0),IF(AH{r}>AK{r},0,ROUND((AK{r}-AH{r})*AG{r},0))))',  # AN  Final Units (For Under-ordering)
-            41: f'=IF(AN{r}="","",MIN(AN{r},H{r}))',                                   # AO  Final Supply Qty (For Over-ordering)
+            33: f'=IF(AF{r}=0,"",ROUND(AE{r}/AF{r},1))',                               # AG  Net Total Days
+            36: f"=AH{r}+AI{r}",                                                        # AJ  Total Target Days
+            37: f"=ROUND(AF{r}*AJ{r},0)",                                               # AK  Target Stock = DRR * Total Target Days
+            38: f'=IF(AF{r}=0,"",IF(AG{r}<AH{r},ROUND(AF{r}*AJ{r},0),IF(AG{r}>AJ{r},0,ROUND((AJ{r}-AG{r})*AF{r},0))))',  # AL  Final Units (For Under-ordering)
+            39: f'=IF(AL{r}="","",MIN(AL{r},H{r}))',                                   # AM  Final Supply Qty (For Over-ordering)
         }
         if supply_qty_override is not None:
             formulas.pop(9, None)
             static[9] = supply_qty_override
         if final_units_override is not None:
-            formulas.pop(40, None)
-            static[40] = final_units_override
+            formulas.pop(38, None)
+            static[38] = final_units_override
         if final_supply_fo_override is not None:
             formulas.pop(9, None)
-            formulas.pop(41, None)
+            formulas.pop(39, None)
             static[9] = final_supply_fo_override
-            static[41] = final_supply_fo_override
+            static[39] = final_supply_fo_override
 
-        total_cols = 41 + len(_month_headers)
+        total_cols = 39 + len(_month_headers)
         for col_idx in range(1, total_cols + 1):
             if col_idx in formulas:
                 cell = ws.cell(row=r, column=col_idx, value=formulas[col_idx])
@@ -2051,17 +2048,17 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
                 cell.number_format = num_format
             elif col_idx in (16, 18):  # GST%, Margin%
                 cell.number_format = pct_format
-            elif col_idx in (8, 10, 12, 27, 29, 30, 31, 32, 35, 36, 37, 38, 39, 40, 41) or col_idx >= 42:
+            elif col_idx in (8, 10, 12, 27, 29, 30, 31, 34, 35, 36, 37, 38, 39) or col_idx >= 40:
                 cell.number_format = int_format
-            elif col_idx == 33:  # Final DRR
+            elif col_idx == 32:  # Final DRR
                 cell.number_format = "0.000"
-            elif col_idx == 34:  # Net Total Days
+            elif col_idx == 33:  # Net Total Days
                 cell.number_format = days_format
 
     for col_idx in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = 16
     ws.column_dimensions["G"].width = 40
-    ws.column_dimensions["AG"].width = 26  # Final DRR with date range
+    ws.column_dimensions["AF"].width = 26  # Final DRR with date range
     ws.row_dimensions[1].height = 50
 
     buf = io.BytesIO()
