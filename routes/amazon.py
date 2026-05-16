@@ -2450,7 +2450,7 @@ def compute_drr_v3(daily_data: list, total_returns: float):
 
     parsed.sort(key=lambda x: x["date"], reverse=True)
 
-    in_stock = [d for d in parsed if d["closing_stock"] > 0]
+    in_stock = [d for d in parsed if d["closing_stock"] > 0 or d["units_sold"] > 0]
     total_in_stock = len(in_stock)
 
     if total_in_stock == 0:
@@ -2684,15 +2684,18 @@ def compute_drr_for_asins_sync(db, end: datetime, asins: list) -> dict:
     fba_results = list(db.get_collection("amazon_ledger").aggregate(fba_pipeline, allowDiskUse=True))
     fba_daily = {doc["_id"]: doc["daily_data"] for doc in fba_results}
 
-    # Returns: VC customer returns from amazon_vendor_sales + FBA over the same 90-day window
+    # Returns: VC customer returns + FBA returns over the 30-day window ending at `end`.
+    # Using 30 days to match the Amazon report methodology (returns are scoped to the
+    # same period as the selected in-stock days, not the full 90-day lookback window).
+    returns_start = end - timedelta(days=29)
     vc_ret_results = list(db.get_collection("amazon_vendor_sales").aggregate([
-        {"$match": {"asin": {"$in": asins}, "date": {"$gte": drr_start, "$lte": end}}},
+        {"$match": {"asin": {"$in": asins}, "date": {"$gte": returns_start, "$lte": end}}},
         {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$customerReturns", 0]}}}},
     ]))
     vc_returns = {doc["_id"]: doc["total"] for doc in vc_ret_results}
 
     fba_ret_results = list(db.get_collection(FBA_RETURNS_COLLECTION).aggregate([
-        {"$match": {"asin": {"$in": asins}, "return_date": {"$gte": drr_start, "$lte": end}}},
+        {"$match": {"asin": {"$in": asins}, "return_date": {"$gte": returns_start, "$lte": end}}},
         {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$quantity", 0]}}}},
     ]))
     fba_returns = {doc["_id"]: doc["total"] for doc in fba_ret_results}
@@ -4172,7 +4175,7 @@ async def download_report_by_date_range(
             fba_raw = await generate_amazon_data(start, end, database, "fba+seller_flex", any_last_90_days, keep_daily_data=True)
             # Collect per-platform daily data before combining
             for item in vendor_raw:
-                vc_daily_by_asin[item["asin"]] = item.get("_daily_data", [])
+                vc_daily_by_asin[item["asin"]] = item.get("_drr_daily_data", [])
                 drr_vc_daily_by_asin[item["asin"]] = item.get("_drr_daily_data", [])
             for item in fba_raw:
                 fba_daily_by_asin[item["asin"]] = item.get("_daily_data", [])
@@ -4185,8 +4188,10 @@ async def download_report_by_date_range(
         elif report_type == "vendor_central":
             vendor_raw = await generate_vendor_central_data(start, end, database, any_last_90_days, keep_daily_data=True)
             for item in vendor_raw:
-                vc_daily_by_asin[item["asin"]] = item.pop("_daily_data", [])
-                drr_vc_daily_by_asin[item["asin"]] = item.pop("_drr_daily_data", [])
+                drr_data = item.pop("_drr_daily_data", [])
+                item.pop("_daily_data", None)
+                vc_daily_by_asin[item["asin"]] = drr_data
+                drr_vc_daily_by_asin[item["asin"]] = drr_data
             report_data = vendor_raw
 
         else:  # fba, seller_flex, fba+seller_flex
@@ -4232,10 +4237,24 @@ async def download_report_by_date_range(
             if report_type in ("vendor_central", "all"):
                 missing_vc_drr = await _fetch_vc_drr_daily(database, end, missing_asin_ids)
                 drr_vc_daily_by_asin.update(missing_vc_drr)
+                vc_daily_by_asin.update(missing_vc_drr)
             if report_type != "vendor_central":
                 fba_type = "fba+seller_flex" if report_type == "all" else report_type
                 missing_fba_drr = await _fetch_fba_drr_daily(database, end, missing_asin_ids, fba_type)
                 drr_fba_daily_by_asin.update(missing_fba_drr)
+                fba_daily_by_asin.update(missing_fba_drr)
+
+        # For "all" reports: ASINs with FBA sales but no VC sales won't be in
+        # vc_daily_by_asin. Fetch their VC inventory data so the VC Inventory
+        # sheet shows the correct closing stock.
+        if report_type == "all":
+            fba_only_asins = [
+                item["asin"] for item in report_data
+                if item.get("asin") and item["asin"] not in vc_daily_by_asin
+            ]
+            if fba_only_asins:
+                extra_vc = await _fetch_vc_drr_daily(database, end, fba_only_asins)
+                vc_daily_by_asin.update(extra_vc)
 
         if not report_data:
             raise HTTPException(

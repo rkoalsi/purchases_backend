@@ -1293,6 +1293,17 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
     if doc is None:
         raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
 
+    # Write computed total_cost back to each item in the DB so the list aggregation reflects it.
+    def _write_back_costs():
+        for it in enriched:
+            asin = it.get("asin")
+            db[PO_COLLECTION].update_one(
+                {"po_number": po_number, "items.asin": asin},
+                {"$set": {"items.$.total_cost": it.get("total_cost"), "items.$.total_cost_gst": it.get("total_cost_gst")}},
+            )
+
+    asyncio.create_task(asyncio.to_thread(_write_back_costs))
+
     po_status = doc["po_status"]
     # For new-format frozen POs, live_inv_date is None (stored snapshot used).
     # For old-format frozen POs (no zoho_stock in items), live_inv_date is freshly computed
@@ -2061,7 +2072,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             elif col_idx in (8, 10, 12, 27, 29, 30, 31, 34, 35, 36, 37, 38, 39) or col_idx >= 40:
                 cell.number_format = int_format
             elif col_idx == 32:  # Final DRR
-                cell.number_format = "0.000"
+                cell.number_format = "0.00"
             elif col_idx == 33:  # Net Total Days
                 cell.number_format = days_format
 
