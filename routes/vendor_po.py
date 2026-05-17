@@ -782,6 +782,25 @@ def _enrich_items(
         else:
             final_supply_fo = None
 
+        # Costs based on final_supply_fo (matches the Excel "Supply Qty" column I = AM)
+        if final_supply_fo is not None:
+            if mrp_wo_gst is not None and margin is not None:
+                _rate = round(mrp_wo_gst, 2)
+                _discount_factor = 1 - round(margin * 100, 2) / 100
+                total_cost_fo = round(_rate * final_supply_fo * _discount_factor, 2)
+            elif cost_price_wo_tax is not None:
+                total_cost_fo = round(cost_price_wo_tax * final_supply_fo, 2)
+            else:
+                total_cost_fo = None
+            total_cost_fo_gst = (
+                round(total_cost_fo * (1 + gst / 100), 2)
+                if (total_cost_fo is not None and gst)
+                else total_cost_fo
+            )
+        else:
+            total_cost_fo = None
+            total_cost_fo_gst = None
+
         enriched.append(
             {
                 **item,
@@ -796,6 +815,8 @@ def _enrich_items(
                 "cost_price_wo_tax": cost_price_wo_tax,
                 "total_cost": total_cost,
                 "total_cost_gst": total_cost_gst,
+                "total_cost_fo": total_cost_fo,
+                "total_cost_fo_gst": total_cost_fo_gst,
                 "total_cost_accepted": total_cost_accepted,
                 "total_cost_accepted_gst": total_cost_accepted_gst,
                 "hsn": str(product.get("hsn_or_sac") or ""),
@@ -941,9 +962,40 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "total_received_qty": {
                         "$ifNull": ["$received_qty", {"$sum": "$items.received_qty"}]
                     },
-                    "total_supply_qty": {"$sum": "$items.supply_qty"},
-                    "_items_cost": {"$sum": "$items.total_cost"},
-                    "_items_cost_gst": {"$sum": "$items.total_cost_gst"},
+                    # Supply Qty mirrors Excel col I: supply_qty_override if set, else final_supply_fo
+                    "total_supply_qty": {
+                        "$sum": {
+                            "$map": {
+                                "input": "$items",
+                                "as": "it",
+                                "in": {
+                                    "$cond": [
+                                        {"$ne": ["$$it.supply_qty_override", None]},
+                                        "$$it.supply_qty_override",
+                                        {"$ifNull": ["$$it.final_supply_fo", 0]},
+                                    ]
+                                },
+                            }
+                        }
+                    },
+                    "_items_cost": {
+                        "$sum": {
+                            "$map": {
+                                "input": "$items",
+                                "as": "it",
+                                "in": {"$ifNull": ["$$it.total_cost_fo", {"$ifNull": ["$$it.total_cost", 0]}]},
+                            }
+                        }
+                    },
+                    "_items_cost_gst": {
+                        "$sum": {
+                            "$map": {
+                                "input": "$items",
+                                "as": "it",
+                                "in": {"$ifNull": ["$$it.total_cost_fo_gst", {"$ifNull": ["$$it.total_cost_gst", 0]}]},
+                            }
+                        }
+                    },
                 }
             },
             # Join estimate to get authoritative sub_total / total when linked
@@ -1080,7 +1132,7 @@ async def download_shipment_summary(db=Depends(get_database)):
             {
                 "$addFields": {
                     "total_requested_qty": {"$sum": "$items.requested_qty"},
-                    "total_supply_qty": {"$sum": "$items.supply_qty"},
+                    "total_supply_qty": {"$sum": "$items.final_supply_fo"},
                     "total_accepted_qty": {"$sum": "$items.accepted_qty"},
                     "location": {"$arrayElemAt": ["$items.ship_to_location", 0]},
                 }
@@ -2104,6 +2156,16 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
             use_stored_stock=use_stored,
             po_date_str=doc.get("po_date"),
         )
+        # Write back fresh per-item computed fields so the list aggregation stays current
+        item_updates = {}
+        for i, item in enumerate(enriched):
+            item_updates[f"items.{i}.final_supply_fo"] = item.get("final_supply_fo")
+            item_updates[f"items.{i}.total_cost_fo"] = item.get("total_cost_fo")
+            item_updates[f"items.{i}.total_cost_fo_gst"] = item.get("total_cost_fo_gst")
+        db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {"$set": item_updates},
+        )
         return doc, enriched
 
     doc, enriched = await asyncio.to_thread(_build)
@@ -2394,7 +2456,7 @@ async def get_shipment_summary(db=Depends(get_database)):
             {
                 "$addFields": {
                     "total_requested_qty": {"$sum": "$items.requested_qty"},
-                    "total_supply_qty": {"$sum": "$items.supply_qty"},
+                    "total_supply_qty": {"$sum": "$items.final_supply_fo"},
                     "total_accepted_qty": {"$sum": "$items.accepted_qty"},
                     "location": {"$arrayElemAt": ["$items.ship_to_location", 0]},
                 }
