@@ -27,6 +27,7 @@ from .routes.vendor import router as vendor_router
 from .routes.brand_orders import router as brand_orders_router
 from .routes.design import router as design_router
 from .routes.amazon_fba_shipment import router as amazon_fba_shipment_router
+from .routes.tasks import router as tasks_router
 from .database import connect_db, close_db, get_database
 from contextlib import asynccontextmanager
 from .helpers.scheduler import scheduler, api_scheduler, setup_scheduler
@@ -132,6 +133,7 @@ app.include_router(vendor_router, prefix="/vendors", tags=["vendors"])
 app.include_router(brand_orders_router, prefix="/brand_orders", tags=["brand_orders"])
 app.include_router(design_router, prefix="/design", tags=["design"])
 app.include_router(amazon_fba_shipment_router, prefix="/amazon_fba_shipment", tags=["amazon_fba_shipment"])
+app.include_router(tasks_router, prefix="/tasks", tags=["tasks"])
 
 
 # --- Protected Swagger / ReDoc / OpenAPI schema ---
