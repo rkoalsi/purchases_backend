@@ -671,6 +671,25 @@ def _enrich_items(
             cost_price_wo_tax = round(mrp_wo_gst - mrp_wo_gst * margin, 2)
         else:
             cost_price_wo_tax = None
+
+        # For frozen POs (processing/packed/closed), pricing was established at upload time.
+        # Use the stored values so costs stay consistent with the Zoho estimate created then.
+        if effective_use_stored:
+            stored_etrade_asp = item.get("etrade_asp")
+            stored_mrp_wo_gst = item.get("mrp_wo_gst")
+            stored_gst = item.get("gst")
+            stored_margin = item.get("margin")
+            stored_cost_price = item.get("cost_price_wo_tax")
+            if stored_etrade_asp is not None:
+                etrade_asp = stored_etrade_asp
+            if stored_mrp_wo_gst is not None:
+                mrp_wo_gst = stored_mrp_wo_gst
+            if stored_gst is not None:
+                gst = stored_gst
+            if stored_margin is not None:
+                margin = stored_margin
+            if stored_cost_price is not None:
+                cost_price_wo_tax = stored_cost_price
         etrade = item.get("etrade_unit_cost", 0)
         diff = (
             round(etrade - cost_price_wo_tax, 2)
@@ -840,7 +859,7 @@ def _enrich_items(
                 "accepted_qty": accepted_qty,
                 "received_qty": received_qty,
                 "zoho_mrp": mrp,
-                "etrade_asp": etrade_asp_by_asin.get(asin),
+                "etrade_asp": etrade_asp,
                 "gst": gst,
                 "mrp_wo_gst": mrp_wo_gst,
                 "margin": margin,
@@ -2140,7 +2159,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             13: f'=IF(L{r}="","",J{r}-L{r})',                                          # M   Mismatch
             17: f'=IF(O{r}="",ROUND(N{r}/(1+P{r}),2),ROUND(O{r}/(1+P{r}),2))',        # Q   MRP w/o GST
             19: f'=IF(R{r}="","",ROUND(Q{r}*(1-R{r}),2))',                             # S   Cost Price w/o Tax
-            20: f'=IF(S{r}="","",ROUND(S{r}*I{r},2))',                                 # T   Total Cost (Supply Qty)
+            20: f'=IF(OR(Q{r}="",R{r}="",I{r}=""),"",ROUND(Q{r}*(1-R{r})*I{r},2))',    # T   Total Cost (Supply Qty)
             21: f'=IF(T{r}="","",ROUND(T{r}*(1+P{r}),2))',                             # U   Total cost w/o GST (Supply Qty)
             22: f'=IF(S{r}="","",ROUND(S{r}*J{r},2))',                                 # V   Total Cost (Accepted Qty)
             23: f'=IF(V{r}="","",ROUND(V{r}*(1+P{r}),2))',                             # W   Total cost w/o GST (Accepted Qty)
