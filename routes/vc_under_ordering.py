@@ -114,17 +114,18 @@ def _fetch_data(db, drr_map: dict) -> tuple:
             etrade_inv_by_asin[doc["asin"]] = int(doc.get("sellableOnHandInventoryUnits") or 0)
 
     # 6. Open PO from vendor_purchase_orders
-    #    processing → supply_qty (fallback requested_qty); packed/intransit → accepted_qty
+    #    processing → final_supply_fo_override if set, else final_supply_fo
+    #    packed → accepted_qty
     open_po_by_asin: dict[str, int] = {}
     for doc in db["vendor_purchase_orders"].aggregate([
-        {"$match": {"po_status": {"$in": ["processing", "packed", "intransit"]}}},
+        {"$match": {"po_status": {"$in": ["processing", "packed"]}}},
         {"$unwind": "$items"},
         {"$match": {"items.asin": {"$in": asins}}},
         {"$group": {
             "_id": "$items.asin",
             "total": {"$sum": {"$cond": {
                 "if": {"$eq": ["$po_status", "processing"]},
-                "then": {"$ifNull": ["$items.supply_qty", {"$ifNull": ["$items.requested_qty", 0]}]},
+                "then": {"$ifNull": ["$items.final_supply_fo_override", {"$ifNull": ["$items.final_supply_fo", 0]}]},
                 "else": {"$ifNull": ["$items.accepted_qty", 0]},
             }}},
         }},
