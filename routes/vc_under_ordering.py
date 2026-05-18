@@ -12,7 +12,7 @@ from typing import Optional
 from pydantic import BaseModel
 import logging
 
-from .amazon import compute_drr_for_asins_sync
+from .amazon import compute_drr_for_asins_sync, generate_report_by_date_range
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -40,7 +40,27 @@ class UnderOrderingOverride(BaseModel):
     final_units_override: Optional[int] = None
 
 
-def _fetch_data(db) -> tuple:
+async def _compute_drr_async(db, today: datetime, asins: list[str]) -> dict:
+    """Compute DRR using the same PSR 'all' report function as vendor_po, so values always match."""
+    drr_start = today - timedelta(days=89)
+    report = await generate_report_by_date_range(
+        drr_start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d"), db, report_type="all"
+    )
+    asin_set = set(asins)
+    result = {
+        item["asin"]: {"drr": item.get("drr", 0), "drr_flag": item.get("drr_flag", "")}
+        for item in report
+        if item.get("asin") in asin_set
+    }
+    missing = [a for a in asins if a not in result]
+    if missing:
+        end_dt = today.replace(hour=23, minute=59, second=59, microsecond=999999)
+        fallback = await asyncio.to_thread(compute_drr_for_asins_sync, db, end_dt, missing)
+        result.update(fallback)
+    return result
+
+
+def _fetch_data(db, drr_map: dict) -> tuple:
     today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     drr_start = today - timedelta(days=89)
     drr_period_label = f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
@@ -77,9 +97,6 @@ def _fetch_data(db) -> tuple:
         {"cf_sku_code": 1, "name": 1, "rate": 1, "status": 1, "purchase_status": 1, "item_id": 1, "_id": 0},
     ):
         product_by_sku[p["cf_sku_code"]] = p
-
-    # 4. DRR
-    drr_map: dict = compute_drr_for_asins_sync(db, today, asins)
 
     # 5. Current inventory with Etrade (latest date from amazon_vendor_inventory)
     etrade_latest = db[INVENTORY_COLLECTION].find_one(
@@ -251,7 +268,22 @@ def _fetch_data(db) -> tuple:
 @router.get("/data")
 async def get_data(db=Depends(get_database)):
     try:
-        result, inv_date, drr_period, zoho_date = await asyncio.to_thread(_fetch_data, db)
+        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        # Get ASINs first to compute DRR async (matches PSR/vendor_po)
+        margins_docs = await asyncio.to_thread(
+            lambda: list(db[MARGINS_COLLECTION].find(
+                {"etrade_asp": {"$exists": True, "$ne": None}}, {"asin": 1, "_id": 0}
+            ))
+        )
+        asins_with_asp = [d["asin"] for d in margins_docs if d.get("asin")]
+        sku_docs = await asyncio.to_thread(
+            lambda: list(db[SKU_MAPPING_COLLECTION].find(
+                {"item_id": {"$in": asins_with_asp}}, {"item_id": 1, "_id": 0}
+            ))
+        )
+        asins = [d["item_id"] for d in sku_docs if d.get("item_id")]
+        drr_map = await _compute_drr_async(db, today, asins) if asins else {}
+        result, inv_date, drr_period, zoho_date = await asyncio.to_thread(_fetch_data, db, drr_map)
         return JSONResponse({"rows": result, "inventory_date": inv_date, "drr_period": drr_period, "zoho_date": zoho_date})
     except Exception as e:
         logger.error(f"VC under ordering data error: {e}", exc_info=True)
@@ -294,7 +326,21 @@ async def clear_override(asin: str, field: str, db=Depends(get_database)):
 @router.get("/download")
 async def download_xlsx(db=Depends(get_database)):
     try:
-        result, inv_date, drr_period, zoho_date = await asyncio.to_thread(_fetch_data, db)
+        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        margins_docs = await asyncio.to_thread(
+            lambda: list(db[MARGINS_COLLECTION].find(
+                {"etrade_asp": {"$exists": True, "$ne": None}}, {"asin": 1, "_id": 0}
+            ))
+        )
+        asins_with_asp = [d["asin"] for d in margins_docs if d.get("asin")]
+        sku_docs = await asyncio.to_thread(
+            lambda: list(db[SKU_MAPPING_COLLECTION].find(
+                {"item_id": {"$in": asins_with_asp}}, {"item_id": 1, "_id": 0}
+            ))
+        )
+        asins = [d["item_id"] for d in sku_docs if d.get("item_id")]
+        drr_map = await _compute_drr_async(db, today, asins) if asins else {}
+        result, inv_date, drr_period, zoho_date = await asyncio.to_thread(_fetch_data, db, drr_map)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
