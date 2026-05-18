@@ -2873,10 +2873,12 @@ async def create_zoho_estimate(
                 continue
             margin = it.get("margin")
             discount = round(margin * 100, 2) if margin is not None else 0
+            qty = it.get("final_supply_fo")
+            qty = qty if qty is not None else 0
             line_items.append(
                 {
                     "item_id": zoho_item_id,
-                    "quantity": it["final_supply_qty"],
+                    "quantity": qty,
                     "rate": round(it.get("mrp_wo_gst") or 0, 2),
                     "discount": f"{discount}%",
                     "unit": "pcs",
