@@ -21,7 +21,7 @@ import xlrd
 import xlwt
 from xlutils.copy import copy as xl_copy
 
-from .amazon import compute_drr_for_asins_sync
+from .amazon import compute_drr_for_asins_sync, generate_report_by_date_range
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -365,12 +365,40 @@ def _parse_po_excel(file_bytes: bytes) -> tuple[str, str, list[dict]]:
     return po_number, vendor, items
 
 
+async def _compute_drr_for_po_async(db, po_date_str: str, asins: list[str]) -> dict:
+    """Compute DRR using the exact same PSR 'all' report function so values always match."""
+    if not asins or not po_date_str:
+        return {}
+    try:
+        po_dt = datetime.strptime(po_date_str, "%Y-%m-%d")
+    except ValueError:
+        return {}
+    # Use same 30-day window as a typical PSR run ending on the PO date
+    start_date = (po_dt - timedelta(days=29)).strftime("%Y-%m-%d")
+    report = await generate_report_by_date_range(start_date, po_date_str, db, report_type="all")
+    asin_set = set(asins)
+    result = {
+        item["asin"]: {"drr": item.get("drr", 0), "drr_flag": item.get("drr_flag", "")}
+        for item in report
+        if item.get("asin") in asin_set
+    }
+    # ASINs with no sales in the report window won't appear in the PSR result.
+    # Fall back to the sync 90-day inventory lookback for those.
+    missing = [a for a in asins if a not in result]
+    if missing:
+        end_dt = po_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        fallback = await asyncio.to_thread(compute_drr_for_asins_sync, db, end_dt, missing)
+        result.update(fallback)
+    return result
+
+
 def _enrich_items(
     items: list[dict],
     po_number: str,
     db,
     use_stored_stock: bool = False,
     po_date_str: str | None = None,
+    drr_map: dict | None = None,
 ) -> tuple[list[dict], str | None, str | None]:
     """Enrich PO items with product/stock/sales data. Returns (enriched_items, inventory_date_str, zoho_stock_date_str).
 
@@ -537,7 +565,7 @@ def _enrich_items(
                     doc.get("sellableOnHandInventoryUnits") or 0
                 )
 
-        # open PO: processing → supply_qty; packed/closed/intransit → accepted_qty
+        # open PO: processing → supply_qty if > 0, else requested_qty; packed/closed/intransit → accepted_qty
         for doc in db[PO_COLLECTION].aggregate(
             [
                 {
@@ -558,10 +586,11 @@ def _enrich_items(
                                 "$cond": {
                                     "if": {"$eq": ["$po_status", "processing"]},
                                     "then": {
-                                        "$ifNull": [
-                                            "$items.supply_qty",
-                                            "$items.requested_qty",
-                                        ]
+                                        "$cond": {
+                                            "if": {"$gt": [{"$ifNull": ["$items.supply_qty", 0]}, 0]},
+                                            "then": {"$ifNull": ["$items.supply_qty", 0]},
+                                            "else": {"$ifNull": ["$items.requested_qty", 0]},
+                                        }
                                     },
                                     "else": {"$ifNull": ["$items.accepted_qty", 0]},
                                 }
@@ -592,11 +621,14 @@ def _enrich_items(
         ):
             sales_by_asin[doc["_id"]] = int(doc["total_units"])
 
-    # --- fetch DRR (90-day window ending at PO date, same logic as Amazon 'all' report) ---
-    drr_map: dict = {}
-    if asins:
-        drr_end = po_date_dt if po_date_dt else datetime.now()
-        drr_map = compute_drr_for_asins_sync(db, drr_end, asins)
+    # --- fetch DRR: use pre-computed map from PSR async path if provided, else fall back ---
+    if drr_map is None:
+        _drr_map: dict = {}
+        if asins:
+            drr_end = po_date_dt if po_date_dt else datetime.now()
+            _drr_map = compute_drr_for_asins_sync(db, drr_end, asins)
+    else:
+        _drr_map = drr_map
 
     # --- fetch last 5 months Amazon sales per ASIN ---
     monthly_sales_by_asin: dict = {}
@@ -665,7 +697,7 @@ def _enrich_items(
             else:
                 sv = item.get("supply_qty")
                 supply_qty = sv if sv is not None else item["requested_qty"]
-            asin_drr = drr_map.get(asin, {})
+            asin_drr = _drr_map.get(asin, {})
             drr_result = asin_drr.get("drr")
             drr_flag = asin_drr.get("drr_flag", "")
             final_drr = drr_result if isinstance(drr_result, (int, float)) else None
@@ -702,7 +734,7 @@ def _enrich_items(
                 supply_qty = max(
                     0, min(int(item["requested_qty"]), int(max_allowed_tmp))
                 )
-            asin_drr = drr_map.get(asin, {})
+            asin_drr = _drr_map.get(asin, {})
             drr_result = asin_drr.get("drr")
             drr_flag = asin_drr.get("drr_flag", "")
             final_drr = drr_result if isinstance(drr_result, (int, float)) else None
@@ -870,11 +902,19 @@ async def upload_vendor_po(
 
     file_bytes = await file.read()
 
-    def _process():
-        po_number, vendor, items = _parse_po_excel(file_bytes)
-        if not po_number:
-            raise ValueError("Could not extract PO number from file")
+    # Parse Excel outside the thread (pure bytes, no I/O)
+    try:
+        po_number, vendor, items = await asyncio.to_thread(_parse_po_excel, file_bytes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not po_number:
+        raise HTTPException(status_code=400, detail="Could not extract PO number from file")
 
+    # Compute DRR using same async path as PSR report
+    asins = [it["asin"] for it in items if it.get("asin")]
+    drr_map = await _compute_drr_for_po_async(db, po_date, asins)
+
+    def _process():
         existing = db[PO_COLLECTION].find_one({"po_number": po_number})
         if existing:
             current_status = existing.get("po_status", "pending")
@@ -884,7 +924,7 @@ async def upload_vendor_po(
                 )
             # Re-enrich with fresh data, then preserve accepted_qty/received_qty per item
             enriched_items, inventory_date, zoho_stock_date = _enrich_items(
-                items, po_number, db, po_date_str=po_date
+                items, po_number, db, po_date_str=po_date, drr_map=drr_map
             )
             existing_by_asin = {it["asin"]: it for it in existing.get("items", [])}
             for item in enriched_items:
@@ -913,7 +953,7 @@ async def upload_vendor_po(
             return po_number, enriched_items, inventory_date, zoho_stock_date
 
         enriched_items, inventory_date, zoho_stock_date = _enrich_items(
-            items, po_number, db, po_date_str=po_date
+            items, po_number, db, po_date_str=po_date, drr_map=drr_map
         )
 
         doc = {
@@ -1314,13 +1354,21 @@ async def upload_shipment_summary(
 async def get_po_report(po_number: str, db=Depends(get_database)):
     """Generate enriched report for a PO."""
 
+    def _get_doc():
+        return db[PO_COLLECTION].find_one({"po_number": po_number})
+
+    doc = await asyncio.to_thread(_get_doc)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+
+    # Compute DRR using same async path as PSR report
+    _items = doc.get("items", [])
+    _asins = [it["asin"] for it in _items if it.get("asin")]
+    _drr_map = await _compute_drr_for_po_async(db, doc.get("po_date", ""), _asins)
+
     def _fetch():
-        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
-        if not doc:
-            return None, None, None, None
         items = doc.get("items", [])
         po_status = doc.get("po_status", "pending")
-        # frozen statuses + processing: serve stored snapshot; pending: re-fetch live with T-2 cutoff
         use_stored = po_status in FREEZE_ON_STATUS
         enriched, inv_date, zoho_date = _enrich_items(
             items,
@@ -1328,6 +1376,7 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
             db,
             use_stored_stock=use_stored,
             po_date_str=doc.get("po_date"),
+            drr_map=_drr_map,
         )
         # Attach per-item dispatched costs from the linked package (if any)
         pkg_number = doc.get("package_number")
@@ -1339,11 +1388,9 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
                     it["dispatched_qty"] = d["qty"]
                     it["total_cost_dispatched"] = d["item_total"]
                     it["total_cost_dispatched_gst"] = d["item_total_gst"]
-        return doc, enriched, inv_date, zoho_date
+        return enriched, inv_date, zoho_date
 
-    doc, enriched, live_inv_date, live_zoho_date = await asyncio.to_thread(_fetch)
-    if doc is None:
-        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    enriched, live_inv_date, live_zoho_date = await asyncio.to_thread(_fetch)
 
     # Write computed total_cost back to each item in the DB so the list aggregation reflects it.
     def _write_back_costs():
@@ -1671,11 +1718,21 @@ async def update_po_status(po_number: str, po_status: str, db=Depends(get_databa
             status_code=400, detail=f"status must be one of {VALID_STATUSES}"
         )
 
-    def _update():
-        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
-        if not doc:
-            return None
+    def _get_doc():
+        return db[PO_COLLECTION].find_one({"po_number": po_number})
 
+    doc = await asyncio.to_thread(_get_doc)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+
+    # If transitioning to a frozen status, compute DRR using PSR async path before the thread
+    _freeze_drr_map: dict = {}
+    if po_status in FREEZE_ON_STATUS and doc.get("po_status") not in FREEZE_ON_STATUS:
+        _freeze_asins = [it["asin"] for it in doc.get("items", []) if it.get("asin")]
+        if _freeze_asins and doc.get("po_date"):
+            _freeze_drr_map = await _compute_drr_for_po_async(db, doc.get("po_date", ""), _freeze_asins)
+
+    def _update():
         update_fields: dict = {"po_status": po_status, "updated_at": datetime.now()}
 
         # Transitioning into processing or a frozen status: re-enrich with live T-2 data and freeze permanently
@@ -1689,6 +1746,7 @@ async def update_po_status(po_number: str, po_status: str, db=Depends(get_databa
                 db,
                 use_stored_stock=False,
                 po_date_str=doc.get("po_date"),
+                drr_map=_freeze_drr_map,
             )
             update_fields["items"] = enriched
             update_fields["inventory_date"] = inv_date
@@ -1699,9 +1757,7 @@ async def update_po_status(po_number: str, po_status: str, db=Depends(get_databa
         db[PO_COLLECTION].update_one({"po_number": po_number}, {"$set": update_fields})
         return po_status
 
-    result = await asyncio.to_thread(_update)
-    if result is None:
-        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    await asyncio.to_thread(_update)
     return {"po_number": po_number, "po_status": po_status}
 
 
@@ -2143,10 +2199,17 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
 async def download_po_report(po_number: str, db=Depends(get_database)):
     """Download enriched PO report as Excel."""
 
+    def _get_doc():
+        return db[PO_COLLECTION].find_one({"po_number": po_number})
+
+    doc = await asyncio.to_thread(_get_doc)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+
+    _dl_asins = [it["asin"] for it in doc.get("items", []) if it.get("asin")]
+    _dl_drr_map = await _compute_drr_for_po_async(db, doc.get("po_date", ""), _dl_asins)
+
     def _build():
-        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
-        if not doc:
-            return None, None
         po_status = doc.get("po_status", "pending")
         use_stored = po_status in FREEZE_ON_STATUS
         enriched, _, __ = _enrich_items(
@@ -2155,6 +2218,7 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
             db,
             use_stored_stock=use_stored,
             po_date_str=doc.get("po_date"),
+            drr_map=_dl_drr_map,
         )
         # Write back fresh per-item computed fields so the list aggregation stays current
         item_updates = {}
@@ -2166,11 +2230,9 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
             {"po_number": po_number},
             {"$set": item_updates},
         )
-        return doc, enriched
+        return enriched
 
-    doc, enriched = await asyncio.to_thread(_build)
-    if doc is None:
-        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    enriched = await asyncio.to_thread(_build)
 
     excel_bytes = _build_po_excel(doc, enriched)
     po_date_str = doc.get("po_date", "unknown")
@@ -2188,12 +2250,28 @@ async def bulk_download_po_reports(po_numbers: list[str], db=Depends(get_databas
     if not po_numbers:
         raise HTTPException(status_code=400, detail="No PO numbers provided")
 
+    # Fetch all docs first, then compute DRR async in parallel, then enrich
+    def _fetch_docs():
+        return [
+            db[PO_COLLECTION].find_one({"po_number": pn})
+            for pn in po_numbers
+        ]
+
+    raw_docs = await asyncio.to_thread(_fetch_docs)
+    docs = [(pn, doc) for pn, doc in zip(po_numbers, raw_docs) if doc]
+
+    drr_maps = await asyncio.gather(*[
+        _compute_drr_for_po_async(
+            db,
+            doc.get("po_date", ""),
+            [it["asin"] for it in doc.get("items", []) if it.get("asin")],
+        )
+        for _, doc in docs
+    ])
+
     def _build_all():
         results = []
-        for pn in po_numbers:
-            doc = db[PO_COLLECTION].find_one({"po_number": pn})
-            if not doc:
-                continue
+        for (pn, doc), drr_map in zip(docs, drr_maps):
             po_status = doc.get("po_status", "pending")
             use_stored = po_status in FREEZE_ON_STATUS
             enriched, _, __ = _enrich_items(
@@ -2202,6 +2280,7 @@ async def bulk_download_po_reports(po_numbers: list[str], db=Depends(get_databas
                 db,
                 use_stored_stock=use_stored,
                 po_date_str=doc.get("po_date"),
+                drr_map=drr_map,
             )
             results.append((pn, doc.get("po_date", "unknown"), doc, enriched))
         return results
