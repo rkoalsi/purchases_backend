@@ -1,0 +1,465 @@
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
+from fastapi.responses import JSONResponse, StreamingResponse
+from datetime import datetime, timedelta
+from ..database import get_database
+import asyncio
+import io
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Optional
+from pydantic import BaseModel
+import logging
+
+from .amazon import compute_drr_for_asins_sync
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+OVERRIDES_COLLECTION = "vc_under_ordering_overrides"
+SKU_MAPPING_COLLECTION = "amazon_sku_mapping"
+MARGINS_COLLECTION = "vendor_margins"
+INVENTORY_COLLECTION = "amazon_vendor_inventory"
+SALES_COLLECTION = "amazon_vendor_sales"
+ZOHO_STOCK_COLLECTION = "zoho_warehouse_stock"
+
+DEFAULT_LEAD_TIME = 10
+DEFAULT_COVERAGE_DAYS = 35
+
+MONTH_NAMES = {
+    1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+    7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
+}
+
+
+class UnderOrderingOverride(BaseModel):
+    open_po_override: Optional[int] = None
+    lead_time_override: Optional[int] = None
+    coverage_days_override: Optional[int] = None
+    final_units_override: Optional[int] = None
+
+
+def _fetch_data(db) -> tuple:
+    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    drr_start = today - timedelta(days=89)
+    drr_period_label = f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
+
+    # 1. All ASINs from vendor_margins with etrade_asp set
+    margins_docs = list(db[MARGINS_COLLECTION].find(
+        {"etrade_asp": {"$exists": True, "$ne": None}},
+        {"asin": 1, "etrade_asp": 1, "_id": 0},
+    ))
+    asins_with_asp = {d["asin"] for d in margins_docs if d.get("asin")}
+    etrade_asp_by_asin: dict[str, float] = {
+        d["asin"]: float(d["etrade_asp"]) for d in margins_docs if d.get("asin") and d.get("etrade_asp") is not None
+    }
+
+    if not asins_with_asp:
+        return []
+
+    # 2. amazon_sku_mapping for these ASINs
+    sku_docs = list(db[SKU_MAPPING_COLLECTION].find(
+        {"item_id": {"$in": list(asins_with_asp)}},
+        {"item_id": 1, "sku_code": 1, "_id": 0},
+    ))
+    asin_to_sku: dict[str, str] = {d["item_id"]: d["sku_code"] for d in sku_docs if d.get("item_id") and d.get("sku_code")}
+    asins = list(asin_to_sku.keys())
+
+    if not asins:
+        return []
+
+    # 3. Product details by SKU
+    skus = list(set(asin_to_sku.values()))
+    product_by_sku: dict[str, dict] = {}
+    for p in db["products"].find(
+        {"cf_sku_code": {"$in": skus}},
+        {"cf_sku_code": 1, "name": 1, "rate": 1, "status": 1, "purchase_status": 1, "item_id": 1, "_id": 0},
+    ):
+        product_by_sku[p["cf_sku_code"]] = p
+
+    # 4. DRR
+    drr_map: dict = compute_drr_for_asins_sync(db, today, asins)
+
+    # 5. Current inventory with Etrade (latest date from amazon_vendor_inventory)
+    etrade_latest = db[INVENTORY_COLLECTION].find_one(
+        {"asin": {"$in": asins}}, {"date": 1}, sort=[("date", -1)]
+    )
+    etrade_inv_by_asin: dict[str, int] = {}
+    inventory_date_str = ""
+    if etrade_latest:
+        etrade_date = etrade_latest["date"]
+        inventory_date_str = etrade_date.strftime("%d %b %Y") if isinstance(etrade_date, datetime) else str(etrade_date)
+        for doc in db[INVENTORY_COLLECTION].find(
+            {"asin": {"$in": asins}, "date": etrade_date},
+            {"asin": 1, "sellableOnHandInventoryUnits": 1},
+        ):
+            etrade_inv_by_asin[doc["asin"]] = int(doc.get("sellableOnHandInventoryUnits") or 0)
+
+    # 6. Open PO from vendor_purchase_orders
+    #    processing → supply_qty (fallback requested_qty); packed/intransit → accepted_qty
+    open_po_by_asin: dict[str, int] = {}
+    for doc in db["vendor_purchase_orders"].aggregate([
+        {"$match": {"po_status": {"$in": ["processing", "packed", "intransit"]}}},
+        {"$unwind": "$items"},
+        {"$match": {"items.asin": {"$in": asins}}},
+        {"$group": {
+            "_id": "$items.asin",
+            "total": {"$sum": {"$cond": {
+                "if": {"$eq": ["$po_status", "processing"]},
+                "then": {"$ifNull": ["$items.supply_qty", {"$ifNull": ["$items.requested_qty", 0]}]},
+                "else": {"$ifNull": ["$items.accepted_qty", 0]},
+            }}},
+        }},
+    ]):
+        open_po_by_asin[doc["_id"]] = int(doc["total"] or 0)
+
+    # 7. Zoho stock
+    item_id_by_sku: dict[str, str] = {}
+    for p in db["products"].find({"cf_sku_code": {"$in": skus}}, {"cf_sku_code": 1, "item_id": 1, "_id": 0}):
+        item_id_by_sku[p["cf_sku_code"]] = p.get("item_id", "")
+    zoho_item_ids = list({v for v in item_id_by_sku.values() if v})
+    zoho_latest: dict[str, int] = {}
+    zoho_date_str = ""
+    if zoho_item_ids:
+        latest_zoho_date = None
+        for doc in db[ZOHO_STOCK_COLLECTION].aggregate([
+            {"$match": {"zoho_item_id": {"$in": zoho_item_ids}}},
+            {"$sort": {"date": -1}},
+            {"$group": {"_id": "$zoho_item_id", "warehouses": {"$first": "$warehouses"}, "date": {"$first": "$date"}}},
+        ]):
+            wh = doc.get("warehouses", {})
+            zoho_latest[doc["_id"]] = int(sum(v for v in wh.values() if isinstance(v, (int, float)))) if isinstance(wh, dict) else 0
+            d = doc.get("date")
+            if d and (latest_zoho_date is None or d > latest_zoho_date):
+                latest_zoho_date = d
+        if latest_zoho_date:
+            zoho_date_str = latest_zoho_date.strftime("%-d %b %Y") if isinstance(latest_zoho_date, datetime) else str(latest_zoho_date)
+
+    # 8. Monthly sales — last 4 calendar months from amazon_vendor_sales
+    months: list[tuple[int, int]] = []
+    ref = today.replace(day=1)
+    for _ in range(4):
+        ref = (ref - timedelta(days=1)).replace(day=1)
+        months.append((ref.year, ref.month))
+    months.reverse()
+
+    def month_bounds(y: int, m: int):
+        s = datetime(y, m, 1)
+        e = datetime(y + 1, 1, 1) if m == 12 else datetime(y, m + 1, 1)
+        return s, e
+
+    monthly_sales: dict[str, dict] = {a: {} for a in asins}
+    for (y, m) in months:
+        label = f"{MONTH_NAMES[m]} {y}"
+        ms, me = month_bounds(y, m)
+        for doc in db[SALES_COLLECTION].aggregate([
+            {"$match": {"asin": {"$in": asins}, "date": {"$gte": ms, "$lt": me}}},
+            {"$group": {"_id": "$asin", "total": {"$sum": "$orderedUnits"}}},
+        ]):
+            monthly_sales[doc["_id"]][label] = int(doc["total"] or 0)
+
+    month_labels = [f"{MONTH_NAMES[m]} {y}" for (y, m) in months]
+
+    # 9. Load overrides
+    overrides: dict[str, dict] = {}
+    for doc in db[OVERRIDES_COLLECTION].find({"asin": {"$in": asins}}):
+        overrides[doc["asin"]] = doc
+
+    # 10. Assemble rows
+    rows = []
+    for asin in sorted(asins):
+        sku = asin_to_sku.get(asin, "")
+        prod = product_by_sku.get(sku, {})
+        override = overrides.get(asin, {})
+
+        drr_info = drr_map.get(asin, {})
+        drr_val = drr_info.get("drr") if isinstance(drr_info, dict) else None
+        drr_flag = drr_info.get("drr_flag", "") if isinstance(drr_info, dict) else ""
+        try:
+            drr = float(drr_val) if drr_val is not None and str(drr_val) not in ("No data", "No stock") else 0.0
+        except (TypeError, ValueError):
+            drr = 0.0
+
+        current_inv = etrade_inv_by_asin.get(asin, 0)
+        open_po_auto = open_po_by_asin.get(asin, 0)
+        open_po_override = override.get("open_po_override")
+        open_po = open_po_override if open_po_override is not None else open_po_auto
+        total_inv = current_inv + open_po
+
+        net_total_days = round(total_inv / drr, 2) if drr > 0 else None
+
+        lead_time = override.get("lead_time_override") if override.get("lead_time_override") is not None else DEFAULT_LEAD_TIME
+        coverage_days = override.get("coverage_days_override") if override.get("coverage_days_override") is not None else DEFAULT_COVERAGE_DAYS
+        total_target_days = lead_time + coverage_days
+        target_stock = int(
+            (Decimal(str(drr)) * Decimal(str(total_target_days))).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        ) if drr > 0 else 0
+
+        # Final Units (under-ordering formula)
+        final_units_override = override.get("final_units_override")
+        if final_units_override is not None:
+            final_units = final_units_override
+        elif drr > 0 and net_total_days is not None:
+            if net_total_days < lead_time:
+                final_units = int(
+                    (Decimal(str(drr)) * Decimal(str(total_target_days))).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+                )
+            elif net_total_days > total_target_days:
+                final_units = 0
+            else:
+                diff = Decimal(str(total_target_days)) - Decimal(str(net_total_days))
+                final_units = int(diff * Decimal(str(drr)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        else:
+            final_units = None
+
+        item_id = item_id_by_sku.get(sku, "")
+        zoho_stock = zoho_latest.get(item_id, 0)
+
+        rows.append({
+            "asin": asin,
+            "sku_code": sku,
+            "item_name": prod.get("name", ""),
+            "current_inv": current_inv,
+            "open_po": open_po,
+            "open_po_auto": open_po_auto,
+            "open_po_overridden": open_po_override is not None,
+            "total_inv": total_inv,
+            "drr": round(drr, 2),
+            "drr_flag": drr_flag,
+            "net_total_days": net_total_days,
+            "lead_time": lead_time,
+            "lead_time_overridden": override.get("lead_time_override") is not None,
+            "coverage_days": coverage_days,
+            "coverage_days_overridden": override.get("coverage_days_override") is not None,
+            "total_target_days": total_target_days,
+            "target_stock": target_stock,
+            "final_units": final_units,
+            "final_units_overridden": final_units_override is not None,
+            "zoho_stock": zoho_stock,
+            "status": prod.get("purchase_status") or prod.get("status") or "",
+            "etrade_asp": etrade_asp_by_asin.get(asin),
+            "monthly_sales": monthly_sales.get(asin, {}),
+            "month_labels": month_labels,
+        })
+
+    return rows, inventory_date_str, drr_period_label, zoho_date_str
+
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
+@router.get("/data")
+async def get_data(db=Depends(get_database)):
+    try:
+        result, inv_date, drr_period, zoho_date = await asyncio.to_thread(_fetch_data, db)
+        return JSONResponse({"rows": result, "inventory_date": inv_date, "drr_period": drr_period, "zoho_date": zoho_date})
+    except Exception as e:
+        logger.error(f"VC under ordering data error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/overrides/{asin}")
+async def save_override(asin: str, body: UnderOrderingOverride, db=Depends(get_database)):
+    update: dict = {}
+    if body.open_po_override is not None:
+        update["open_po_override"] = body.open_po_override
+    if body.lead_time_override is not None:
+        update["lead_time_override"] = body.lead_time_override
+    if body.coverage_days_override is not None:
+        update["coverage_days_override"] = body.coverage_days_override
+    if body.final_units_override is not None:
+        update["final_units_override"] = body.final_units_override
+
+    await asyncio.to_thread(
+        lambda: db[OVERRIDES_COLLECTION].update_one(
+            {"asin": asin},
+            {"$set": {"asin": asin, **update}},
+            upsert=True,
+        )
+    )
+    return JSONResponse({"ok": True})
+
+
+@router.delete("/overrides/{asin}/{field}")
+async def clear_override(asin: str, field: str, db=Depends(get_database)):
+    allowed = {"open_po_override", "lead_time_override", "coverage_days_override", "final_units_override"}
+    if field not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid field")
+    await asyncio.to_thread(
+        lambda: db[OVERRIDES_COLLECTION].update_one({"asin": asin}, {"$unset": {field: ""}})
+    )
+    return JSONResponse({"ok": True})
+
+
+@router.get("/download")
+async def download_xlsx(db=Depends(get_database)):
+    try:
+        result, inv_date, drr_period, zoho_date = await asyncio.to_thread(_fetch_data, db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Under-ordering (For All ASINs)"
+
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    editable_fill = PatternFill("solid", fgColor="FFF2CC")
+    header_font = Font(bold=True, color="FFFFFF", size=10)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    month_labels = result[0]["month_labels"] if result else []
+    inv_label = f"Current Inv\n(Etrade{(' – ' + inv_date) if inv_date else ''})"
+    drr_label = f"DRR\n({drr_period})" if drr_period else "DRR"
+    zoho_label = f"Zoho Stock\n({zoho_date})" if zoho_date else "Zoho Stock"
+    static_headers = [
+        "ASIN", "SKU Code", "Item Name",
+        inv_label, "Open PO Qty",
+        "Total Inventory\n(Current Inv + Open PO)",
+        drr_label, "Net Total Days",
+        "Lead Time ✎", "Coverage Days ✎",
+        "Total Target Days", "Target Stock",
+        "Final Units\n(For under-ordering) ✎",
+        zoho_label, "Status",
+    ]
+    headers = static_headers + month_labels
+
+    # Row 1: editable hint
+    editable_cols = [9, 10, 13]  # Lead Time, Coverage Days, Final Units (1-indexed)
+    hint_row = [""] * len(headers)
+    for c in editable_cols:
+        hint_row[c - 1] = "Keep this editable"
+    ws.append(hint_row)
+    for i, val in enumerate(hint_row, 1):
+        cell = ws.cell(row=1, column=i)
+        if val:
+            cell.fill = editable_fill
+            cell.font = Font(bold=True, size=9)
+            cell.alignment = center
+
+    # Row 2: headers
+    ws.append(headers)
+    for i, h in enumerate(headers, 1):
+        cell = ws.cell(row=2, column=i)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+
+    # Data rows
+    for row in result:
+        ms = row.get("monthly_sales", {})
+        data_row = [
+            row["asin"],
+            row["sku_code"],
+            row["item_name"],
+            row["current_inv"],
+            row["open_po"],
+            row["total_inv"],
+            row["drr"] if row["drr"] else row.get("drr_flag", ""),
+            row["net_total_days"] if row["net_total_days"] is not None else "",
+            row["lead_time"],
+            row["coverage_days"],
+            row["total_target_days"],
+            row["target_stock"],
+            row["final_units"] if row["final_units"] is not None else "",
+            row["zoho_stock"],
+            row["status"],
+        ] + [ms.get(lbl, 0) for lbl in month_labels]
+        ws.append(data_row)
+
+    # Column widths
+    col_widths = [14, 14, 40, 12, 10, 12, 8, 10, 10, 12, 12, 12, 14, 10, 12] + [12] * len(month_labels)
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.row_dimensions[2].height = 36
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=vc_under_ordering.xlsx"},
+    )
+
+
+@router.post("/upload")
+async def upload_overrides(file: UploadFile = File(...), db=Depends(get_database)):
+    """Bulk update overrides from Excel. Expected columns: ASIN, Open PO Qty, Lead Time, Coverage Days, Final Units."""
+    content = await file.read()
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+        ws = wb.active
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Excel file")
+
+    # Find header row (look for ASIN column)
+    header_row_idx = None
+    headers: dict[str, int] = {}
+    for r_idx, row in enumerate(ws.iter_rows(values_only=True), 1):
+        row_lower = [str(c).strip().lower() if c is not None else "" for c in row]
+        if "asin" in row_lower:
+            header_row_idx = r_idx
+            for c_idx, val in enumerate(row_lower):
+                headers[val] = c_idx
+            break
+
+    if header_row_idx is None:
+        raise HTTPException(status_code=400, detail="Could not find ASIN header row")
+
+    def _col(name: str) -> Optional[int]:
+        for k, v in headers.items():
+            if name in k:
+                return v
+        return None
+
+    col_asin = _col("asin")
+    col_open_po = _col("open po")
+    col_lead = _col("lead time")
+    col_cover = _col("coverage")
+    col_final = _col("final units")
+
+    if col_asin is None:
+        raise HTTPException(status_code=400, detail="ASIN column not found")
+
+    def _safe_int(val):
+        try:
+            return int(float(val))
+        except (TypeError, ValueError):
+            return None
+
+    updated = 0
+    ops = []
+    for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+        asin = str(row[col_asin]).strip() if row[col_asin] else None
+        if not asin or asin.lower() in ("none", "asin", ""):
+            continue
+
+        upd: dict = {}
+        if col_open_po is not None:
+            v = _safe_int(row[col_open_po])
+            if v is not None:
+                upd["open_po_override"] = v
+        if col_lead is not None:
+            v = _safe_int(row[col_lead])
+            if v is not None:
+                upd["lead_time_override"] = v
+        if col_cover is not None:
+            v = _safe_int(row[col_cover])
+            if v is not None:
+                upd["coverage_days_override"] = v
+        if col_final is not None:
+            v = _safe_int(row[col_final])
+            if v is not None:
+                upd["final_units_override"] = v
+
+        if upd:
+            ops.append({"asin": asin, **upd})
+            updated += 1
+
+    def _do_upserts():
+        for op in ops:
+            a = op.pop("asin")
+            db[OVERRIDES_COLLECTION].update_one({"asin": a}, {"$set": {"asin": a, **op}}, upsert=True)
+
+    await asyncio.to_thread(_do_upserts)
+    return JSONResponse({"updated": updated})
