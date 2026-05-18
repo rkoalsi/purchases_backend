@@ -302,75 +302,105 @@ async def download_xlsx(db=Depends(get_database)):
     ws = wb.active
     ws.title = "Under-ordering (For All ASINs)"
 
-    header_fill = PatternFill("solid", fgColor="1F4E79")
-    editable_fill = PatternFill("solid", fgColor="FFF2CC")
-    header_font = Font(bold=True, color="FFFFFF", size=10)
-    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    header_fill  = PatternFill("solid", fgColor="1F4E79")
+    formula_fill  = PatternFill("solid", fgColor="D6EAF8")   # light blue — auto formula
+    header_font  = Font(bold=True, color="FFFFFF", size=10)
+    center       = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left_wrap    = Alignment(horizontal="left",   vertical="top",    wrap_text=True)
 
     month_labels = result[0]["month_labels"] if result else []
-    inv_label = f"Current Inv\n(Etrade{(' – ' + inv_date) if inv_date else ''})"
-    drr_label = f"DRR\n({drr_period})" if drr_period else "DRR"
+    inv_label  = f"Current Inv\n(Etrade{(' – ' + inv_date) if inv_date else ''})"
+    drr_label  = f"DRR\n({drr_period})" if drr_period else "DRR"
     zoho_label = f"Zoho Stock\n({zoho_date})" if zoho_date else "Zoho Stock"
-    static_headers = [
+
+    # Column layout (1-indexed):
+    # A=1 ASIN  B=2 SKU  C=3 Item Name  D=4 Curr Inv  E=5 Open PO
+    # F=6 Total Inv (formula)  G=7 DRR  H=8 Net Days (formula)
+    # I=9 Lead Time  J=10 Coverage Days
+    # K=11 Total Target Days (formula)  L=12 Target Stock (formula)
+    # M=13 Final Units (formula or override)
+    # N=14 Zoho Stock  O=15 Status  P+ monthly sales
+
+    headers = [
         "ASIN", "SKU Code", "Item Name",
         inv_label, "Open PO Qty",
-        "Total Inventory\n(Current Inv + Open PO)",
-        drr_label, "Net Total Days",
-        "Lead Time ✎", "Coverage Days ✎",
-        "Total Target Days", "Target Stock",
-        "Final Units\n(For under-ordering) ✎",
+        "Total Inventory\n(=Curr Inv + Open PO)",
+        drr_label, "Net Total Days\n(=Total Inv ÷ DRR)",
+        "Lead Time", "Coverage Days",
+        "Total Target Days\n(=Lead + Coverage)",
+        "Target Stock\n(=DRR × Total Target Days)",
+        "Final Units\n(under-ordering formula)",
         zoho_label, "Status",
-    ]
-    headers = static_headers + month_labels
+    ] + month_labels
 
-    # Row 1: editable hint
-    editable_cols = [9, 10, 13]  # Lead Time, Coverage Days, Final Units (1-indexed)
-    hint_row = [""] * len(headers)
-    for c in editable_cols:
-        hint_row[c - 1] = "Keep this editable"
-    ws.append(hint_row)
-    for i, val in enumerate(hint_row, 1):
-        cell = ws.cell(row=1, column=i)
-        if val:
-            cell.fill = editable_fill
-            cell.font = Font(bold=True, size=9)
-            cell.alignment = center
-
-    # Row 2: headers
-    ws.append(headers)
-    for i, h in enumerate(headers, 1):
-        cell = ws.cell(row=2, column=i)
-        cell.fill = header_fill
-        cell.font = header_font
+    # Row 1: headers
+    for col_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.value     = h
+        cell.fill      = header_fill
+        cell.font      = header_font
         cell.alignment = center
+    ws.row_dimensions[1].height = 48
 
-    # Data rows
-    for row in result:
+    # Data rows — formula cells use Excel formulas
+    DATA_START = 2
+    for row_offset, row in enumerate(result):
+        r = DATA_START + row_offset
         ms = row.get("monthly_sales", {})
-        data_row = [
-            row["asin"],
-            row["sku_code"],
-            row["item_name"],
-            row["current_inv"],
-            row["open_po"],
-            row["total_inv"],
-            row["drr"] if row["drr"] else row.get("drr_flag", ""),
-            row["net_total_days"] if row["net_total_days"] is not None else "",
-            row["lead_time"],
-            row["coverage_days"],
-            row["total_target_days"],
-            row["target_stock"],
-            row["final_units"] if row["final_units"] is not None else "",
-            row["zoho_stock"],
-            row["status"],
-        ] + [ms.get(lbl, 0) for lbl in month_labels]
-        ws.append(data_row)
+
+        # Static / input columns
+        ws.cell(r, 1,  row["asin"])
+        ws.cell(r, 2,  row["sku_code"])
+        ws.cell(r, 3,  row["item_name"]).alignment = left_wrap
+        ws.cell(r, 4,  row["current_inv"])
+        ws.cell(r, 5,  row["open_po"])
+
+        # F: Total Inventory = Current Inv + Open PO
+        ws.cell(r, 6,  f"=D{r}+E{r}").fill = formula_fill
+
+        # G: DRR (algorithmically computed — raw value)
+        ws.cell(r, 7,  row["drr"] if row["drr"] else row.get("drr_flag", ""))
+
+        # H: Net Total Days = Total Inv / DRR  (blank if DRR=0)
+        ws.cell(r, 8,  f'=IF(G{r}=0,"",ROUND(F{r}/G{r},2))').fill = formula_fill
+
+        # I, J: Lead Time, Coverage Days (editable)
+        ws.cell(r, 9,  row["lead_time"])
+        ws.cell(r, 10, row["coverage_days"])
+
+        # K: Total Target Days = Lead Time + Coverage Days
+        ws.cell(r, 11, f"=I{r}+J{r}").fill = formula_fill
+
+        # L: Target Stock = DRR × Total Target Days
+        ws.cell(r, 12, f"=IF(G{r}=0,0,ROUND(G{r}*K{r},0))").fill = formula_fill
+
+        # M: Final Units — keep override as hard value; otherwise use under-ordering formula:
+        #   if DRR=0          → ""
+        #   if Net Days < LT  → DRR × TotalTargetDays   (urgent: order full cover)
+        #   if Net Days > TTD → 0                         (well stocked)
+        #   else              → (TotalTargetDays - NetDays) × DRR
+        if row.get("final_units_overridden") and row.get("final_units") is not None:
+            ws.cell(r, 13, row["final_units"])
+        else:
+            ws.cell(r, 13,
+                f'=IF(G{r}=0,"",'
+                f'IF(H{r}<I{r},ROUND(G{r}*K{r},0),'
+                f'IF(H{r}>K{r},0,'
+                f'MAX(0,ROUND((K{r}-H{r})*G{r},0)))))'
+            ).fill = formula_fill
+
+        # N, O: Zoho Stock, Status
+        ws.cell(r, 14, row["zoho_stock"])
+        ws.cell(r, 15, row["status"])
+
+        # Monthly sales
+        for lbl_idx, lbl in enumerate(month_labels):
+            ws.cell(r, 16 + lbl_idx, ms.get(lbl, 0))
 
     # Column widths
-    col_widths = [14, 14, 40, 12, 10, 12, 8, 10, 10, 12, 12, 12, 14, 10, 12] + [12] * len(month_labels)
+    col_widths = [14, 14, 42, 12, 10, 14, 10, 14, 10, 12, 16, 18, 18, 10, 12] + [12] * len(month_labels)
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
-    ws.row_dimensions[2].height = 36
 
     buf = io.BytesIO()
     wb.save(buf)
