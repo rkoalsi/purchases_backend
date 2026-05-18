@@ -675,13 +675,10 @@ def _enrich_items(
         # For frozen POs (processing/packed/closed), pricing was established at upload time.
         # Use the stored values so costs stay consistent with the Zoho estimate created then.
         if effective_use_stored:
-            stored_etrade_asp = item.get("etrade_asp")
             stored_mrp_wo_gst = item.get("mrp_wo_gst")
             stored_gst = item.get("gst")
             stored_margin = item.get("margin")
             stored_cost_price = item.get("cost_price_wo_tax")
-            if stored_etrade_asp is not None:
-                etrade_asp = stored_etrade_asp
             if stored_mrp_wo_gst is not None:
                 mrp_wo_gst = stored_mrp_wo_gst
             if stored_gst is not None:
@@ -859,7 +856,7 @@ def _enrich_items(
                 "accepted_qty": accepted_qty,
                 "received_qty": received_qty,
                 "zoho_mrp": mrp,
-                "etrade_asp": etrade_asp,
+                "etrade_asp": etrade_asp_by_asin.get(asin),
                 "gst": gst,
                 "mrp_wo_gst": mrp_wo_gst,
                 "margin": margin,
