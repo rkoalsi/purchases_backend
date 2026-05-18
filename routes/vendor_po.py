@@ -374,7 +374,7 @@ async def _compute_drr_for_po_async(db, po_date_str: str, asins: list[str]) -> d
     except ValueError:
         return {}
     # Use same 30-day window as a typical PSR run ending on the PO date
-    start_date = (po_dt - timedelta(days=29)).strftime("%Y-%m-%d")
+    start_date = (po_dt - timedelta(days=30)).strftime("%Y-%m-%d")
     report = await generate_report_by_date_range(start_date, po_date_str, db, report_type="all")
     asin_set = set(asins)
     result = {
