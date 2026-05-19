@@ -28,9 +28,10 @@ logger = logging.getLogger(__name__)
 class ReportRequest(BaseModel):
     start_date: str
     end_date: str
-    brand: str
-    exclude_customers: bool
+    brand: str = ""  # empty = all brands
+    exclude_customers: bool = False
     min_quantity: float = None
+    report_type: str = "customer"  # "customer" or "transfer_order"
 
     @validator("start_date", "end_date")
     def validate_date_format(cls, v):
@@ -74,6 +75,7 @@ EXCLUDED_CUSTOMERS_LIST = [
     "KIRANAKART (Bhiwandi)",
     "KIRANAKART (Bangalore)",
     "Pupscribe Enterprises Private Limited (Blinkit)",
+    "(SPUR) Staff purchase",
 ]
 
 router = APIRouter()
@@ -270,7 +272,9 @@ def update_purchase_status(item_id: str, body: PurchaseStatusUpdate):
         )
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Product not found")
-        return JSONResponse(content={"success": True, "purchase_status": body.purchase_status})
+        return JSONResponse(
+            content={"success": True, "purchase_status": body.purchase_status}
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -334,17 +338,19 @@ def get_composite_products(
             list(collection.find(query_filter).sort("name", 1).skip(skip).limit(limit))
         )
 
-        return JSONResponse(content={
-            "items": items,
-            "pagination": {
-                "currentPage": page,
-                "totalPages": total_pages,
-                "totalItems": total_count,
-                "limit": limit,
-                "hasNextPage": page < total_pages,
-                "hasPrevPage": page > 1,
-            },
-        })
+        return JSONResponse(
+            content={
+                "items": items,
+                "pagination": {
+                    "currentPage": page,
+                    "totalPages": total_pages,
+                    "totalItems": total_count,
+                    "limit": limit,
+                    "hasNextPage": page < total_pages,
+                    "hasPrevPage": page > 1,
+                },
+            }
+        )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -670,50 +676,52 @@ _cache_lock = threading.Lock()
 def get_item_names_by_brand(db, brand: str) -> List[str]:
     """
     Cached version of item name lookup with TTL for better performance.
+    Pass empty string to get all item names across all brands.
     """
     current_time = datetime.now().timestamp()
 
+    cache_key = brand if brand else "__all__"
     with _cache_lock:
-        if brand in _item_name_cache:  # Change cache name
-            cache_entry = _item_name_cache[brand]
+        if cache_key in _item_name_cache:
+            cache_entry = _item_name_cache[cache_key]
             if current_time - cache_entry["timestamp"] < _cache_ttl:
-                logger.info(f"Using cached item names for brand {brand}")
+                logger.info(f"Using cached item names for brand '{brand or 'all'}'")
                 return cache_entry["item_names"]
 
     # Fetch from database
     try:
         products_collection = db.get_collection(PRODUCTS_COLLECTION)
 
+        match_stage = {"$match": {"brand": brand}} if brand else {"$match": {}}
         pipeline = [
-            {"$match": {"brand": brand}},
-            {"$project": {"name": 1, "_id": 0}},  # Get item names instead of SKUs
+            match_stage,
+            {"$project": {"name": 1, "_id": 0}},
             {"$group": {"_id": None, "item_names": {"$addToSet": "$name"}}},
         ]
 
         result = list(products_collection.aggregate(pipeline))
 
         if result and "item_names" in result[0]:
-            item_names = result[0]["item_names"]
-            # Filter out None/null values
-            item_names = [name for name in item_names if name is not None]
+            item_names = [name for name in result[0]["item_names"] if name is not None]
 
-            # Cache the result
             with _cache_lock:
-                _item_name_cache[brand] = {
+                _item_name_cache[cache_key] = {
                     "item_names": item_names,
                     "timestamp": current_time,
                 }
 
-            logger.info(f"Found {len(item_names)} item names for brand {brand}")
+            logger.info(
+                f"Found {len(item_names)} item names for brand '{brand or 'all'}'"
+            )
             return item_names
         else:
-            logger.warning(f"No item names found for brand {brand}")
+            logger.warning(f"No item names found for brand '{brand or 'all'}'")
             return []
 
     except Exception as e:
-        logger.error(f"Error getting item names for brand {brand}: {e}")
+        logger.error(f"Error getting item names for brand '{brand}': {e}")
         raise HTTPException(
-            status_code=500, detail=f"Error retrieving item names for brand {brand}"
+            status_code=500, detail=f"Error retrieving item names for brand '{brand}'"
         )
 
 
@@ -723,12 +731,17 @@ def query_invoices_for_item_names(
     start_date: datetime,
     end_date: datetime,
     exclude_customers: bool,
+    report_type: str = "customer",
+    include_brand: bool = False,
 ) -> List[dict]:
     """
-    Query invoices by matching item names directly - much simpler!
+    Query invoices by matching item names.
+    report_type="transfer_order" filters to only internal/excluded customers.
+    report_type="customer" with exclude_customers=True filters them out.
     """
     try:
         invoices_collection = db.get_collection(INVOICES_COLLECTION)
+        products_collection = db.get_collection(PRODUCTS_COLLECTION)
 
         base_match: dict = {
             "$expr": {
@@ -740,15 +753,20 @@ def query_invoices_for_item_names(
             "status": {"$nin": ["draft", "void"]},
             "line_items": {"$elemMatch": {"name": {"$in": item_names}}},
         }
-        if exclude_customers:
-            base_match["customer_name"] = {"$nin": EXCLUDED_CUSTOMERS_LIST}
-        match_statement = {"$match": base_match}
 
-        # Simplified aggregation pipeline
+        if report_type == "transfer_order":
+            base_match["$or"] = [
+                {"customer_name": {"$in": []}},
+                {"customer_name": {"$regex": "pupscribe", "$options": "i"}},
+            ]
+        elif exclude_customers:
+            base_match["$nor"] = [
+                {"customer_name": {"$in": EXCLUDED_CUSTOMERS_LIST}},
+                {"customer_name": {"$regex": "pupscribe", "$options": "i"}},
+            ]
+
         pipeline = [
-            # Stage 1: Match documents
-            match_statement,
-            # Stage 2: Filter line items to only matching ones
+            {"$match": base_match},
             {
                 "$addFields": {
                     "_matchingItems": {
@@ -760,50 +778,68 @@ def query_invoices_for_item_names(
                     }
                 }
             },
-            # Stage 3: Unwind matching items
             {"$unwind": "$_matchingItems"},
-            # Stage 4: Project final fields - much simpler!
             {
                 "$project": {
                     "_id": 1,
                     "customer_name": 1,
+                    "invoice_status": "$status",
                     "created_date_str": "$created_date",
                     "created_at": 1,
                     "quantity": "$_matchingItems.quantity",
+                    "item_total": "$_matchingItems.item_total",
                     "item_name": "$_matchingItems.name",
                     "sku_code": {
                         "$ifNull": [
-                            "$_matchingItems.sku",  # Try direct SKU field first
+                            "$_matchingItems.sku",
                             {
                                 "$arrayElemAt": [
                                     "$_matchingItems.item_custom_fields.value",
                                     0,
                                 ]
-                            },  # Fallback to custom fields if available
+                            },
                         ]
                     },
                 }
             },
         ]
 
-        logger.info(f"Executing item name aggregation for {len(item_names)} items")
+        logger.info(
+            f"Executing item name aggregation for {len(item_names)} items (report_type={report_type})"
+        )
         results = list(invoices_collection.aggregate(pipeline, allowDiskUse=True))
-        logger.info(f"Found {len(results)} total matching invoices for all items")
+        logger.info(f"Found {len(results)} total matching line items")
 
-        # Process results
+        # Batch-load product info (brand, status, purchase_status) by item name
+        result_item_names = list(
+            {doc.get("item_name") for doc in results if doc.get("item_name")}
+        )
+        product_docs = list(
+            products_collection.find(
+                {"name": {"$in": result_item_names}},
+                {"name": 1, "brand": 1, "status": 1, "purchase_status": 1, "_id": 0},
+            )
+        )
+        product_info = {p["name"]: p for p in product_docs}
+
         all_results = []
         for doc in results:
-            all_results.append(
-                {
-                    "Invoice ID": str(doc["_id"]),
-                    "Customer": doc.get("customer_name", "N/A"),
-                    "Item": doc.get("item_name", "N/A"),
-                    "Quantity": doc.get("quantity", 0),
-                    "Created Date (DB String)": doc.get("created_date_str", "N/A"),
-                    "Created At (Timestamp)": doc.get("created_at", "N/A"),
-                    "SKU": doc.get("sku_code", "N/A"),
-                }
-            )
+            item_name = doc.get("item_name", "N/A")
+            product = product_info.get(item_name, {})
+            row = {
+                "SKU Code": doc.get("sku_code", "N/A"),
+                "Item": item_name,
+                "Customer": doc.get("customer_name", "N/A"),
+                "Quantity": doc.get("quantity", 0),
+                "Total Amount": doc.get("item_total", 0),
+                "Status": product.get("status", "N/A"),
+                "Purchase Status": product.get("purchase_status", "N/A"),
+                "Invoice ID": str(doc["_id"]),
+                "Created Date": doc.get("created_date_str", "N/A"),
+            }
+            if include_brand:
+                row["Brand"] = product.get("brand", "N/A")
+            all_results.append(row)
 
         return all_results
 
@@ -826,28 +862,30 @@ def create_excel_file(data: List[dict]) -> io.BytesIO:
 
         # For large datasets, process in parallel
         if len(data) > 10000:
-            # Split data into chunks for parallel processing
-            chunk_size = len(data) // 4  # 4 chunks
+            chunk_size = len(data) // 4
             chunks = [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
-
-            # Process chunks in parallel
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 df_chunks = list(executor.map(pd.DataFrame, chunks))
-
-            # Combine chunks
             df = pd.concat(df_chunks, ignore_index=True)
         else:
-            # For smaller datasets, process normally
             df = pd.DataFrame(data)
 
-        # Format timestamp column if it exists
-        if "Created At (Timestamp)" in df.columns and not df.empty:
-            if pd.api.types.is_datetime64_any_dtype(df["Created At (Timestamp)"]):
-                df["Created At (Timestamp)"] = df["Created At (Timestamp)"].dt.strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-            else:
-                df["Created At (Timestamp)"] = df["Created At (Timestamp)"].astype(str)
+        # Enforce column order: SKU Code first, then rest
+        desired_order = [
+            "SKU Code",
+            "Item",
+            "Customer",
+            "Brand",
+            "Quantity",
+            "Total Amount",
+            "Status",
+            "Purchase Status",
+            "Invoice ID",
+            "Created Date",
+        ]
+        ordered_cols = [c for c in desired_order if c in df.columns]
+        extra_cols = [c for c in df.columns if c not in desired_order]
+        df = df[ordered_cols + extra_cols]
 
         # Create Excel file in memory
         excel_buffer = io.BytesIO()
@@ -891,21 +929,28 @@ def generate_invoice_report(
         start_date = datetime.strptime(request.start_date, "%Y-%m-%d")
         end_date = datetime.strptime(request.end_date, "%Y-%m-%d")
 
-        # STEP 1: Get item names instead of SKUs
+        # STEP 1: Get item names (empty brand = all brands)
         item_name_start = datetime.now()
         item_names = get_item_names_by_brand(db, request.brand)
         item_name_duration = (datetime.now() - item_name_start).total_seconds()
         logger.info(f"Item name lookup took {item_name_duration:.2f} seconds")
 
         if not item_names:
-            raise HTTPException(
-                status_code=404, detail=f"No items found for brand '{request.brand}'"
-            )
+            label = request.brand or "all brands"
+            raise HTTPException(status_code=404, detail=f"No items found for '{label}'")
+
+        include_brand = not request.brand  # show Brand column when all brands selected
 
         # STEP 2: Query invoices by item names
         query_start = datetime.now()
         invoice_data = query_invoices_for_item_names(
-            db, item_names, start_date, end_date, request.exclude_customers
+            db,
+            item_names,
+            start_date,
+            end_date,
+            request.exclude_customers,
+            request.report_type,
+            include_brand,
         )
         query_duration = (datetime.now() - query_start).total_seconds()
         logger.info(f"Invoice query took {query_duration:.2f} seconds")
@@ -919,10 +964,13 @@ def generate_invoice_report(
         if request.min_quantity is not None and request.min_quantity > 0:
             before_count = len(invoice_data)
             invoice_data = [
-                row for row in invoice_data
+                row
+                for row in invoice_data
                 if float(row.get("Quantity", 0)) >= request.min_quantity
             ]
-            logger.info(f"Min quantity filter ({request.min_quantity}): {before_count} -> {len(invoice_data)} rows")
+            logger.info(
+                f"Min quantity filter ({request.min_quantity}): {before_count} -> {len(invoice_data)} rows"
+            )
 
             if not invoice_data:
                 raise HTTPException(
@@ -938,7 +986,11 @@ def generate_invoice_report(
 
         # Generate filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"invoice_report_{request.brand}_{timestamp}.xlsx"
+        brand_label = request.brand or "all_brands"
+        report_label = (
+            "transfer_order" if request.report_type == "transfer_order" else "invoice"
+        )
+        filename = f"{report_label}_report_{brand_label}_{request.start_date}_to_{request.end_date}_{timestamp}.xlsx"
 
         total_duration = (datetime.now() - start_time).total_seconds()
         logger.info(
@@ -1344,10 +1396,17 @@ async def fetch_stock_data_for_items_batch(
         # Build period_index switch branches using datetime comparison
         period_branches = []
         for i, (p_start, p_end) in enumerate(periods):
-            period_branches.append({
-                "case": {"$and": [{"$gte": ["$date", p_start]}, {"$lte": ["$date", p_end]}]},
-                "then": i,
-            })
+            period_branches.append(
+                {
+                    "case": {
+                        "$and": [
+                            {"$gte": ["$date", p_start]},
+                            {"$lte": ["$date", p_end]},
+                        ]
+                    },
+                    "then": i,
+                }
+            )
 
         pipeline = [
             {
@@ -1385,9 +1444,7 @@ async def fetch_stock_data_for_items_batch(
                 "$group": {
                     "_id": {"item_id": "$zoho_item_id", "period": "$period_index"},
                     "total_days_in_stock": {
-                        "$sum": {
-                            "$cond": [{"$gt": ["$pupscribe_stock", 0]}, 1, 0]
-                        }
+                        "$sum": {"$cond": [{"$gt": ["$pupscribe_stock", 0]}, 1, 0]}
                     },
                 }
             },
@@ -1461,7 +1518,9 @@ async def fetch_zoho_lookback_sales_batch(
         # Build custom pipeline that carries doc_date through composite expansion
         # so we can bucket results by period_index
         cn_start = datetime.strptime(overall_start_str, "%Y-%m-%d")
-        cn_end = datetime.strptime(overall_end_str, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+        cn_end = datetime.strptime(overall_end_str, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59
+        )
 
         invoice_match = {
             "$match": {
@@ -1487,10 +1546,17 @@ async def fetch_zoho_lookback_sales_batch(
         for i, (p_start, p_end) in enumerate(periods):
             ps = p_start.strftime("%Y-%m-%d")
             pe = p_end.strftime("%Y-%m-%d")
-            period_branches.append({
-                "case": {"$and": [{"$gte": ["$doc_date", ps]}, {"$lte": ["$doc_date", pe]}]},
-                "then": i,
-            })
+            period_branches.append(
+                {
+                    "case": {
+                        "$and": [
+                            {"$gte": ["$doc_date", ps]},
+                            {"$lte": ["$doc_date", pe]},
+                        ]
+                    },
+                    "then": i,
+                }
+            )
 
         custom_pipeline = [
             invoice_match,
@@ -1508,7 +1574,12 @@ async def fetch_zoho_lookback_sales_batch(
                                     "$cond": {
                                         "if": {"$eq": [{"$type": "$date"}, "string"]},
                                         "then": "$date",
-                                        "else": {"$dateToString": {"format": "%Y-%m-%d", "date": "$date"}},
+                                        "else": {
+                                            "$dateToString": {
+                                                "format": "%Y-%m-%d",
+                                                "date": "$date",
+                                            }
+                                        },
                                     }
                                 },
                             }
@@ -1633,6 +1704,7 @@ async def fetch_zoho_lookback_sales_batch(
     except Exception as e:
         logger.error(f"Error fetching lookback sales batch: {e}")
         import traceback
+
         logger.error(traceback.format_exc())
         return {}
 
@@ -1704,7 +1776,9 @@ async def fetch_stock_data_optimized(
                 },
             ]
             result = {}
-            for doc in stock_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000):
+            for doc in stock_collection.aggregate(
+                pipeline, allowDiskUse=True, batchSize=10000
+            ):
                 result[doc["_id"]] = doc.get("total_days_in_stock", 0)
             return result
 
@@ -1741,7 +1815,9 @@ async def fetch_stock_data_optimized(
                 },
             ]
             result = {}
-            for doc in stock_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000):
+            for doc in stock_collection.aggregate(
+                pipeline, allowDiskUse=True, batchSize=10000
+            ):
                 result[doc["_id"]] = {
                     "closing_stock": doc.get("closing_stock", 0) or 0,
                     "latest_date": doc.get("latest_date"),
@@ -1972,7 +2048,9 @@ def build_optimized_pipeline_with_credit_notes_and_composites(
     """
     # credit_notes stores date as ISODate, invoices as string
     cn_start = datetime.strptime(start_date, "%Y-%m-%d")
-    cn_end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    cn_end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+        hour=23, minute=59, second=59
+    )
 
     # Build invoice match conditions
     invoice_match_conditions = [
@@ -2316,7 +2394,9 @@ async def get_sales_report_fast(
         )
         products_task = asyncio.create_task(fetch_all_products_indexed(db))
 
-        logger.info("Executing invoice aggregation, stock fetch, and products fetch in parallel...")
+        logger.info(
+            "Executing invoice aggregation, stock fetch, and products fetch in parallel..."
+        )
         raw_invoice_docs, stock_data, products_map = await asyncio.gather(
             invoice_task, stock_task, products_task
         )
