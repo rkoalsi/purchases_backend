@@ -565,7 +565,8 @@ def _enrich_items(
                     doc.get("sellableOnHandInventoryUnits") or 0
                 )
 
-        # open PO: processing → supply_qty if > 0, else requested_qty; packed/closed/intransit → accepted_qty
+        # open PO: processing → supply_qty_override if set, else final_supply_fo if set, else supply_qty if > 0, else requested_qty
+        #          packed/closed/intransit → accepted_qty
         for doc in db[PO_COLLECTION].aggregate(
             [
                 {
@@ -587,9 +588,21 @@ def _enrich_items(
                                     "if": {"$eq": ["$po_status", "processing"]},
                                     "then": {
                                         "$cond": {
-                                            "if": {"$gt": [{"$ifNull": ["$items.supply_qty", 0]}, 0]},
-                                            "then": {"$ifNull": ["$items.supply_qty", 0]},
-                                            "else": {"$ifNull": ["$items.requested_qty", 0]},
+                                            "if": {"$ne": [{"$ifNull": ["$items.supply_qty_override", None]}, None]},
+                                            "then": {"$ifNull": ["$items.supply_qty_override", 0]},
+                                            "else": {
+                                                "$cond": {
+                                                    "if": {"$ne": [{"$ifNull": ["$items.final_supply_fo", None]}, None]},
+                                                    "then": {"$ifNull": ["$items.final_supply_fo", 0]},
+                                                    "else": {
+                                                        "$cond": {
+                                                            "if": {"$gt": [{"$ifNull": ["$items.supply_qty", 0]}, 0]},
+                                                            "then": {"$ifNull": ["$items.supply_qty", 0]},
+                                                            "else": {"$ifNull": ["$items.requested_qty", 0]},
+                                                        }
+                                                    },
+                                                }
+                                            },
                                         }
                                     },
                                     "else": {"$ifNull": ["$items.accepted_qty", 0]},
