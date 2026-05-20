@@ -2883,12 +2883,22 @@ async def create_zoho_estimate(
         if not items:
             raise ValueError("PO has no active items")
 
-        # Batch-load zoho item_id by cf_sku_code
+        # Batch-load zoho item_id: ASIN → sku_code (via amazon_sku_mapping) → item_id (via products)
         model_numbers = [it["model_number"] for it in items if it.get("model_number")]
-        products_by_model: dict[str, str] = {
+        # asin_to_sku_code: maps ASIN → cf_sku_code
+        asin_to_sku_code: dict[str, str] = {
+            m["item_id"]: m["sku_code"]
+            for m in db[SKU_MAPPING_COLLECTION].find(
+                {"item_id": {"$in": model_numbers}},
+                {"item_id": 1, "sku_code": 1},
+            )
+            if m.get("item_id") and m.get("sku_code")
+        }
+        sku_codes = list(asin_to_sku_code.values())
+        sku_to_zoho_item_id: dict[str, str] = {
             p["cf_sku_code"]: p["item_id"]
             for p in db[PRODUCTS_COLLECTION].find(
-                {"cf_sku_code": {"$in": model_numbers}},
+                {"cf_sku_code": {"$in": sku_codes}},
                 {"cf_sku_code": 1, "item_id": 1},
             )
             if p.get("cf_sku_code") and p.get("item_id")
@@ -2897,7 +2907,8 @@ async def create_zoho_estimate(
         skipped: list[str] = []
         line_items: list[dict] = []
         for it in items:
-            zoho_item_id = products_by_model.get(it.get("model_number", ""))
+            sku_code = asin_to_sku_code.get(it.get("model_number", ""))
+            zoho_item_id = sku_to_zoho_item_id.get(sku_code or "")
             if not zoho_item_id:
                 skipped.append(it.get("model_number", it.get("asin", "?")))
                 continue
