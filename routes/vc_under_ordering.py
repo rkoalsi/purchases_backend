@@ -114,23 +114,43 @@ def _fetch_data(db, drr_map: dict) -> tuple:
             etrade_inv_by_asin[doc["asin"]] = int(doc.get("sellableOnHandInventoryUnits") or 0)
 
     # 6. Open PO from vendor_purchase_orders
-    #    processing → final_supply_fo_override if set, else final_supply_fo
-    #    packed → accepted_qty
-    open_po_by_asin: dict[str, int] = {}
+    #    pending/processing → MAX(final_supply_fo + stored open_po) per ASIN across all active POs
+    #      Using MAX (not SUM) avoids double-counting when an ASIN appears in multiple processing POs,
+    #      because the latest-enriched PO's stored open_po already includes earlier POs' contributions.
+    #    packed/intransit/closed → SUM(accepted_qty)
+    processing_po_by_asin: dict[str, int] = {}
     for doc in db["vendor_purchase_orders"].aggregate([
-        {"$match": {"po_status": {"$in": ["processing", "packed"]}}},
+        {"$match": {"po_status": {"$in": ["pending", "processing"]}}},
         {"$unwind": "$items"},
         {"$match": {"items.asin": {"$in": asins}}},
         {"$group": {
             "_id": "$items.asin",
-            "total": {"$sum": {"$cond": {
-                "if": {"$eq": ["$po_status", "processing"]},
-                "then": {"$ifNull": ["$items.final_supply_fo_override", {"$ifNull": ["$items.final_supply_fo", 0]}]},
-                "else": {"$ifNull": ["$items.accepted_qty", 0]},
-            }}},
+            "total": {"$max": {"$add": [
+                {"$ifNull": ["$items.final_supply_fo_override", {"$ifNull": ["$items.final_supply_fo", 0]}]},
+                {"$ifNull": ["$items.open_po_override", {"$ifNull": ["$items.open_po", 0]}]},
+            ]}},
         }},
     ]):
-        open_po_by_asin[doc["_id"]] = int(doc["total"] or 0)
+        processing_po_by_asin[doc["_id"]] = int(doc["total"] or 0)
+
+    packed_po_by_asin: dict[str, int] = {}
+    for doc in db["vendor_purchase_orders"].aggregate([
+        {"$match": {"po_status": {"$in": ["packed", "intransit", "closed"]}}},
+        {"$unwind": "$items"},
+        {"$match": {"items.asin": {"$in": asins}}},
+        {"$group": {
+            "_id": "$items.asin",
+            "total": {"$sum": {"$ifNull": ["$items.accepted_qty", 0]}},
+        }},
+    ]):
+        packed_po_by_asin[doc["_id"]] = int(doc["total"] or 0)
+
+    # Take max: processing total already includes packed contributions captured at enrichment time
+    all_po_asins = set(list(processing_po_by_asin.keys()) + list(packed_po_by_asin.keys()))
+    open_po_by_asin: dict[str, int] = {
+        a: max(processing_po_by_asin.get(a, 0), packed_po_by_asin.get(a, 0))
+        for a in all_po_asins
+    }
 
     # 7. Zoho stock
     item_id_by_sku: dict[str, str] = {}
