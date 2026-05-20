@@ -1,3 +1,5 @@
+import os
+import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import io, logging, math, json, re
@@ -673,10 +675,12 @@ _cache_ttl = 300  # 5 minutes
 _cache_lock = threading.Lock()
 
 
-def get_item_names_by_brand(db, brand: str) -> List[str]:
+def get_item_names_by_brand(db, brand: str) -> tuple:
     """
     Cached version of item name lookup with TTL for better performance.
     Pass empty string to get all item names across all brands.
+    Returns (item_names, sku_to_name) where sku_to_name maps EAN sku → current product name.
+    Used to match invoice line items by either name or sku (handles renamed products).
     """
     current_time = datetime.now().timestamp()
 
@@ -686,7 +690,7 @@ def get_item_names_by_brand(db, brand: str) -> List[str]:
             cache_entry = _item_name_cache[cache_key]
             if current_time - cache_entry["timestamp"] < _cache_ttl:
                 logger.info(f"Using cached item names for brand '{brand or 'all'}'")
-                return cache_entry["item_names"]
+                return cache_entry["item_names"], cache_entry["sku_to_name"]
 
     # Fetch from database
     try:
@@ -695,28 +699,29 @@ def get_item_names_by_brand(db, brand: str) -> List[str]:
         match_stage = {"$match": {"brand": brand}} if brand else {"$match": {}}
         pipeline = [
             match_stage,
-            {"$project": {"name": 1, "_id": 0}},
-            {"$group": {"_id": None, "item_names": {"$addToSet": "$name"}}},
+            {"$project": {"name": 1, "sku": 1, "_id": 0}},
         ]
 
         result = list(products_collection.aggregate(pipeline))
 
-        if result and "item_names" in result[0]:
-            item_names = [name for name in result[0]["item_names"] if name is not None]
+        item_names = [p["name"] for p in result if p.get("name")]
+        sku_to_name = {
+            str(p["sku"]): p["name"]
+            for p in result
+            if p.get("sku") and p.get("name")
+        }
 
-            with _cache_lock:
-                _item_name_cache[cache_key] = {
-                    "item_names": item_names,
-                    "timestamp": current_time,
-                }
+        with _cache_lock:
+            _item_name_cache[cache_key] = {
+                "item_names": item_names,
+                "sku_to_name": sku_to_name,
+                "timestamp": current_time,
+            }
 
-            logger.info(
-                f"Found {len(item_names)} item names for brand '{brand or 'all'}'"
-            )
-            return item_names
-        else:
-            logger.warning(f"No item names found for brand '{brand or 'all'}'")
-            return []
+        logger.info(
+            f"Found {len(item_names)} item names, {len(sku_to_name)} skus for brand '{brand or 'all'}'"
+        )
+        return item_names, sku_to_name
 
     except Exception as e:
         logger.error(f"Error getting item names for brand '{brand}': {e}")
@@ -728,6 +733,7 @@ def get_item_names_by_brand(db, brand: str) -> List[str]:
 def query_invoices_for_item_names(
     db,
     item_names: List[str],
+    sku_to_name: dict,
     start_date: datetime,
     end_date: datetime,
     exclude_customers: bool,
@@ -735,7 +741,8 @@ def query_invoices_for_item_names(
     include_brand: bool = False,
 ) -> List[dict]:
     """
-    Query invoices by matching item names.
+    Query invoices by matching item names or EAN sku.
+    Matching by sku handles products that were renamed after invoices were created.
     report_type="transfer_order" filters to only internal/excluded customers.
     report_type="customer" with exclude_customers=True filters them out.
     """
@@ -743,15 +750,24 @@ def query_invoices_for_item_names(
         invoices_collection = db.get_collection(INVOICES_COLLECTION)
         products_collection = db.get_collection(PRODUCTS_COLLECTION)
 
+        sku_list = list(sku_to_name.keys())
+
         base_match: dict = {
             "$expr": {
                 "$and": [
-                    {"$gte": [{"$toDate": "$created_date"}, start_date]},
-                    {"$lte": [{"$toDate": "$created_date"}, end_date]},
+                    {"$gte": [{"$toDate": "$date"}, start_date]},
+                    {"$lte": [{"$toDate": "$date"}, end_date]},
                 ]
             },
             "status": {"$nin": ["draft", "void"]},
-            "line_items": {"$elemMatch": {"name": {"$in": item_names}}},
+            "line_items": {
+                "$elemMatch": {
+                    "$or": [
+                        {"name": {"$in": item_names}},
+                        {"sku": {"$in": sku_list}},
+                    ]
+                }
+            },
         }
 
         if report_type == "transfer_order":
@@ -773,7 +789,12 @@ def query_invoices_for_item_names(
                         "$filter": {
                             "input": "$line_items",
                             "as": "item",
-                            "cond": {"$in": ["$$item.name", item_names]},
+                            "cond": {
+                                "$or": [
+                                    {"$in": ["$$item.name", item_names]},
+                                    {"$in": [{"$toString": "$$item.sku"}, sku_list]},
+                                ]
+                            },
                         }
                     }
                 }
@@ -782,13 +803,15 @@ def query_invoices_for_item_names(
             {
                 "$project": {
                     "_id": 1,
+                    "invoice_number": 1,
                     "customer_name": 1,
                     "invoice_status": "$status",
-                    "created_date_str": "$created_date",
+                    "created_date_str": "$date",
                     "created_at": 1,
                     "quantity": "$_matchingItems.quantity",
                     "item_total": "$_matchingItems.item_total",
                     "item_name": "$_matchingItems.name",
+                    "item_sku": {"$toString": "$_matchingItems.sku"},
                     "sku_code": {
                         "$ifNull": [
                             "$_matchingItems.sku",
@@ -805,12 +828,13 @@ def query_invoices_for_item_names(
         ]
 
         logger.info(
-            f"Executing item name aggregation for {len(item_names)} items (report_type={report_type})"
+            f"Executing item name aggregation for {len(item_names)} items, {len(sku_list)} skus (report_type={report_type})"
         )
         results = list(invoices_collection.aggregate(pipeline, allowDiskUse=True))
         logger.info(f"Found {len(results)} total matching line items")
 
-        # Batch-load product info (brand, status, purchase_status) by item name
+        # Batch-load product info (brand, status, purchase_status) by item name.
+        # Also build sku→product map for items whose names changed since invoice was created.
         result_item_names = list(
             {doc.get("item_name") for doc in results if doc.get("item_name")}
         )
@@ -824,8 +848,11 @@ def query_invoices_for_item_names(
 
         all_results = []
         for doc in results:
-            item_name = doc.get("item_name", "N/A")
-            product = product_info.get(item_name, {})
+            raw_item_name = doc.get("item_name", "N/A")
+            item_sku = doc.get("item_sku", "")
+            # Normalize to current product name if invoice used an old name
+            item_name = sku_to_name.get(item_sku, raw_item_name)
+            product = product_info.get(item_name) or product_info.get(raw_item_name, {})
             row = {
                 "SKU Code": doc.get("sku_code", "N/A"),
                 "Item": item_name,
@@ -834,6 +861,7 @@ def query_invoices_for_item_names(
                 "Total Amount": doc.get("item_total", 0),
                 "Status": product.get("status", "N/A"),
                 "Purchase Status": product.get("purchase_status", "N/A"),
+                "Invoice Number": doc.get("invoice_number", "N/A"),
                 "Invoice ID": str(doc["_id"]),
                 "Created Date": doc.get("created_date_str", "N/A"),
             }
@@ -880,6 +908,7 @@ def create_excel_file(data: List[dict]) -> io.BytesIO:
             "Total Amount",
             "Status",
             "Purchase Status",
+            "Invoice Number",
             "Invoice ID",
             "Created Date",
         ]
@@ -931,7 +960,7 @@ def generate_invoice_report(
 
         # STEP 1: Get item names (empty brand = all brands)
         item_name_start = datetime.now()
-        item_names = get_item_names_by_brand(db, request.brand)
+        item_names, sku_to_name = get_item_names_by_brand(db, request.brand)
         item_name_duration = (datetime.now() - item_name_start).total_seconds()
         logger.info(f"Item name lookup took {item_name_duration:.2f} seconds")
 
@@ -941,11 +970,12 @@ def generate_invoice_report(
 
         include_brand = not request.brand  # show Brand column when all brands selected
 
-        # STEP 2: Query invoices by item names
+        # STEP 2: Query invoices by item names or sku
         query_start = datetime.now()
         invoice_data = query_invoices_for_item_names(
             db,
             item_names,
+            sku_to_name,
             start_date,
             end_date,
             request.exclude_customers,
@@ -1008,6 +1038,399 @@ def generate_invoice_report(
         raise
     except Exception as e:
         logger.error(f"Unexpected error generating report: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+_BOOKS_URL = os.getenv("BOOKS_URL")
+_BOOKS_CLIENT_ID = os.getenv("CLIENT_ID")
+_BOOKS_CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+_BOOKS_REFRESH_TOKEN = os.getenv("BOOKS_REFRESH_TOKEN")
+_BOOKS_ORGANIZATION_ID = os.getenv("ORGANIZATION_ID", "776755316")
+_ZOHO_BOOKS_BASE = "https://books.zoho.com/api/v3"
+
+
+def _get_zoho_books_token() -> str:
+    url = _BOOKS_URL.format(
+        clientId=_BOOKS_CLIENT_ID,
+        clientSecret=_BOOKS_CLIENT_SECRET,
+        grantType="refresh_token",
+        books_refresh_token=_BOOKS_REFRESH_TOKEN,
+    )
+    r = requests.post(url, timeout=30)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def _fetch_pl_data_from_zoho(from_date: str, to_date: str) -> dict:
+    """
+    Fetch horizontal P&L from Zoho Books and extract specific account totals.
+    Returns dict with: other_charges, shipping_charges, post_supply_discount
+    """
+    token = _get_zoho_books_token()
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    params = {
+        "organization_id": _BOOKS_ORGANIZATION_ID,
+        "from_date": from_date,
+        "to_date": to_date,
+        "filter_by": "TransactionDate.CustomDate",
+        "response_option": "1",
+    }
+    r = requests.get(
+        f"{_ZOHO_BOOKS_BASE}/reports/horizontalprofitandloss",
+        headers=headers,
+        params=params,
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    if data.get("code") != 0:
+        raise ValueError(f"Zoho Books P&L API error: {data.get('message')}")
+
+    # Map exact Zoho account names (case-insensitive) to result keys
+    target_names = {
+        "other charges (sales)": "other_charges",
+        "shipping charges (sales)": "shipping_charges",
+        "post supply discount": "post_supply_discount",
+    }
+    result = {k: 0.0 for k in target_names.values()}
+
+    def _walk(obj):
+        if isinstance(obj, dict):
+            name = (obj.get("name") or obj.get("total_label") or "").lower().strip()
+            if name in target_names:
+                val = obj.get("total") or 0
+                try:
+                    result[target_names[name]] = float(str(val).replace(",", ""))
+                except (TypeError, ValueError):
+                    pass
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item)
+
+    _walk(data)
+    logger.info("Zoho Books P&L charges fetched: %s", result)
+    return result
+
+
+class BrandSalesReportRequest(BaseModel):
+    start_date: str
+    end_date: str
+
+    @validator("start_date", "end_date")
+    def validate_date_format(cls, v):
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+            return v
+        except ValueError:
+            raise ValueError("Date must be in YYYY-MM-DD format")
+
+
+def _query_line_items_for_brand_report(
+    invoices_col, start_date: datetime, end_date: datetime, filter_type: str
+) -> list:
+    """
+    filter_type: 'all' | 'transfer_order' | 'customer_only'
+    Returns list of {item_name, item_sku, item_total}.
+    """
+    match: dict = {
+        "$expr": {
+            "$and": [
+                {"$gte": [{"$toDate": "$date"}, start_date]},
+                {"$lte": [{"$toDate": "$date"}, end_date]},
+            ]
+        },
+        "status": {"$nin": ["draft", "void"]},
+    }
+    if filter_type == "transfer_order":
+        match["customer_name"] = {"$regex": "pupscribe", "$options": "i"}
+    elif filter_type == "customer_only":
+        match["$nor"] = [
+            {"customer_name": {"$in": EXCLUDED_CUSTOMERS_LIST}},
+            {"customer_name": {"$regex": "pupscribe", "$options": "i"}},
+        ]
+
+    pipeline = [
+        {"$match": match},
+        {"$unwind": "$line_items"},
+        {"$match": {"line_items.name": {"$exists": True, "$nin": [None, ""]}}},
+        {
+            "$project": {
+                "_id": 0,
+                "item_name": "$line_items.name",
+                "item_sku": {"$toString": "$line_items.sku"},
+                "item_total": "$line_items.item_total",
+            }
+        },
+    ]
+    return list(invoices_col.aggregate(pipeline, allowDiskUse=True))
+
+
+@router.post("/generate-brand-sales-report")
+def generate_brand_sales_report(
+    request: BrandSalesReportRequest, db=Depends(get_database)
+):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from openpyxl.utils import get_column_letter
+        from collections import defaultdict
+
+        start_date = datetime.strptime(request.start_date, "%Y-%m-%d")
+        end_date = datetime.strptime(request.end_date, "%Y-%m-%d")
+        month_label = start_date.strftime("%B %Y")
+
+        # Fetch P&L charges from Zoho Books
+        pl = _fetch_pl_data_from_zoho(request.start_date, request.end_date)
+
+        invoices_col = db.get_collection(INVOICES_COLLECTION)
+        products_col = db.get_collection(PRODUCTS_COLLECTION)
+
+        # Load product catalog: name/sku → {brand, category, sub_category}
+        products = list(
+            products_col.find(
+                {},
+                {
+                    "name": 1,
+                    "sku": 1,
+                    "brand": 1,
+                    "category": 1,
+                    "sub_category": 1,
+                    "_id": 0,
+                },
+            )
+        )
+        name_to_prod = {p["name"]: p for p in products if p.get("name")}
+        sku_to_prod = {str(p["sku"]): p for p in products if p.get("sku")}
+
+        def get_prod(item_name, item_sku):
+            return sku_to_prod.get(item_sku) or name_to_prod.get(item_name) or {}
+
+        # Fetch all 3 line-item sets
+        all_items = _query_line_items_for_brand_report(
+            invoices_col, start_date, end_date, "all"
+        )
+        transfer_items = _query_line_items_for_brand_report(
+            invoices_col, start_date, end_date, "transfer_order"
+        )
+        customer_items = _query_line_items_for_brand_report(
+            invoices_col, start_date, end_date, "customer_only"
+        )
+
+        # Aggregate BWS: brand totals
+        all_by_brand = defaultdict(float)
+        for item in all_items:
+            brand = get_prod(item["item_name"], item["item_sku"]).get("brand", "Unknown")
+            all_by_brand[brand] += item.get("item_total") or 0
+
+        transfer_by_brand = defaultdict(float)
+        for item in transfer_items:
+            brand = get_prod(item["item_name"], item["item_sku"]).get("brand", "Unknown")
+            transfer_by_brand[brand] += item.get("item_total") or 0
+
+        # customer_by_brand: pure sales (matches BWC/BWSC exactly — excludes transfer + excluded customers)
+        customer_by_brand = defaultdict(float)
+
+        # Aggregate BWC/BWSC: customer-only sales by brand + category/sub_category
+        bwc: dict = defaultdict(lambda: defaultdict(float))
+        bwsc: dict = defaultdict(lambda: defaultdict(float))
+        for item in customer_items:
+            prod = get_prod(item["item_name"], item["item_sku"])
+            brand = prod.get("brand", "Unknown")
+            category = prod.get("category") or "Uncategorized"
+            sub_cat = prod.get("sub_category") or "Uncategorized"
+            amt = item.get("item_total") or 0
+            customer_by_brand[brand] += amt
+            bwc[brand][category] += amt
+            bwsc[brand][sub_cat] += amt
+
+        all_brands = sorted(
+            set(all_by_brand) | set(transfer_by_brand) | set(bwc) | set(bwsc)
+        )
+
+        # ── Styles ──────────────────────────────────────────────────────────
+        header_fill = PatternFill("solid", fgColor="4472C4")
+        header_font = Font(bold=True, color="FFFFFF")
+        total_fill = PatternFill("solid", fgColor="D9E1F2")
+        total_font = Font(bold=True)
+        title_font = Font(bold=True, size=12)
+        thin = Side(style="thin")
+        thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        def style_header(cell):
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = thin_border
+
+        def style_total(cell):
+            cell.font = total_font
+            cell.fill = total_fill
+            cell.border = thin_border
+
+        def fmt_num(ws, cell_ref, value):
+            ws[cell_ref] = round(value, 2) if value else 0
+            ws[cell_ref].number_format = "#,##0.00"
+
+        wb = Workbook()
+
+        # ════════════════════════════════════════════════════════════════════
+        # SHEET 1: BWS
+        # ════════════════════════════════════════════════════════════════════
+        ws1 = wb.active
+        ws1.title = f"(BWS) {month_label}"
+
+        ws1["A1"] = f"{month_label} (Sales Data With Transfer Order and without Transfer order)"
+        ws1["A1"].font = title_font
+        ws1.merge_cells("A1:D1")
+
+        headers = ["Row Labels", "Sum of Amount", "Transfer Order Value", "Pure Sales"]
+        for col, h in enumerate(headers, 1):
+            cell = ws1.cell(row=3, column=col, value=h)
+            style_header(cell)
+
+        data_start = 4
+        for r, brand in enumerate(all_brands, data_start):
+            ws1.cell(row=r, column=1, value=brand).border = thin_border
+            total_val = all_by_brand.get(brand, 0)
+            transfer_val = transfer_by_brand.get(brand, 0)
+            ws1.cell(row=r, column=2, value=round(total_val, 2)).number_format = "#,##0.00"
+            ws1.cell(row=r, column=2).border = thin_border
+            if transfer_val:
+                ws1.cell(row=r, column=3, value=round(transfer_val, 2)).number_format = "#,##0.00"
+            ws1.cell(row=r, column=3).border = thin_border
+            pure_val = customer_by_brand.get(brand, 0)
+            ws1.cell(row=r, column=4, value=round(pure_val, 2)).number_format = "#,##0.00"
+            ws1.cell(row=r, column=4).border = thin_border
+
+        grand_row = data_start + len(all_brands)
+        ws1.cell(row=grand_row, column=1, value="Grand Total")
+        style_total(ws1.cell(row=grand_row, column=1))
+        for col, letter in [(2, "B"), (3, "C"), (4, "D")]:
+            formula = f"=SUM({letter}{data_start}:{letter}{grand_row - 1})"
+            cell = ws1.cell(row=grand_row, column=col, value=formula)
+            cell.number_format = "#,##0.00"
+            style_total(cell)
+
+        # Below grand total: P&L charges (fetched from Zoho Books)
+        charges = [
+            ("Other Charges (Sales)", pl["other_charges"]),
+            ("Shipping Charges (Sales)", pl["shipping_charges"]),
+            ("Post Supply Discount", pl["post_supply_discount"]),
+        ]
+        for i, (label, val) in enumerate(charges):
+            r = grand_row + 1 + i
+            ws1.cell(row=r, column=1, value=label)
+            ws1.cell(row=r, column=2, value=round(val, 2)).number_format = "#,##0.00"
+
+        pl_row = grand_row + 1 + len(charges)
+        ws1.cell(row=pl_row, column=1, value="Total Sales as per P & l account").font = total_font
+        charge_rows = "+".join(
+            f"B{grand_row + 1 + i}" for i in range(len(charges))
+        )
+        ws1.cell(
+            row=pl_row, column=2,
+            value=f"=B{grand_row}+{charge_rows}"
+        ).number_format = "#,##0.00"
+
+        # Column widths
+        ws1.column_dimensions["A"].width = 35
+        for col in ["B", "C", "D"]:
+            ws1.column_dimensions[col].width = 20
+
+        # ════════════════════════════════════════════════════════════════════
+        # Helper: build pivot sheet (BWC or BWSC)
+        # ════════════════════════════════════════════════════════════════════
+        def build_pivot_sheet(ws, pivot_data: dict, col_label: str, sheet_title: str):
+            all_cols = sorted(
+                {col for brand_dict in pivot_data.values() for col in brand_dict}
+            )
+            brands_in_pivot = [b for b in all_brands if b in pivot_data]
+
+            ws["A1"] = sheet_title
+            ws["A1"].font = title_font
+            ws.merge_cells(f"A1:{get_column_letter(len(all_cols) + 2)}1")
+
+            # Header row
+            ws.cell(row=3, column=1, value="Row Labels")
+            style_header(ws.cell(row=3, column=1))
+            for ci, col_name in enumerate(all_cols, 2):
+                cell = ws.cell(row=3, column=ci, value=col_name)
+                style_header(cell)
+            gt_col = len(all_cols) + 2
+            cell = ws.cell(row=3, column=gt_col, value="Grand Total")
+            style_header(cell)
+
+            data_start = 4
+            for ri, brand in enumerate(brands_in_pivot, data_start):
+                ws.cell(row=ri, column=1, value=brand).border = thin_border
+                for ci, col_name in enumerate(all_cols, 2):
+                    val = pivot_data[brand].get(col_name, 0)
+                    c = ws.cell(row=ri, column=ci, value=round(val, 2) if val else None)
+                    c.number_format = "#,##0.00"
+                    c.border = thin_border
+                # Grand Total formula for this row
+                first = get_column_letter(2)
+                last = get_column_letter(len(all_cols) + 1)
+                gt_cell = ws.cell(
+                    row=ri, column=gt_col,
+                    value=f"=SUM({first}{ri}:{last}{ri})"
+                )
+                gt_cell.number_format = "#,##0.00"
+                gt_cell.border = thin_border
+
+            grand_row = data_start + len(brands_in_pivot)
+            ws.cell(row=grand_row, column=1, value="Grand Total")
+            style_total(ws.cell(row=grand_row, column=1))
+            for ci in range(2, gt_col + 1):
+                letter = get_column_letter(ci)
+                formula = f"=SUM({letter}{data_start}:{letter}{grand_row - 1})"
+                cell = ws.cell(row=grand_row, column=ci, value=formula)
+                cell.number_format = "#,##0.00"
+                style_total(cell)
+
+            ws.column_dimensions["A"].width = 30
+            for ci in range(2, gt_col + 1):
+                ws.column_dimensions[get_column_letter(ci)].width = 18
+
+        # ════════════════════════════════════════════════════════════════════
+        # SHEET 2: BWC
+        # ════════════════════════════════════════════════════════════════════
+        ws2 = wb.create_sheet(title=f"(BWC) {month_label}")
+        build_pivot_sheet(
+            ws2, bwc,
+            col_label="item.CF.Category",
+            sheet_title=f"item.CF.Category ({month_label})"
+        )
+
+        # ════════════════════════════════════════════════════════════════════
+        # SHEET 3: BWSC
+        # ════════════════════════════════════════════════════════════════════
+        ws3 = wb.create_sheet(title=f"(BWSC) {month_label}")
+        build_pivot_sheet(
+            ws3, bwsc,
+            col_label="item.CF.Sub Category",
+            sheet_title=f"item.CF.Sub Category ({month_label})"
+        )
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        month_slug = start_date.strftime("%Y-%m")
+        filename = f"brand_sales_report_{month_slug}.xlsx"
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating brand sales report: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
