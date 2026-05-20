@@ -713,12 +713,13 @@ def _enrich_items(
             else:
                 sv = item.get("supply_qty")
                 supply_qty = sv if sv is not None else item["requested_qty"]
-            asin_drr = _drr_map.get(asin, {})
-            drr_result = asin_drr.get("drr")
-            drr_flag = asin_drr.get("drr_flag", "")
-            final_drr = drr_result if isinstance(drr_result, (int, float)) else None
+            # DRR was computed and stored at freeze time — use it so Final Supply Qty
+            # doesn't drift when Amazon sales data changes after the PO is locked.
+            stored_drr = item.get("final_drr")
+            stored_drr_flag = item.get("final_drr_flag", "")
+            final_drr = stored_drr if isinstance(stored_drr, (int, float)) else None
             final_drr_flag = (
-                drr_flag if not isinstance(drr_result, (int, float)) else ""
+                stored_drr_flag if not isinstance(stored_drr, (int, float)) else ""
             )
         else:
             zoho_stock = zoho_latest.get(zoho_item_id, 0) if zoho_item_id else 0
