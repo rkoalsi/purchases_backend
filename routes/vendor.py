@@ -449,6 +449,30 @@ async def save_draft_order(body: SaveDraftOrderRequest, db=Depends(get_database)
     return JSONResponse(status_code=201, content=serialize_mongo_document(doc))
 
 
+def _increment_po_number(po_number: str) -> str:
+    match = re.search(r'(\d+)$', po_number)
+    if match:
+        num_str = match.group(1)
+        incremented = str(int(num_str) + 1).zfill(len(num_str))
+        return po_number[:match.start()] + incremented
+    return po_number
+
+
+@router.get("/draft_orders/last_po_number")
+def get_last_po_number(vendor_id: str = Query(...), db=Depends(get_database)):
+    """Get the last PO number for a vendor and return the suggested next one."""
+    col = db.get_collection(PURCHASE_ORDERS_COLLECTION)
+    last_po = col.find_one(
+        {"vendor_id": vendor_id},
+        {"purchaseorder_number": 1},
+        sort=[("created_at", -1)],
+    )
+    if not last_po or not last_po.get("purchaseorder_number"):
+        return {"last_po_number": None, "next_po_number": None}
+    last_num = last_po["purchaseorder_number"]
+    return {"last_po_number": last_num, "next_po_number": _increment_po_number(last_num)}
+
+
 @router.delete("/draft_orders/{draft_id}")
 async def delete_draft_order(draft_id: str, db=Depends(get_database)):
     """Delete a saved draft order by its MongoDB _id."""
