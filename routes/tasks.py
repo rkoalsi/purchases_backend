@@ -18,7 +18,7 @@ from ..database import get_database, serialize_mongo_document
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-TASKS_COLLECTION = "design_tasks"
+TASKS_COLLECTION = "tasks"
 S3_BUCKET = os.getenv("S3_BUCKET", "pupscribe-purchases")
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 # Pre-signed URLs valid for 7 days — only the s3_key is persisted in MongoDB
@@ -38,10 +38,12 @@ class CreateTaskRequest(BaseModel):
     status: Optional[str] = "todo"
     assigned_to: Optional[List[str]] = []
     assigned_to_names: Optional[List[str]] = []
+    assigned_to_departments: Optional[List[str]] = []
     deadline: Optional[str] = None
     tags: Optional[List[str]] = []
     created_by: str
     created_by_name: str
+    creator_department: Optional[str] = None
 
 
 class UpdateTaskRequest(BaseModel):
@@ -51,6 +53,7 @@ class UpdateTaskRequest(BaseModel):
     status: Optional[str] = None
     assigned_to: Optional[List[str]] = None
     assigned_to_names: Optional[List[str]] = None
+    assigned_to_departments: Optional[List[str]] = None
     deadline: Optional[str] = None
     tags: Optional[List[str]] = None
     actor_id: Optional[str] = None
@@ -122,32 +125,52 @@ def _activity_entry(
     }
 
 
+def _visibility_filter(viewer_id: Optional[str], viewer_role: Optional[str]) -> dict:
+    """Return a MongoDB match fragment enforcing per-role visibility rules.
+    Admin/manager see everything; regular users only see tasks they created or are assigned to.
+    If viewer_id is absent (e.g. old Design Tasks callers), no filter is applied.
+    """
+    if not viewer_id or viewer_role in ("admin", "manager"):
+        return {}
+    return {"$or": [{"assigned_to": viewer_id}, {"created_by": viewer_id}]}
+
+
 # ── List tasks ────────────────────────────────────────────────────────────────
 
 @router.get("")
 async def list_tasks(
+    viewer_id: Optional[str] = Query(None),
+    viewer_role: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
     priority: Optional[str] = Query(None),
     assigned_to: Optional[str] = Query(None),
+    department: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     sort_by: Optional[str] = Query("created_at", description="created_at | updated_at | deadline | priority | title"),
     sort_dir: Optional[str] = Query("desc", description="asc | desc"),
     db=Depends(get_database),
 ):
     def _fetch():
-        query: dict = {}
+        query: dict = {**_visibility_filter(viewer_id, viewer_role)}
         if status_filter and status_filter in VALID_STATUSES:
             query["status"] = status_filter
         if priority and priority in VALID_PRIORITIES:
             query["priority"] = priority
         if assigned_to:
             query["assigned_to"] = assigned_to
+        if department:
+            query["creator_department"] = department
         if search:
-            query["$or"] = [
+            search_or = [
                 {"title": {"$regex": re.escape(search), "$options": "i"}},
                 {"description": {"$regex": re.escape(search), "$options": "i"}},
                 {"tags": {"$regex": re.escape(search), "$options": "i"}},
             ]
+            existing_or = query.pop("$or", None)
+            if existing_or:
+                query["$and"] = [{"$or": existing_or}, {"$or": search_or}]
+            else:
+                query["$or"] = search_or
 
         direction = -1 if sort_dir == "desc" else 1
 
@@ -183,10 +206,17 @@ async def list_tasks(
 # ── Stats (admin breakdown) ───────────────────────────────────────────────────
 
 @router.get("/stats")
-async def get_task_stats(db=Depends(get_database)):
+async def get_task_stats(
+    viewer_id: Optional[str] = Query(None),
+    viewer_role: Optional[str] = Query(None),
+    db=Depends(get_database),
+):
+    vis = _visibility_filter(viewer_id, viewer_role)
+
     def _fetch():
         now = datetime.utcnow().isoformat()
         pipeline = [
+            {"$match": vis},
             {
                 "$facet": {
                     "by_status": [
@@ -194,6 +224,9 @@ async def get_task_stats(db=Depends(get_database)):
                     ],
                     "by_priority": [
                         {"$group": {"_id": "$priority", "count": {"$sum": 1}}},
+                    ],
+                    "by_department": [
+                        {"$group": {"_id": "$creator_department", "count": {"$sum": 1}}},
                     ],
                     "overdue": [
                         {
@@ -275,10 +308,13 @@ async def get_task_stats(db=Depends(get_database)):
 
     recent_activity = serialize_mongo_document(raw.get("recent_activity", []))
 
+    by_department = {d["_id"] or "None": d["count"] for d in raw.get("by_department", [])}
+
     return {
         "total": total,
         "by_status": by_status,
         "by_priority": by_priority,
+        "by_department": by_department,
         "overdue": overdue,
         "by_assignee": list(assignee_map.values()),
         "recent_activity": recent_activity,
@@ -309,10 +345,12 @@ async def create_task(request: CreateTaskRequest, db=Depends(get_database)):
             "status": request.status,
             "assigned_to": request.assigned_to or [],
             "assigned_to_names": request.assigned_to_names or [],
+            "assigned_to_departments": request.assigned_to_departments or [],
             "deadline": request.deadline,
             "tags": request.tags or [],
             "created_by": request.created_by,
             "created_by_name": request.created_by_name,
+            "creator_department": request.creator_department,
             "comments": [],
             "attachments": [],
             "activity": [activity],
@@ -505,7 +543,7 @@ async def upload_attachment(
     db=Depends(get_database),
 ):
     """
-    Upload a file to S3 under design_tasks/{task_id}/ and store only the s3_key.
+    Upload a file to S3 under tasks/{task_id}/ and store only the s3_key.
     Pre-signed URLs (7 days) are generated on demand via the /url endpoint.
     """
     file_bytes = await file.read()
@@ -519,8 +557,7 @@ async def upload_attachment(
 
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         safe_filename = re.sub(r"[^\w.\-]", "_", filename)
-        # All task attachments live under design_tasks/{task_id}/
-        s3_key = f"design_tasks/{task_id}/{ts}_{safe_filename}"
+        s3_key = f"tasks/{task_id}/{ts}_{safe_filename}"
 
         _upload_to_s3(file_bytes, s3_key, content_type)
 

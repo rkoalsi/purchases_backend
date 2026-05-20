@@ -19,6 +19,7 @@ class CreateUserRequest(BaseModel):
     password: str
     role: Optional[str] = "user"
     status: Optional[str] = "active"
+    department: Optional[str] = None
 
 
 class UpdateUserRequest(BaseModel):
@@ -26,6 +27,7 @@ class UpdateUserRequest(BaseModel):
     email: Optional[str] = None
     role: Optional[str] = None
     status: Optional[str] = None
+    department: Optional[str] = None
 
 
 class UpdateUserPermissionsRequest(BaseModel):
@@ -79,6 +81,7 @@ def create_user(request: CreateUserRequest):
             "password": pwd_context.hash(request.password),
             "role": request.role,
             "status": request.status,
+            "department": request.department,
             "permissions": [],
         }
         result = db["purchase_users"].insert_one(doc)
