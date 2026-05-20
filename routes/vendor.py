@@ -44,8 +44,10 @@ def _get_zoho_token() -> str:
 
 
 def _parse_draft_order_excel(file_bytes: bytes) -> list[dict]:
-    """Parse draft order Excel. Columns: Manufacturer Code, BBCode, Item Name, Qty, Unit Price, ...
-    Reads cell number_format on the Unit Price column to detect per-row currency (USD vs CNY).
+    """Parse draft order Excel. Detects column positions from headers so files with an
+    extra SKU Codes column (or other variations) are handled correctly.
+    Expected headers (case-insensitive, partial match): Manufacturer Code, BBCode,
+    Item Name, Qty, Unit Price. Reads number_format on the Unit Price cell to detect currency.
     """
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     ws = wb.active
@@ -54,23 +56,52 @@ def _parse_draft_order_excel(file_bytes: bytes) -> list[dict]:
     if header_row is None:
         raise ValueError("Order file has no data rows")
 
+    # Map column name keywords → 0-based index
+    col_map: dict[str, int] = {}
+    for idx, cell in enumerate(header_row):
+        h = str(cell.value or "").strip().lower()
+        if "manufacturer" in h:
+            col_map.setdefault("mfr", idx)
+        elif "bbcode" in h or "bb code" in h or "bb_code" in h:
+            col_map.setdefault("bb", idx)
+        elif "item name" in h or "item_name" in h:
+            col_map.setdefault("name", idx)
+        elif "qty" in h or "quantity" in h:
+            col_map.setdefault("qty", idx)
+        elif "unit price" in h or "unit_price" in h:
+            col_map.setdefault("price", idx)
+
+    # Fall back to positional defaults if headers not recognised
+    mfr_idx = col_map.get("mfr", 0)
+    bb_idx = col_map.get("bb", 1)
+    name_idx = col_map.get("name", 2)
+    qty_idx = col_map.get("qty", 3)
+    price_idx = col_map.get("price", 4)
+
     items = []
     for row in ws.iter_rows(min_row=2):
-        if not row[0].value and not row[1].value:
+        if len(row) <= max(mfr_idx, bb_idx, name_idx, qty_idx, price_idx):
             continue
-        qty = row[3].value
+        if not row[mfr_idx].value and not row[bb_idx].value:
+            continue
+        qty = row[qty_idx].value
+        if qty is not None and isinstance(qty, str):
+            try:
+                qty = float(qty)
+            except ValueError:
+                qty = None
         if not isinstance(qty, (int, float)) or qty <= 0:
             continue
 
-        price_cell = row[4]
+        price_cell = row[price_idx]
         fmt = price_cell.number_format or ""
         currency = "CNY" if ("¥" in fmt or "\\¥" in fmt) else "USD"
 
         items.append(
             {
-                "manufacturer_code": str(row[0].value).strip() if row[0].value else "",
-                "bb_code": str(row[1].value).strip() if row[1].value else "",
-                "item_name": str(row[2].value).strip() if row[2].value else "",
+                "manufacturer_code": str(row[mfr_idx].value).strip() if row[mfr_idx].value else "",
+                "bb_code": str(row[bb_idx].value).strip() if row[bb_idx].value else "",
+                "item_name": str(row[name_idx].value).strip() if row[name_idx].value else "",
                 "qty": int(qty),
                 "unit_price": float(price_cell.value) if price_cell.value is not None else 0.0,
                 "currency": currency,
