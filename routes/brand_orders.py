@@ -129,10 +129,26 @@ async def create_order(
     def _insert():
         brand_name = brand.strip()
         vid = (vendor_id or "").strip() or None
-        count = db[COLLECTION].count_documents({"brand": brand_name, "vendor_id": vid})
-        name = f"Order #{count + 1}"
-        now = datetime.now()
         po_num = (purchaseorder_number or "").strip() or None
+
+        # Block duplicate: same brand + PO number
+        if po_num and db[COLLECTION].find_one({"brand": brand_name, "purchaseorder_number": po_num}):
+            raise ValueError(f"A brand order for {brand_name} with PO {po_num} already exists")
+
+        # Derive next order number from max existing name for this brand+vendor
+        existing = list(db[COLLECTION].find(
+            {"brand": brand_name, "vendor_id": vid},
+            {"name": 1},
+        ))
+        max_num = 0
+        import re as _re
+        for ex in existing:
+            m = _re.search(r"#(\d+)", ex.get("name", ""))
+            if m:
+                max_num = max(max_num, int(m.group(1)))
+        name = f"Order #{max_num + 1}"
+
+        now = datetime.now()
         doc = {
             "brand": brand_name,
             "vendor_id": vid,
@@ -148,7 +164,10 @@ async def create_order(
         result = db[COLLECTION].insert_one(doc)
         return str(result.inserted_id), doc
 
-    order_id, doc = await asyncio.to_thread(_insert)
+    try:
+        order_id, doc = await asyncio.to_thread(_insert)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return JSONResponse(status_code=201, content={"_id": order_id, **serialize_mongo_document(doc)})
 
 

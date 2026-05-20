@@ -302,7 +302,7 @@ async def validate_draft_order(
         PRODUCT_PROJECTION = {
             "cf_sku_code": 1, "cf_item_code": 1, "item_id": 1,
             "name": 1, "item_name": 1, "brand": 1,
-            "hsn_or_sac": 1, "purchase_account_id": 1,
+            "hsn_or_sac": 1, "purchase_account_id": 1, "status": 1,
         }
 
         products_by_bb: dict[str, dict] = {}
@@ -322,6 +322,7 @@ async def validate_draft_order(
 
         validated = []
         missing = []
+        inactive_items = []
         first_brand: str | None = None
         for it in items:
             product = None
@@ -334,15 +335,24 @@ async def validate_draft_order(
                 brand = product.get("brand") or ""
                 if brand and first_brand is None:
                     first_brand = brand
-                validated.append(
-                    {
-                        **it,
-                        "item_id": product.get("item_id", ""),
-                        "product_name": product.get("name") or product.get("item_name", ""),
-                        "hsn_or_sac": product.get("hsn_or_sac", ""),
-                        "purchase_account_id": product.get("purchase_account_id", ""),
-                    }
-                )
+                item_status = product.get("status", "active")
+                enriched = {
+                    **it,
+                    "item_id": product.get("item_id", ""),
+                    "product_name": product.get("name") or product.get("item_name", ""),
+                    "hsn_or_sac": product.get("hsn_or_sac", ""),
+                    "purchase_account_id": product.get("purchase_account_id", ""),
+                    "status": item_status,
+                }
+                if item_status != "active":
+                    inactive_items.append({
+                        "manufacturer_code": it["manufacturer_code"],
+                        "bb_code": it["bb_code"],
+                        "item_name": enriched["product_name"] or it["item_name"],
+                        "status": item_status,
+                    })
+                else:
+                    validated.append(enriched)
             else:
                 missing.append(
                     {
@@ -375,10 +385,10 @@ async def validate_draft_order(
                             "currency_code": vendor_doc.get("currency_code", "USD"),
                         })
 
-        return validated, missing, detected_vendors
+        return validated, missing, inactive_items, detected_vendors
 
     try:
-        validated, missing, detected_vendors = await asyncio.to_thread(_process)
+        validated, missing, inactive_items, detected_vendors = await asyncio.to_thread(_process)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -399,6 +409,7 @@ async def validate_draft_order(
             "valid": True,
             "items": serialize_mongo_document(validated),
             "total_items": len(validated),
+            "inactive_items": inactive_items,
             "detected_vendors": detected_vendors,
         },
     )
