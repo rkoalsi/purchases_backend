@@ -135,7 +135,7 @@ def _auto_width(ws):
         ws.column_dimensions[col_letter].width = min(max_len + 4, 40)
 
 
-def _build_item_sheet(ws, title: str, interval_label: str, rows: list, fill_hex: str):
+def _build_item_sheet(ws, interval_label: str, rows: list, fill_hex: str):
     headers = [
         "Item ID", "Item Name", "Brand",
         interval_label, f"Asset Value ({interval_label})",
@@ -165,61 +165,225 @@ def _build_item_sheet(ws, title: str, interval_label: str, rows: list, fill_hex:
     _auto_width(ws)
 
 
-def _build_brand_sheet(ws, brand_totals: dict, stock_date: str):
-    # Stock date label placed in column F (away from the table)
+def _build_summary_sheet(ws, curr_rows: list, prev_rows: list, curr_label: str, prev_label: str, fill_hex: str):
+    """Build a comparison summary sheet with all unique items from both periods."""
+    curr_map = {r["item_name"]: r["qty"] for r in curr_rows}
+    prev_map = {r["item_name"]: r["qty"] for r in prev_rows}
+
+    all_names = sorted(set(curr_map) | set(prev_map))
+
+    headers = ["Item Name", prev_label, curr_label, "Status", "Difference Qty", "Change %"]
+    ws.append(headers)
+    _apply_header_style(ws, 1, len(headers), fill_hex)
+    ws.row_dimensions[1].height = 20
+
+    pct_fmt = '0.00%'
+
+    for i, name in enumerate(all_names, start=2):
+        prev_qty = prev_map.get(name, 0)
+        curr_qty = curr_map.get(name, 0)
+        diff = curr_qty - prev_qty
+
+        if prev_qty == 0:
+            status = "New Added"
+            change_pct = "New Added"
+        elif curr_qty == 0:
+            status = "Removed"
+            change_pct = -1.0
+        elif curr_qty > prev_qty:
+            status = "Increased"
+            change_pct = diff / prev_qty
+        elif curr_qty < prev_qty:
+            status = "Decreased"
+            change_pct = diff / prev_qty
+        else:
+            status = "No Change"
+            change_pct = 0.0
+
+        ws.append([name, prev_qty, curr_qty, status, diff, change_pct if isinstance(change_pct, float) else change_pct])
+        _apply_row_style(ws, i, len(headers), i % 2 == 0)
+
+        # Format Change % column as percentage if it's a number
+        pct_cell = ws.cell(row=i, column=6)
+        if isinstance(change_pct, float):
+            pct_cell.number_format = pct_fmt
+
+        # Colour-code the Status cell
+        status_cell = ws.cell(row=i, column=4)
+        if status == "New Added":
+            status_cell.fill = PatternFill("solid", fgColor="D5F5E3")
+            status_cell.font = Font(color="1E8449")
+        elif status == "Removed":
+            status_cell.fill = PatternFill("solid", fgColor="FADBD8")
+            status_cell.font = Font(color="C0392B")
+        elif status == "Increased":
+            status_cell.fill = PatternFill("solid", fgColor="D6EAF8")
+            status_cell.font = Font(color="1A5276")
+        elif status == "Decreased":
+            status_cell.fill = PatternFill("solid", fgColor="FEF9E7")
+            status_cell.font = Font(color="9A7D0A")
+
+    _auto_width(ws)
+
+
+def _aggregate_by_brand(rows: list) -> dict:
+    """Sum qty and total_mrp (qty * mrp) per brand from item rows."""
+    totals: dict[str, dict] = {}
+    for r in rows:
+        brand = r["brand"]
+        if brand not in totals:
+            totals[brand] = {"qty": 0.0, "total_mrp": 0.0}
+        totals[brand]["qty"] += r["qty"]
+        totals[brand]["total_mrp"] += r["qty"] * r["mrp"]
+    return totals
+
+
+def _write_brand_section(ws, title: str, fill_hex: str, stock_col_label: str,
+                         brand_data: dict, start_row: int) -> int:
+    """Write a titled brand table starting at start_row. Returns the next free row."""
+    # Section title
+    title_cell = ws.cell(row=start_row, column=1, value=title)
+    title_cell.font = Font(bold=True, color="FFFFFF", size=11)
+    title_cell.fill = PatternFill("solid", fgColor=fill_hex)
+    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[start_row].height = 18
+    for col in range(2, 5):
+        cell = ws.cell(row=start_row, column=col)
+        cell.fill = PatternFill("solid", fgColor=fill_hex)
+    start_row += 1
+
+    # Headers
+    headers = ["Brand", stock_col_label, "Total MRP Value", "Collection Value"]
+    for col, h in enumerate(headers, start=1):
+        ws.cell(row=start_row, column=col, value=h)
+    _apply_header_style(ws, start_row, len(headers), fill_hex)
+    ws.row_dimensions[start_row].height = 18
+    data_start = start_row + 1
+    start_row += 1
+
+    for brand, data in sorted(brand_data.items()):
+        qty = round(data.get("stock", data.get("qty", 0)), 2)
+        tmrp = round(data.get("total_mrp", 0), 2)
+        ws.cell(row=start_row, column=1, value=brand)
+        ws.cell(row=start_row, column=2, value=qty)
+        ws.cell(row=start_row, column=3, value=tmrp)
+        ws.cell(row=start_row, column=4, value=f"=C{start_row}/2")
+        _apply_row_style(ws, start_row, len(headers), start_row % 2 == 0)
+        start_row += 1
+
+    total_row = start_row
+    end_data_row = total_row - 1
+    ws.cell(row=total_row, column=1, value="TOTAL")
+    ws.cell(row=total_row, column=2, value=f"=SUM(B{data_start}:B{end_data_row})")
+    ws.cell(row=total_row, column=3, value=f"=SUM(C{data_start}:C{end_data_row})")
+    ws.cell(row=total_row, column=4, value=f"=SUM(D{data_start}:D{end_data_row})")
+    bold = Font(bold=True)
+    for col in range(1, 5):
+        ws.cell(row=total_row, column=col).font = bold
+    start_row += 1
+
+    return start_row
+
+
+def _build_brand_sheet(ws, brand_totals: dict, stock_date: str,
+                       slow_rows: list, dead_rows: list):
+    # Stock date label in col F
     ws.cell(row=1, column=6, value="Zoho Stock Date")
     ws.cell(row=1, column=6).font = Font(bold=True)
     ws.cell(row=2, column=6, value=stock_date)
     ws.column_dimensions["F"].width = 20
 
-    headers = ["Brand", "Zoho Stock", "Total MRP Value", "Collection Value"]
-    ws.append(headers)
-    header_row = ws.max_row
-    _apply_header_style(ws, header_row, len(headers), "1F5C99")
-    ws.row_dimensions[header_row].height = 20
-    start_data_row = header_row + 1
+    next_row = 1
 
-    for brand, data in sorted(brand_totals.items()):
-        stock = round(data["stock"], 2)
-        tmrp = round(data["total_mrp"], 2)
-        ws.append([brand, stock, tmrp, None])
-        row_num = ws.max_row
-        ws.cell(row=row_num, column=4).value = f"=C{row_num}/2"
-        _apply_row_style(ws, row_num, len(headers), row_num % 2 == 0)
+    # Section 1 – Current Stock
+    next_row = _write_brand_section(
+        ws, "Current Stock", "1F5C99", "Zoho Stock",
+        brand_totals, next_row,
+    )
+    next_row += 2  # gap
 
-    total_row = ws.max_row + 1
-    end_data_row = total_row - 1
-    ws.cell(row=total_row, column=1, value="TOTAL")
-    ws.cell(row=total_row, column=2).value = f"=SUM(B{start_data_row}:B{end_data_row})"
-    ws.cell(row=total_row, column=3).value = f"=SUM(C{start_data_row}:C{end_data_row})"
-    ws.cell(row=total_row, column=4).value = f"=SUM(D{start_data_row}:D{end_data_row})"
-    bold = Font(bold=True)
-    for col in range(1, 5):
-        ws.cell(row=total_row, column=col).font = bold
+    # Section 2 – Slow Movers
+    slow_by_brand = _aggregate_by_brand(slow_rows)
+    next_row = _write_brand_section(
+        ws, "Slow Movers (181–270 days)", "C0392B", "Qty (181–270 days)",
+        slow_by_brand, next_row,
+    )
+    next_row += 2  # gap
+
+    # Section 3 – Deadstock
+    dead_by_brand = _aggregate_by_brand(dead_rows)
+    _write_brand_section(
+        ws, "Deadstock (>270 days)", "7D3C98", "Qty (>270 days)",
+        dead_by_brand, next_row,
+    )
 
     _auto_width(ws)
 
 
+def _build_rows_from_items(items: list, product_map: dict) -> tuple[list, list]:
+    """Extract slow_rows and dead_rows from Zoho aging items."""
+    slow_rows = []
+    dead_rows = []
+
+    for item in items:
+        item_id = item["item_id"]
+        item_name = item["item_name"]
+        intervals = item.get("intervals", [])
+        prod = product_map.get(item_id, {})
+        brand = (prod.get("brand") or "Unknown").strip() or "Unknown"
+        mrp = prod.get("rate") or 0.0
+
+        slow_qty, slow_val = _extract_interval(intervals, "181 - 270 days")
+        dead_qty, dead_val = _extract_interval(intervals, "> 270 days")
+
+        base = {"item_id": item_id, "item_name": item_name, "brand": brand, "mrp": mrp}
+
+        if slow_qty > 0:
+            slow_rows.append({**base, "qty": slow_qty, "asset_value": slow_val})
+
+        if dead_qty > 0:
+            dead_rows.append({**base, "qty": dead_qty, "asset_value": dead_val})
+
+    slow_rows.sort(key=lambda r: (r["brand"], r["item_name"]))
+    dead_rows.sort(key=lambda r: (r["brand"], r["item_name"]))
+    return slow_rows, dead_rows
+
+
+def _date_label(date_str: str) -> str:
+    """Convert YYYY-MM-DD to a short label like '09 May 26'."""
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%d %b %y")
+    except Exception:
+        return date_str
+
+
 @router.get("/download")
 async def download_inventory_aging(
-    to_date: str = Query(..., description="Report end date in YYYY-MM-DD format"),
+    to_date: str = Query(..., description="Current report date (YYYY-MM-DD)"),
+    prev_date: str = Query(..., description="Previous period date (YYYY-MM-DD)"),
     db=Depends(get_database),
 ):
-    # Validate date
-    try:
-        datetime.strptime(to_date, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="to_date must be YYYY-MM-DD")
+    for label, val in [("to_date", to_date), ("prev_date", prev_date)]:
+        try:
+            datetime.strptime(val, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{label} must be YYYY-MM-DD")
 
-    # Fetch Zoho data
+    if prev_date >= to_date:
+        raise HTTPException(status_code=400, detail="prev_date must be earlier than to_date")
+
+    # Fetch Zoho token once, then fetch both periods in parallel
     token = await asyncio.to_thread(_get_zoho_token)
-    raw_items = await asyncio.to_thread(_fetch_all_aging_items, token, to_date)
+    curr_items, prev_items = await asyncio.gather(
+        asyncio.to_thread(_fetch_all_aging_items, token, to_date),
+        asyncio.to_thread(_fetch_all_aging_items, token, prev_date),
+    )
 
-    if not raw_items:
-        raise HTTPException(status_code=404, detail="No inventory aging data returned from Zoho")
+    if not curr_items:
+        raise HTTPException(status_code=404, detail="No inventory aging data returned for current date")
 
-    # Batch-load products (for slow/dead rows) and all brands in parallel
-    all_item_ids = [item["item_id"] for item in raw_items]
+    # Batch-load products and brands in parallel
+    all_item_ids = list({item["item_id"] for item in curr_items + prev_items})
     products_col = db["products"]
     brands_col = db["brands"]
     stock_col = db["zoho_warehouse_stock"]
@@ -249,7 +413,7 @@ async def download_inventory_aging(
 
     product_map = {p["item_id"]: p for p in product_docs}
 
-    # Build brand_totals from zoho_warehouse_stock on the nearest date <= to_date
+    # Build brand_totals from zoho_warehouse_stock
     brand_names = [b["name"] for b in brand_docs if b.get("name")]
     brand_totals: dict[str, dict] = {
         name: {"stock": 0.0, "total_mrp": 0.0, "collection_value": 0.0}
@@ -293,51 +457,46 @@ async def download_inventory_aging(
             brand_totals[brand]["total_mrp"] += total_mrp_val
             brand_totals[brand]["collection_value"] += total_mrp_val / 2
 
-    # Build slow/dead rows from Zoho aging API data
-    slow_rows = []
-    dead_rows = []
+    # Build slow/dead rows for both periods
+    curr_slow, curr_dead = _build_rows_from_items(curr_items, product_map)
+    prev_slow, prev_dead = _build_rows_from_items(prev_items, product_map)
 
-    for item in raw_items:
-        item_id = item["item_id"]
-        item_name = item["item_name"]
-        intervals = item.get("intervals", [])
-        prod = product_map.get(item_id, {})
-        brand = (prod.get("brand") or "Unknown").strip() or "Unknown"
-        mrp = prod.get("rate") or 0.0
-
-        slow_qty, slow_val = _extract_interval(intervals, "181 - 270 days")
-        dead_qty, dead_val = _extract_interval(intervals, "> 270 days")
-
-        base = {"item_id": item_id, "item_name": item_name, "brand": brand, "mrp": mrp}
-
-        if slow_qty > 0:
-            slow_rows.append({**base, "qty": slow_qty, "asset_value": slow_val})
-
-        if dead_qty > 0:
-            dead_rows.append({**base, "qty": dead_qty, "asset_value": dead_val})
-
-    # Sort by brand then item_name
-    slow_rows.sort(key=lambda r: (r["brand"], r["item_name"]))
-    dead_rows.sort(key=lambda r: (r["brand"], r["item_name"]))
+    curr_label = _date_label(to_date)
+    prev_label = _date_label(prev_date)
 
     # Build XLSX
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
-    ws_slow = wb.create_sheet("Slow Movers")
-    _build_item_sheet(ws_slow, "Slow Movers", "181 - 270 days", slow_rows, "C0392B")
+    # Slow Movers sheets
+    ws_slow_summary = wb.create_sheet("Summary - Slow Movers")
+    _build_summary_sheet(ws_slow_summary, curr_slow, prev_slow, curr_label, prev_label, "C0392B")
 
-    ws_dead = wb.create_sheet("Deadstock")
-    _build_item_sheet(ws_dead, "Deadstock", "> 270 days", dead_rows, "7D3C98")
+    ws_slow_curr = wb.create_sheet(f"Slow Movers ({curr_label})")
+    _build_item_sheet(ws_slow_curr, "181 - 270 days", curr_slow, "C0392B")
 
+    ws_slow_prev = wb.create_sheet(f"Slow Movers ({prev_label})")
+    _build_item_sheet(ws_slow_prev, "181 - 270 days", prev_slow, "E74C3C")
+
+    # Deadstock sheets
+    ws_dead_summary = wb.create_sheet("Summary - Deadstock")
+    _build_summary_sheet(ws_dead_summary, curr_dead, prev_dead, curr_label, prev_label, "7D3C98")
+
+    ws_dead_curr = wb.create_sheet(f"Deadstock ({curr_label})")
+    _build_item_sheet(ws_dead_curr, "> 270 days", curr_dead, "7D3C98")
+
+    ws_dead_prev = wb.create_sheet(f"Deadstock ({prev_label})")
+    _build_item_sheet(ws_dead_prev, "> 270 days", prev_dead, "9B59B6")
+
+    # Brand sheet — three sections: current stock, slow movers, deadstock
     ws_brand = wb.create_sheet("Brand wise collection value")
-    _build_brand_sheet(ws_brand, brand_totals, stock_date_str)
+    _build_brand_sheet(ws_brand, brand_totals, stock_date_str, curr_slow, curr_dead)
 
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
 
-    filename = f"Inventory_Aging_{to_date}.xlsx"
+    filename = f"Inventory_Aging_{to_date}_vs_{prev_date}.xlsx"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
