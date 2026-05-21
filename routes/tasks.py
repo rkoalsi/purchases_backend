@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from pymongo.errors import PyMongoError
 
 from ..database import get_database, serialize_mongo_document
+from ..helpers.scheduler import send_task_assignment_notification
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -361,6 +362,25 @@ async def create_task(request: CreateTaskRequest, db=Depends(get_database)):
         return db[TASKS_COLLECTION].find_one({"_id": result.inserted_id})
 
     task = await asyncio.to_thread(_insert)
+
+    if request.assigned_to:
+        new_assignees = [
+            {"name": name, "department": dept}
+            for name, dept in zip(
+                request.assigned_to_names or [],
+                request.assigned_to_departments or [],
+            )
+        ]
+        asyncio.create_task(
+            asyncio.to_thread(
+                send_task_assignment_notification,
+                request.title.strip(),
+                request.created_by_name,
+                request.created_by_name,
+                new_assignees,
+            )
+        )
+
     return JSONResponse(status_code=201, content=serialize_mongo_document(task))
 
 
@@ -394,10 +414,15 @@ async def update_task(task_id: str, request: UpdateTaskRequest, db=Depends(get_d
     if not update_fields:
         raise HTTPException(status_code=400, detail="No fields to update")
 
+    old_assignees_snapshot: list = []
+
     def _update():
+        nonlocal old_assignees_snapshot
         existing = db[TASKS_COLLECTION].find_one({"_id": ObjectId(task_id)})
         if not existing:
             return None
+
+        old_assignees_snapshot = list(existing.get("assigned_to") or [])
 
         activities = []
         # Track meaningful field changes for the activity log
@@ -436,6 +461,30 @@ async def update_task(task_id: str, request: UpdateTaskRequest, db=Depends(get_d
     task = await asyncio.to_thread(_update)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    # Fire Slack notification for newly added assignees
+    if "assigned_to" in update_fields:
+        old_ids = set(old_assignees_snapshot)
+        new_ids = update_fields.get("assigned_to") or []
+        new_names = update_fields.get("assigned_to_names") or []
+        new_depts = update_fields.get("assigned_to_departments") or []
+
+        added_assignees = [
+            {"name": name, "department": dept}
+            for uid, name, dept in zip(new_ids, new_names, new_depts)
+            if uid not in old_ids
+        ]
+        if added_assignees:
+            asyncio.create_task(
+                asyncio.to_thread(
+                    send_task_assignment_notification,
+                    task.get("title", ""),
+                    task.get("created_by_name", ""),
+                    actor_name,
+                    added_assignees,
+                )
+            )
+
     return serialize_mongo_document(task)
 
 

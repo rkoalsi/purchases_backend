@@ -18,6 +18,12 @@ logger = logging.getLogger(__name__)
 
 SLACK_URL = os.getenv("SLACK_URL")
 
+# Per-department Slack webhook URLs — unmapped departments fall back to SLACK_URL_PURCHASE
+SLACK_DEPT_URLS: dict = {
+    "design": os.getenv("SLACK_URL_DESIGN"),
+    "purchase": os.getenv("SLACK_URL_PURCHASE"),
+}
+
 
 def send_slack_notification(
     title: str, success: bool = True, details: Dict = None, error_msg: str = None
@@ -78,6 +84,65 @@ def send_slack_notification(
             logger.error(f"Slack notification failed: {response.status_code} - {response.text}")
     except Exception as e:
         logger.error(f"Error sending Slack notification: {e}")
+
+def send_task_assignment_notification(
+    task_title: str,
+    created_by_name: str,
+    assigned_by_name: str,
+    new_assignees: list,  # [{"name": str, "department": str}]
+):
+    """Send Slack notification to per-department channels when a task is assigned."""
+    if not new_assignees:
+        return
+
+    assignee_names = ", ".join(a["name"] for a in new_assignees)
+    assignee_depts = ", ".join(
+        filter(None, {(a.get("department") or "").title() for a in new_assignees})
+    ) or "—"
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f":clipboard: Task Assigned: {task_title[:70]}",
+                "emoji": True,
+            },
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Created by:*\n{created_by_name}"},
+                {"type": "mrkdwn", "text": f"*Assigned by:*\n{assigned_by_name}"},
+                {"type": "mrkdwn", "text": f"*Assigned to:*\n{assignee_names}"},
+                {"type": "mrkdwn", "text": f"*Department(s):*\n{assignee_depts}"},
+            ],
+        },
+    ]
+
+    # Collect unique department webhook URLs
+    urls_to_notify: set = set()
+    unmapped_depts = False
+    for assignee in new_assignees:
+        dept_key = (assignee.get("department") or "").lower()
+        url = SLACK_DEPT_URLS.get(dept_key)
+        if url:
+            urls_to_notify.add(url)
+        else:
+            unmapped_depts = True
+
+    # Fall back to purchase channel for any unmapped department
+    if unmapped_depts:
+        fallback = os.getenv("SLACK_URL_PURCHASE") or SLACK_URL
+        if fallback:
+            urls_to_notify.add(fallback)
+
+    for url in urls_to_notify:
+        try:
+            requests.post(url, json={"blocks": blocks}, timeout=10)
+        except Exception as e:
+            logger.error(f"Task assignment Slack notification failed: {e}")
+
 
 # Global scheduler instance
 scheduler = AsyncIOScheduler()
