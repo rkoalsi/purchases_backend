@@ -850,6 +850,11 @@ async def get_order_line_items(order_id: str, db=Depends(get_database)):
             return []
         line_items = po.get("line_items", [])
         po_date = po.get("date")
+        if isinstance(po_date, str):
+            try:
+                po_date = datetime.strptime(po_date, "%Y-%m-%d")
+            except ValueError:
+                po_date = None
         if po_date and line_items:
             item_ids = [li.get("item_id") for li in line_items if li.get("item_id")]
             products = {
