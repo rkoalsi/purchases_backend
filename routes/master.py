@@ -716,7 +716,8 @@ class OptimizedMasterReportService:
                      "cf_item_code": 1, "purchase_price": 1, "currency": 1,
                      "purchase_status": 1, "stock_in_transit_1": 1, "stock_in_transit_2": 1,
                      "stock_in_transit_3": 1, "created_at": 1,
-                     "hsn_or_sac": 1, "is_combo_product": 1, "_id": 0},
+                     "hsn_or_sac": 1, "is_combo_product": 1,
+                     "category": 1, "sub_category": 1, "series": 1, "sku": 1, "_id": 0},
                 ).sort("_id", 1))
 
             products = await asyncio.to_thread(_fetch_all)
@@ -752,6 +753,10 @@ class OptimizedMasterReportService:
                     "is_new": is_new,
                     "hsn_or_sac": product.get("hsn_or_sac", ""),
                     "is_combo_product": product.get("is_combo_product", False),
+                    "category": product.get("category", "") or "",
+                    "sub_category": product.get("sub_category", "") or "",
+                    "series": product.get("series", "") or "",
+                    "sku": product.get("sku", "") or "",
                 }
 
             logger.info(f"Batch loaded all product data for {len(result)} products")
@@ -2361,6 +2366,13 @@ async def _generate_master_report_data(
                 if fba_only_skus:
                     fba_only_product_data = await report_service.batch_load_all_product_data(fba_only_skus)
                     all_product_data.update(fba_only_product_data)
+                    for _s, _pd in fba_only_product_data.items():
+                        _r = _pd.get("rate")
+                        if _r is not None:
+                            try:
+                                product_rates[_s] = float(_r)
+                            except (ValueError, TypeError):
+                                pass
                     for sku in sorted(fba_only_skus):
                         pdata = fba_only_product_data.get(sku, {})
                         # Respect brand filter if active
@@ -2430,6 +2442,13 @@ async def _generate_master_report_data(
                 if brand_sku_set:
                     brand_only_product_data = await report_service.batch_load_all_product_data(brand_sku_set)
                     all_product_data.update(brand_only_product_data)
+                    for _s, _pd in brand_only_product_data.items():
+                        _r = _pd.get("rate")
+                        if _r is not None:
+                            try:
+                                product_rates[_s] = float(_r)
+                            except (ValueError, TypeError):
+                                pass
                     injected = 0
                     for sku in sorted(brand_sku_set):
                         pdata = brand_only_product_data.get(sku, {})
@@ -2504,6 +2523,10 @@ async def _generate_master_report_data(
                 item["manufacturer_code"] = all_product_data.get(sku, {}).get("manufacturer_code", "")
                 item["mrp"] = product_rates.get(sku)
                 item["brand"] = product_brands.get(sku, "")
+                item["category"] = _pdata.get("category", "") or ""
+                item["sub_category"] = _pdata.get("sub_category", "") or ""
+                item["series"] = _pdata.get("series", "") or ""
+                item["sku"] = _pdata.get("sku", "") or ""
                 # Etrade (Vendor Central) inventory
                 vc_data = vc_by_sku.get(sku, {})
                 vc_stock = round(vc_data.get("closing_stock", 0), 2)
@@ -3374,6 +3397,11 @@ async def download_master_report(
                         "Manufacturer Code": item.get("manufacturer_code", ""),
                         "BBCode": item.get("sku_code", ""),
                         "Item Name": item.get("item_name", ""),
+                        "SKU Code": item.get("sku", ""),
+                        "Category": item.get("category", ""),
+                        "Sub Category": item.get("sub_category", ""),
+                        "Series": item.get("series", ""),
+                        "MRP": item.get("mrp") or "",
                         "Qty": None,
                         "Unit Price": item.get("unit_price", 0) or None,
                         "Total": None,
@@ -3420,6 +3448,7 @@ async def download_master_report(
                         _dcar    = _dcol("Cartons")
                         _dcbm    = _dcol("CBM")
                         _dtcbm   = _dcol("Total CBM")
+                        _dmrp    = _dcol("MRP")
 
                         for r_idx, row in enumerate(_group_rows):
                             r = r_idx + 2  # 1-based, skip header
@@ -3436,6 +3465,7 @@ async def download_master_report(
                             num_fmt = _CURRENCY_FORMATS.get(currency_code.upper(), _DEFAULT_NUMBER_FMT)
                             ws_draft[f"{_dup}{r}"].number_format = num_fmt
                             ws_draft[f"{_dtot}{r}"].number_format = num_fmt
+                            ws_draft[f"{_dmrp}{r}"].number_format = '₹#,##0.00'
 
                         # ── Totals row ──────────────────────────────────────────
                         _last_data_row = len(_group_rows) + 1

@@ -5,7 +5,7 @@ import re
 import zipfile
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, List, Optional
 
 import openpyxl
@@ -767,11 +767,29 @@ async def get_order_line_items(order_id: str, db=Depends(get_database)):
             return []
         po = db[PO_COLLECTION].find_one(
             {"purchaseorder_number": order["purchaseorder_number"]},
-            {"line_items": 1}
+            {"line_items": 1, "date": 1}
         )
         if not po:
             return []
-        return po.get("line_items", [])
+        line_items = po.get("line_items", [])
+        po_date = po.get("date")
+        if po_date and line_items:
+            item_ids = [li.get("item_id") for li in line_items if li.get("item_id")]
+            products = {
+                str(p["item_id"]): p.get("created_at")
+                for p in db["products"].find(
+                    {"item_id": {"$in": item_ids}},
+                    {"item_id": 1, "created_at": 1, "_id": 0},
+                )
+                if p.get("item_id")
+            }
+            for li in line_items:
+                prod_created = products.get(str(li.get("item_id")))
+                if isinstance(prod_created, datetime) and isinstance(po_date, datetime):
+                    li["is_new"] = abs((prod_created - po_date).days) <= 30
+                else:
+                    li["is_new"] = False
+        return line_items
     items = await asyncio.to_thread(_fetch)
     return serialize_mongo_document(items)
 

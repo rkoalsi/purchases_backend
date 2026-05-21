@@ -70,6 +70,18 @@ def _parse_draft_order_excel(file_bytes: bytes) -> list[dict]:
             col_map.setdefault("qty", idx)
         elif "unit price" in h or "unit_price" in h:
             col_map.setdefault("price", idx)
+        elif "hsn" in h:
+            col_map.setdefault("hsn", idx)
+        elif "sub category" in h or "sub_category" in h:
+            col_map.setdefault("sub_category", idx)
+        elif "category" in h:
+            col_map.setdefault("category", idx)
+        elif "series" in h:
+            col_map.setdefault("series", idx)
+        elif "mrp" in h:
+            col_map.setdefault("mrp", idx)
+        elif "sku" in h:
+            col_map.setdefault("sku_barcode", idx)
 
     # Fall back to positional defaults if headers not recognised
     mfr_idx = col_map.get("mfr", 0)
@@ -77,6 +89,18 @@ def _parse_draft_order_excel(file_bytes: bytes) -> list[dict]:
     name_idx = col_map.get("name", 2)
     qty_idx = col_map.get("qty", 3)
     price_idx = col_map.get("price", 4)
+    hsn_idx = col_map.get("hsn")
+    sku_barcode_idx = col_map.get("sku_barcode")
+    category_idx = col_map.get("category")
+    sub_category_idx = col_map.get("sub_category")
+    series_idx = col_map.get("series")
+    mrp_idx = col_map.get("mrp")
+
+    def _cell_str(row, idx):
+        if idx is None or idx >= len(row):
+            return ""
+        v = row[idx].value
+        return str(v).strip() if v is not None else ""
 
     items = []
     for row in ws.iter_rows(min_row=2):
@@ -97,6 +121,13 @@ def _parse_draft_order_excel(file_bytes: bytes) -> list[dict]:
         fmt = price_cell.number_format or ""
         currency = "CNY" if ("¥" in fmt or "\\¥" in fmt) else "USD"
 
+        mrp_val = None
+        if mrp_idx is not None and mrp_idx < len(row) and row[mrp_idx].value is not None:
+            try:
+                mrp_val = float(row[mrp_idx].value)
+            except (ValueError, TypeError):
+                pass
+
         items.append(
             {
                 "manufacturer_code": str(row[mfr_idx].value).strip() if row[mfr_idx].value else "",
@@ -105,9 +136,59 @@ def _parse_draft_order_excel(file_bytes: bytes) -> list[dict]:
                 "qty": int(qty),
                 "unit_price": float(price_cell.value) if price_cell.value is not None else 0.0,
                 "currency": currency,
+                "hsn_or_sac": _cell_str(row, hsn_idx),
+                "sku_code": _cell_str(row, sku_barcode_idx),
+                "category": _cell_str(row, category_idx),
+                "sub_category": _cell_str(row, sub_category_idx),
+                "series": _cell_str(row, series_idx),
+                "mrp": mrp_val,
             }
         )
     return items
+
+
+TAX_RATE_MAP: dict[int, dict] = {
+    5: {
+        "intra": {"tax_id": "3220178000000935227", "tax_specification": "intra"},
+        "inter": {"tax_id": "3220178000000085045", "tax_specification": "inter"},
+    },
+    12: {
+        "intra": {"tax_id": "3220178000000085117", "tax_specification": "intra"},
+        "inter": {"tax_id": "3220178000000085049", "tax_specification": "inter"},
+    },
+    18: {
+        "intra": {"tax_id": "3220178000000085129", "tax_specification": "intra"},
+        "inter": {"tax_id": "3220178000000085053", "tax_specification": "inter"},
+    },
+}
+
+
+class ZohoItemToCreate(BaseModel):
+    item_name: str
+    manufacturer_code: str = ""
+    bb_code: str = ""
+    sku_code: str = ""
+    hsn_or_sac: str = ""
+    category: str = ""
+    sub_category: str = ""
+    series: str = ""
+    mrp: Optional[float] = None
+    brand: str = ""
+    tax_rate: int = 18
+    upc_code: str = ""
+    ean_code: str = ""
+
+
+class CreateZohoItemsRequest(BaseModel):
+    items: List[ZohoItemToCreate]
+
+
+class SavePendingItemRequest(BaseModel):
+    bb_code: str
+    manufacturer_code: str = ""
+    tax_rate: int = 18
+    upc_code: str = ""
+    ean_code: str = ""
 
 
 class CreateDraftPORequest(BaseModel):
@@ -354,11 +435,21 @@ async def validate_draft_order(
                 else:
                     validated.append(enriched)
             else:
+                barcode = it.get("sku_code", "") or ""
                 missing.append(
                     {
                         "manufacturer_code": it["manufacturer_code"],
                         "bb_code": it["bb_code"],
                         "item_name": it["item_name"],
+                        "hsn_or_sac": it.get("hsn_or_sac", ""),
+                        "sku_code": barcode,
+                        "category": it.get("category", ""),
+                        "sub_category": it.get("sub_category", ""),
+                        "series": it.get("series", ""),
+                        "mrp": it.get("mrp"),
+                        "tax_rate": 18,
+                        "upc_code": barcode,
+                        "ean_code": barcode,
                     }
                 )
 
@@ -393,6 +484,23 @@ async def validate_draft_order(
         raise HTTPException(status_code=400, detail=str(e))
 
     if missing:
+        # Merge any previously saved edits (tax_rate, upc_code, ean_code) from DB
+        keys = [m["bb_code"] or m["manufacturer_code"] for m in missing if m["bb_code"] or m["manufacturer_code"]]
+        if keys:
+            saved = {
+                doc["_key"]: doc
+                for doc in db.get_collection("draft_order_pending_items").find({"_key": {"$in": keys}})
+            }
+            for m in missing:
+                key = m["bb_code"] or m["manufacturer_code"]
+                if key in saved:
+                    s = saved[key]
+                    if "tax_rate" in s:
+                        m["tax_rate"] = s["tax_rate"]
+                    if "upc_code" in s:
+                        m["upc_code"] = s["upc_code"]
+                    if "ean_code" in s:
+                        m["ean_code"] = s["ean_code"]
         return JSONResponse(
             status_code=200,
             content={
@@ -413,6 +521,169 @@ async def validate_draft_order(
             "detected_vendors": detected_vendors,
         },
     )
+
+
+@router.put("/draft_orders/pending_item")
+async def save_pending_item(body: SavePendingItemRequest, db=Depends(get_database)):
+    """Upsert a missing item's editable fields into draft_order_pending_items collection."""
+    key = body.bb_code or body.manufacturer_code
+    if not key:
+        raise HTTPException(status_code=400, detail="bb_code or manufacturer_code required")
+    col = db.get_collection("draft_order_pending_items")
+    col.update_one(
+        {"_key": key},
+        {"$set": {
+            "_key": key,
+            "bb_code": body.bb_code,
+            "manufacturer_code": body.manufacturer_code,
+            "tax_rate": body.tax_rate,
+            "upc_code": body.upc_code,
+            "ean_code": body.ean_code,
+            "updated_at": datetime.utcnow(),
+        }},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+@router.post("/draft_orders/create_zoho_items")
+async def create_zoho_items(body: CreateZohoItemsRequest):
+    """Create missing items on Zoho Books. Returns per-item created/failed results."""
+
+    FIXED_ACCOUNT_ID         = "3220178000000000388"
+    FIXED_PURCHASE_ACCOUNT   = "3220178000000034003"
+    FIXED_INVENTORY_ACCOUNT  = "3220178000000034001"
+    FIXED_UNIT               = "pcs"
+    FIXED_UNIT_ID            = "3220178000000075076"
+    CUSTOM_FIELD_MFR_CODE    = "3220178000000075178"
+    CUSTOM_FIELD_SKU_CODE    = "3220178000000075190"
+    CUSTOM_FIELD_CATEGORY    = "3220178000505344016"
+    CUSTOM_FIELD_SUB_CAT     = "3220178000505344022"
+    CUSTOM_FIELD_SERIES      = "3220178000505344028"
+    CUSTOM_FIELD_EXTRA       = "3220178000517626009"
+
+    def _do_create():
+        token = _get_zoho_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+        created = []
+        failed = []
+
+        for item in body.items:
+            barcode = item.sku_code or ""
+            upc = item.upc_code or barcode
+            ean = item.ean_code or barcode
+            tax_prefs = TAX_RATE_MAP.get(item.tax_rate, TAX_RATE_MAP[18])
+            item_tax_preferences = [tax_prefs["intra"], tax_prefs["inter"]]
+            payload = {
+                "name": item.item_name,
+                "rate": item.mrp or 0,
+                "account_id": FIXED_ACCOUNT_ID,
+                "sku": barcode,
+                "upc": upc,
+                "ean": ean,
+                "purchase_rate": 0,
+                "purchase_account_id": FIXED_PURCHASE_ACCOUNT,
+                "purchase_description": "",
+                "inventory_account_id": FIXED_INVENTORY_ACCOUNT,
+                "hsn_or_sac": item.hsn_or_sac or "",
+                "brand": item.brand or "",
+                "product_type": "goods",
+                "is_taxable": True,
+                "taxability_type": "none",
+                "item_tax_preferences": item_tax_preferences,
+                "track_serial_number": False,
+                "track_batch_number": False,
+                "is_returnable": True,
+                "can_be_sold": True,
+                "can_be_purchased": True,
+                "track_inventory": True,
+                "inventory_valuation_method": "fifo",
+                "unit": FIXED_UNIT,
+                "unit_id": FIXED_UNIT_ID,
+                "unit_group_id": "",
+                "default_sales_unit_conversion_id": "",
+                "default_purchase_unit_conversion_id": "",
+                "package_details": {
+                    "length": "", "width": "", "height": "",
+                    "weight": "", "weight_unit": "kg", "dimension_unit": "cm",
+                },
+                "custom_fields": [
+                    {"customfield_id": CUSTOM_FIELD_MFR_CODE, "value": item.manufacturer_code or ""},
+                    {"customfield_id": CUSTOM_FIELD_SKU_CODE, "value": item.bb_code or ""},
+                    {"customfield_id": CUSTOM_FIELD_CATEGORY, "value": item.category or ""},
+                    {"customfield_id": CUSTOM_FIELD_SUB_CAT,  "value": item.sub_category or ""},
+                    {"customfield_id": CUSTOM_FIELD_SERIES,   "value": item.series or ""},
+                    {"customfield_id": CUSTOM_FIELD_EXTRA,    "value": ""},
+                ],
+            }
+            try:
+                r = requests.post(
+                    f"{ZOHO_BOOKS_BASE}/items",
+                    headers=headers,
+                    json=payload,
+                    params={"organization_id": ORGANIZATION_ID},
+                    timeout=30,
+                )
+                r.raise_for_status()
+                data = r.json()
+                if data.get("code") != 0:
+                    raise ValueError(data.get("message", "Zoho error"))
+                zoho_item = data.get("item", {})
+                created.append({
+                    "item_name": item.item_name,
+                    "bb_code": item.bb_code,
+                    "manufacturer_code": item.manufacturer_code,
+                    "item_id": zoho_item.get("item_id", ""),
+                })
+            except Exception as exc:
+                logger.error("Failed to create Zoho item '%s': %s", item.item_name, exc)
+                failed.append({
+                    "item_name": item.item_name,
+                    "bb_code": item.bb_code,
+                    "manufacturer_code": item.manufacturer_code,
+                    "error": str(exc),
+                })
+
+        return created, failed
+
+    try:
+        created, failed = await asyncio.to_thread(_do_create)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if created:
+        def _notify():
+            import os as _os
+            purchase_url = _os.getenv("SLACK_URL_PURCHASE")
+            design_url   = _os.getenv("SLACK_URL_DESIGN")
+            n = len(created)
+            item_lines = "\n".join(
+                f"• *{c['item_name']}*  `{c['bb_code'] or c['manufacturer_code']}`"
+                for c in created
+            )
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": f":sparkles: {n} New Product{'s' if n != 1 else ''} Created on Zoho", "emoji": True},
+                },
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": item_lines},
+                },
+                {
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": f"Created via Draft Order Upload · {datetime.utcnow().strftime('%d %b %Y, %H:%M UTC')}"}],
+                },
+            ]
+            payload = {"blocks": blocks}
+            for url in {u for u in (purchase_url, design_url) if u}:
+                try:
+                    requests.post(url, json=payload, timeout=10)
+                except Exception:
+                    pass
+        await asyncio.to_thread(_notify)
+
+    return {"created": created, "failed": failed}
 
 
 @router.get("/draft_orders")
