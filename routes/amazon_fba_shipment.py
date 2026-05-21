@@ -100,6 +100,21 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
     asin_to_sku: dict[str, str] = {d["item_id"]: d["sku_code"] for d in sku_map_docs if d.get("item_id") and d.get("sku_code")}
     asin_to_fnsku_default: dict[str, str] = {d["item_id"]: d.get("fnsku", "") for d in sku_map_docs if d.get("item_id")}
 
+    # Platform derived from vendor_margins flags
+    etrade_po_asins: set[str] = set()
+    etrade_df_asins: set[str] = set()
+    for d in db["vendor_margins"].find(
+        {"asin": {"$in": asins}, "$or": [{"etrade_po": True}, {"etrade_df": True}]},
+        {"asin": 1, "etrade_po": 1, "etrade_df": 1, "_id": 0},
+    ):
+        a = d.get("asin")
+        if not a:
+            continue
+        if d.get("etrade_po"):
+            etrade_po_asins.add(a)
+        elif d.get("etrade_df"):
+            etrade_df_asins.add(a)
+
     # 2. Product details by SKU
     skus = list(asin_to_sku.values())
     product_by_sku: dict[str, dict] = {}
@@ -129,20 +144,11 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
         ]):
             fba_inv_by_asin[doc["_id"]] = int(doc["total"] or 0)
 
-    # 4. Open shipment qty from VC POs
+    # 4. Open shipment qty from FBA processing sheet (uploaded shipments)
     open_fba_shipment: dict[str, int] = {}
-    for doc in db["vendor_purchase_orders"].aggregate([
-        {"$match": {"po_status": {"$in": ["processing", "packed", "intransit"]}}},
-        {"$unwind": "$items"},
-        {"$match": {"items.asin": {"$in": asins}}},
-        {"$group": {
-            "_id": "$items.asin",
-            "total": {"$sum": {"$cond": {
-                "if": {"$eq": ["$po_status", "processing"]},
-                "then": {"$ifNull": ["$items.requested_qty", 0]},
-                "else": {"$ifNull": ["$items.accepted_qty", 0]},
-            }}},
-        }},
+    for doc in db[PROCESSING_COLLECTION].aggregate([
+        {"$match": {"asin": {"$in": asins}}},
+        {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$requested_qty", 0]}}}},
     ]):
         open_fba_shipment[doc["_id"]] = int(doc["total"] or 0)
 
@@ -182,19 +188,41 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
         ):
             etrade_inv_by_asin[doc["asin"]] = int(doc.get("sellableOnHandInventoryUnits") or 0)
 
-    # 7. Open PO (etrade)
+    # 7. Open PO (etrade) — same logic as vc_under_ordering.py:
+    #    processing → supply_qty_override → final_supply_fo → supply_qty (if >0) → requested_qty
+    #    packed/closed/intransit → accepted_qty
     open_etrade_po: dict[str, int] = {}
     for doc in db["vendor_purchase_orders"].aggregate([
-        {"$match": {"po_status": {"$in": ["processing", "packed", "intransit"]}}},
+        {"$match": {"po_status": {"$in": ["processing", "packed", "closed", "intransit"]}}},
         {"$unwind": "$items"},
         {"$match": {"items.asin": {"$in": asins}}},
         {"$group": {
             "_id": "$items.asin",
-            "total": {"$sum": {"$cond": {
-                "if": {"$eq": ["$po_status", "processing"]},
-                "then": {"$ifNull": ["$items.supply_qty", {"$ifNull": ["$items.requested_qty", 0]}]},
-                "else": {"$ifNull": ["$items.accepted_qty", 0]},
-            }}},
+            "total": {"$sum": {
+                "$cond": {
+                    "if": {"$eq": ["$po_status", "processing"]},
+                    "then": {
+                        "$cond": {
+                            "if": {"$ne": [{"$ifNull": ["$items.supply_qty_override", None]}, None]},
+                            "then": {"$ifNull": ["$items.supply_qty_override", 0]},
+                            "else": {
+                                "$cond": {
+                                    "if": {"$ne": [{"$ifNull": ["$items.final_supply_fo", None]}, None]},
+                                    "then": {"$ifNull": ["$items.final_supply_fo", 0]},
+                                    "else": {
+                                        "$cond": {
+                                            "if": {"$gt": [{"$ifNull": ["$items.supply_qty", 0]}, 0]},
+                                            "then": {"$ifNull": ["$items.supply_qty", 0]},
+                                            "else": {"$ifNull": ["$items.requested_qty", 0]},
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                    "else": {"$ifNull": ["$items.accepted_qty", 0]},
+                }
+            }},
         }},
     ]):
         open_etrade_po[doc["_id"]] = int(doc["total"] or 0)
@@ -314,7 +342,11 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
             "final_units_to_send": max(0, final_units),
             "zoho_stock": zoho_stock,
             "status": status,
-            "platform": override.get("platform") or "FBA",
+            "platform": override.get("platform") or (
+                "Etrade - PO & DF" if asin in etrade_po_asins
+                else "Etrade - DF only" if asin in etrade_df_asins
+                else "FBA or SC"
+            ),
             "current_inventory_etrade": etrade_inv,
             "open_po": open_po,
             "total_qty": total_qty,

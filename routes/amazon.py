@@ -2098,6 +2098,16 @@ async def upload_etrade_margins(
                 detail=f"Missing required columns: {', '.join(missing)}",
             )
 
+        def _parse_bool(val) -> bool | None:
+            if not pd.notna(val):
+                return None
+            s = str(val).strip().lower()
+            if s in ("true", "yes", "y", "1"):
+                return True
+            if s in ("false", "no", "n", "0"):
+                return False
+            return None
+
         collection = database.get_collection(MARGINS_COLLECTION)
         upserted = 0
         skipped = 0
@@ -2115,6 +2125,14 @@ async def upload_etrade_margins(
                 update_fields["margin"] = float(row["New Margin"])
             if pd.notna(row["Cost Price w/o Tax"]):
                 update_fields["cost_price_wo_tax"] = float(row["Cost Price w/o Tax"])
+            if "Etrade PO" in df.columns:
+                v = _parse_bool(row["Etrade PO"])
+                if v is not None:
+                    update_fields["etrade_po"] = v
+            if "Etrade DF" in df.columns:
+                v = _parse_bool(row["Etrade DF"])
+                if v is not None:
+                    update_fields["etrade_df"] = v
 
             if not update_fields:
                 skipped += 1
@@ -2157,14 +2175,14 @@ def download_etrade_margins_template(database=Depends(get_database)):
         margins_collection = database.get_collection(MARGINS_COLLECTION)
 
         skus = list(sku_collection.find({}, {"item_id": 1, "item_name": 1, "_id": 0}))
-        margins_list = list(margins_collection.find({}, {"asin": 1, "etrade_asp": 1, "margin": 1, "cost_price_wo_tax": 1, "_id": 0}))
+        margins_list = list(margins_collection.find({}, {"asin": 1, "etrade_asp": 1, "margin": 1, "cost_price_wo_tax": 1, "etrade_po": 1, "etrade_df": 1, "_id": 0}))
         margins_by_asin = {m["asin"]: m for m in margins_list}
 
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "eTrade Margins"
 
-        headers = ["ASIN", "Item Name", "ASP", "New Margin", "Cost Price w/o Tax"]
+        headers = ["ASIN", "Item Name", "ASP", "New Margin", "Cost Price w/o Tax", "Etrade PO", "Etrade DF"]
         header_fill = PatternFill("solid", fgColor="1E3A5F")
         header_font = Font(bold=True, color="FFFFFF")
         for col, h in enumerate(headers, 1):
@@ -2181,6 +2199,8 @@ def download_etrade_margins_template(database=Depends(get_database)):
             ws.cell(row=row_idx, column=3, value=m.get("etrade_asp"))
             ws.cell(row=row_idx, column=4, value=m.get("margin"))
             ws.cell(row=row_idx, column=5, value=m.get("cost_price_wo_tax"))
+            ws.cell(row=row_idx, column=6, value="Yes" if m.get("etrade_po") else ("No" if "etrade_po" in m else ""))
+            ws.cell(row=row_idx, column=7, value="Yes" if m.get("etrade_df") else ("No" if "etrade_df" in m else ""))
 
         for col in ws.columns:
             max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col)

@@ -2657,12 +2657,14 @@ async def upsert_margin(
     margin: Optional[float] = None,
     cost_price_wo_tax: Optional[float] = None,
     etrade_asp: Optional[float] = None,
+    etrade_po: Optional[bool] = None,
+    etrade_df: Optional[bool] = None,
     db=Depends(get_database),
 ):
-    if margin is None and cost_price_wo_tax is None and etrade_asp is None:
+    if all(v is None for v in [margin, cost_price_wo_tax, etrade_asp, etrade_po, etrade_df]):
         raise HTTPException(
             status_code=400,
-            detail="At least one of margin, cost_price_wo_tax, or etrade_asp must be provided",
+            detail="At least one field must be provided",
         )
     if margin is not None and not (0 <= margin <= 1):
         raise HTTPException(
@@ -2680,17 +2682,16 @@ async def upsert_margin(
         fields["cost_price_wo_tax"] = cost_price_wo_tax
     if etrade_asp is not None:
         fields["etrade_asp"] = etrade_asp
+    if etrade_po is not None:
+        fields["etrade_po"] = etrade_po
+    if etrade_df is not None:
+        fields["etrade_df"] = etrade_df
 
     def _upsert():
         db[MARGINS_COLLECTION].update_one({"asin": asin}, {"$set": fields}, upsert=True)
 
     await asyncio.to_thread(_upsert)
-    return {
-        "asin": asin,
-        "margin": margin,
-        "cost_price_wo_tax": cost_price_wo_tax,
-        "etrade_asp": etrade_asp,
-    }
+    return {"asin": asin, **{k: v for k, v in fields.items() if k not in ("asin", "updated_at")}}
 
 
 @router.post("/bulk_update")
