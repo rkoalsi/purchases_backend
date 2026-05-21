@@ -188,7 +188,7 @@ def get_products(
         # Get products with pagination
         cursor = (
             collection.find(query_filter)
-            .sort(actual_sort_field, sort_direction)
+            .sort([(actual_sort_field, sort_direction), ("_id", sort_direction)])
             .skip(skip)
             .limit(limit)
         )
