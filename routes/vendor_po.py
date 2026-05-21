@@ -228,6 +228,28 @@ def _get_dispatched_costs_by_asin(package_number: str, db) -> dict:
     return result
 
 
+def _compute_packages_accepted_costs(
+    package_numbers: list[str], db
+) -> tuple[float | None, float | None]:
+    """Sum accepted_total_cost and accepted_total_cost_gst across all linked packages."""
+    total_cost: float = 0.0
+    total_cost_gst: float = 0.0
+    has_any = False
+    for pkg_num in package_numbers:
+        try:
+            c, cg = _compute_package_accepted_costs(pkg_num, db)
+        except ValueError:
+            continue
+        if c is not None:
+            total_cost += c
+            has_any = True
+        if cg is not None:
+            total_cost_gst += cg
+    if not has_any:
+        return None, None
+    return round(total_cost, 2), round(total_cost_gst, 2)
+
+
 def _compute_package_accepted_costs(
     package_number: str, db
 ) -> tuple[float | None, float | None]:
@@ -1117,6 +1139,8 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "transfer_order_id": 1,
                     "bundle_ids": 1,
                     "assembly_numbers": 1,
+                    "packages": 1,
+                    "sales_order_no": 1,
                     "_id": 0,
                 }
             },
@@ -1408,12 +1432,20 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
             po_date_str=doc.get("po_date"),
             drr_map=_drr_map,
         )
-        # Attach per-item dispatched costs from the linked package (if any)
-        pkg_number = doc.get("package_number")
-        if pkg_number:
-            dispatched_by_asin = _get_dispatched_costs_by_asin(pkg_number, db)
+        # Attach per-item dispatched costs from all linked packages (if any)
+        pkg_numbers = doc.get("packages") or ([doc["package_number"]] if doc.get("package_number") else [])
+        if pkg_numbers:
+            merged: dict = {}
+            for pn in pkg_numbers:
+                for asin, d in _get_dispatched_costs_by_asin(pn, db).items():
+                    if asin in merged:
+                        merged[asin]["qty"] += d["qty"]
+                        merged[asin]["item_total"] += d["item_total"]
+                        merged[asin]["item_total_gst"] += d["item_total_gst"]
+                    else:
+                        merged[asin] = dict(d)
             for it in enriched:
-                d = dispatched_by_asin.get(it.get("asin"))
+                d = merged.get(it.get("asin"))
                 if d:
                     it["dispatched_qty"] = d["qty"]
                     it["total_cost_dispatched"] = d["item_total"]
@@ -1456,6 +1488,8 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
         "transfer_order_id": doc.get("transfer_order_id"),
         "bundle_ids": doc.get("bundle_ids") or [],
         "assembly_numbers": doc.get("assembly_numbers") or [],
+        "packages": doc.get("packages") or [],
+        "sales_order_no": doc.get("sales_order_no"),
         "items": serialize_mongo_document(enriched),
     }
 
@@ -1591,10 +1625,10 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
         doc = db[PO_COLLECTION].find_one({"po_number": po_number})
         if not doc:
             return None, None
-        pkg_number = doc.get("package_number")
-        if not pkg_number:
+        pkg_numbers = doc.get("packages") or ([doc["package_number"]] if doc.get("package_number") else [])
+        if not pkg_numbers:
             return doc, None
-        pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_number})
+        pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_numbers[0]})
         return doc, pkg
 
     doc, pkg = await asyncio.to_thread(_fetch)
@@ -1603,7 +1637,8 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
     if pkg is None:
         raise HTTPException(status_code=404, detail="No package linked to this PO")
 
-    package_number = doc["package_number"]
+    pkg_numbers = doc.get("packages") or ([doc["package_number"]] if doc.get("package_number") else [])
+    package_number = pkg_numbers[0]
     line_items = pkg.get("line_items") or []
 
     # Extract SKU, qty, name per line item
@@ -3177,52 +3212,88 @@ class PackageLinkRequest(BaseModel):
 async def link_package(
     po_number: str, body: PackageLinkRequest, db=Depends(get_database)
 ):
-    """Link a Zoho package to a PO by package_number. Computes accepted costs from package line items."""
+    """Add a Zoho package to the PO's packages array. Recomputes accepted costs from all packages."""
 
     def _link():
-        if not db[PO_COLLECTION].find_one({"po_number": po_number}):
+        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
+        if not doc:
             raise ValueError(f"PO {po_number} not found")
-        accepted_total_cost, accepted_total_cost_gst = _compute_package_accepted_costs(
-            body.package_number, db
+        # Validate package exists
+        if not db[PACKAGES_COLLECTION].find_one({"package_number": body.package_number}):
+            raise ValueError(f"Package {body.package_number!r} not found in packages collection")
+        # Add to array (addToSet avoids duplicates)
+        db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {"$addToSet": {"packages": body.package_number}, "$set": {"updated_at": datetime.now()}},
         )
-        update: dict = {
-            "package_number": body.package_number,
-            "updated_at": datetime.now(),
-        }
+        # Recompute accepted costs across all packages
+        updated_doc = db[PO_COLLECTION].find_one({"po_number": po_number}, {"packages": 1})
+        all_packages = updated_doc.get("packages") or []
+        accepted_total_cost, accepted_total_cost_gst = _compute_packages_accepted_costs(all_packages, db)
+        cost_update: dict = {"updated_at": datetime.now()}
         if accepted_total_cost is not None:
-            update["accepted_total_cost"] = accepted_total_cost
+            cost_update["accepted_total_cost"] = accepted_total_cost
         if accepted_total_cost_gst is not None:
-            update["accepted_total_cost_gst"] = accepted_total_cost_gst
-        db[PO_COLLECTION].update_one({"po_number": po_number}, {"$set": update})
-        return accepted_total_cost, accepted_total_cost_gst
+            cost_update["accepted_total_cost_gst"] = accepted_total_cost_gst
+        db[PO_COLLECTION].update_one({"po_number": po_number}, {"$set": cost_update})
+        return all_packages, accepted_total_cost, accepted_total_cost_gst
 
     try:
-        accepted_total_cost, accepted_total_cost_gst = await asyncio.to_thread(_link)
+        packages, accepted_total_cost, accepted_total_cost_gst = await asyncio.to_thread(_link)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     return {
         "po_number": po_number,
-        "package_number": body.package_number,
+        "packages": packages,
         "accepted_total_cost": accepted_total_cost,
         "accepted_total_cost_gst": accepted_total_cost_gst,
     }
 
 
+@router.delete("/{po_number}/package/{pkg_number}")
+async def unlink_specific_package(po_number: str, pkg_number: str, db=Depends(get_database)):
+    """Remove a specific package from the PO's packages array and recompute accepted costs."""
+
+    def _unlink():
+        result = db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {"$pull": {"packages": pkg_number}, "$set": {"updated_at": datetime.now()}},
+        )
+        if not result.matched_count:
+            return None, None, None
+        updated_doc = db[PO_COLLECTION].find_one({"po_number": po_number}, {"packages": 1})
+        remaining = updated_doc.get("packages") or []
+        if remaining:
+            accepted_total_cost, accepted_total_cost_gst = _compute_packages_accepted_costs(remaining, db)
+            db[PO_COLLECTION].update_one(
+                {"po_number": po_number},
+                {"$set": {"accepted_total_cost": accepted_total_cost, "accepted_total_cost_gst": accepted_total_cost_gst}},
+            )
+        else:
+            accepted_total_cost = accepted_total_cost_gst = None
+            db[PO_COLLECTION].update_one(
+                {"po_number": po_number},
+                {"$unset": {"accepted_total_cost": "", "accepted_total_cost_gst": ""}},
+            )
+        return remaining, accepted_total_cost, accepted_total_cost_gst
+
+    packages, accepted_total_cost, accepted_total_cost_gst = await asyncio.to_thread(_unlink)
+    if packages is None:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    return {"po_number": po_number, "packages": packages, "accepted_total_cost": accepted_total_cost, "accepted_total_cost_gst": accepted_total_cost_gst}
+
+
 @router.delete("/{po_number}/package")
-async def unlink_package(po_number: str, db=Depends(get_database)):
-    """Remove the package link and accepted cost fields from a PO."""
+async def unlink_all_packages(po_number: str, db=Depends(get_database)):
+    """Remove all packages and accepted cost fields from a PO."""
 
     def _unlink():
         result = db[PO_COLLECTION].update_one(
             {"po_number": po_number},
             {
-                "$unset": {
-                    "package_number": "",
-                    "accepted_total_cost": "",
-                    "accepted_total_cost_gst": "",
-                },
-                "$set": {"updated_at": datetime.now()},
+                "$set": {"packages": [], "updated_at": datetime.now()},
+                "$unset": {"package_number": "", "accepted_total_cost": "", "accepted_total_cost_gst": ""},
             },
         )
         return result.matched_count
@@ -3230,7 +3301,60 @@ async def unlink_package(po_number: str, db=Depends(get_database)):
     count = await asyncio.to_thread(_unlink)
     if not count:
         raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
-    return {"po_number": po_number, "unlinked": True}
+    return {"po_number": po_number, "packages": [], "unlinked": True}
+
+
+# ─── sales order number ────────────────────────────────────────────────────────
+
+
+SALES_ORDERS_COLLECTION = "sales_orders"
+
+
+class SalesOrderLinkRequest(BaseModel):
+    sales_order_no: str
+
+
+@router.get("/search/sales_orders")
+async def search_sales_orders(q: str = "", db=Depends(get_database)):
+    """Search sales_orders collection by salesorder_number (prefix match)."""
+
+    def _search():
+        if not q.strip():
+            return []
+        results = db[SALES_ORDERS_COLLECTION].find(
+            {"salesorder_number": {"$regex": q.strip(), "$options": "i"}},
+            {"salesorder_number": 1, "salesorder_id": 1, "customer_name": 1, "_id": 0},
+        ).limit(10)
+        return list(results)
+
+    return await asyncio.to_thread(_search)
+
+
+@router.patch("/{po_number}/sales_order_no")
+async def update_sales_order_no(
+    po_number: str, body: SalesOrderLinkRequest, db=Depends(get_database)
+):
+    """Set or update the sales order number on a PO. Looks up salesorder_id if SO exists in DB."""
+
+    def _update():
+        so_number = body.sales_order_no.strip()
+        so_doc = db[SALES_ORDERS_COLLECTION].find_one(
+            {"salesorder_number": so_number},
+            {"salesorder_id": 1, "_id": 0},
+        )
+        update_fields: dict = {"sales_order_no": so_number, "updated_at": datetime.now()}
+        if so_doc:
+            update_fields["sales_order_id"] = so_doc["salesorder_id"]
+        result = db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {"$set": update_fields},
+        )
+        return result.matched_count, so_number, so_doc.get("salesorder_id") if so_doc else None
+
+    count, so_number, so_id = await asyncio.to_thread(_update)
+    if not count:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    return {"po_number": po_number, "sales_order_no": so_number, "sales_order_id": so_id}
 
 
 # ─── transfer order ────────────────────────────────────────────────────────────
