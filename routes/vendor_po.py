@@ -1496,6 +1496,20 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
 
     # Compute PO item totals using the estimate formula
     po_items = [it for it in doc.get("items", []) if (it.get("status") or "").lower() != "inactive"]
+
+    # Build ASIN → cf_sku_code map so PO items with ASINs as model_number can match estimate line items keyed by cf_sku_code
+    po_model_numbers = [it["model_number"] for it in po_items if it.get("model_number")]
+    def _fetch_sku_map():
+        return {
+            m["item_id"]: m["sku_code"]
+            for m in db[SKU_MAPPING_COLLECTION].find(
+                {"item_id": {"$in": po_model_numbers}},
+                {"item_id": 1, "sku_code": 1},
+            )
+            if m.get("item_id") and m.get("sku_code")
+        }
+    asin_to_sku_diff: dict[str, str] = await asyncio.to_thread(_fetch_sku_map)
+
     rows = []
     for it in po_items:
         model = it.get("model_number") or ""
@@ -1515,7 +1529,9 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
             rate = None
             po_item_total = None
 
-        eli = est_by_sku.get(model)
+        # model_number may be an ASIN — resolve to cf_sku_code for estimate lookup
+        sku_key = asin_to_sku_diff.get(model, model)
+        eli = est_by_sku.get(sku_key)
         in_estimate = eli is not None
         est_qty = eli.get("quantity") if eli else None
         est_rate = eli.get("rate") if eli else None
@@ -1541,7 +1557,8 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
         })
 
     # Items in estimate but not in PO
-    po_skus = {it.get("model_number") for it in po_items}
+    # Resolve ASIN model_numbers to cf_sku_codes so the comparison uses the same key as est_by_sku
+    po_skus = {asin_to_sku_diff.get(it.get("model_number", ""), it.get("model_number", "")) for it in po_items}
     only_in_estimate = [
         {"sku": _cf_sku(li), "name": li.get("name", ""), "quantity": li.get("quantity"), "rate": li.get("rate"), "item_total": li.get("item_total")}
         for li in est.get("line_items", [])
@@ -2904,11 +2921,28 @@ async def create_zoho_estimate(
             if p.get("cf_sku_code") and p.get("item_id")
         }
 
+        # Fallback: model_numbers not found as ASINs may be direct cf_sku_codes (VC POs).
+        # Prefer active products to handle dual 5%/12% GST variants where 12% are inactive.
+        direct_sku_codes = [mn for mn in model_numbers if mn not in asin_to_sku_code]
+        if direct_sku_codes:
+            for p in db[PRODUCTS_COLLECTION].find(
+                {"cf_sku_code": {"$in": direct_sku_codes}},
+                {"cf_sku_code": 1, "item_id": 1, "status": 1},
+            ):
+                sku = p.get("cf_sku_code")
+                item_id = p.get("item_id")
+                if not sku or not item_id:
+                    continue
+                # Active entry wins; only write inactive if nothing stored yet
+                if p.get("status") == "active" or sku not in sku_to_zoho_item_id:
+                    sku_to_zoho_item_id[sku] = item_id
+
         skipped: list[str] = []
         line_items: list[dict] = []
         for it in items:
             sku_code = asin_to_sku_code.get(it.get("model_number", ""))
-            zoho_item_id = sku_to_zoho_item_id.get(sku_code or "")
+            # For direct sku_code model_numbers, look up the model_number itself
+            zoho_item_id = sku_to_zoho_item_id.get(sku_code or it.get("model_number", ""))
             if not zoho_item_id:
                 skipped.append(it.get("model_number", it.get("asin", "?")))
                 continue
