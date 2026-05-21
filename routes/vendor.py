@@ -162,6 +162,49 @@ TAX_RATE_MAP: dict[int, dict] = {
     },
 }
 
+# HSN code → GST rate mapping. Sourced from HSN master sheet.
+# Conditional entries include a price_threshold: rate is below_rate when price <= threshold,
+# otherwise the standard rate applies.
+HSN_GST_MAP: dict[str, dict] = {
+    "33059030":  {"rate": 5},
+    "63079099":  {"rate": 5, "price_threshold": 2500, "above_threshold_rate": 18},
+    "96190090":  {"rate": 5},
+    "1517":      {"rate": 5},
+    "62171030":  {"rate": 5},
+    "23091000":  {"rate": 18},
+    "15159099":  {"rate": 5},
+    "33073090":  {"rate": 18},
+    "39269099":  {"rate": 18},
+    "40169990":  {"rate": 18},
+    "40169100":  {"rate": 18},
+    "3926":      {"rate": 18},
+    "96161010":  {"rate": 5},
+    "21069099":  {"rate": 18},
+    "48239090":  {"rate": 18},
+    "48189000":  {"rate": 18},
+    "25081090":  {"rate": 5},
+    "63079090":  {"rate": 5},
+    "42010000":  {"rate": 18},
+    "23099090":  {"rate": 18},
+    "38249900":  {"rate": 18},
+    "82142010":  {"rate": 18},
+    "40170090":  {"rate": 18},
+    "33051090":  {"rate": 18},
+    "14049090":  {"rate": 5},
+    "58110090":  {"rate": 5},
+}
+
+
+def resolve_gst_rate(hsn_or_sac: str, price: Optional[float]) -> int:
+    """Return GST rate % for the given HSN code and price. Defaults to 18 if HSN not in map."""
+    entry = HSN_GST_MAP.get(str(hsn_or_sac).strip())
+    if not entry:
+        return 18
+    if "price_threshold" in entry and price is not None:
+        if price > entry["price_threshold"]:
+            return entry["above_threshold_rate"]
+    return entry["rate"]
+
 
 class ZohoItemToCreate(BaseModel):
     item_name: str
@@ -447,7 +490,7 @@ async def validate_draft_order(
                         "sub_category": it.get("sub_category", ""),
                         "series": it.get("series", ""),
                         "mrp": it.get("mrp"),
-                        "tax_rate": 18,
+                        "tax_rate": resolve_gst_rate(it.get("hsn_or_sac", ""), it.get("mrp")),
                         "upc_code": barcode,
                         "ean_code": barcode,
                     }
