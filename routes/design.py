@@ -157,7 +157,7 @@ def get_new_items(
 
         pipeline = [
             {"$match": query_filter},
-            {"$sort": {"created_at": -1}},
+            {"$sort": {"created_at": -1, "_id": -1}},
             {"$skip": skip},
             {"$limit": limit},
             {"$lookup": {
@@ -623,7 +623,7 @@ def download_products_xlsx(
 
         pipeline = [
             {"$match": q},
-            {"$sort": {"created_at": -1}},
+            {"$sort": {"created_at": -1, "_id": -1}},
             {"$lookup": {
                 "from": DESIGN_CATALOGUE_COLLECTION,
                 "localField": "_id",
@@ -742,6 +742,12 @@ async def list_designer_orders(db=Depends(get_database)):
             {"$addFields": {"doc_count": {"$size": {"$ifNull": ["$designer_documents", []]}}}},
             {"$project": {"documents": 0}},
             {"$lookup": {
+                "from": PO_COLLECTION,
+                "localField": "purchaseorder_number",
+                "foreignField": "purchaseorder_number",
+                "as": "_po",
+            }},
+            {"$lookup": {
                 "from": VENDORS_COLLECTION,
                 "localField": "vendor_id",
                 "foreignField": "contact_id",
@@ -749,8 +755,32 @@ async def list_designer_orders(db=Depends(get_database)):
             }},
             {"$addFields": {
                 "vendor_name": {"$arrayElemAt": ["$_vendor.contact_name", 0]},
+                "po_status": {
+                    "$let": {
+                        "vars": {
+                            "fmt": {"$arrayElemAt": ["$_po.order_status_formatted", 0]},
+                            "raw": {"$arrayElemAt": ["$_po.order_status", 0]},
+                        },
+                        "in": {
+                            "$cond": {
+                                "if": {"$gt": [{"$strLenCP": {"$ifNull": ["$$fmt", ""]}}, 0]},
+                                "then": "$$fmt",
+                                "else": {
+                                    "$cond": {
+                                        "if": {"$gt": [{"$strLenCP": {"$ifNull": ["$$raw", ""]}}, 0]},
+                                        "then": {"$concat": [
+                                            {"$toUpper": {"$substrCP": ["$$raw", 0, 1]}},
+                                            {"$substrCP": ["$$raw", 1, {"$subtract": [{"$strLenCP": "$$raw"}, 1]}]},
+                                        ]},
+                                        "else": None,
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
             }},
-            {"$project": {"_vendor": 0}},
+            {"$project": {"_vendor": 0, "_po": 0}},
             {"$addFields": {
                 "_sort_num": {
                     "$convert": {
