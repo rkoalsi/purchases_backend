@@ -17,6 +17,7 @@ from jose import jwt, JWTError
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+import requests
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -220,18 +221,7 @@ async def list_orders(brand: Optional[str] = None, db=Depends(get_database)):
                 "vendor_name": {"$arrayElemAt": ["$_vendor.contact_name", 0]},
             }},
             {"$project": {"_po": 0, "_vendor": 0}},
-            {"$addFields": {
-                "_sort_num": {
-                    "$convert": {
-                        "input": {"$trim": {"input": {"$arrayElemAt": [{"$split": ["$name", "#"]}, 1]}}},
-                        "to": "int",
-                        "onError": 0,
-                        "onNull": 0,
-                    }
-                }
-            }},
-            {"$sort": {"_sort_num": -1}},
-            {"$project": {"_sort_num": 0}},
+            {"$sort": {"created_at": -1, "_id": -1}},
         ]
         return list(db[COLLECTION].aggregate(pipeline))
 
@@ -436,14 +426,74 @@ async def update_order(
             fields[field] = val or None
 
     def _update():
+        order_doc = db[COLLECTION].find_one(
+            {"_id": ObjectId(order_id)},
+            {"brand": 1, "name": 1, "ready_date": 1, "etd_date": 1},
+        )
+        if not order_doc:
+            return None, None, {}
+        prev_dates = {
+            "ready_date": order_doc.get("ready_date"),
+            "etd_date": order_doc.get("etd_date"),
+        }
         result = db[COLLECTION].update_one(
             {"_id": ObjectId(order_id)}, {"$set": fields}
         )
-        return result.matched_count
+        return result.matched_count, order_doc, prev_dates
 
-    matched = await asyncio.to_thread(_update)
+    matched, order_doc, prev_dates = await asyncio.to_thread(_update)
     if not matched:
         raise HTTPException(status_code=404, detail="Order not found")
+
+    # Notify design Slack channel only when a date transitions from unset → set
+    _DATE_NOTIFICATIONS = {
+        "ready_date": (":package: Order Ready Date Set", "The order is ready for shipment."),
+        "etd_date": (":ship: ETD Date Set", "The estimated departure date has been confirmed."),
+    }
+    if order_doc:
+        def _notify_dates(brand: str, order_name: str, notifications: list):
+            url = os.getenv("SLACK_URL_DESIGN")
+            if not url:
+                return
+            for title, subtitle, date_val in notifications:
+                blocks = [
+                    {
+                        "type": "header",
+                        "text": {"type": "plain_text", "text": title, "emoji": True},
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
+                            {"type": "mrkdwn", "text": f"*Brand:*\n{brand}"},
+                            {"type": "mrkdwn", "text": f"*Order:*\n{order_name}"},
+                            {"type": "mrkdwn", "text": f"*Date:*\n{date_val}"},
+                        ],
+                    },
+                    {
+                        "type": "context",
+                        "elements": [{"type": "mrkdwn", "text": f"{subtitle}  ·  {datetime.now().strftime('%d %b %Y, %H:%M')}"}],
+                    },
+                ]
+                try:
+                    requests.post(url, json={"blocks": blocks}, timeout=10)
+                except Exception as exc:
+                    logger.warning("Brand order Slack notification failed: %s", exc)
+
+        notifications_to_send = []
+        for field, (title, subtitle) in _DATE_NOTIFICATIONS.items():
+            new_val = fields.get(field)
+            old_val = prev_dates.get(field)
+            if new_val and not old_val:
+                notifications_to_send.append((title, subtitle, new_val))
+
+        if notifications_to_send:
+            await asyncio.to_thread(
+                _notify_dates,
+                order_doc.get("brand", ""),
+                order_doc.get("name", ""),
+                notifications_to_send,
+            )
+
     return {"_id": order_id, **{k: v for k, v in fields.items() if k != "updated_at"}}
 
 
