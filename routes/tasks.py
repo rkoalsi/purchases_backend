@@ -59,6 +59,7 @@ class UpdateTaskRequest(BaseModel):
     tags: Optional[List[str]] = None
     actor_id: Optional[str] = None
     actor_name: Optional[str] = None
+    notify_assignees: Optional[bool] = False
 
 
 class AddCommentRequest(BaseModel):
@@ -404,8 +405,9 @@ async def update_task(task_id: str, request: UpdateTaskRequest, db=Depends(get_d
     actor_id = request.actor_id or "system"
     actor_name = request.actor_name or "System"
 
+    notify_assignees = request.notify_assignees or False
     update_fields = {k: v for k, v in request.model_dump().items()
-                     if v is not None and k not in ("actor_id", "actor_name")}
+                     if v is not None and k not in ("actor_id", "actor_name", "notify_assignees")}
 
     if "priority" in update_fields and update_fields["priority"] not in VALID_PRIORITIES:
         raise HTTPException(status_code=400, detail=f"Invalid priority: {update_fields['priority']}")
@@ -462,8 +464,9 @@ async def update_task(task_id: str, request: UpdateTaskRequest, db=Depends(get_d
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # Fire Slack notification for newly added assignees
-    if "assigned_to" in update_fields:
+    # Fire Slack notification for newly added assignees — only when the frontend
+    # explicitly confirms (notify_assignees=True), i.e. the user clicked "Done"
+    if notify_assignees and "assigned_to" in update_fields:
         old_ids = set(old_assignees_snapshot)
         new_ids = update_fields.get("assigned_to") or []
         new_names = update_fields.get("assigned_to_names") or []
