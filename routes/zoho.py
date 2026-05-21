@@ -132,47 +132,38 @@ def get_products(
         db = get_database()
         collection = db[PRODUCTS_COLLECTION]
 
-        # Build query filter
-        query_filter = {}
+        # Build query filter using $and so each condition is independent
+        conditions = []
 
-        # Search functionality
         if search:
             search_regex = {"$regex": re.escape(search), "$options": "i"}
-            query_filter["$or"] = [
+            conditions.append({"$or": [
                 {"name": search_regex},
                 {"sku": search_regex},
                 {"cf_sku_code": search_regex},
                 {"item_id": search_regex},
                 {"description": search_regex},
-            ]
+            ]})
 
-        # Brand filter
         if brand:
-            query_filter["brand"] = brand
+            conditions.append({"brand": brand})
 
-        # Category filter
         if category:
-            query_filter["$or"] = query_filter.get("$or", []) + [
-                {"category_name": {"$regex": category, "$options": "i"}},
-                {"item_type": {"$regex": category, "$options": "i"}},
-            ]
+            conditions.append({"$or": [
+                {"category_name": {"$regex": re.escape(category), "$options": "i"}},
+                {"item_type": {"$regex": re.escape(category), "$options": "i"}},
+            ]})
 
-        # Status filter
         if status:
             if status.lower() == "active":
-                query_filter["$or"] = query_filter.get("$or", []) + [
-                    {"status": "active"},
-                    {"is_active": True},
-                ]
+                conditions.append({"$or": [{"status": "active"}, {"is_active": True}]})
             elif status.lower() == "inactive":
-                query_filter["$or"] = query_filter.get("$or", []) + [
-                    {"status": {"$ne": "active"}},
-                    {"is_active": {"$ne": True}},
-                ]
+                conditions.append({"$or": [{"status": {"$ne": "active"}}, {"is_active": {"$ne": True}}]})
 
-        # Purchase status filter
         if purchase_status:
-            query_filter["purchase_status"] = purchase_status
+            conditions.append({"purchase_status": purchase_status})
+
+        query_filter = {"$and": conditions} if conditions else {}
 
         # Sort configuration
         sort_field_mapping = {

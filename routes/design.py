@@ -324,6 +324,53 @@ def patch_product_images(product_id: str, body: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ProductDetailsPatch(BaseModel):
+    category: Optional[str] = None
+    sub_category: Optional[str] = None
+    series: Optional[str] = None
+
+
+@router.patch("/products/{product_id}/details")
+def patch_product_details(product_id: str, body: ProductDetailsPatch):
+    """Update product-level category, sub_category, series fields."""
+    try:
+        db = get_database()
+        update: dict = {k: v for k, v in body.dict().items() if v is not None}
+        if not update:
+            raise HTTPException(status_code=400, detail="No fields to update")
+        update["updated_at"] = datetime.utcnow()
+        db[PRODUCTS_COLLECTION].update_one(
+            {"_id": ObjectId(product_id)},
+            {"$set": update},
+        )
+        return JSONResponse(content={"ok": True})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/products/{product_id}/catalogue-details")
+def patch_product_catalogue_details(product_id: str, body: CatalogueItemPatch):
+    """Upsert catalogue details by product_id — works with or without an existing catalogue entry."""
+    try:
+        db = get_database()
+        update: dict = {k: v for k, v in body.dict().items() if v is not None}
+        if not update:
+            raise HTTPException(status_code=400, detail="No fields to update")
+        update["updated_at"] = datetime.utcnow()
+        db[DESIGN_CATALOGUE_COLLECTION].update_one(
+            {"product_id": ObjectId(product_id)},
+            {"$set": update},
+            upsert=True,
+        )
+        return JSONResponse(content={"ok": True})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/products/{product_id}/upload-image")
 async def upload_product_image(product_id: str, file: UploadFile = File(...)):
     """Upload an image to the public S3 bucket and return its public URL."""
