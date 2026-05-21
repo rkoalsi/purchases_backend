@@ -613,6 +613,108 @@ async def search_documents(q: str, db=Depends(get_database)):
 
 # ─── line items ────────────────────────────────────────────────────────────────
 
+_LINE_ITEM_EXPORT_FIELDS = [
+    ("name", "Product Name"),
+    ("sku", "SKU"),
+    ("quantity", "Quantity"),
+    ("quantity_received", "Qty Received"),
+    ("quantity_billed", "Qty Billed"),
+    ("quantity_cancelled", "Qty Cancelled"),
+    ("quantity_intransit", "Qty In-Transit"),
+    ("quantity_marked_as_received", "Qty Marked Received"),
+    ("rate", "Rate"),
+    ("_currency_code", "Currency Code"),
+    ("item_total", "Item Total"),
+    ("tax_name", "Tax Name"),
+    ("tax_percentage", "Tax %"),
+    ("unit", "Unit"),
+    ("hsn_or_sac", "HSN/SAC"),
+    ("warehouse_name", "Warehouse"),
+    ("line_item_category", "Category"),
+    ("header_name", "Header"),
+    ("description", "Description"),
+]
+
+
+def _build_line_items_excel(line_items: list, currency_code: str) -> io.BytesIO:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Line Items"
+
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF", size=9)
+    data_font = Font(size=9)
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+
+    ws.append([label for _, label in _LINE_ITEM_EXPORT_FIELDS])
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+        cell.border = border
+    ws.row_dimensions[1].height = 20
+
+    for item in line_items:
+        row = []
+        for key, _ in _LINE_ITEM_EXPORT_FIELDS:
+            if key == "_currency_code":
+                row.append(currency_code or "")
+            else:
+                row.append(item.get(key, ""))
+        ws.append(row)
+        for cell in ws[ws.max_row]:
+            cell.font = data_font
+            cell.border = border
+            cell.alignment = left
+
+    for col in ws.columns:
+        max_len = max((len(str(cell.value)) if cell.value is not None else 0) for cell in col)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
+
+    ws.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+@router.get("/{order_id}/line-items/download")
+async def download_order_line_items(order_id: str, db=Depends(get_database)):
+    """Download line items for the order's linked PO as XLSX, including the PO's currency code."""
+    def _fetch():
+        order = db[COLLECTION].find_one(
+            {"_id": ObjectId(order_id)},
+            {"purchaseorder_number": 1, "brand": 1, "name": 1},
+        )
+        if not order or not order.get("purchaseorder_number"):
+            return None, None, None
+        po = db[PO_COLLECTION].find_one(
+            {"purchaseorder_number": order["purchaseorder_number"]},
+            {"line_items": 1, "currency_code": 1},
+        )
+        if not po:
+            return order, None, None
+        return order, po.get("line_items", []), po.get("currency_code", "")
+
+    order, line_items, currency_code = await asyncio.to_thread(_fetch)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found or no PO attached")
+    if line_items is None:
+        raise HTTPException(status_code=404, detail="Linked PO not found")
+
+    buf = await asyncio.to_thread(_build_line_items_excel, line_items, currency_code or "")
+    po_number = order.get("purchaseorder_number", order_id)
+    filename = f"{po_number}_line_items.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/{order_id}/line-items")
 async def get_order_line_items(order_id: str, db=Depends(get_database)):
     def _fetch():
