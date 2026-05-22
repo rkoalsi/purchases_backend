@@ -178,6 +178,163 @@ async def fetch_last_n_days_in_stock_blinkit(
         return {}
 
 
+def _parse_daily_date_blinkit(date_val):
+    """Parse a date from a datetime or string to a date object."""
+    from datetime import date as date_type
+    if isinstance(date_val, date_type) and not isinstance(date_val, datetime):
+        return date_val
+    if isinstance(date_val, datetime):
+        return date_val.date()
+    if isinstance(date_val, str):
+        try:
+            return datetime.fromisoformat(date_val.replace("Z", "+00:00")).date()
+        except ValueError:
+            return datetime.strptime(date_val[:10], "%Y-%m-%d").date()
+    return None
+
+
+def compute_drr_blinkit(daily_data: list, total_returns: float):
+    """
+    DRR for Blinkit – same algorithm as Amazon DRR v3:
+    - Select 30 most recent in-stock days (closing_stock > 0 OR units_sold > 0) from 90-day window
+    - Raw mean = total_gross / 30; spike threshold = 2x raw mean
+    - Spike days replaced with threshold; net = max(0, cleaned - returns)
+    - Final DRR = net / 30
+    Returns: (drr, lookback_label, lookback_sales, drr_flag)
+    """
+    if not daily_data:
+        msg = "Manual Input Required - No Sales History"
+        return msg, None, 0, msg
+
+    parsed = []
+    for d in daily_data:
+        dk = _parse_daily_date_blinkit(d.get("date"))
+        if dk:
+            parsed.append({
+                "date": dk,
+                "closing_stock": d.get("closing_stock", 0) or 0,
+                "units_sold": max(0, d.get("units_sold", 0) or 0),
+            })
+
+    if not parsed:
+        msg = "Manual Input Required - No Sales History"
+        return msg, None, 0, msg
+
+    parsed.sort(key=lambda x: x["date"], reverse=True)
+    in_stock = [d for d in parsed if d["closing_stock"] > 0 or d["units_sold"] > 0]
+    total_in_stock = len(in_stock)
+
+    if total_in_stock == 0:
+        msg = "Manual Input Required - No Sales History"
+        return msg, None, 0, msg
+
+    if total_in_stock < 30:
+        msg = f"Manual Input Required - Only {total_in_stock} Days Found"
+        flag = f"Manual Input Required - Only {total_in_stock} In-Stock Days Found"
+        return msg, None, 0, flag
+
+    selected = in_stock[:30]
+    oldest = min(d["date"] for d in selected)
+    newest = max(d["date"] for d in selected)
+    lookback_label = f"{oldest.strftime('%-d %b %Y')} – {newest.strftime('%-d %b %Y')}"
+
+    total_gross = sum(d["units_sold"] for d in selected)
+    lookback_sales = total_gross
+
+    raw_mean = round(total_gross / 30, 2)
+    spike_threshold = max(raw_mean * 2, 5)
+
+    spike_excess = sum(
+        d["units_sold"] - spike_threshold
+        for d in selected
+        if d["units_sold"] > spike_threshold
+    )
+    cleaned_units = total_gross - spike_excess
+    spike_count = sum(1 for d in selected if d["units_sold"] > spike_threshold)
+
+    total_ret = max(0, total_returns or 0)
+    net_units = max(0.0, cleaned_units - total_ret)
+    final_drr = round(net_units / 30, 2)
+
+    flag = (
+        f"OK - {spike_count} Spike Day(s) Replaced with 2x Mean"
+        if spike_count > 0
+        else "OK - Full Confidence"
+    )
+    return final_drr, lookback_label, lookback_sales, flag
+
+
+async def _fetch_blinkit_drr_daily_by_state(db, end: datetime, skus: list) -> dict:
+    """
+    Fetch 90 days of {date, closing_stock, units_sold} per (sku_code, state) for DRR.
+    Inventory is already stored state-wise; sales (city-level) are mapped to states via CITY_TO_STATE.
+    Returns: dict mapping (sku_code, state) -> list of {date, closing_stock, units_sold}
+    """
+    drr_start = end - timedelta(days=89)
+
+    def _fetch_inv():
+        pipeline = [
+            {"$match": {
+                "sku_code": {"$in": skus},
+                "date": {"$gte": drr_start, "$lte": end},
+            }},
+            {"$group": {
+                "_id": {"sku": "$sku_code", "city": "$city", "date": "$date"},
+                "closing_stock": {"$sum": "$warehouse_inventory"},
+            }},
+        ]
+        return list(db["blinkit_inventory"].aggregate(pipeline, allowDiskUse=True))
+
+    def _fetch_sales():
+        pipeline = [
+            {"$match": {
+                "sku_code": {"$in": skus},
+                "order_date": {"$gte": drr_start, "$lte": end},
+            }},
+            {"$group": {
+                "_id": {"sku": "$sku_code", "city": "$city", "date": "$order_date"},
+                "units_sold": {"$sum": "$quantity"},
+            }},
+        ]
+        return list(db["blinkit_sales"].aggregate(pipeline, allowDiskUse=True))
+
+    inv_results, sales_results = await asyncio.gather(
+        asyncio.to_thread(_fetch_inv),
+        asyncio.to_thread(_fetch_sales),
+    )
+
+    # daily_map: (sku, state) -> {date_str: {date, closing_stock, units_sold}}
+    daily_map: dict = {}
+
+    for doc in inv_results:
+        sku = doc["_id"]["sku"]
+        city = doc["_id"]["city"]
+        state = CITY_TO_STATE.get(city, city)
+        key = (sku, state)
+        date_val = doc["_id"]["date"]
+        date_str = date_val.strftime("%Y-%m-%d") if isinstance(date_val, datetime) else str(date_val)[:10]
+        if key not in daily_map:
+            daily_map[key] = {}
+        if date_str not in daily_map[key]:
+            daily_map[key][date_str] = {"date": date_val, "closing_stock": 0, "units_sold": 0}
+        daily_map[key][date_str]["closing_stock"] += doc["closing_stock"]
+
+    for doc in sales_results:
+        sku = doc["_id"]["sku"]
+        city = doc["_id"]["city"]
+        state = CITY_TO_STATE.get(city, city)
+        key = (sku, state)
+        date_val = doc["_id"]["date"]
+        date_str = date_val.strftime("%Y-%m-%d") if isinstance(date_val, datetime) else str(date_val)[:10]
+        if key not in daily_map:
+            daily_map[key] = {}
+        if date_str not in daily_map[key]:
+            daily_map[key][date_str] = {"date": date_val, "closing_stock": 0, "units_sold": 0}
+        daily_map[key][date_str]["units_sold"] += doc["units_sold"]
+
+    return {key: list(date_dict.values()) for key, date_dict in daily_map.items()}
+
+
 # Optimize SKU mapping with caching
 class SKUCache:
     def __init__(self):
@@ -225,6 +382,31 @@ CITIES = [
 WAREHOUSE_CITY_MAP = {
     "Farukhnagar - SR Feeder": "Gurgaon"
     # Add other specific mappings here if needed
+}
+
+# Map Blinkit city names → state names (new inventory is state-level)
+CITY_TO_STATE = {
+    "Mumbai": "Maharashtra",
+    "Pune": "Maharashtra",
+    "Maharashtra": "Maharashtra",
+    "Bengaluru": "Karnataka",
+    "Karnataka": "Karnataka",
+    "Chennai": "Tamil Nadu",
+    "Tamil Nadu": "Tamil Nadu",
+    "Hyderabad": "Telangana",
+    "Telangana": "Telangana",
+    "Kolkata": "West Bengal",
+    "West Bengal": "West Bengal",
+    "Gurgaon": "Haryana",
+    "Faridabad": "Haryana",
+    "Farukhnagar": "Haryana",
+    "Haryana": "Haryana",
+    "Jharkhand": "Jharkhand",
+    "Delhi": "Delhi",
+    "Rajasthan": "Rajasthan",
+    "Gujarat": "Gujarat",
+    "Uttar Pradesh": "Uttar Pradesh",
+    "Andhra Pradesh": "Andhra Pradesh",
 }
 
 DAYS_IN_WEEK = 7
@@ -1642,6 +1824,12 @@ async def generate_report_by_date_range(
             sc_key = (sku, city)
             sku_city_days_with_inventory[sc_key] = sku_city_days_with_inventory.get(sc_key, 0) + 1
 
+        # Fetch 90-day DRR daily data (state-level aggregation)
+        all_skus_for_drr = list(set(sku for sku, _ in valid_sku_city_pairs))
+        drr_state_map: dict = {}
+        if all_skus_for_drr:
+            drr_state_map = await _fetch_blinkit_drr_daily_by_state(database, overall_end_date, all_skus_for_drr)
+
         # Fetch last 90 days in stock if requested
         last_90_days_data = {}
         if any_last_90_days and valid_sku_city_pairs:
@@ -1776,13 +1964,24 @@ async def generate_report_by_date_range(
             # Get last 90 days in stock dates if available
             last_90_days_dates = last_90_days_data.get(sku_city_key, "")
 
+            # Compute DRR at state level
+            city_state = CITY_TO_STATE.get(city, city)
+            drr_daily = drr_state_map.get((sku, city_state), [])
+            total_returns_for_drr = current_period_returns.get(sku_city_key, 0)
+            drr_val, drr_lookback, drr_lookback_sales, drr_flag = compute_drr_blinkit(drr_daily, total_returns_for_drr)
+
             # Create report item
             report_item = {
                 "item_name": item_name,
                 "item_id": item_id,
                 "city": city,
+                "state": city_state,
                 "warehouse": combined_warehouses,
                 "sku_code": sku,
+                "drr": drr_val,
+                "drr_lookback": drr_lookback or "",
+                "drr_lookback_sales": drr_lookback_sales,
+                "drr_flag": drr_flag,
                 "last_90_days_dates": last_90_days_dates,
                 "best_performing_month": best_month_info["formatted"],
                 "best_performing_month_details": {
@@ -1902,13 +2101,16 @@ async def download_report_by_date_range(
             flat_item = {
                 "Item Name": item.get("item_name", "Unknown Item"),
                 "Item ID": item.get("item_id", "Unknown ID"),
-                "City": item.get("city", "Unknown"),
+                "State": item.get("state", ""),
                 "Sku Code": item.get("sku_code", "Unknown"),
-                "Warehouse": item.get("warehouse", "Unknown Warehouse"),
                 "Start Date": period_info.get("start_date"),
                 "End Date": period_info.get("end_date"),
                 "Period Name": period_info.get("period_name"),
                 "Days in Range": period_info.get("days_in_range"),
+                "DRR": item.get("drr", ""),
+                "DRR Flag": item.get("drr_flag", ""),
+                "DRR Lookback Period": item.get("drr_lookback", ""),
+                "DRR Lookback Sales": item.get("drr_lookback_sales", 0),
                 "Avg Daily Sales (Stock Days)": metrics.get(
                     "avg_daily_on_stock_days", 0
                 ),
@@ -1952,13 +2154,16 @@ async def download_report_by_date_range(
         column_order = [
             "Item Name",
             "Item ID",
+            "State",
             "Sku Code",
-            "City",
-            "Warehouse",
             "Start Date",
             "End Date",
             "Period Name",
             "Days in Range",
+            "DRR",
+            "DRR Flag",
+            "DRR Lookback Period",
+            "DRR Lookback Sales",
             "Avg Daily Sales (Stock Days)",
             "Avg Weekly Sales (Stock Days)",
             "Avg Monthly Sales (Stock Days)",
