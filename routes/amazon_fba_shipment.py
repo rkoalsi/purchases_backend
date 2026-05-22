@@ -25,11 +25,198 @@ DEFAULT_LEAD_TIME = 10
 DEFAULT_COVERAGE_DAYS = 30
 
 MONTH_NAMES = {
-    1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
-    7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
 }
 
+EXCLUDED_ASINS = [
+    "B0GP69VJM2",
+    "B0FCSGCBNC",
+    "B0FCS6K9SP",
+    "B0FCSCFSZY",
+    "B0H1JMTWVV",
+    "B0GP6PNJN6",
+    "B08RNHT15R",
+    "B0FRLVMP6V",
+    "B0C5HPTBMH",
+    "B09V2XYPX1",
+    "B0D7SDWMMB",
+    "B09XV4WXJF",
+    "B0GLHF3MN1",
+    "B0C3M9PRDK",
+    "B0GL77X9NH",
+    "B0FMS1Z318",
+    "B0B7XWXZRF",
+    "B0B7S3WVXD",
+    "B09ZLLMQ2K",
+    "B0CDH72346",
+    "B0B9GR9SP1",
+    "B098LNZVNR",
+    "B0B7X8BZ5M",
+    "B09ZLQBTBW",
+    "B0DDGT97VL",
+    "B0CNPXH2J9",
+    "B09B2TMGCM",
+    "B0GLHNX5SP",
+    "B0BJ8ZRHGW",
+    "B09Y9914KG",
+    "B0FZB5JXJZ",
+    "B098LNZBMY",
+    "B0B7S1F22L",
+    "B09GR818PH",
+    "B0B31VDTRT",
+    "B0DN5NTTZ5",
+    "B0CPQ3ZGJV",
+    "B0FDKSXXND",
+    "B0GXSQ9HTT",
+    "B0C555B1MP",
+    "B098LQGWTY",
+    "B09YH9RNLC",
+    "B0B31VLXBM",
+    "B08RNH1DKP",
+    "B09ZLLTQDJ",
+    "B08KJ2G1Z3",
+    "B0CNXMVPLH",
+    "B0B9GRBMG6",
+    "B09PV8KR9F",
+    "B0B31MBBHD",
+    "B09ZLLGFVR",
+    "B0GVQB9K99",
+    "B0GMPTX2Y3",
+    "B0DHD7PB5G",
+    "B0GXSXCGDZ",
+    "B0FY3Z7FCM",
+    "B09T6XRRY5",
+    "B0DDCPMNB4",
+    "B09RH7S1FC",
+    "B0CC4V41NK",
+    "B0DYJDQ6Q7",
+    "B09RH8Q2NC",
+    "B0FV3JVBBH",
+    "B0DKBKWKDL",
+    "B0DDKHZKL3",
+    "B098LMHMVD",
+    "B0D33YLBNR",
+    "B0FVXX3JB7",
+    "B093C6V33C",
+    "B0D4ZBFCLT",
+    "B0G2WW1NN5",
+    "B0B7S2VHGX",
+    "B0GMPHHFKV",
+    "B08BX1ZLGY",
+    "B08RN5C43N",
+    "B09FZL1L5Z",
+    "B0FPDCDLGC",
+    "B09Y98LLVZ",
+    "B0D4JKYYX6",
+    "B09ZJ5KRFJ",
+    "B093CB5XV2",
+    "B0GPXT2VPD",
+    "B0FM8QH3FF",
+    "B0CC53TTFM",
+    "B093C8RDD2",
+    "B09ZLMJHT4",
+    "B09ZJ3HR6M",
+    "B08WPX98XR",
+    "B0C6R272BG",
+    "B0DDT9HMMW",
+    "B09PLCLNHD",
+    "B0FXVMFC9C",
+    "B09ZJ3727L",
+    "B0B81VHB39",
+    "B0DD48LN2S",
+    "B0G7VZDHR4",
+    "B0DTTDG6YK",
+    "B09RK8Y73J",
+    "B09RK9VZQS",
+    "B0DF7H32XY",
+    "B08RZ9CJ9R",
+    "B0B7XWSYSN",
+    "B08XMMVSGB",
+    "B09FGH6K7Y",
+    "B0CC4YFQWM",
+    "B0FBGGQX57",
+    "B0CGDWBDXF",
+    "B0CNTH2NLK",
+    "B0FV3HD63F",
+    "B0GTFV7BPC",
+    "B09PLBQWCL",
+    "B09ZJ5CDG1",
+    "B0F484C9V3",
+    "B0BJ8ZNVDW",
+    "B09RPT5XF9",
+    "B0DKBKXNXC",
+    "B09ZJ4GZSF",
+    "B0G5YFSBG5",
+    "B09FZKX8XF",
+    "B0DKFRSWZS",
+    "B0D947RP1X",
+    "B0DDH3B9FL",
+    "B0C6R2HNJY",
+    "B0CXJMW615",
+    "B0B7XB3PH1",
+    "B0CC52S93K",
+    "B093C87K9H",
+    "B0D7MTLW9S",
+    "B08WPCYNRN",
+    "B0DYJ6596P",
+    "B0GLH692G5",
+    "B0GFNFBJX9",
+    "B09RPTM16Y",
+    "B093C8P9M8",
+    "B09ZJ4N8LV",
+    "B09HNKH3GB",
+    "B0FDB7HYGH",
+    "B09XV6QFH8",
+    "B09Y9CDR44",
+    "B0B9GSFP63",
+    "B0C69GBXVP",
+    "B0DDH9X9P1",
+    "B0C3MB3826",
+    "B0GRRVZB91",
+    "B0855K8X8B",
+    "B09PLC4196",
+    "B09PLD3N53",
+    "B0D949FQ6F",
+    "B09RH62YRR",
+    "B0GLDVBWTG",
+    "B096SVSNJS",
+    "B09FGKFS4T",
+    "B0FXVP9ZBM",
+    "B09P85TSJB",
+    "B09ZLK1W8F",
+    "B09ZJ4SXD6",
+    "B09ZJ3D9GY",
+    "B0C69JWS33",
+    "B09W5PFJWW",
+    "B0B9GSPCDS",
+    "B0C23K137X",
+    "B09ZJ44PJK",
+    "B0CPSFFWSH",
+    "B0G1GYW6P3",
+    "B08WPFCXGY",
+    "B08DJ7J6T6",
+    "B0B7RSDK88",
+    "B08RMSTGQ8",
+    "B0DM5932LJ",
+    "B09P874YBJ",
+    "B0GVG639SP",
+    "B0GN2M9824",
+    "B09ZJ3GX5Z",
+]
+
 # ─── Pydantic models ──────────────────────────────────────────────────────────
+
 
 class PlanningOverride(BaseModel):
     asin: str
@@ -43,6 +230,7 @@ class PlanningOverride(BaseModel):
     sp_override: Optional[float] = None
     status_override: Optional[str] = None
 
+
 class SummaryUpdate(BaseModel):
     reason_for_short_supply: Optional[str] = None
     appointment_initiated_date: Optional[str] = None
@@ -53,13 +241,17 @@ class SummaryUpdate(BaseModel):
 
 # ─── DRR (same methodology as vendor_po and vc_under_ordering) ───────────────
 
+
 async def _compute_drr_async(db, today: datetime, asins: list[str]) -> dict:
     """Compute DRR using the PSR 'all' report, matching vendor_po and vc_under_ordering."""
     if not asins:
         return {}
     drr_start = today - timedelta(days=89)
     report = await generate_report_by_date_range(
-        drr_start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d"), db, report_type="all"
+        drr_start.strftime("%Y-%m-%d"),
+        today.strftime("%Y-%m-%d"),
+        db,
+        report_type="all",
     )
     asin_set = set(asins)
     result = {
@@ -70,15 +262,22 @@ async def _compute_drr_async(db, today: datetime, asins: list[str]) -> dict:
     missing = [a for a in asins if a not in result]
     if missing:
         end_dt = today.replace(hour=23, minute=59, second=59, microsecond=999999)
-        fallback = await asyncio.to_thread(compute_drr_for_asins_sync, db, end_dt, missing)
+        fallback = await asyncio.to_thread(
+            compute_drr_for_asins_sync, db, end_dt, missing
+        )
         result.update(fallback)
     return result
 
 
 # ─── Sync helpers (run in thread) ────────────────────────────────────────────
 
+
 def _get_asins(db) -> list[str]:
-    docs = list(db[SKU_MAPPING_COLLECTION].find({}, {"item_id": 1, "_id": 0}))
+    docs = list(
+        db[SKU_MAPPING_COLLECTION].find(
+            {"item_id": {"$nin": EXCLUDED_ASINS}}, {"item_id": 1, "_id": 0}
+        )
+    )
     return list({d["item_id"] for d in docs if d.get("item_id")})
 
 
@@ -90,15 +289,23 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
     etrade_date_str = ""
 
     # 1. All ASINs from amazon_sku_mapping
-    sku_map_docs = list(db[SKU_MAPPING_COLLECTION].find(
-        {}, {"item_id": 1, "sku_code": 1, "fnsku": 1, "_id": 0}
-    ))
+    sku_map_docs = list(
+        db[SKU_MAPPING_COLLECTION].find(
+            {}, {"item_id": 1, "sku_code": 1, "fnsku": 1, "_id": 0}
+        )
+    )
     if not sku_map_docs:
         return []
 
     asins = list({d["item_id"] for d in sku_map_docs if d.get("item_id")})
-    asin_to_sku: dict[str, str] = {d["item_id"]: d["sku_code"] for d in sku_map_docs if d.get("item_id") and d.get("sku_code")}
-    asin_to_fnsku_default: dict[str, str] = {d["item_id"]: d.get("fnsku", "") for d in sku_map_docs if d.get("item_id")}
+    asin_to_sku: dict[str, str] = {
+        d["item_id"]: d["sku_code"]
+        for d in sku_map_docs
+        if d.get("item_id") and d.get("sku_code")
+    }
+    asin_to_fnsku_default: dict[str, str] = {
+        d["item_id"]: d.get("fnsku", "") for d in sku_map_docs if d.get("item_id")
+    }
 
     # Platform derived from vendor_margins flags
     etrade_po_asins: set[str] = set()
@@ -120,58 +327,110 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
     product_by_sku: dict[str, dict] = {}
     for p in db["products"].find(
         {"cf_sku_code": {"$in": skus}},
-        {"cf_sku_code": 1, "name": 1, "rate": 1, "item_tax_preferences": 1, "status": 1, "_id": 0},
+        {
+            "cf_sku_code": 1,
+            "name": 1,
+            "rate": 1,
+            "item_tax_preferences": 1,
+            "status": 1,
+            "_id": 0,
+        },
     ):
         product_by_sku[p["cf_sku_code"]] = p
 
     # 3. Current FBA inventory from amazon_ledger (exclude VKSX, SELLABLE only)
     ledger_latest = db["amazon_ledger"].find_one(
-        {"asin": {"$in": asins}, "location": {"$ne": "VKSX"}, "disposition": "SELLABLE"},
-        {"date": 1}, sort=[("date", -1)],
+        {
+            "asin": {"$in": asins},
+            "location": {"$ne": "VKSX"},
+            "disposition": "SELLABLE",
+        },
+        {"date": 1},
+        sort=[("date", -1)],
     )
     fba_inv_by_asin: dict[str, int] = {}
     if ledger_latest:
         fba_inv_date = ledger_latest["date"]
-        fba_inv_date_str = fba_inv_date.strftime("%-d %b %Y") if isinstance(fba_inv_date, datetime) else str(fba_inv_date)
-        for doc in db["amazon_ledger"].aggregate([
-            {"$match": {
-                "asin": {"$in": asins},
-                "date": fba_inv_date,
-                "location": {"$ne": "VKSX"},
-                "disposition": "SELLABLE",
-            }},
-            {"$group": {"_id": "$asin", "total": {"$sum": "$ending_warehouse_balance"}}},
-        ]):
+        fba_inv_date_str = (
+            fba_inv_date.strftime("%-d %b %Y")
+            if isinstance(fba_inv_date, datetime)
+            else str(fba_inv_date)
+        )
+        for doc in db["amazon_ledger"].aggregate(
+            [
+                {
+                    "$match": {
+                        "asin": {"$in": asins},
+                        "date": fba_inv_date,
+                        "location": {"$ne": "VKSX"},
+                        "disposition": "SELLABLE",
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$asin",
+                        "total": {"$sum": "$ending_warehouse_balance"},
+                    }
+                },
+            ]
+        ):
             fba_inv_by_asin[doc["_id"]] = int(doc["total"] or 0)
 
     # 4. Open shipment qty from FBA processing sheet (uploaded shipments)
     open_fba_shipment: dict[str, int] = {}
-    for doc in db[PROCESSING_COLLECTION].aggregate([
-        {"$match": {"asin": {"$in": asins}}},
-        {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$requested_qty", 0]}}}},
-    ]):
+    for doc in db[PROCESSING_COLLECTION].aggregate(
+        [
+            {"$match": {"asin": {"$in": asins}}},
+            {
+                "$group": {
+                    "_id": "$asin",
+                    "total": {"$sum": {"$ifNull": ["$requested_qty", 0]}},
+                }
+            },
+        ]
+    ):
         open_fba_shipment[doc["_id"]] = int(doc["total"] or 0)
 
     # 5. Latest Zoho stock by item_id
-    zoho_item_ids = list({p.get("item_id", "") for p in product_by_sku.values() if p.get("item_id")})
+    zoho_item_ids = list(
+        {p.get("item_id", "") for p in product_by_sku.values() if p.get("item_id")}
+    )
     zoho_latest: dict[str, int] = {}
     if zoho_item_ids:
         latest_zoho_dt = None
-        for doc in db["zoho_warehouse_stock"].aggregate([
-            {"$match": {"zoho_item_id": {"$in": zoho_item_ids}}},
-            {"$sort": {"date": -1}},
-            {"$group": {"_id": "$zoho_item_id", "warehouses": {"$first": "$warehouses"}, "date": {"$first": "$date"}}},
-        ]):
+        for doc in db["zoho_warehouse_stock"].aggregate(
+            [
+                {"$match": {"zoho_item_id": {"$in": zoho_item_ids}}},
+                {"$sort": {"date": -1}},
+                {
+                    "$group": {
+                        "_id": "$zoho_item_id",
+                        "warehouses": {"$first": "$warehouses"},
+                        "date": {"$first": "$date"},
+                    }
+                },
+            ]
+        ):
             wh = doc.get("warehouses", {})
-            zoho_latest[doc["_id"]] = int(sum(v for v in wh.values() if isinstance(v, (int, float)))) if isinstance(wh, dict) else 0
+            zoho_latest[doc["_id"]] = (
+                int(sum(v for v in wh.values() if isinstance(v, (int, float))))
+                if isinstance(wh, dict)
+                else 0
+            )
             d = doc.get("date")
             if d and (latest_zoho_dt is None or d > latest_zoho_dt):
                 latest_zoho_dt = d
         if latest_zoho_dt:
-            zoho_date_str = latest_zoho_dt.strftime("%-d %b %Y") if isinstance(latest_zoho_dt, datetime) else str(latest_zoho_dt)
+            zoho_date_str = (
+                latest_zoho_dt.strftime("%-d %b %Y")
+                if isinstance(latest_zoho_dt, datetime)
+                else str(latest_zoho_dt)
+            )
 
     item_id_by_sku: dict[str, str] = {}
-    for p in db["products"].find({"cf_sku_code": {"$in": skus}}, {"cf_sku_code": 1, "item_id": 1, "_id": 0}):
+    for p in db["products"].find(
+        {"cf_sku_code": {"$in": skus}}, {"cf_sku_code": 1, "item_id": 1, "_id": 0}
+    ):
         item_id_by_sku[p["cf_sku_code"]] = p.get("item_id", "")
 
     # 6. Current inventory with Etrade (amazon_vendor_inventory)
@@ -181,50 +440,115 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
     etrade_inv_by_asin: dict[str, int] = {}
     if etrade_latest_doc:
         etrade_date = etrade_latest_doc["date"]
-        etrade_date_str = etrade_date.strftime("%-d %b %Y") if isinstance(etrade_date, datetime) else str(etrade_date)
+        etrade_date_str = (
+            etrade_date.strftime("%-d %b %Y")
+            if isinstance(etrade_date, datetime)
+            else str(etrade_date)
+        )
         for doc in db["amazon_vendor_inventory"].find(
             {"asin": {"$in": asins}, "date": etrade_date},
             {"asin": 1, "sellableOnHandInventoryUnits": 1},
         ):
-            etrade_inv_by_asin[doc["asin"]] = int(doc.get("sellableOnHandInventoryUnits") or 0)
+            etrade_inv_by_asin[doc["asin"]] = int(
+                doc.get("sellableOnHandInventoryUnits") or 0
+            )
 
     # 7. Open PO (etrade) — same logic as vc_under_ordering.py:
     #    processing → supply_qty_override → final_supply_fo → supply_qty (if >0) → requested_qty
     #    packed/closed/intransit → accepted_qty
     open_etrade_po: dict[str, int] = {}
-    for doc in db["vendor_purchase_orders"].aggregate([
-        {"$match": {"po_status": {"$in": ["processing", "packed", "closed", "intransit"]}}},
-        {"$unwind": "$items"},
-        {"$match": {"items.asin": {"$in": asins}}},
-        {"$group": {
-            "_id": "$items.asin",
-            "total": {"$sum": {
-                "$cond": {
-                    "if": {"$eq": ["$po_status", "processing"]},
-                    "then": {
-                        "$cond": {
-                            "if": {"$ne": [{"$ifNull": ["$items.supply_qty_override", None]}, None]},
-                            "then": {"$ifNull": ["$items.supply_qty_override", 0]},
-                            "else": {
-                                "$cond": {
-                                    "if": {"$ne": [{"$ifNull": ["$items.final_supply_fo", None]}, None]},
-                                    "then": {"$ifNull": ["$items.final_supply_fo", 0]},
-                                    "else": {
-                                        "$cond": {
-                                            "if": {"$gt": [{"$ifNull": ["$items.supply_qty", 0]}, 0]},
-                                            "then": {"$ifNull": ["$items.supply_qty", 0]},
-                                            "else": {"$ifNull": ["$items.requested_qty", 0]},
-                                        }
-                                    },
-                                }
-                            },
+    for doc in db["vendor_purchase_orders"].aggregate(
+        [
+            {
+                "$match": {
+                    "po_status": {
+                        "$in": ["processing", "packed", "closed", "intransit"]
+                    }
+                }
+            },
+            {"$unwind": "$items"},
+            {"$match": {"items.asin": {"$in": asins}}},
+            {
+                "$group": {
+                    "_id": "$items.asin",
+                    "total": {
+                        "$sum": {
+                            "$cond": {
+                                "if": {"$eq": ["$po_status", "processing"]},
+                                "then": {
+                                    "$cond": {
+                                        "if": {
+                                            "$ne": [
+                                                {
+                                                    "$ifNull": [
+                                                        "$items.supply_qty_override",
+                                                        None,
+                                                    ]
+                                                },
+                                                None,
+                                            ]
+                                        },
+                                        "then": {
+                                            "$ifNull": ["$items.supply_qty_override", 0]
+                                        },
+                                        "else": {
+                                            "$cond": {
+                                                "if": {
+                                                    "$ne": [
+                                                        {
+                                                            "$ifNull": [
+                                                                "$items.final_supply_fo",
+                                                                None,
+                                                            ]
+                                                        },
+                                                        None,
+                                                    ]
+                                                },
+                                                "then": {
+                                                    "$ifNull": [
+                                                        "$items.final_supply_fo",
+                                                        0,
+                                                    ]
+                                                },
+                                                "else": {
+                                                    "$cond": {
+                                                        "if": {
+                                                            "$gt": [
+                                                                {
+                                                                    "$ifNull": [
+                                                                        "$items.supply_qty",
+                                                                        0,
+                                                                    ]
+                                                                },
+                                                                0,
+                                                            ]
+                                                        },
+                                                        "then": {
+                                                            "$ifNull": [
+                                                                "$items.supply_qty",
+                                                                0,
+                                                            ]
+                                                        },
+                                                        "else": {
+                                                            "$ifNull": [
+                                                                "$items.requested_qty",
+                                                                0,
+                                                            ]
+                                                        },
+                                                    }
+                                                },
+                                            }
+                                        },
+                                    }
+                                },
+                                "else": {"$ifNull": ["$items.accepted_qty", 0]},
+                            }
                         }
                     },
-                    "else": {"$ifNull": ["$items.accepted_qty", 0]},
                 }
-            }},
-        }},
-    ]):
+            },
+        ]
+    ):
         open_etrade_po[doc["_id"]] = int(doc["total"] or 0)
 
     # 8. Monthly sales — last 4 calendar months
@@ -241,18 +565,27 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
         return s, e
 
     monthly_sales: dict[str, dict] = {a: {} for a in asins}
-    for (y, m) in months:
+    for y, m in months:
         label = f"{MONTH_NAMES[m]} {y}"
         ms, me = month_start_end(y, m)
-        for doc in db["amazon_vendor_sales"].aggregate([
-            {"$match": {"asin": {"$in": asins}, "date": {"$gte": ms, "$lt": me}}},
-            {"$group": {"_id": "$asin", "total": {"$sum": "$orderedUnits"}}},
-        ]):
+        for doc in db["amazon_vendor_sales"].aggregate(
+            [
+                {"$match": {"asin": {"$in": asins}, "date": {"$gte": ms, "$lt": me}}},
+                {"$group": {"_id": "$asin", "total": {"$sum": "$orderedUnits"}}},
+            ]
+        ):
             monthly_sales[doc["_id"]][label] = int(doc["total"] or 0)
-        for doc in db["amazon_ledger"].aggregate([
-            {"$match": {"asin": {"$in": asins}, "date": {"$gte": ms, "$lt": me}}},
-            {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$customer_shipments", 0]}}}},
-        ]):
+        for doc in db["amazon_ledger"].aggregate(
+            [
+                {"$match": {"asin": {"$in": asins}, "date": {"$gte": ms, "$lt": me}}},
+                {
+                    "$group": {
+                        "_id": "$asin",
+                        "total": {"$sum": {"$ifNull": ["$customer_shipments", 0]}},
+                    }
+                },
+            ]
+        ):
             existing = monthly_sales[doc["_id"]].get(label, 0)
             monthly_sales[doc["_id"]][label] = existing + int(doc["total"] or 0)
 
@@ -271,17 +604,30 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
         override = overrides.get(asin, {})
 
         # MRP/SP: use override if present, else fall back to product rate
-        mrp = override["mrp_override"] if override.get("mrp_override") is not None else (prod.get("rate") or 0)
-        sp = override["sp_override"] if override.get("sp_override") is not None else (prod.get("rate") or 0)
+        mrp = (
+            override["mrp_override"]
+            if override.get("mrp_override") is not None
+            else (prod.get("rate") or 0)
+        )
+        sp = (
+            override["sp_override"]
+            if override.get("sp_override") is not None
+            else (prod.get("rate") or 0)
+        )
 
         # Status: use override if present
-        status = override["status_override"] if override.get("status_override") is not None else prod.get("status", "")
+        status = (
+            override["status_override"]
+            if override.get("status_override") is not None
+            else prod.get("status", "")
+        )
 
         current_fba_inv = fba_inv_by_asin.get(asin, 0)
 
         open_shipment_qty = (
             override["open_shipment_qty_override"]
-            if "open_shipment_qty_override" in override and override["open_shipment_qty_override"] is not None
+            if "open_shipment_qty_override" in override
+            and override["open_shipment_qty_override"] is not None
             else open_fba_shipment.get(asin, 0)
         )
 
@@ -290,18 +636,33 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
         drr_info = drr_map.get(asin, {})
         drr_val = drr_info.get("drr") if isinstance(drr_info, dict) else None
         try:
-            drr = float(drr_val) if drr_val is not None and str(drr_val) != "No data" else 0.0
+            drr = (
+                float(drr_val)
+                if drr_val is not None and str(drr_val) != "No data"
+                else 0.0
+            )
         except (TypeError, ValueError):
             drr = 0.0
 
         net_total_days = round(total_inventory / drr, 2) if drr > 0 else 0
 
-        lead_time = override.get("lead_time") if override.get("lead_time") is not None else DEFAULT_LEAD_TIME
-        coverage_days = override.get("coverage_days") if override.get("coverage_days") is not None else DEFAULT_COVERAGE_DAYS
+        lead_time = (
+            override.get("lead_time")
+            if override.get("lead_time") is not None
+            else DEFAULT_LEAD_TIME
+        )
+        coverage_days = (
+            override.get("coverage_days")
+            if override.get("coverage_days") is not None
+            else DEFAULT_COVERAGE_DAYS
+        )
         total_target_days = lead_time + coverage_days
         target_stock = round(drr * total_target_days, 0) if drr > 0 else 0
 
-        if "final_units_override" in override and override["final_units_override"] is not None:
+        if (
+            "final_units_override" in override
+            and override["final_units_override"] is not None
+        ):
             final_units = override["final_units_override"]
         else:
             if drr == 0:
@@ -322,39 +683,50 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
 
         sales_by_month = monthly_sales.get(asin, {})
 
-        rows.append({
-            "asin": asin,
-            "sku_code": sku,
-            "fnsku": override.get("fnsku") or asin_to_fnsku_default.get(asin, ""),
-            "item_name": prod.get("name", ""),
-            "mrp": mrp,
-            "sp": sp,
-            "current_fba_inventory": current_fba_inv,
-            "open_shipment_qty": open_shipment_qty,
-            "open_shipment_qty_auto": open_fba_shipment.get(asin, 0),
-            "total_inventory": total_inventory,
-            "drr": round(drr, 2),
-            "net_total_days": net_total_days,
-            "lead_time": lead_time,
-            "coverage_days": coverage_days,
-            "total_target_days": total_target_days,
-            "target_stock": target_stock,
-            "final_units_to_send": max(0, final_units),
-            "zoho_stock": zoho_stock,
-            "status": status,
-            "platform": override.get("platform") or (
-                "Etrade - PO & DF" if asin in etrade_po_asins
-                else "Etrade - DF only" if asin in etrade_df_asins
-                else "FBA or SC"
-            ),
-            "current_inventory_etrade": etrade_inv,
-            "open_po": open_po,
-            "total_qty": total_qty,
-            "monthly_sales": sales_by_month,
-            "month_labels": month_labels,
-            "open_shipment_overridden": "open_shipment_qty_override" in override and override["open_shipment_qty_override"] is not None,
-            "final_units_overridden": "final_units_override" in override and override["final_units_override"] is not None,
-        })
+        if asin not in EXCLUDED_ASINS:
+            rows.append(
+                {
+                    "asin": asin,
+                    "sku_code": sku,
+                    "fnsku": override.get("fnsku")
+                    or asin_to_fnsku_default.get(asin, ""),
+                    "item_name": prod.get("name", ""),
+                    "mrp": mrp,
+                    "sp": sp,
+                    "current_fba_inventory": current_fba_inv,
+                    "open_shipment_qty": open_shipment_qty,
+                    "open_shipment_qty_auto": open_fba_shipment.get(asin, 0),
+                    "total_inventory": total_inventory,
+                    "drr": round(drr, 2),
+                    "net_total_days": net_total_days,
+                    "lead_time": lead_time,
+                    "coverage_days": coverage_days,
+                    "total_target_days": total_target_days,
+                    "target_stock": target_stock,
+                    "final_units_to_send": max(0, final_units),
+                    "zoho_stock": zoho_stock,
+                    "status": status,
+                    "platform": override.get("platform")
+                    or (
+                        "Etrade - PO & DF"
+                        if asin in etrade_po_asins
+                        else (
+                            "Etrade - DF only"
+                            if asin in etrade_df_asins
+                            else "FBA or SC"
+                        )
+                    ),
+                    "current_inventory_etrade": etrade_inv,
+                    "open_po": open_po,
+                    "total_qty": total_qty,
+                    "monthly_sales": sales_by_month,
+                    "month_labels": month_labels,
+                    "open_shipment_overridden": "open_shipment_qty_override" in override
+                    and override["open_shipment_qty_override"] is not None,
+                    "final_units_overridden": "final_units_override" in override
+                    and override["final_units_override"] is not None,
+                }
+            )
 
     return rows, fba_inv_date_str, zoho_date_str, etrade_date_str
 
@@ -366,28 +738,39 @@ def _fetch_processing_data(db) -> list[dict]:
 
 def _fetch_summary_data(db) -> list[dict]:
     pipeline = [
-        {"$group": {
-            "_id": {"shipment_id": "$shipment_id", "location": "$location"},
-            "shipment_date": {"$first": "$date"},
-            "requested_qty": {"$sum": "$requested_qty"},
-            "dispatched_qty": {"$sum": "$packed_qty"},
-        }},
-        {"$project": {
-            "_id": 0,
-            "shipment_id": "$_id.shipment_id",
-            "location": "$_id.location",
-            "shipment_date": 1,
-            "requested_qty": 1,
-            "dispatched_qty": 1,
-            "short_supply_qty": {"$subtract": ["$requested_qty", "$dispatched_qty"]},
-            "short_supply_pct": {
-                "$cond": {
-                    "if": {"$gt": ["$dispatched_qty", 0]},
-                    "then": {"$divide": [{"$subtract": ["$requested_qty", "$dispatched_qty"]}, "$dispatched_qty"]},
-                    "else": 0,
-                }
-            },
-        }},
+        {
+            "$group": {
+                "_id": {"shipment_id": "$shipment_id", "location": "$location"},
+                "shipment_date": {"$first": "$date"},
+                "requested_qty": {"$sum": "$requested_qty"},
+                "dispatched_qty": {"$sum": "$packed_qty"},
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "shipment_id": "$_id.shipment_id",
+                "location": "$_id.location",
+                "shipment_date": 1,
+                "requested_qty": 1,
+                "dispatched_qty": 1,
+                "short_supply_qty": {
+                    "$subtract": ["$requested_qty", "$dispatched_qty"]
+                },
+                "short_supply_pct": {
+                    "$cond": {
+                        "if": {"$gt": ["$dispatched_qty", 0]},
+                        "then": {
+                            "$divide": [
+                                {"$subtract": ["$requested_qty", "$dispatched_qty"]},
+                                "$dispatched_qty",
+                            ]
+                        },
+                        "else": 0,
+                    }
+                },
+            }
+        },
         {"$sort": {"shipment_date": -1, "shipment_id": 1}},
     ]
     aggregated = list(db[PROCESSING_COLLECTION].aggregate(pipeline))
@@ -401,14 +784,18 @@ def _fetch_summary_data(db) -> list[dict]:
     for row in aggregated:
         key = f"{row['shipment_id']}|||{row.get('location', '')}"
         edit = stored_edits.get(key, {})
-        rows.append({
-            **row,
-            "reason_for_short_supply": edit.get("reason_for_short_supply", ""),
-            "appointment_initiated_date": edit.get("appointment_initiated_date", ""),
-            "appointment_date": edit.get("appointment_date", ""),
-            "dispatched_date": edit.get("dispatched_date", ""),
-            "status": edit.get("status", "Pending"),
-        })
+        rows.append(
+            {
+                **row,
+                "reason_for_short_supply": edit.get("reason_for_short_supply", ""),
+                "appointment_initiated_date": edit.get(
+                    "appointment_initiated_date", ""
+                ),
+                "appointment_date": edit.get("appointment_date", ""),
+                "dispatched_date": edit.get("dispatched_date", ""),
+                "status": edit.get("status", "Pending"),
+            }
+        )
     return rows
 
 
@@ -440,10 +827,18 @@ def _generate_planning_excel(
     # S(19) Etrade Inv  T(20) Open PO  U(21)=S+T Total Qty
     # V+(22+) Monthly Sales
 
-    fba_inv_label = f"Current FBA\nInventory\n({fba_inv_date})" if fba_inv_date else "Current FBA\nInventory"
+    fba_inv_label = (
+        f"Current FBA\nInventory\n({fba_inv_date})"
+        if fba_inv_date
+        else "Current FBA\nInventory"
+    )
     drr_label = f"DRR\n({drr_period})" if drr_period else "DRR"
     zoho_label = f"Zoho Stock\n({zoho_date})" if zoho_date else "Zoho Stock"
-    etrade_label = f"Current Inventory\nwith Etrade\n({etrade_date})" if etrade_date else "Current Inventory\nwith Etrade"
+    etrade_label = (
+        f"Current Inventory\nwith Etrade\n({etrade_date})"
+        if etrade_date
+        else "Current Inventory\nwith Etrade"
+    )
 
     headers = [
         "ASIN",
@@ -494,27 +889,57 @@ def _generate_planning_excel(
         ws.cell(row=r, column=5, value=row.get("sp") or None)
         ws.cell(row=r, column=6, value=row.get("current_fba_inventory") or None)
         ws.cell(row=r, column=7, value=row.get("open_shipment_qty") or None)
-        ws.cell(row=r, column=8, value=f"=F{r}+G{r}")                                                                    # H: Total Inv
-        ws.cell(row=r, column=9, value=drr_val)                                                                           # I: DRR
-        ws.cell(row=r, column=10, value=f'=IF(I{r}=0,"",ROUND(H{r}/I{r},2))')                                           # J: Net Days
+        ws.cell(row=r, column=8, value=f"=F{r}+G{r}")  # H: Total Inv
+        ws.cell(row=r, column=9, value=drr_val)  # I: DRR
+        ws.cell(
+            row=r, column=10, value=f'=IF(I{r}=0,"",ROUND(H{r}/I{r},2))'
+        )  # J: Net Days
         ws.cell(row=r, column=11, value=row.get("lead_time", DEFAULT_LEAD_TIME))
         ws.cell(row=r, column=12, value=row.get("coverage_days", DEFAULT_COVERAGE_DAYS))
-        ws.cell(row=r, column=13, value=f"=K{r}+L{r}")                                                                   # M: Total Target Days
-        ws.cell(row=r, column=14, value=f"=IF(I{r}=0,0,ROUND(I{r}*M{r},0))")                                            # N: Target Stock
-        ws.cell(row=r, column=15, value=f'=IF(I{r}=0,"",IF(J{r}<K{r},ROUND(I{r}*M{r},0),IF(J{r}>M{r},0,MAX(0,ROUND((M{r}-J{r})*I{r},0)))))') # O: Final Units
+        ws.cell(row=r, column=13, value=f"=K{r}+L{r}")  # M: Total Target Days
+        ws.cell(
+            row=r, column=14, value=f"=IF(I{r}=0,0,ROUND(I{r}*M{r},0))"
+        )  # N: Target Stock
+        ws.cell(
+            row=r,
+            column=15,
+            value=f'=IF(I{r}=0,"",IF(J{r}<K{r},ROUND(I{r}*M{r},0),IF(J{r}>M{r},0,MAX(0,ROUND((M{r}-J{r})*I{r},0)))))',
+        )  # O: Final Units
         ws.cell(row=r, column=16, value=row.get("zoho_stock") or None)
         ws.cell(row=r, column=17, value=row.get("status") or None)
         ws.cell(row=r, column=18, value=row.get("platform") or None)
         ws.cell(row=r, column=19, value=row.get("current_inventory_etrade") or None)
         ws.cell(row=r, column=20, value=row.get("open_po") or None)
-        ws.cell(row=r, column=21, value=f"=S{r}+T{r}")                                                                   # U: Total Qty
+        ws.cell(row=r, column=21, value=f"=S{r}+T{r}")  # U: Total Qty
 
         monthly_sales = row.get("monthly_sales", {})
         for offset, label in enumerate(month_labels):
             val = monthly_sales.get(label)
             ws.cell(row=r, column=22 + offset, value=val if val else None)
 
-    col_widths = [14, 18, 50, 8, 8, 12, 12, 14, 10, 12, 9, 10, 14, 14, 14, 10, 12, 12, 15, 9, 12]
+    col_widths = [
+        14,
+        18,
+        50,
+        8,
+        8,
+        12,
+        12,
+        14,
+        10,
+        12,
+        9,
+        10,
+        14,
+        14,
+        14,
+        10,
+        12,
+        12,
+        15,
+        9,
+        12,
+    ]
     col_widths += [14] * len(month_labels)
     for col_idx, width in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
@@ -529,16 +954,27 @@ def _generate_planning_excel(
 
 # ─── Page 1: Planning ─────────────────────────────────────────────────────────
 
+
 @router.get("/planning")
 async def get_fba_planning(database=Depends(get_database)):
     try:
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         drr_start = today - timedelta(days=89)
-        drr_period = f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
+        drr_period = (
+            f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
+        )
         asins = await asyncio.to_thread(_get_asins, database)
         drr_map = await _compute_drr_async(database, today, asins)
-        rows, fba_inv_date, zoho_date, etrade_date = await asyncio.to_thread(_fetch_planning_data, database, drr_map)
-        return {"rows": rows, "fba_inv_date": fba_inv_date, "zoho_date": zoho_date, "etrade_date": etrade_date, "drr_period": drr_period}
+        rows, fba_inv_date, zoho_date, etrade_date = await asyncio.to_thread(
+            _fetch_planning_data, database, drr_map
+        )
+        return {
+            "rows": rows,
+            "fba_inv_date": fba_inv_date,
+            "zoho_date": zoho_date,
+            "etrade_date": etrade_date,
+            "drr_period": drr_period,
+        }
     except Exception as e:
         logger.error(f"Error fetching FBA planning data: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -549,11 +985,17 @@ async def download_fba_planning(database=Depends(get_database)):
     try:
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         drr_start = today - timedelta(days=89)
-        drr_period = f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
+        drr_period = (
+            f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
+        )
         asins = await asyncio.to_thread(_get_asins, database)
         drr_map = await _compute_drr_async(database, today, asins)
-        rows, fba_inv_date, zoho_date, etrade_date = await asyncio.to_thread(_fetch_planning_data, database, drr_map)
-        excel_bytes = _generate_planning_excel(rows, fba_inv_date, zoho_date, etrade_date, drr_period)
+        rows, fba_inv_date, zoho_date, etrade_date = await asyncio.to_thread(
+            _fetch_planning_data, database, drr_map
+        )
+        excel_bytes = _generate_planning_excel(
+            rows, fba_inv_date, zoho_date, etrade_date, drr_period
+        )
         filename = f"fba_shipment_planning_{today.strftime('%Y%m%d')}.xlsx"
         return StreamingResponse(
             io.BytesIO(excel_bytes),
@@ -566,11 +1008,15 @@ async def download_fba_planning(database=Depends(get_database)):
 
 
 @router.put("/planning/{asin}")
-async def update_planning_override(asin: str, payload: PlanningOverride, database=Depends(get_database)):
+async def update_planning_override(
+    asin: str, payload: PlanningOverride, database=Depends(get_database)
+):
     try:
         update_doc = {}
         if payload.open_shipment_qty_override is not None:
-            update_doc["open_shipment_qty_override"] = payload.open_shipment_qty_override
+            update_doc["open_shipment_qty_override"] = (
+                payload.open_shipment_qty_override
+            )
         if payload.lead_time is not None:
             update_doc["lead_time"] = payload.lead_time
         if payload.coverage_days is not None:
@@ -589,12 +1035,14 @@ async def update_planning_override(asin: str, payload: PlanningOverride, databas
             update_doc["status_override"] = payload.status_override
 
         if update_doc:
+
             def _upsert(db):
                 db[PLANNING_OVERRIDES_COLLECTION].update_one(
                     {"asin": asin},
                     {"$set": {**update_doc, "updated_at": datetime.utcnow()}},
                     upsert=True,
                 )
+
             await asyncio.to_thread(_upsert, database)
 
         return {"success": True}
@@ -604,9 +1052,19 @@ async def update_planning_override(asin: str, payload: PlanningOverride, databas
 
 
 @router.delete("/planning/{asin}/override")
-async def clear_planning_override(asin: str, field: str, database=Depends(get_database)):
+async def clear_planning_override(
+    asin: str, field: str, database=Depends(get_database)
+):
     """Clear a specific override field so the auto-computed value is used."""
-    allowed = {"open_shipment_qty_override", "lead_time", "coverage_days", "final_units_override", "mrp_override", "sp_override", "status_override"}
+    allowed = {
+        "open_shipment_qty_override",
+        "lead_time",
+        "coverage_days",
+        "final_units_override",
+        "mrp_override",
+        "sp_override",
+        "status_override",
+    }
     if field not in allowed:
         raise HTTPException(status_code=400, detail=f"Field {field} is not clearable")
 
@@ -615,12 +1073,15 @@ async def clear_planning_override(asin: str, field: str, database=Depends(get_da
             {"asin": asin},
             {"$unset": {field: ""}, "$set": {"updated_at": datetime.utcnow()}},
         )
+
     await asyncio.to_thread(_clear, database)
     return {"success": True}
 
 
 @router.post("/planning/upload")
-async def upload_planning_overrides(file: UploadFile = File(...), database=Depends(get_database)):
+async def upload_planning_overrides(
+    file: UploadFile = File(...), database=Depends(get_database)
+):
     """
     Upload the FBA shipment planning Excel to populate amazon_sku_mapping and overrides.
     Expected columns match the reference format:
@@ -647,7 +1108,9 @@ async def upload_planning_overrides(file: UploadFile = File(...), database=Depen
                 break
 
         if header_row is None:
-            raise HTTPException(status_code=400, detail="Could not find header row with 'ASIN' column")
+            raise HTTPException(
+                status_code=400, detail="Could not find header row with 'ASIN' column"
+            )
 
         def _col(*names):
             for name in names:
@@ -678,13 +1141,21 @@ async def upload_planning_overrides(file: UploadFile = File(...), database=Depen
 
         def _int_or_none(val):
             try:
-                return int(float(val)) if val is not None and str(val).strip() not in ("", "None", "N/A") else None
+                return (
+                    int(float(val))
+                    if val is not None and str(val).strip() not in ("", "None", "N/A")
+                    else None
+                )
             except (TypeError, ValueError):
                 return None
 
         def _float_or_none(val):
             try:
-                return float(val) if val is not None and str(val).strip() not in ("", "None", "N/A") else None
+                return (
+                    float(val)
+                    if val is not None and str(val).strip() not in ("", "None", "N/A")
+                    else None
+                )
             except (TypeError, ValueError):
                 return None
 
@@ -697,7 +1168,7 @@ async def upload_planning_overrides(file: UploadFile = File(...), database=Depen
 
         def _process_rows(db):
             nonlocal updated_sku_mapping, updated_overrides
-            for row in rows[header_idx + 1:]:
+            for row in rows[header_idx + 1 :]:
                 if not any(row):
                     continue
                 asin_val = _str_or_none(row[idx_asin]) if idx_asin is not None else None
@@ -705,7 +1176,9 @@ async def upload_planning_overrides(file: UploadFile = File(...), database=Depen
                     continue
 
                 sku_val = _str_or_none(row[idx_sku]) if idx_sku is not None else None
-                fnsku_val = _str_or_none(row[idx_fnsku]) if idx_fnsku is not None else None
+                fnsku_val = (
+                    _str_or_none(row[idx_fnsku]) if idx_fnsku is not None else None
+                )
 
                 # Upsert amazon_sku_mapping
                 if sku_val or fnsku_val:
@@ -739,23 +1212,39 @@ async def upload_planning_overrides(file: UploadFile = File(...), database=Depen
                 if lead_val is not None:
                     override_update["lead_time"] = lead_val
 
-                coverage_val = _int_or_none(row[idx_coverage]) if idx_coverage is not None else None
+                coverage_val = (
+                    _int_or_none(row[idx_coverage])
+                    if idx_coverage is not None
+                    else None
+                )
                 if coverage_val is not None:
                     override_update["coverage_days"] = coverage_val
 
-                status_val = _str_or_none(row[idx_status]) if idx_status is not None else None
+                status_val = (
+                    _str_or_none(row[idx_status]) if idx_status is not None else None
+                )
                 if status_val is not None:
                     override_update["status_override"] = status_val
 
-                platform_val = _str_or_none(row[idx_platform]) if idx_platform is not None else None
+                platform_val = (
+                    _str_or_none(row[idx_platform])
+                    if idx_platform is not None
+                    else None
+                )
                 if platform_val is not None:
                     override_update["platform"] = platform_val
 
-                open_qty_val = _int_or_none(row[idx_open_qty]) if idx_open_qty is not None else None
+                open_qty_val = (
+                    _int_or_none(row[idx_open_qty])
+                    if idx_open_qty is not None
+                    else None
+                )
                 if open_qty_val is not None:
                     override_update["open_shipment_qty_override"] = open_qty_val
 
-                final_val = _int_or_none(row[idx_final]) if idx_final is not None else None
+                final_val = (
+                    _int_or_none(row[idx_final]) if idx_final is not None else None
+                )
                 if final_val is not None:
                     override_update["final_units_override"] = final_val
 
@@ -783,6 +1272,7 @@ async def upload_planning_overrides(file: UploadFile = File(...), database=Depen
 
 # ─── Page 2: Processing ───────────────────────────────────────────────────────
 
+
 @router.get("/processing")
 async def get_fba_processing(database=Depends(get_database)):
     try:
@@ -794,7 +1284,9 @@ async def get_fba_processing(database=Depends(get_database)):
 
 
 @router.post("/processing/upload")
-async def upload_fba_processing(file: UploadFile = File(...), database=Depends(get_database)):
+async def upload_fba_processing(
+    file: UploadFile = File(...), database=Depends(get_database)
+):
     """
     Upload FBA shipment processing sheet.
     Expected columns: Shipment ID, Date, Location, SKU Code, ASIN, FNSKU, Item Name, MRP, SP,
@@ -819,7 +1311,10 @@ async def upload_fba_processing(file: UploadFile = File(...), database=Depends(g
                 break
 
         if header_row is None:
-            raise HTTPException(status_code=400, detail="Could not find header row with 'Shipment ID' column")
+            raise HTTPException(
+                status_code=400,
+                detail="Could not find header row with 'Shipment ID' column",
+            )
 
         def _find_col(*names):
             for name in names:
@@ -849,13 +1344,21 @@ async def upload_fba_processing(file: UploadFile = File(...), database=Depends(g
 
         def _safe_num(val):
             try:
-                return float(val) if val is not None and str(val).strip() not in ("", "None") else None
+                return (
+                    float(val)
+                    if val is not None and str(val).strip() not in ("", "None")
+                    else None
+                )
             except (TypeError, ValueError):
                 return None
 
         def _safe_int(val):
             try:
-                return int(float(val)) if val is not None and str(val).strip() not in ("", "None") else 0
+                return (
+                    int(float(val))
+                    if val is not None and str(val).strip() not in ("", "None")
+                    else 0
+                )
             except (TypeError, ValueError):
                 return 0
 
@@ -880,7 +1383,7 @@ async def upload_fba_processing(file: UploadFile = File(...), database=Depends(g
                     return None
 
         records = []
-        for raw in all_rows[header_idx + 1:]:
+        for raw in all_rows[header_idx + 1 :]:
             if not any(raw):
                 continue
             shipment_id = _safe_str(raw[idx_shipment_id], idx_shipment_id)
@@ -890,17 +1393,37 @@ async def upload_fba_processing(file: UploadFile = File(...), database=Depends(g
             record = {
                 "shipment_id": shipment_id,
                 "date": _parse_date(raw[idx_date] if idx_date is not None else None),
-                "location": _safe_str(raw[idx_location] if idx_location is not None else None, idx_location),
-                "sku_code": _safe_str(raw[idx_sku] if idx_sku is not None else None, idx_sku),
-                "asin": _safe_str(raw[idx_asin] if idx_asin is not None else None, idx_asin),
-                "fnsku": _safe_str(raw[idx_fnsku] if idx_fnsku is not None else None, idx_fnsku),
-                "item_name": _safe_str(raw[idx_item_name] if idx_item_name is not None else None, idx_item_name),
+                "location": _safe_str(
+                    raw[idx_location] if idx_location is not None else None,
+                    idx_location,
+                ),
+                "sku_code": _safe_str(
+                    raw[idx_sku] if idx_sku is not None else None, idx_sku
+                ),
+                "asin": _safe_str(
+                    raw[idx_asin] if idx_asin is not None else None, idx_asin
+                ),
+                "fnsku": _safe_str(
+                    raw[idx_fnsku] if idx_fnsku is not None else None, idx_fnsku
+                ),
+                "item_name": _safe_str(
+                    raw[idx_item_name] if idx_item_name is not None else None,
+                    idx_item_name,
+                ),
                 "mrp": _safe_num(raw[idx_mrp] if idx_mrp is not None else None),
                 "sp": _safe_num(raw[idx_sp] if idx_sp is not None else None),
-                "requested_qty": _safe_int(raw[idx_requested_qty] if idx_requested_qty is not None else None),
-                "packed_qty": _safe_int(raw[idx_packed_qty] if idx_packed_qty is not None else None),
-                "cost_price": _safe_num(raw[idx_cost_price] if idx_cost_price is not None else None),
-                "hsn_code": _safe_str(raw[idx_hsn] if idx_hsn is not None else None, idx_hsn),
+                "requested_qty": _safe_int(
+                    raw[idx_requested_qty] if idx_requested_qty is not None else None
+                ),
+                "packed_qty": _safe_int(
+                    raw[idx_packed_qty] if idx_packed_qty is not None else None
+                ),
+                "cost_price": _safe_num(
+                    raw[idx_cost_price] if idx_cost_price is not None else None
+                ),
+                "hsn_code": _safe_str(
+                    raw[idx_hsn] if idx_hsn is not None else None, idx_hsn
+                ),
                 "gst": _safe_num(raw[idx_gst] if idx_gst is not None else None),
                 "uploaded_at": datetime.utcnow(),
             }
@@ -912,7 +1435,11 @@ async def upload_fba_processing(file: UploadFile = File(...), database=Depends(g
         def _store(db):
             for rec in records:
                 db[PROCESSING_COLLECTION].update_one(
-                    {"shipment_id": rec["shipment_id"], "sku_code": rec["sku_code"], "asin": rec["asin"]},
+                    {
+                        "shipment_id": rec["shipment_id"],
+                        "sku_code": rec["sku_code"],
+                        "asin": rec["asin"],
+                    },
                     {"$set": rec},
                     upsert=True,
                 )
@@ -930,13 +1457,16 @@ async def upload_fba_processing(file: UploadFile = File(...), database=Depends(g
 @router.delete("/processing")
 async def clear_fba_processing(database=Depends(get_database)):
     """Clear all processing records."""
+
     def _clear(db):
         return db[PROCESSING_COLLECTION].delete_many({}).deleted_count
+
     deleted = await asyncio.to_thread(_clear, database)
     return {"success": True, "deleted": deleted}
 
 
 # ─── Page 3: Summary ──────────────────────────────────────────────────────────
+
 
 @router.get("/summary")
 async def get_fba_summary(database=Depends(get_database)):
@@ -949,13 +1479,24 @@ async def get_fba_summary(database=Depends(get_database)):
 
 
 @router.put("/summary/{shipment_id}")
-async def update_fba_summary(shipment_id: str, location: str, payload: SummaryUpdate, database=Depends(get_database)):
+async def update_fba_summary(
+    shipment_id: str,
+    location: str,
+    payload: SummaryUpdate,
+    database=Depends(get_database),
+):
     try:
-        update_doc: dict = {"shipment_id": shipment_id, "location": location, "updated_at": datetime.utcnow()}
+        update_doc: dict = {
+            "shipment_id": shipment_id,
+            "location": location,
+            "updated_at": datetime.utcnow(),
+        }
         if payload.reason_for_short_supply is not None:
             update_doc["reason_for_short_supply"] = payload.reason_for_short_supply
         if payload.appointment_initiated_date is not None:
-            update_doc["appointment_initiated_date"] = payload.appointment_initiated_date
+            update_doc["appointment_initiated_date"] = (
+                payload.appointment_initiated_date
+            )
         if payload.appointment_date is not None:
             update_doc["appointment_date"] = payload.appointment_date
         if payload.dispatched_date is not None:
@@ -969,6 +1510,7 @@ async def update_fba_summary(shipment_id: str, location: str, payload: SummaryUp
                 {"$set": update_doc},
                 upsert=True,
             )
+
         await asyncio.to_thread(_upsert, database)
         return {"success": True}
     except Exception as e:
