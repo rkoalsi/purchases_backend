@@ -159,7 +159,7 @@ def _fetch_planning_data(db, today: datetime, drr_by_sku: dict, sku_state_drr: d
     # 1. All SKUs from blinkit_sku_mapping
     sku_docs = list(db[SKU_COLLECTION].find({}, {"item_id": 1, "sku_code": 1, "item_name": 1, "_id": 0}))
     if not sku_docs:
-        return [], ""
+        return [], "", ""
 
     skus = [d["sku_code"] for d in sku_docs if d.get("sku_code")]
     sku_to_item_id: dict[str, int] = {d["sku_code"]: d["item_id"] for d in sku_docs if d.get("sku_code") and d.get("item_id")}
