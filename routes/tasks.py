@@ -161,7 +161,15 @@ async def list_tasks(
         if assigned_to:
             query["assigned_to"] = assigned_to
         if department:
-            query["creator_department"] = department
+            dept_or = [
+                {"creator_department": department},
+                {"assigned_to_departments": department},
+            ]
+            existing_or = query.pop("$or", None)
+            if existing_or:
+                query["$and"] = [{"$or": existing_or}, {"$or": dept_or}]
+            else:
+                query["$or"] = dept_or
         if search:
             search_or = [
                 {"title": {"$regex": re.escape(search), "$options": "i"}},
