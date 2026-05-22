@@ -38,6 +38,7 @@ ESTIMATES_COLLECTION = "estimates"
 PACKAGES_COLLECTION = "packages"
 TRANSFER_ORDERS_COLLECTION = "transfer_orders"
 ASSEMBLIES_COLLECTION = "assemblies"
+SALES_ORDERS_COLLECTION = "sales_orders"
 
 ZOHO_BOOKS_BASE = "https://books.zoho.com/api/v3"
 ZOHO_INVENTORY_BASE = os.getenv("ZOHO_INVENTORY_BASE", "https://www.zohoapis.com/inventory/v1")
@@ -1104,6 +1105,39 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "_est": {"$arrayElemAt": ["$_est", 0]},
                 }
             },
+            # Join sales order by estimate_id to derive packages automatically
+            {
+                "$lookup": {
+                    "from": SALES_ORDERS_COLLECTION,
+                    "localField": "zoho_estimate_id",
+                    "foreignField": "estimate_id",
+                    "as": "_so",
+                }
+            },
+            {
+                "$addFields": {
+                    "_so": {"$arrayElemAt": ["$_so", 0]},
+                }
+            },
+            {
+                "$addFields": {
+                    # null = no SO found; [] = SO exists but no packages; [...] = package numbers
+                    "so_packages": {
+                        "$cond": {
+                            "if": {"$gt": ["$_so", None]},
+                            "then": {
+                                "$map": {
+                                    "input": {"$ifNull": ["$_so.packages", []]},
+                                    "as": "pkg",
+                                    "in": "$$pkg.package_number",
+                                }
+                            },
+                            "else": None,
+                        }
+                    },
+                    "so_number": "$_so.salesorder_number",
+                }
+            },
             {
                 "$addFields": {
                     # Use estimate sub_total/total when available, else fall back to item sums
@@ -1141,6 +1175,8 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "assembly_numbers": 1,
                     "packages": 1,
                     "sales_order_no": 1,
+                    "so_packages": 1,
+                    "so_number": 1,
                     "_id": 0,
                 }
             },
@@ -1624,20 +1660,28 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
     def _fetch():
         doc = db[PO_COLLECTION].find_one({"po_number": po_number})
         if not doc:
-            return None, None
-        pkg_numbers = doc.get("packages") or ([doc["package_number"]] if doc.get("package_number") else [])
+            return None, None, []
+        # Derive package numbers from linked sales order
+        est_id = doc.get("zoho_estimate_id")
+        pkg_numbers: list[str] = []
+        if est_id:
+            so = db[SALES_ORDERS_COLLECTION].find_one({"estimate_id": est_id}, {"packages": 1})
+            if so:
+                pkg_numbers = [p["package_number"] for p in (so.get("packages") or []) if p.get("package_number")]
+        # Fall back to manually linked packages for backward compatibility
         if not pkg_numbers:
-            return doc, None
+            pkg_numbers = doc.get("packages") or ([doc["package_number"]] if doc.get("package_number") else [])
+        if not pkg_numbers:
+            return doc, None, []
         pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_numbers[0]})
-        return doc, pkg
+        return doc, pkg, pkg_numbers
 
-    doc, pkg = await asyncio.to_thread(_fetch)
+    doc, pkg, pkg_numbers = await asyncio.to_thread(_fetch)
     if doc is None:
         raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
     if pkg is None:
         raise HTTPException(status_code=404, detail="No package linked to this PO")
 
-    pkg_numbers = doc.get("packages") or ([doc["package_number"]] if doc.get("package_number") else [])
     package_number = pkg_numbers[0]
     line_items = pkg.get("line_items") or []
 
@@ -3305,9 +3349,6 @@ async def unlink_all_packages(po_number: str, db=Depends(get_database)):
 
 
 # ─── sales order number ────────────────────────────────────────────────────────
-
-
-SALES_ORDERS_COLLECTION = "sales_orders"
 
 
 class SalesOrderLinkRequest(BaseModel):
