@@ -133,6 +133,7 @@ def _compute_drr_per_sku(db, today: datetime, skus: list) -> dict:
 
     # Compute DRR per (sku, state), then sum per sku
     sku_drr: dict[str, float] = {}
+    sku_state_drr: dict[str, dict[str, float]] = {}
     for (sku, state), date_dict in state_daily.items():
         daily_data = list(date_dict.values())
         returns = state_returns.get((sku, state), 0)
@@ -142,13 +143,17 @@ def _compute_drr_per_sku(db, today: datetime, skus: list) -> dict:
         except (TypeError, ValueError):
             drr = 0.0
         sku_drr[sku] = round(sku_drr.get(sku, 0.0) + drr, 2)
+        if drr > 0:
+            if sku not in sku_state_drr:
+                sku_state_drr[sku] = {}
+            sku_state_drr[sku][state] = round(drr, 2)
 
-    return sku_drr
+    return sku_drr, sku_state_drr
 
 
 # ─── Sync helper: fetch all planning rows ────────────────────────────────────
 
-def _fetch_planning_data(db, today: datetime, drr_by_sku: dict) -> tuple:
+def _fetch_planning_data(db, today: datetime, drr_by_sku: dict, sku_state_drr: dict | None = None) -> tuple:
     inv_date_str = ""
 
     # 1. All SKUs from blinkit_sku_mapping
@@ -304,6 +309,7 @@ def _fetch_planning_data(db, today: datetime, drr_by_sku: dict) -> tuple:
         zoho_item_id = prod.get("item_id", "")
         zoho_stock = zoho_latest.get(zoho_item_id, 0) if zoho_item_id else 0
 
+        state_drr_for_sku = (sku_state_drr or {}).get(sku, {})
         rows.append({
             "item_id": sku_to_item_id.get(sku, ""),
             "sku_code": sku,
@@ -313,6 +319,7 @@ def _fetch_planning_data(db, today: datetime, drr_by_sku: dict) -> tuple:
             "open_shipment_qty_auto": open_shipment_auto,
             "total_inventory": total_inventory,
             "drr": round(drr, 2),
+            "state_drr": state_drr_for_sku,
             "net_total_days": net_total_days,
             "lead_time": lead_time,
             "coverage_days": coverage_days,
@@ -344,9 +351,17 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
     inv_label = f"Current Inventory\n({inv_date})" if inv_date else "Current Inventory"
     drr_label = f"DRR\n({drr_period})" if drr_period else "DRR"
 
+    # Collect all unique states with DRR > 0, sorted alphabetically
+    all_states = sorted({
+        state
+        for row in rows
+        for state, val in row.get("state_drr", {}).items()
+        if val and val > 0
+    })
+
     # Columns: A=Item ID, B=SKU Code, C=Item Name, D=Current Inv, E=Open Shipment,
     # F=Total Inv, G=DRR, H=Net Days, I=Lead Time, J=Coverage, K=Target Days,
-    # L=Target Stock, M=Final Units, N=Zoho Stock, O=Status, P+=Monthly Sales
+    # L=Target Stock, M=Final Units, N=Zoho Stock, O=Status, P+=Monthly Sales, then State DRRs
     headers = [
         "Item ID", "SKU Code", "Item Name",
         inv_label, "Open Shipment Qty",
@@ -357,7 +372,7 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
         "Target Stock\n(=DRR × Target Days)",
         "Final Units\n(Under-ordering formula)",
         "Zoho Stock", "Status",
-    ] + [f"{label}\nUnits Sold" for label in month_labels]
+    ] + [f"{label}\nUnits Sold" for label in month_labels] + [f"DRR\n{state}" for state in all_states]
 
     header_fill = PatternFill("solid", fgColor="4472C4")
     header_font = Font(bold=True, color="FFFFFF")
@@ -399,8 +414,15 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
             val = ms.get(label)
             ws.cell(row=r, column=16 + offset, value=val if val else None)
 
+        state_drr = row.get("state_drr", {})
+        state_col_start = 16 + len(month_labels)
+        for offset, state in enumerate(all_states):
+            val = state_drr.get(state)
+            ws.cell(row=r, column=state_col_start + offset, value=val if val else None)
+
     col_widths = [12, 18, 50, 14, 14, 18, 10, 12, 9, 10, 14, 14, 14, 10, 12]
     col_widths += [14] * len(month_labels)
+    col_widths += [14] * len(all_states)
     for col_idx, width in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
@@ -416,8 +438,8 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
 def _fetch_all_planning(db, today: datetime) -> tuple:
     """Single-threaded entry point: compute DRR then assemble rows."""
     skus = [d["sku_code"] for d in db[SKU_COLLECTION].find({}, {"sku_code": 1, "_id": 0}) if d.get("sku_code")]
-    drr_by_sku = _compute_drr_per_sku(db, today, skus)
-    rows, inv_date_str, zoho_stock_date_str = _fetch_planning_data(db, today, drr_by_sku)
+    drr_by_sku, sku_state_drr = _compute_drr_per_sku(db, today, skus)
+    rows, inv_date_str, zoho_stock_date_str = _fetch_planning_data(db, today, drr_by_sku, sku_state_drr)
     return rows, inv_date_str, zoho_stock_date_str
 
 
