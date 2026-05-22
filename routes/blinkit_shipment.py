@@ -210,7 +210,16 @@ def _fetch_planning_data(db, today: datetime, drr_by_sku: dict) -> tuple:
 
     zoho_item_ids = [p["item_id"] for p in product_by_sku.values() if p.get("item_id")]
     zoho_latest: dict[str, int] = {}
+    zoho_stock_date_str = ""
     if zoho_item_ids:
+        latest_zoho = db["zoho_warehouse_stock"].find_one(
+            {"zoho_item_id": {"$in": zoho_item_ids}},
+            {"date": 1},
+            sort=[("date", -1)],
+        )
+        if latest_zoho and latest_zoho.get("date"):
+            zd = latest_zoho["date"]
+            zoho_stock_date_str = zd.strftime("%-d %b %Y") if isinstance(zd, datetime) else str(zd)[:10]
         for doc in db["zoho_warehouse_stock"].aggregate([
             {"$match": {"zoho_item_id": {"$in": zoho_item_ids}}},
             {"$sort": {"date": -1}},
@@ -318,7 +327,7 @@ def _fetch_planning_data(db, today: datetime, drr_by_sku: dict) -> tuple:
             "final_units_overridden": "final_units_override" in override and override["final_units_override"] is not None,
         })
 
-    return rows, inv_date_str
+    return rows, inv_date_str, zoho_stock_date_str
 
 
 def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: str = "") -> bytes:
@@ -408,7 +417,8 @@ def _fetch_all_planning(db, today: datetime) -> tuple:
     """Single-threaded entry point: compute DRR then assemble rows."""
     skus = [d["sku_code"] for d in db[SKU_COLLECTION].find({}, {"sku_code": 1, "_id": 0}) if d.get("sku_code")]
     drr_by_sku = _compute_drr_per_sku(db, today, skus)
-    return _fetch_planning_data(db, today, drr_by_sku)
+    rows, inv_date_str, zoho_stock_date_str = _fetch_planning_data(db, today, drr_by_sku)
+    return rows, inv_date_str, zoho_stock_date_str
 
 
 @router.get("/planning")
@@ -417,8 +427,8 @@ async def get_blinkit_planning(database=Depends(get_database)):
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         drr_start = today - timedelta(days=89)
         drr_period = f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
-        rows, inv_date = await asyncio.to_thread(_fetch_all_planning, database, today)
-        return {"rows": rows, "inv_date": inv_date, "drr_period": drr_period}
+        rows, inv_date, zoho_stock_date = await asyncio.to_thread(_fetch_all_planning, database, today)
+        return {"rows": rows, "inv_date": inv_date, "drr_period": drr_period, "zoho_stock_date": zoho_stock_date}
     except Exception as e:
         logger.error(f"Error fetching Blinkit planning data: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -430,7 +440,7 @@ async def download_blinkit_planning(database=Depends(get_database)):
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         drr_start = today - timedelta(days=89)
         drr_period = f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
-        rows, inv_date = await asyncio.to_thread(_fetch_all_planning, database, today)
+        rows, inv_date, _zoho_date = await asyncio.to_thread(_fetch_all_planning, database, today)
         excel_bytes = _generate_planning_excel(rows, inv_date, drr_period)
         filename = f"blinkit_shipment_planning_{today.strftime('%Y%m%d')}.xlsx"
         return StreamingResponse(
