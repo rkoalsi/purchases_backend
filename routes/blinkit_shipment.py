@@ -11,7 +11,7 @@ from typing import Optional
 from pydantic import BaseModel
 import logging
 
-from .blinkit import compute_drr_blinkit
+from .blinkit import compute_drr_blinkit, CITY_TO_STATE
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -49,58 +49,106 @@ class SummaryUpdate(BaseModel):
     status: Optional[str] = None
 
 
-# ─── DRR (SKU-level, aggregated across all states) ───────────────────────────
+# ─── DRR (SKU-level, matching PSR methodology: per state then summed) ────────
 
-def _fetch_drr_daily_all_skus(db, today: datetime, skus: list) -> dict:
+def _compute_drr_per_sku(db, today: datetime, skus: list) -> dict:
     """
-    Fetch 90 days of {date, closing_stock, units_sold} per sku_code (all cities combined).
-    Returns dict: sku_code -> list of {date, closing_stock, units_sold}
+    Compute DRR per sku_code by replicating the PSR state-level methodology:
+    1. Aggregate inventory by (sku, city, date) — city normalized to state via CITY_TO_STATE
+    2. Aggregate sales by (sku, city, date) — city normalized to state
+    3. Run compute_drr_blinkit per (sku, state)
+    4. Sum state DRRs per sku to get total DRR (consistent with PSR showing per-state DRRs)
+    Returns dict: sku_code -> total DRR (float)
     """
     drr_start = today - timedelta(days=89)
 
     inv_results = list(db["blinkit_inventory"].aggregate([
         {"$match": {"sku_code": {"$in": skus}, "date": {"$gte": drr_start, "$lte": today}}},
         {"$group": {
-            "_id": {"sku": "$sku_code", "date": "$date"},
+            "_id": {"sku": "$sku_code", "city": "$city", "date": "$date"},
             "closing_stock": {"$sum": "$warehouse_inventory"},
         }},
     ], allowDiskUse=True))
 
     sales_results = list(db["blinkit_sales"].aggregate([
-        {"$match": {"sku_code": {"$in": skus}, "order_date": {"$gte": drr_start, "$lte": today}}},
+        {"$match": {
+            "sku_code": {"$in": skus},
+            "order_date": {"$gte": drr_start, "$lte": today},
+            "source": {"$ne": "return_orders"},
+        }},
         {"$group": {
-            "_id": {"sku": "$sku_code", "date": "$order_date"},
+            "_id": {"sku": "$sku_code", "city": "$city", "date": "$order_date"},
             "units_sold": {"$sum": "$quantity"},
         }},
     ], allowDiskUse=True))
 
-    daily_map: dict = {}
+    returns_results = list(db["blinkit_sales"].aggregate([
+        {"$match": {
+            "sku_code": {"$in": skus},
+            "order_date": {"$gte": drr_start, "$lte": today},
+            "source": "return_orders",
+        }},
+        {"$group": {
+            "_id": {"sku": "$sku_code", "city": "$city"},
+            "total": {"$sum": "$quantity"},
+        }},
+    ], allowDiskUse=True))
+
+    # Build (sku, state) -> {date_str: {date, closing_stock, units_sold}}
+    state_daily: dict = {}
     for doc in inv_results:
         sku = doc["_id"]["sku"]
+        city = doc["_id"]["city"]
+        state = CITY_TO_STATE.get(city, city)
+        key = (sku, state)
         date_val = doc["_id"]["date"]
         date_str = date_val.strftime("%Y-%m-%d") if isinstance(date_val, datetime) else str(date_val)[:10]
-        if sku not in daily_map:
-            daily_map[sku] = {}
-        if date_str not in daily_map[sku]:
-            daily_map[sku][date_str] = {"date": date_val, "closing_stock": 0, "units_sold": 0}
-        daily_map[sku][date_str]["closing_stock"] += doc["closing_stock"]
+        if key not in state_daily:
+            state_daily[key] = {}
+        if date_str not in state_daily[key]:
+            state_daily[key][date_str] = {"date": date_val, "closing_stock": 0, "units_sold": 0}
+        state_daily[key][date_str]["closing_stock"] += doc["closing_stock"]
 
     for doc in sales_results:
         sku = doc["_id"]["sku"]
+        city = doc["_id"]["city"]
+        state = CITY_TO_STATE.get(city, city)
+        key = (sku, state)
         date_val = doc["_id"]["date"]
         date_str = date_val.strftime("%Y-%m-%d") if isinstance(date_val, datetime) else str(date_val)[:10]
-        if sku not in daily_map:
-            daily_map[sku] = {}
-        if date_str not in daily_map[sku]:
-            daily_map[sku][date_str] = {"date": date_val, "closing_stock": 0, "units_sold": 0}
-        daily_map[sku][date_str]["units_sold"] += doc["units_sold"]
+        if key not in state_daily:
+            state_daily[key] = {}
+        if date_str not in state_daily[key]:
+            state_daily[key][date_str] = {"date": date_val, "closing_stock": 0, "units_sold": 0}
+        state_daily[key][date_str]["units_sold"] += doc["units_sold"]
 
-    return {sku: list(date_dict.values()) for sku, date_dict in daily_map.items()}
+    # Build (sku, state) -> total returns
+    state_returns: dict = {}
+    for doc in returns_results:
+        sku = doc["_id"]["sku"]
+        city = doc["_id"]["city"]
+        state = CITY_TO_STATE.get(city, city)
+        key = (sku, state)
+        state_returns[key] = state_returns.get(key, 0) + doc["total"]
+
+    # Compute DRR per (sku, state), then sum per sku
+    sku_drr: dict[str, float] = {}
+    for (sku, state), date_dict in state_daily.items():
+        daily_data = list(date_dict.values())
+        returns = state_returns.get((sku, state), 0)
+        drr_val, _, _, _ = compute_drr_blinkit(daily_data, returns)
+        try:
+            drr = float(drr_val)
+        except (TypeError, ValueError):
+            drr = 0.0
+        sku_drr[sku] = round(sku_drr.get(sku, 0.0) + drr, 2)
+
+    return sku_drr
 
 
 # ─── Sync helper: fetch all planning rows ────────────────────────────────────
 
-def _fetch_planning_data(db, today: datetime) -> tuple:
+def _fetch_planning_data(db, today: datetime, drr_by_sku: dict) -> tuple:
     inv_date_str = ""
 
     # 1. All SKUs from blinkit_sku_mapping
@@ -207,23 +255,7 @@ def _fetch_planning_data(db, today: datetime) -> tuple:
     for doc in db[PLANNING_OVERRIDES_COLLECTION].find({"sku_code": {"$in": skus}}):
         overrides[doc["sku_code"]] = doc
 
-    # 7. DRR per SKU (all states combined)
-    drr_daily_map = _fetch_drr_daily_all_skus(db, today, skus)
-
-    # 8. Returns (last 90 days) per SKU for DRR net calc
-    drr_start = today - timedelta(days=89)
-    returns_by_sku: dict[str, int] = {}
-    for doc in db["blinkit_sales"].aggregate([
-        {"$match": {
-            "sku_code": {"$in": skus},
-            "order_date": {"$gte": drr_start, "$lte": today},
-            "source": "return_orders",
-        }},
-        {"$group": {"_id": "$sku_code", "total": {"$sum": "$quantity"}}},
-    ]):
-        returns_by_sku[doc["_id"]] = int(doc["total"] or 0)
-
-    # 9. Assemble rows
+    # 7. Assemble rows (drr_by_sku passed in from async caller)
     rows = []
     for sku in skus:
         override = overrides.get(sku, {})
@@ -238,13 +270,7 @@ def _fetch_planning_data(db, today: datetime) -> tuple:
         )
         total_inventory = current_inv + open_shipment
 
-        daily_data = drr_daily_map.get(sku, [])
-        returns = returns_by_sku.get(sku, 0)
-        drr_val, drr_lookback, _, drr_flag = compute_drr_blinkit(daily_data, returns)
-        try:
-            drr = float(drr_val) if drr_val is not None and str(drr_val) not in ("", "No data") else 0.0
-        except (TypeError, ValueError):
-            drr = 0.0
+        drr = drr_by_sku.get(sku, 0.0)
 
         net_total_days = round(total_inventory / drr, 2) if drr > 0 else 0
 
@@ -278,8 +304,6 @@ def _fetch_planning_data(db, today: datetime) -> tuple:
             "open_shipment_qty_auto": open_shipment_auto,
             "total_inventory": total_inventory,
             "drr": round(drr, 2),
-            "drr_flag": drr_flag,
-            "drr_lookback": drr_lookback or "",
             "net_total_days": net_total_days,
             "lead_time": lead_time,
             "coverage_days": coverage_days,
@@ -380,13 +404,20 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
 
 # ─── Page 1: Planning ─────────────────────────────────────────────────────────
 
+def _fetch_all_planning(db, today: datetime) -> tuple:
+    """Single-threaded entry point: compute DRR then assemble rows."""
+    skus = [d["sku_code"] for d in db[SKU_COLLECTION].find({}, {"sku_code": 1, "_id": 0}) if d.get("sku_code")]
+    drr_by_sku = _compute_drr_per_sku(db, today, skus)
+    return _fetch_planning_data(db, today, drr_by_sku)
+
+
 @router.get("/planning")
 async def get_blinkit_planning(database=Depends(get_database)):
     try:
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        rows, inv_date = await asyncio.to_thread(_fetch_planning_data, database, today)
         drr_start = today - timedelta(days=89)
         drr_period = f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
+        rows, inv_date = await asyncio.to_thread(_fetch_all_planning, database, today)
         return {"rows": rows, "inv_date": inv_date, "drr_period": drr_period}
     except Exception as e:
         logger.error(f"Error fetching Blinkit planning data: {e}", exc_info=True)
@@ -397,9 +428,9 @@ async def get_blinkit_planning(database=Depends(get_database)):
 async def download_blinkit_planning(database=Depends(get_database)):
     try:
         today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        rows, inv_date = await asyncio.to_thread(_fetch_planning_data, database, today)
         drr_start = today - timedelta(days=89)
         drr_period = f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
+        rows, inv_date = await asyncio.to_thread(_fetch_all_planning, database, today)
         excel_bytes = _generate_planning_excel(rows, inv_date, drr_period)
         filename = f"blinkit_shipment_planning_{today.strftime('%Y%m%d')}.xlsx"
         return StreamingResponse(
