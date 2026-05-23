@@ -359,11 +359,13 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
         if val and val > 0
     })
 
-    # Columns: A=Item ID, B=SKU Code, C=Item Name, D=Current Inv, E=Open Shipment,
-    # F=Total Inv, G=DRR, H=Net Days, I=Lead Time, J=Coverage, K=Target Days,
-    # L=Target Stock, M+=State Units, then Zoho Stock, Status, Monthly Sales, State DRRs
+    # Columns: A=Item ID, B=SKU Code, C=Item Name, D=Zoho Stock, E=Status,
+    # F=Current Inv, G=Open Shipment, H=Total Inv, I=DRR, J=Net Days,
+    # K=Lead Time, L=Coverage, M=Target Days, N=Target Stock, O+=State Units,
+    # then Monthly Sales, State DRRs
     headers = [
         "Item ID", "SKU Code", "Item Name",
+        "Zoho Stock", "Status",
         inv_label, "Open Shipment Qty",
         "Total Inventory\n(Current + Open Shipment)",
         drr_label, "Net Total Days\n(=Total Inv ÷ DRR)",
@@ -371,8 +373,8 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
         "Total Target Days\n(=Lead + Coverage)",
         "Target Stock\n(=DRR × Target Days)",
     ] + [f"{state}\nUnits" for state in all_states] + [
-        "Zoho Stock", "Status",
-    ] + [f"{label}\nUnits Sold" for label in month_labels] + [f"DRR\n{state}" for state in all_states]
+        f"{label}\nUnits Sold" for label in month_labels
+    ] + [f"DRR\n{state}" for state in all_states]
 
     header_fill = PatternFill("solid", fgColor="4472C4")
     header_font = Font(bold=True, color="FFFFFF")
@@ -395,32 +397,28 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
         ws.cell(row=r, column=2, value=row.get("sku_code", ""))
         c = ws.cell(row=r, column=3, value=row.get("item_name", "") or None)
         c.alignment = left_wrap
-        ws.cell(row=r, column=4, value=row.get("current_inventory") or None)   # D
-        ws.cell(row=r, column=5, value=row.get("open_shipment_qty") or None)   # E
-        ws.cell(row=r, column=6, value=f"=D{r}+E{r}")                          # F
-        ws.cell(row=r, column=7, value=drr_val)                                # G
-        ws.cell(row=r, column=8, value=f'=IF(G{r}=0,"",ROUND(F{r}/G{r},2))')  # H
-        ws.cell(row=r, column=9, value=row.get("lead_time", DEFAULT_LEAD_TIME))
-        ws.cell(row=r, column=10, value=row.get("coverage_days", DEFAULT_COVERAGE_DAYS))
-        ws.cell(row=r, column=11, value=f"=I{r}+J{r}")                         # K
-        ws.cell(row=r, column=12, value=f"=IF(G{r}=0,0,ROUND(G{r}*K{r},0))")  # L
+        ws.cell(row=r, column=4, value=row.get("zoho_stock") or None)           # D
+        ws.cell(row=r, column=5, value=row.get("status") or None)               # E
+        ws.cell(row=r, column=6, value=row.get("current_inventory") or None)    # F
+        ws.cell(row=r, column=7, value=row.get("open_shipment_qty") or None)    # G
+        ws.cell(row=r, column=8, value=f"=F{r}+G{r}")                           # H
+        ws.cell(row=r, column=9, value=drr_val)                                 # I
+        ws.cell(row=r, column=10, value=f'=IF(I{r}=0,"",ROUND(H{r}/I{r},2))')  # J
+        ws.cell(row=r, column=11, value=row.get("lead_time", DEFAULT_LEAD_TIME))  # K
+        ws.cell(row=r, column=12, value=row.get("coverage_days", DEFAULT_COVERAGE_DAYS))  # L
+        ws.cell(row=r, column=13, value=f"=K{r}+L{r}")                          # M
+        ws.cell(row=r, column=14, value=f"=IF(I{r}=0,0,ROUND(I{r}*M{r},0))")   # N
 
         n_states = len(all_states)
-        # State unit columns: 13 .. 12+n  (one per state, referencing state DRR cols)
-        # Zoho: 13+n, Status: 14+n
+        # State unit columns: 15 .. 14+n  (one per state, referencing state DRR cols)
         # Monthly: 15+n .. 14+n+len(months)
-        # State DRRs: 15+n+len(months) .. 14+n+len(months)+n
+        # State DRRs: 15+n+len(months) ..
         state_drr_col_start = 15 + n_states + len(month_labels)
         for i, state in enumerate(all_states):
             drr_col_letter = get_column_letter(state_drr_col_start + i)
-            unit_col = 13 + i
+            unit_col = 15 + i
             ws.cell(row=r, column=unit_col,
-                value=f'=IF({drr_col_letter}{r}=0,"",IF(H{r}<I{r},ROUND({drr_col_letter}{r}*K{r},0),IF(H{r}>K{r},0,MAX(0,ROUND((K{r}-H{r})*{drr_col_letter}{r},0)))))')
-
-        zoho_col = 13 + n_states
-        status_col = 14 + n_states
-        ws.cell(row=r, column=zoho_col, value=row.get("zoho_stock") or None)
-        ws.cell(row=r, column=status_col, value=row.get("status") or None)
+                value=f'=IF({drr_col_letter}{r}=0,"",IF(J{r}<K{r},ROUND({drr_col_letter}{r}*M{r},0),IF(J{r}>M{r},0,MAX(0,ROUND((M{r}-J{r})*{drr_col_letter}{r},0)))))')
 
         ms = row.get("monthly_sales", {})
         monthly_col_start = 15 + n_states
@@ -433,10 +431,12 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
             val = state_drr.get(state)
             ws.cell(row=r, column=state_drr_col_start + offset, value=val if val else None)
 
-    # A-L fixed, then n state-unit cols, Zoho, Status, monthly cols, n state-DRR cols
-    col_widths = [12, 18, 50, 14, 14, 18, 10, 12, 9, 10, 14, 14]
+    # A-N fixed: Item ID, SKU Code, Item Name, Zoho Stock, Status,
+    #            Current Inv, Open Shipment, Total Inv, DRR, Net Days,
+    #            Lead Time, Coverage, Target Days, Target Stock
+    # then n state-unit cols, monthly cols, n state-DRR cols
+    col_widths = [12, 18, 50, 10, 12, 14, 14, 18, 10, 12, 9, 10, 14, 14]
     col_widths += [14] * len(all_states)   # state unit columns
-    col_widths += [10, 12]                  # Zoho Stock, Status
     col_widths += [14] * len(month_labels)  # monthly sales
     col_widths += [14] * len(all_states)    # state DRR columns
     for col_idx, width in enumerate(col_widths, 1):
