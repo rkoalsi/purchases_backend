@@ -15,8 +15,9 @@ from openpyxl.utils import get_column_letter
 import boto3
 from botocore.config import Config as BotocoreConfig
 from bson import ObjectId
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from jose import jwt, JWTError
 from pydantic import BaseModel
 from pymongo.errors import PyMongoError
 
@@ -101,12 +102,14 @@ def _delete_from_s3(s3_key: str) -> None:
 # ─── new-items (existing endpoint) ───────────────────────────────────────────
 
 _CATALOGUE_LOOKUP_FIELDS = {
-    "bb_code": 1, "product_category": 1, "sub_category": 1,
+    # product_name, product_category, hsn_code intentionally excluded —
+    # those always come from the products collection (Zoho source of truth).
+    "bb_code": 1, "sub_category": 1,
     "mrp": 1, "dimensions": 1, "material": 1, "features": 1,
     "image_links": 1, "squeaker": 1, "catnip": 1,
     "age_group": 1, "pet_size": 1, "chewing_style": 1,
     "size_chart": 1, "ingredient_list": 1, "nutritional_analysis": 1,
-    "hsn_code": 1, "gst_percentage": 1,
+    "gst_percentage": 1,
 }
 
 
@@ -490,7 +493,7 @@ def _make_unified_xlsx(products: list) -> io.BytesIO:
             p.get("cf_sku_code") or "",
             cat.get("bb_code") or "",
             p.get("brand") or "",
-            cat.get("product_category") or "",
+            p.get("category") or "",
             cat.get("sub_category") or "",
             p.get("rate"),
             p.get("status") or "",
@@ -690,6 +693,442 @@ def download_catalogue_xlsx(
         )
     except PyMongoError as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Product Information Sheet (PIS) upload ───────────────────────────────────
+
+# Normalise a header string for lookup
+def _norm_header(h: str | None) -> str:
+    return (h or "").strip().lower()
+
+
+# Maps normalised header → internal key.
+# Keys starting with "_" are handled specially (not direct catalogue fields).
+# None means intentionally ignored.
+_PIS_COL_MAP: dict[str, str | None] = {
+    "bb code": "__bb_code",
+    "item name": "product_name",
+    "product name": "product_name",
+    "hsn": "hsn_code",
+    "ean/upc": None,
+    "category": "product_category",
+    "sub-category": "sub_category",
+    "series": "series",
+    "mrp": "mrp",
+    "gst": "gst_percentage",
+    # dimensions parsed separately
+    "product weight w/ packaging (g)": "_weight_with",
+    "product weight w/o packaging(g)": "_weight_without",
+    "product weight w/o packaging(g) ": "_weight_without",
+    "product weight w/o packaging(g) - single piece": "_weight_without",
+    "product dimensions w/ packaging (cm)": "_dims_with",
+    "product dimensions w/o packaging (cm)": "_dims_without",
+    "product dimensions w/o packaging (cm) - single piece": "_dims_without",
+    "product dimensions w/o packaging (cm) - single piece ": "_dims_without",
+    # features
+    "features 1": "_feat_1",
+    "features 2": "_feat_2",
+    "features 3": "_feat_3",
+    "features 4": "_feat_4",
+    "features 5": "_feat_5",
+    # attributes
+    "materials": "material",
+    "material": "material",
+    "squeaker": "_squeaker",
+    "catnip (local/imported)": "_catnip",
+    "catnip": "_catnip",
+    "dog size": "pet_size",
+    "dog age": "age_group",
+    "chewing strength": "chewing_style",
+    "images": "image_links",
+    # treats-specific
+    "ingredient list %": "ingredient_list",
+    "nutrition analysis": "nutritional_analysis",
+    # explicitly skipped
+    "item code (manufacturer)": None,
+    "sr no": None,
+    "case pack": None,
+    "cleaning instructions": None,
+    "padding (plush toys)": None,
+    "absorption capacity": None,
+    "composition": None,
+    "scented / unscented": None,
+    "shelf life": None,
+    "natural ingredients (yes/no)": None,
+    "grain free (yes/no)": None,
+    "gluten free (yes/no)": None,
+    "functional treat (specify the function, ex: dental)": None,
+    "human grade ingredients (yes/no)": None,
+    "main animal source": None,
+    "form used": None,
+    "answer": None,
+    "answer ": None,
+    "source of ingredients ": None,
+    "starch source": None,
+    "plant protein source": None,
+    "glycerin type & source": None,
+    "other animal source": None,
+    "special additives": None,
+    "animal body parts used": None,
+    "feeding guide": None,
+    "lab test reports (if any)": None,
+}
+
+
+def _parse_dims_str(s: Any) -> tuple[float, float, float] | None:
+    if not s:
+        return None
+    parts = re.split(r"\s*[*xX×]\s*", str(s).strip())
+    if len(parts) != 3:
+        return None
+    try:
+        return (float(parts[0]), float(parts[1]), float(parts[2]))
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_bool(val: Any) -> bool | None:
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s in ("yes", "y", "1", "true", "local", "imported", "local/imported"):
+        return True
+    if s in ("no", "n", "0", "false", ""):
+        return False
+    return None
+
+
+def _to_float(val: Any) -> float | None:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_image_links(val: Any) -> list[str] | None:
+    if not val:
+        return None
+    raw = str(val).strip()
+    if not raw:
+        return None
+    # could be newline-or-comma-separated
+    parts = [p.strip() for p in re.split(r"[\n,]+", raw) if p.strip()]
+    return parts if parts else None
+
+
+def _process_pis_sheet(ws, sheet_name: str, db, dry_run: bool = False) -> dict:
+    """Parse one PIS sheet. If dry_run=True, checks matches without writing. Returns result dict."""
+    updated = []
+    not_found = []
+    skipped = []
+
+    headers_raw = [cell.value for cell in ws[1]]
+    headers_norm = [_norm_header(h) for h in headers_raw]
+
+    # Build col index → internal key mapping
+    col_keys: list[str | None] = []
+    for h in headers_norm:
+        col_keys.append(_PIS_COL_MAP.get(h, "__unknown__"))
+
+    has_bb_code_col = "__bb_code" in col_keys
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        # Skip blank rows
+        if all(v is None or str(v).strip() == "" for v in row):
+            continue
+
+        raw: dict[str, Any] = {}
+        for col_i, val in enumerate(row):
+            key = col_keys[col_i] if col_i < len(col_keys) else "__unknown__"
+            if key is None or key == "__unknown__":
+                continue
+            # For duplicate headers (e.g. two "Category" cols) keep first non-empty
+            if key in raw and raw[key] is not None:
+                continue
+            raw[key] = val
+
+        bb_code: str | None = str(raw.get("__bb_code", "") or "").strip() or None
+        product_name: str | None = str(raw.get("product_name", "") or "").strip() or None
+
+        if not bb_code and not product_name:
+            skipped.append({"row": row_idx, "sheet": sheet_name, "reason": "No BB code or product name"})
+            continue
+
+        # Build catalogue $set payload
+        set_fields: dict[str, Any] = {}
+        fields_updated: list[str] = []
+
+        # Direct scalar fields
+        for key in ("product_name", "product_category", "sub_category", "series",
+                    "material", "pet_size", "age_group", "chewing_style",
+                    "ingredient_list", "nutritional_analysis", "hsn_code"):
+            v = str(raw[key]).strip() if raw.get(key) is not None else None
+            if v:
+                set_fields[key] = v
+                fields_updated.append(key)
+
+        for key in ("mrp", "gst_percentage"):
+            v = _to_float(raw.get(key))
+            if v is not None:
+                set_fields[key] = v
+                fields_updated.append(key)
+
+        # Boolean fields
+        squeaker = _to_bool(raw.get("_squeaker"))
+        if squeaker is not None:
+            set_fields["squeaker"] = squeaker
+            fields_updated.append("squeaker")
+
+        catnip = _to_bool(raw.get("_catnip"))
+        if catnip is not None:
+            set_fields["catnip"] = catnip
+            fields_updated.append("catnip")
+
+        # Features
+        features = [
+            str(raw[f"_feat_{i}"]).strip()
+            for i in range(1, 6)
+            if raw.get(f"_feat_{i}") and str(raw[f"_feat_{i}"]).strip()
+        ]
+        if features:
+            set_fields["features"] = features
+            fields_updated.append("features")
+
+        # Image links
+        links = _parse_image_links(raw.get("image_links"))
+        if links:
+            set_fields["image_links"] = links
+            fields_updated.append("image_links")
+
+        # Dimensions
+        dims_with = _parse_dims_str(raw.get("_dims_with"))
+        weight_with = _to_float(raw.get("_weight_with"))
+        dims_without = _parse_dims_str(raw.get("_dims_without"))
+        weight_without = _to_float(raw.get("_weight_without"))
+
+        with_pkg: dict[str, Any] = {}
+        without_pkg: dict[str, Any] = {}
+        if dims_with:
+            with_pkg.update({"length_cm": dims_with[0], "breadth_cm": dims_with[1], "height_cm": dims_with[2]})
+        if weight_with is not None:
+            with_pkg["gross_weight_g"] = weight_with
+        if dims_without:
+            without_pkg.update({"length_cm": dims_without[0], "breadth_cm": dims_without[1], "height_cm": dims_without[2]})
+        if weight_without is not None:
+            without_pkg["net_weight_g"] = weight_without
+
+        if with_pkg or without_pkg:
+            set_fields["dimensions"] = {
+                "with_packaging": with_pkg or None,
+                "without_packaging": without_pkg or None,
+            }
+            fields_updated.append("dimensions")
+
+        if not set_fields:
+            skipped.append({"row": row_idx, "sheet": sheet_name, "reason": "No mappable data"})
+            continue
+
+        # Snapshot values before adding timestamp (used in preview tooltips)
+        fields_values: dict[str, Any] = dict(set_fields)
+
+        set_fields["updated_at"] = datetime.utcnow()
+
+        # Match catalogue doc
+        if bb_code:
+            filter_q = {"bb_code": bb_code}
+        else:
+            filter_q = {"product_name": {"$regex": f"^{re.escape(product_name)}$", "$options": "i"}}
+
+        if dry_run:
+            existing = db[DESIGN_CATALOGUE_COLLECTION].find_one(filter_q, {"_id": 1, "product_name": 1})
+            matched = existing is not None
+        else:
+            res = db[DESIGN_CATALOGUE_COLLECTION].update_one(filter_q, {"$set": set_fields})
+            matched = res.matched_count > 0
+
+        if not matched:
+            not_found.append({
+                "identifier": bb_code or product_name,
+                "product_name": product_name,
+                "sheet": sheet_name,
+            })
+        else:
+            updated.append({
+                "bb_code": bb_code or "—",
+                "product_name": product_name or set_fields.get("product_name", ""),
+                "sheet": sheet_name,
+                "fields_updated": fields_updated,
+                "fields_values": fields_values,
+            })
+
+    return {"updated": updated, "not_found": not_found, "skipped": skipped}
+
+
+def _parse_pis_workbook(data: bytes, db, dry_run: bool) -> dict:
+    """Load and process all sheets from PIS XLSX bytes. Returns combined result dict."""
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read Excel file")
+
+    all_updated: list[dict] = []
+    all_not_found: list[dict] = []
+    all_skipped: list[dict] = []
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        if ws.max_row < 2:
+            continue
+        result = _process_pis_sheet(ws, sheet_name, db, dry_run=dry_run)
+        all_updated.extend(result["updated"])
+        all_not_found.extend(result["not_found"])
+        all_skipped.extend(result["skipped"])
+
+    return {
+        "summary": {
+            "total_rows": len(all_updated) + len(all_not_found) + len(all_skipped),
+            "updated": len(all_updated),
+            "not_found": len(all_not_found),
+            "skipped": len(all_skipped),
+        },
+        "updated": all_updated,
+        "not_found": all_not_found,
+        "skipped": all_skipped,
+    }
+
+
+def _extract_email_from_token(authorization: str | None) -> str | None:
+    """Return email (sub) from Bearer JWT, or None if missing/invalid."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ", 1)[1]
+    try:
+        secret = os.getenv("SECRET_KEY") or ""
+        algo = os.getenv("ALGORITHM") or "HS256"
+        payload = jwt.decode(token, secret, algorithms=[algo], options={"verify_aud": False, "verify_exp": False})
+        return payload.get("sub")
+    except (JWTError, Exception):
+        return None
+
+
+@router.post("/new-items/upload-pis")
+async def preview_pis(file: UploadFile = File(...)):
+    """Dry-run parse of a PIS XLSX — returns what would be updated without writing to DB."""
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="File must be an Excel (.xlsx) file")
+
+    data = await file.read()
+    db = get_database()
+    result = await asyncio.to_thread(_parse_pis_workbook, data, db, True)
+    return JSONResponse(content=result)
+
+
+@router.post("/new-items/confirm-pis")
+async def confirm_pis(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    """Apply a PIS XLSX to the DB and archive the file to S3 with uploader info."""
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="File must be an Excel (.xlsx) file")
+
+    email = _extract_email_from_token(authorization)
+    data = await file.read()
+    db = get_database()
+
+    result = await asyncio.to_thread(_parse_pis_workbook, data, db, False)
+
+    # Upload to S3 for audit trail
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_email = re.sub(r"[^\w@.\-]", "_", email or "unknown")
+    safe_filename = re.sub(r"[^\w.\-]", "_", file.filename)
+    s3_key = f"pis_uploads/{safe_email}/{ts}_{safe_filename}"
+    try:
+        await asyncio.to_thread(_upload_to_s3, data, s3_key, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        result["audit"] = {"uploaded_by": email or "unknown", "uploaded_at": ts, "s3_key": s3_key}
+    except Exception as exc:
+        logger.warning("PIS S3 upload failed: %s", exc)
+        result["audit"] = {"uploaded_by": email or "unknown", "uploaded_at": ts, "s3_key": None}
+
+    return JSONResponse(content=result)
+
+
+# PIS sheet definitions: (sheet_name, [column_headers])
+_PIS_SHEETS: list[tuple[str, list[str]]] = [
+    ("Toys", [
+        "Item Code (Manufacturer)", "BB code", "Item Name", "HSN", "EAN/UPC",
+        "Category", "Sub-Category", "Series",
+        "Product weight w/ packaging (g)", "Product weight w/o packaging(g)",
+        "Product dimensions w/ packaging (cm)", "Product dimensions w/o packaging (cm)",
+        "Features 1", "Features 2", "Features 3", "Features 4", "Features 5",
+        "Materials", "Cleaning Instructions", "Padding (Plush Toys)",
+        "Squeaker", "Catnip (Local/Imported)",
+        "Dog Size", "Dog Age", "Chewing Strength", "Images",
+    ]),
+    ("Hygeine", [
+        "Item Code (Manufacturer)", "BB code", "Item Name", "HSN", "EAN/UPC",
+        "Category", "Sub-Category", "Series",
+        "Product weight w/ packaging (g)", "Product weight w/o packaging(g)",
+        "Product dimensions w/ packaging (cm)", "Product dimensions w/o packaging (cm) - Single Piece",
+        "Product weight w/o packaging(g) - Single Piece",
+        "Absorption Capacity", "Composition", "Scented / Unscented", "Shelf Life",
+        "Features 1", "Features 2", "Features 3", "Features 4", "Features 5",
+        "Materials", "Dog Size", "Images",
+    ]),
+    ("Outdoor Gear", [
+        "Item Code (Manufacturer)", "BB code", "Item Name", "HSN", "EAN/UPC",
+        "Category", "Sub-Category", "Series",
+        "Product weight w/ packaging (g)", "Product weight w/o packaging(g)",
+        "Product dimensions w/ packaging (cm)", "Product dimensions w/o packaging (cm)",
+        "Features 1", "Features 2", "Features 3", "Features 4", "Features 5",
+        "Materials", "Cleaning Instructions", "Images",
+    ]),
+    ("Treats", [
+        "Sr No", "Product Name", "HSN", "EAN/UPC",
+        "Category", "Sub-Category", "Series",
+        "Product weight w/ packaging (g)", "Product weight w/o packaging(g)",
+        "Product dimensions w/ packaging (cm)", "Product dimensions w/o packaging (cm) - Single piece",
+        "Product weight w/o packaging(g) - Single Piece",
+        "Ingredient List %", "Nutrition Analysis",
+        "Natural Ingredients (Yes/No)", "Grain Free (Yes/No)", "Gluten Free (Yes/No)",
+        "Functional Treat (Specify the function, ex: Dental)", "Human Grade Ingredients (Yes/No)",
+        "Main Animal Source", "Form Used",
+        "Shelf Life", "feeding guide", "Images", "Lab Test Reports (If Any)",
+    ]),
+    ("Apparel & Accessories", [
+        "Item Code (Manufacturer)", "BB code", "Item Name", "HSN", "EAN/UPC",
+        "Category", "Sub-Category", "Series",
+        "Product weight w/ packaging (g)", "Product weight w/o packaging(g)",
+        "Product dimensions w/ packaging (cm)", "Product dimensions w/o packaging (cm)",
+        "Features 1", "Features 2", "Features 3", "Features 4", "Features 5",
+        "Materials", "Dog Size", "Images",
+    ]),
+]
+
+
+@router.get("/new-items/pis-template")
+def download_pis_template():
+    """Return an empty Product Information Sheet XLSX template with all column headers."""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)  # remove default sheet
+
+    for sheet_name, headers in _PIS_SHEETS:
+        ws = wb.create_sheet(title=sheet_name)
+        ws.append(headers)
+        _style_header_row(ws, 1, len(headers))
+        ws.freeze_panes = "A2"
+        _auto_col_width(ws)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="PIS_Template.xlsx"'},
+    )
 
 
 # ─── designer orders ──────────────────────────────────────────────────────────
