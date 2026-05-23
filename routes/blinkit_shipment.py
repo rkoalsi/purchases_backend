@@ -361,7 +361,7 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
 
     # Columns: A=Item ID, B=SKU Code, C=Item Name, D=Current Inv, E=Open Shipment,
     # F=Total Inv, G=DRR, H=Net Days, I=Lead Time, J=Coverage, K=Target Days,
-    # L=Target Stock, M=Final Units, N=Zoho Stock, O=Status, P+=Monthly Sales, then State DRRs
+    # L=Target Stock, M+=State Units, then Zoho Stock, Status, Monthly Sales, State DRRs
     headers = [
         "Item ID", "SKU Code", "Item Name",
         inv_label, "Open Shipment Qty",
@@ -370,7 +370,7 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
         "Lead Time", "Coverage Days",
         "Total Target Days\n(=Lead + Coverage)",
         "Target Stock\n(=DRR × Target Days)",
-        "Final Units\n(Under-ordering formula)",
+    ] + [f"{state}\nUnits" for state in all_states] + [
         "Zoho Stock", "Status",
     ] + [f"{label}\nUnits Sold" for label in month_labels] + [f"DRR\n{state}" for state in all_states]
 
@@ -404,25 +404,41 @@ def _generate_planning_excel(rows: list[dict], inv_date: str = "", drr_period: s
         ws.cell(row=r, column=10, value=row.get("coverage_days", DEFAULT_COVERAGE_DAYS))
         ws.cell(row=r, column=11, value=f"=I{r}+J{r}")                         # K
         ws.cell(row=r, column=12, value=f"=IF(G{r}=0,0,ROUND(G{r}*K{r},0))")  # L
-        ws.cell(row=r, column=13,
-            value=f'=IF(G{r}=0,"",IF(H{r}<I{r},ROUND(G{r}*K{r},0),IF(H{r}>K{r},0,MAX(0,ROUND((K{r}-H{r})*G{r},0)))))')  # M
-        ws.cell(row=r, column=14, value=row.get("zoho_stock") or None)
-        ws.cell(row=r, column=15, value=row.get("status") or None)
+
+        n_states = len(all_states)
+        # State unit columns: 13 .. 12+n  (one per state, referencing state DRR cols)
+        # Zoho: 13+n, Status: 14+n
+        # Monthly: 15+n .. 14+n+len(months)
+        # State DRRs: 15+n+len(months) .. 14+n+len(months)+n
+        state_drr_col_start = 15 + n_states + len(month_labels)
+        for i, state in enumerate(all_states):
+            drr_col_letter = get_column_letter(state_drr_col_start + i)
+            unit_col = 13 + i
+            ws.cell(row=r, column=unit_col,
+                value=f'=IF({drr_col_letter}{r}=0,"",IF(H{r}<I{r},ROUND({drr_col_letter}{r}*K{r},0),IF(H{r}>K{r},0,MAX(0,ROUND((K{r}-H{r})*{drr_col_letter}{r},0)))))')
+
+        zoho_col = 13 + n_states
+        status_col = 14 + n_states
+        ws.cell(row=r, column=zoho_col, value=row.get("zoho_stock") or None)
+        ws.cell(row=r, column=status_col, value=row.get("status") or None)
 
         ms = row.get("monthly_sales", {})
+        monthly_col_start = 15 + n_states
         for offset, label in enumerate(month_labels):
             val = ms.get(label)
-            ws.cell(row=r, column=16 + offset, value=val if val else None)
+            ws.cell(row=r, column=monthly_col_start + offset, value=val if val else None)
 
         state_drr = row.get("state_drr", {})
-        state_col_start = 16 + len(month_labels)
         for offset, state in enumerate(all_states):
             val = state_drr.get(state)
-            ws.cell(row=r, column=state_col_start + offset, value=val if val else None)
+            ws.cell(row=r, column=state_drr_col_start + offset, value=val if val else None)
 
-    col_widths = [12, 18, 50, 14, 14, 18, 10, 12, 9, 10, 14, 14, 14, 10, 12]
-    col_widths += [14] * len(month_labels)
-    col_widths += [14] * len(all_states)
+    # A-L fixed, then n state-unit cols, Zoho, Status, monthly cols, n state-DRR cols
+    col_widths = [12, 18, 50, 14, 14, 18, 10, 12, 9, 10, 14, 14]
+    col_widths += [14] * len(all_states)   # state unit columns
+    col_widths += [10, 12]                  # Zoho Stock, Status
+    col_widths += [14] * len(month_labels)  # monthly sales
+    col_widths += [14] * len(all_states)    # state DRR columns
     for col_idx, width in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 

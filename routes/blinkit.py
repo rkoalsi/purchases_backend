@@ -1830,6 +1830,27 @@ async def generate_report_by_date_range(
         if all_skus_for_drr:
             drr_state_map = await _fetch_blinkit_drr_daily_by_state(database, overall_end_date, all_skus_for_drr)
 
+        # Fetch current blinkit inventory (latest date, summed across all warehouses per SKU)
+        current_inv_by_sku: dict[str, int] = {}
+        inv_date_label = ""
+        if all_skus_for_drr:
+            def _fetch_current_blinkit_inv():
+                latest = database["blinkit_inventory"].find_one(
+                    {"sku_code": {"$in": all_skus_for_drr}}, {"date": 1}, sort=[("date", -1)]
+                )
+                inv_map: dict[str, int] = {}
+                date_str = ""
+                if latest:
+                    inv_date = latest["date"]
+                    date_str = inv_date.strftime("%-d %b %Y") if isinstance(inv_date, datetime) else str(inv_date)[:10]
+                    for doc in database["blinkit_inventory"].aggregate([
+                        {"$match": {"sku_code": {"$in": all_skus_for_drr}, "date": inv_date}},
+                        {"$group": {"_id": "$sku_code", "total": {"$sum": "$warehouse_inventory"}}},
+                    ]):
+                        inv_map[doc["_id"]] = int(doc["total"] or 0)
+                return inv_map, date_str
+            current_inv_by_sku, inv_date_label = await asyncio.to_thread(_fetch_current_blinkit_inv)
+
         # Fetch last 90 days in stock if requested
         last_90_days_data = {}
         if any_last_90_days and valid_sku_city_pairs:
@@ -1976,6 +1997,8 @@ async def generate_report_by_date_range(
                 "item_id": item_id,
                 "city": city,
                 "state": city_state,
+                "current_inventory": current_inv_by_sku.get(sku, 0),
+                "inventory_date": inv_date_label,
                 "warehouse": combined_warehouses,
                 "sku_code": sku,
                 "drr": drr_val,
@@ -2095,6 +2118,9 @@ async def download_report_by_date_range(
             )
 
         # Generate Excel file with returns data included
+        inv_date_label = report_data_list[0].get("inventory_date", "") if report_data_list else ""
+        inv_col_name = f"Current Inventory ({inv_date_label})" if inv_date_label else "Current Inventory"
+
         flattened_data = []
         for item in report_data_list:
             metrics = item.get("metrics", {})
@@ -2103,6 +2129,7 @@ async def download_report_by_date_range(
                 "Item ID": item.get("item_id", "Unknown ID"),
                 "State": item.get("state", ""),
                 "Sku Code": item.get("sku_code", "Unknown"),
+                inv_col_name: item.get("current_inventory", 0) or 0,
                 "Start Date": period_info.get("start_date"),
                 "End Date": period_info.get("end_date"),
                 "Period Name": period_info.get("period_name"),
@@ -2156,6 +2183,7 @@ async def download_report_by_date_range(
             "Item ID",
             "State",
             "Sku Code",
+            inv_col_name,
             "Start Date",
             "End Date",
             "Period Name",
@@ -2189,8 +2217,47 @@ async def download_report_by_date_range(
 
         df = df.reindex(columns=column_order, fill_value=None)
 
+        col_widths = {
+            "Item Name": 45,
+            "Item ID": 14,
+            "State": 18,
+            "Sku Code": 20,
+            inv_col_name: 18,
+            "Start Date": 14,
+            "End Date": 14,
+            "Period Name": 22,
+            "Days in Range": 12,
+            "DRR": 10,
+            "DRR Flag": 12,
+            "DRR Lookback Period": 22,
+            "DRR Lookback Sales": 18,
+            "Avg Daily Sales (Stock Days)": 22,
+            "Avg Weekly Sales (Stock Days)": 22,
+            "Avg Monthly Sales (Stock Days)": 24,
+            "Total Sales (Period)": 18,
+            "Total Returns (Period)": 18,
+            "Net Sales (Period)": 18,
+            "Days of Coverage (DOC)": 18,
+            "Days with Inventory": 18,
+            "Closing Stock": 14,
+            "Sales Last 7 Days": 16,
+            "Sales Prev 7 Days": 16,
+            "Performance vs Prev 7 Days (%)": 24,
+            "Sales Last 30 Days": 16,
+            "Sales Prev 30 Days": 16,
+            "Performance vs Prev 30 Days (%)": 24,
+            "Best Performing Month": 22,
+            "Quantity Sold in Best Performing Month": 28,
+            "Last 90 Days In Stock (Dates)": 40,
+        }
+
         excel_buffer = io.BytesIO()
-        df.to_excel(excel_buffer, index=False, sheet_name="Sales Inventory Report")
+        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Sales Inventory Report")
+            ws = writer.sheets["Sales Inventory Report"]
+            for i, col in enumerate(df.columns, 1):
+                width = col_widths.get(col, 16)
+                ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
         excel_buffer.seek(0)
 
         filename = f"sales_inventory_report_{start_date}_to_{end_date}.xlsx"
