@@ -840,6 +840,7 @@ class OptimizedMasterReportService:
                         "total_amount": self.safe_float(item.get("total_amount")),
                         "closing_stock": self.safe_float(item.get("closing_stock")),
                         "days_in_stock": self.safe_int(item.get("total_days_in_stock")),
+                        "days_in_stock_any_wh": self.safe_int(item.get("total_days_in_stock_any_wh")),
                         "daily_run_rate": self.safe_float(item.get("drr")),
                         "sessions": 0,
                         "days_of_coverage": 0.0,
@@ -884,6 +885,7 @@ class OptimizedMasterReportService:
                 "closing_stock": 0.0,
                 "sessions": 0,
                 "days_in_stock": 0,
+                "days_in_stock_any_wh": 0,
                 "daily_run_rate": 0.0,
                 "days_of_coverage": 0.0,
                 "additional_metrics": {},
@@ -938,6 +940,9 @@ class OptimizedMasterReportService:
                     agg["days_in_stock"] += self.safe_int(
                         metrics.get("days_with_inventory")
                     )
+                    agg["days_in_stock_any_wh"] += self.safe_int(
+                        metrics.get("days_with_inventory")
+                    )
                     # Take last/max for rates
                     agg["daily_run_rate"] = max(
                         agg["daily_run_rate"],
@@ -954,6 +959,9 @@ class OptimizedMasterReportService:
                     agg["closing_stock"] += self.safe_float(item.get("closing_stock"))
                     agg["sessions"] += self.safe_int(item.get("sessions"))
                     agg["days_in_stock"] += self.safe_int(
+                        item.get("total_days_in_stock")
+                    )
+                    agg["days_in_stock_any_wh"] += self.safe_int(
                         item.get("total_days_in_stock")
                     )
                     agg["daily_run_rate"] = max(
@@ -1009,6 +1017,7 @@ class OptimizedMasterReportService:
                     "total_amount": agg["total_amount"],
                     "closing_stock": agg["closing_stock"],
                     "days_in_stock": agg["days_in_stock"],
+                    "days_in_stock_any_wh": agg["days_in_stock_any_wh"],
                     "daily_run_rate": agg["daily_run_rate"],
                     "sessions": agg["sessions"],
                     "days_of_coverage": 0.0,
@@ -1058,6 +1067,7 @@ class OptimizedMasterReportService:
                     "total_amount": 0.0,
                     "total_closing_stock": 0.0,
                     "total_days_in_stock": 0.0,
+                    "total_days_in_stock_any_wh": 0.0,
                     "avg_daily_run_rate": 0.0,
                     "avg_days_of_coverage": 0.0,
                 },
@@ -1095,6 +1105,7 @@ class OptimizedMasterReportService:
             metrics["total_amount"] += self.safe_float(item.get("total_amount")) * multiplier
             metrics["total_closing_stock"] += self.safe_float(item.get("closing_stock")) * multiplier
             metrics["total_days_in_stock"] += self.safe_float(item.get("days_in_stock"))
+            metrics["total_days_in_stock_any_wh"] += self.safe_float(item.get("days_in_stock_any_wh"))
 
             # Track Zoho units/stock for DRR calculation
             if source == "zoho":
@@ -3143,7 +3154,8 @@ async def download_master_report(
                         "Transfer Orders": metrics.get("transfer_orders", 0),
                         "Net Total Sales": metrics.get("total_sales", 0),
                         "Return %": item.get("return_pct", 0),
-                        "Days in Stock": metrics.get("total_days_in_stock", 0),
+                        "Days in Stock (Pupscribe Warehouse)": metrics.get("total_days_in_stock", 0),
+                        "Days in Stock (Any Warehouse)": metrics.get("total_days_in_stock_any_wh", 0),
                         "Lookback Days in Stock": item.get("drr_lookback_days_in_stock", 0),
                         "Lookback Sales": item.get("drr_lookback_sales", 0),
                         "Lookback Returns": item.get("drr_lookback_returns", 0),

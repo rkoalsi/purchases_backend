@@ -1479,6 +1479,7 @@ class SalesReportItem(BaseModel):
     total_amount: float
     closing_stock: int
     total_days_in_stock: int
+    total_days_in_stock_any_wh: int = 0
     drr: float
     last_90_days_dates: str = ""  # Optional field for last 90 days in stock date ranges
 
@@ -2238,19 +2239,56 @@ async def fetch_stock_data_optimized(
                 }
             return result
 
-        # Run both aggregations in parallel — each gets its own thread + connection
-        days_data, closing_data = await asyncio.gather(
+        def _fetch_days_in_stock_any_wh():
+            """Count days with stock in ANY warehouse within the report period."""
+            pipeline = [
+                {
+                    "$match": {
+                        "date": {"$gte": start_datetime, "$lte": end_datetime},
+                        "zoho_item_id": {"$ne": None},
+                    }
+                },
+                {
+                    "$project": {
+                        "zoho_item_id": 1,
+                        "total_wh_stock": {
+                            "$reduce": {
+                                "input": {"$objectToArray": "$warehouses"},
+                                "initialValue": 0,
+                                "in": {"$add": ["$$value", "$$this.v"]},
+                            }
+                        },
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$zoho_item_id",
+                        "total_days_in_stock_any_wh": {
+                            "$sum": {"$cond": [{"$gt": ["$total_wh_stock", 0]}, 1, 0]}
+                        },
+                    }
+                },
+            ]
+            result = {}
+            for doc in stock_collection.aggregate(pipeline, allowDiskUse=True, batchSize=10000):
+                result[doc["_id"]] = doc.get("total_days_in_stock_any_wh", 0)
+            return result
+
+        # Run all three aggregations in parallel
+        days_data, closing_data, days_any_wh_data = await asyncio.gather(
             asyncio.to_thread(_fetch_days_in_stock),
             asyncio.to_thread(_fetch_closing_stock),
+            asyncio.to_thread(_fetch_days_in_stock_any_wh),
         )
 
-        # Merge: union of all item_ids seen in either query
-        all_item_ids = set(days_data.keys()) | set(closing_data.keys())
+        # Merge: union of all item_ids seen in any query
+        all_item_ids = set(days_data.keys()) | set(closing_data.keys()) | set(days_any_wh_data.keys())
         stock_data = {}
         for item_id in all_item_ids:
             stock_data[item_id] = {
                 "closing_stock": closing_data.get(item_id, {}).get("closing_stock", 0),
                 "total_days_in_stock": days_data.get(item_id, 0),
+                "total_days_in_stock_any_wh": days_any_wh_data.get(item_id, 0),
             }
 
         logger.info(
@@ -2318,6 +2356,7 @@ def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Di
         stock_info = stock_data.get(item_id, {})
         closing_stock = stock_info.get("closing_stock", 0)
         days_in_stock = stock_info.get("total_days_in_stock", 0)
+        days_in_stock_any_wh = stock_info.get("total_days_in_stock_any_wh", 0)
         drr = round(units_sold / days_in_stock, 2) if days_in_stock > 0 else 0
 
         # Only accumulate totals for items with names
@@ -2334,6 +2373,7 @@ def process_batch(batch: List[Dict], stock_data: Dict, products_map: Dict) -> Di
                     total_amount=round(amount, 2),
                     closing_stock=closing_stock,
                     total_days_in_stock=days_in_stock,
+                    total_days_in_stock_any_wh=days_in_stock_any_wh,
                     drr=drr,
                 )
             )
@@ -2699,6 +2739,7 @@ def process_batch_with_credit_notes(
         stock_info = stock_data.get(item_id, {})
         closing_stock = stock_info.get("closing_stock", 0)
         days_in_stock = stock_info.get("total_days_in_stock", 0)
+        days_in_stock_any_wh = stock_info.get("total_days_in_stock_any_wh", 0)
         last_90_days_dates = stock_info.get(
             "last_90_days_dates", ""
         )  # Get the new field
@@ -2727,6 +2768,7 @@ def process_batch_with_credit_notes(
                     total_amount=round(amount, 2),  # This is now net amount
                     closing_stock=closing_stock,
                     total_days_in_stock=days_in_stock,
+                    total_days_in_stock_any_wh=days_in_stock_any_wh,
                     drr=drr,
                     last_90_days_dates=last_90_days_dates,  # Add the new field
                 )
