@@ -1809,6 +1809,8 @@ async def list_fba_shipments_from_db(
 ):
     """
     Return FBA shipments stored in MongoDB (synced by cron).
+    Sorted by the date embedded in ShipmentName ("FBA STA (DD/MM/YYYY HH:MM)-FC"),
+    newest first. Falls back to ShipmentId descending for names without a date.
     Supports filtering by ShipmentStatus and pagination.
     """
     try:
@@ -1818,15 +1820,57 @@ async def list_fba_shipments_from_db(
 
         skip = (page - 1) * page_size
 
+        # Aggregation stage: parse the DD/MM/YYYY HH:MM date from ShipmentName
+        _extract_date = {
+            "$addFields": {
+                "_shipment_dt": {
+                    "$let": {
+                        "vars": {
+                            "m": {
+                                "$regexFind": {
+                                    "input": {"$ifNull": ["$ShipmentName", ""]},
+                                    "regex": r"\((\d{2}/\d{2}/\d{4} \d{2}:\d{2})\)",
+                                }
+                            }
+                        },
+                        "in": {
+                            "$cond": {
+                                "if": {"$ne": ["$$m", None]},
+                                "then": {
+                                    "$dateFromString": {
+                                        "dateString": {
+                                            "$arrayElemAt": ["$$m.captures", 0]
+                                        },
+                                        "format": "%d/%m/%Y %H:%M",
+                                        "onError": None,
+                                        "onNull": None,
+                                    }
+                                },
+                                "else": None,
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
         def _query(db):
-            total = db[FBA_SHIPMENTS_COLLECTION].count_documents(match)
-            docs = list(
-                db[FBA_SHIPMENTS_COLLECTION]
-                .find(match, {"_id": 0})
-                .sort([("ShipmentName", -1), ("ShipmentId", -1)])
-                .skip(skip)
-                .limit(page_size)
+            count_result = list(
+                db[FBA_SHIPMENTS_COLLECTION].aggregate(
+                    [{"$match": match}, {"$count": "total"}]
+                )
             )
+            total = count_result[0]["total"] if count_result else 0
+
+            pipeline = [
+                {"$match": match},
+                _extract_date,
+                {"$sort": {"_shipment_dt": -1, "ShipmentId": -1}},
+                {"$skip": skip},
+                {"$limit": page_size},
+                {"$project": {"_id": 0, "_shipment_dt": 0}},
+            ]
+            docs = list(db[FBA_SHIPMENTS_COLLECTION].aggregate(pipeline))
             return total, docs
 
         total, docs = await asyncio.to_thread(_query, database)
