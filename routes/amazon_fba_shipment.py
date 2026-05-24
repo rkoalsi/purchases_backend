@@ -11,7 +11,7 @@ from typing import Optional, Any
 from pydantic import BaseModel
 import logging
 
-from .amazon import compute_drr_for_asins_sync, generate_report_by_date_range
+from .amazon import compute_drr_for_asins_sync, generate_report_by_date_range, get_amazon_token, make_sp_api_request
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -20,6 +20,7 @@ PLANNING_OVERRIDES_COLLECTION = "amazon_fba_shipment_planning_overrides"
 PROCESSING_COLLECTION = "amazon_fba_shipment_processing"
 SUMMARY_COLLECTION = "amazon_fba_shipment_summary"
 SKU_MAPPING_COLLECTION = "amazon_sku_mapping"
+FBA_SHIPMENTS_COLLECTION = "amazon_fba_shipments"
 
 DEFAULT_LEAD_TIME = 10
 DEFAULT_COVERAGE_DAYS = 30
@@ -1273,6 +1274,53 @@ async def upload_planning_overrides(
 # ─── Page 2: Processing ───────────────────────────────────────────────────────
 
 
+@router.get("/processing/template")
+async def download_fba_processing_template():
+    """Return a blank Excel template with the expected column headers for FBA processing upload."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "FBA Processing"
+
+    headers = [
+        "Shipment ID", "Date", "Location", "SKU Code", "ASIN", "FNSKU",
+        "Item Name", "MRP", "SP", "Requested Qty", "Packed Qty",
+        "Cost Price", "HSN Code", "GST",
+    ]
+
+    header_fill = PatternFill("solid", fgColor="4472C4")
+    header_font = Font(bold=True, color="FFFFFF")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+
+    # Example row
+    ws.append([
+        "FBA1234567890", "2024-01-15", "Mumbai WH", "SKU001",
+        "B01234567890", "X001ABCDEF", "Sample Product Name",
+        999, 899, 100, 100, 450, "33061090", 18,
+    ])
+
+    col_widths = [18, 12, 16, 14, 14, 14, 35, 8, 8, 13, 11, 11, 12, 6]
+    for col_idx, width in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    ws.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="fba_processing_template.xlsx"'},
+    )
+
+
 @router.get("/processing")
 async def get_fba_processing(database=Depends(get_database)):
     try:
@@ -1445,7 +1493,11 @@ async def upload_fba_processing(
                 )
 
         await asyncio.to_thread(_store, database)
-        return {"success": True, "rows_uploaded": len(records)}
+
+        # Immediately link any matching DB shipments
+        linked = await asyncio.to_thread(_relink_processing_uploads, database)
+
+        return {"success": True, "rows_uploaded": len(records), "db_shipments_linked": linked}
 
     except HTTPException:
         raise
@@ -1515,4 +1567,537 @@ async def update_fba_summary(
         return {"success": True}
     except Exception as e:
         logger.error(f"Error updating FBA summary: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Amazon SP-API: FBA Inbound Plans (2024-03-20) + Shipments (v0) ────────────
+
+SP_MARKETPLACE_ID = "A21TJRUUN4KGV"  # India
+FBA_INBOUND_API_VERSION = "2024-03-20"
+
+ALL_SHIPMENT_STATUSES = [
+    "CLOSED",
+    "WORKING",
+    "SHIPPED",
+    "IN_TRANSIT",
+    "DELIVERED",
+    "CHECKED_IN",
+    "RECEIVING",
+    "CANCELLED",
+    "DELETED",
+    "ERROR",
+]
+
+
+# ─── Sync helper (called by cron + manual trigger) ────────────────────────────
+
+
+def _sync_shipments_to_db(db, days: int = 3650) -> dict:
+    """
+    Fetch FBA shipments (DATE_RANGE across all statuses) + their per-SKU items
+    from SP-API v0, then upsert into amazon_fba_shipments.
+
+    - days: how many days back to query (default 90 for nightly cron;
+            use 365 for full initial backfill via the manual trigger endpoint).
+    - Skips re-fetching items for CLOSED shipments that are already in DB and
+      were last synced within 7 days (they won't change).
+    - Cross-references amazon_fba_shipment_processing to flag which SP-API
+      shipments have a corresponding manual processing upload.
+
+    Returns a summary dict with total/inserted/updated/errors/skipped counts.
+    """
+    from datetime import timezone as _tz
+
+    after = (datetime.now(_tz.utc) - timedelta(days=days)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    before = datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # ── 1. Collect all shipment headers ──────────────────────────────────────
+    shipments: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for status in ALL_SHIPMENT_STATUSES:
+        params: dict = {
+            "MarketplaceId": SP_MARKETPLACE_ID,
+            "QueryType": "DATE_RANGE",
+            "ShipmentStatusList": status,
+            "LastUpdatedAfter": after,
+            "LastUpdatedBefore": before,
+        }
+        while True:
+            try:
+                result = make_sp_api_request(
+                    endpoint="/fba/inbound/v0/shipments",
+                    method="GET",
+                    params=params,
+                )
+            except Exception as exc:
+                logger.warning(f"SP-API shipments query ({status}) failed: {exc}")
+                break
+
+            payload = result.get("payload") or {}
+            for s in payload.get("ShipmentData", []):
+                sid = s.get("ShipmentId")
+                if sid and sid not in seen_ids:
+                    seen_ids.add(sid)
+                    shipments.append(s)
+
+            nt = payload.get("NextToken")
+            if not nt:
+                break
+            params = {
+                "MarketplaceId": SP_MARKETPLACE_ID,
+                "QueryType": "NEXT_TOKEN",
+                "NextToken": nt,
+            }
+
+    logger.info(f"_sync_shipments_to_db: found {len(shipments)} shipments to process")
+
+    # ── 2. Pre-load existing DB docs (for smart skip of stable CLOSED ones) ──
+    all_fetched_ids = [s["ShipmentId"] for s in shipments if s.get("ShipmentId")]
+    existing_docs: dict[str, dict] = {
+        doc["ShipmentId"]: doc
+        for doc in db[FBA_SHIPMENTS_COLLECTION].find(
+            {"ShipmentId": {"$in": all_fetched_ids}},
+            {"ShipmentId": 1, "ShipmentStatus": 1, "last_synced_at": 1, "_id": 0},
+        )
+    }
+
+    # ── 3. Pre-load which shipment IDs have processing uploads ───────────────
+    processing_ids: set[str] = {
+        doc["shipment_id"]
+        for doc in db[PROCESSING_COLLECTION].find(
+            {"shipment_id": {"$in": all_fetched_ids}},
+            {"shipment_id": 1, "_id": 0},
+        )
+        if doc.get("shipment_id")
+    }
+
+    # ── 4. For each shipment, fetch items and upsert ──────────────────────────
+    inserted = updated = errors = skipped = 0
+    now = datetime.utcnow()
+    stale_threshold = now - timedelta(days=7)
+
+    for shipment in shipments:
+        shipment_id = shipment.get("ShipmentId")
+        if not shipment_id:
+            continue
+
+        current_status = shipment.get("ShipmentStatus", "")
+        existing = existing_docs.get(shipment_id)
+
+        # Skip re-fetching items for stable CLOSED shipments synced recently
+        if (
+            existing
+            and current_status == "CLOSED"
+            and existing.get("ShipmentStatus") == "CLOSED"
+            and existing.get("last_synced_at")
+            and existing["last_synced_at"] > stale_threshold
+        ):
+            # Still update the header fields (status may differ) but keep old items
+            db[FBA_SHIPMENTS_COLLECTION].update_one(
+                {"ShipmentId": shipment_id},
+                {
+                    "$set": {
+                        **shipment,
+                        "has_processing_upload": shipment_id in processing_ids,
+                        "last_synced_at": now,
+                    }
+                },
+            )
+            skipped += 1
+            continue
+
+        # Fetch per-SKU items from SP-API
+        try:
+            items_result = make_sp_api_request(
+                endpoint=f"/fba/inbound/v0/shipments/{shipment_id}/items",
+                method="GET",
+                params={"MarketplaceId": SP_MARKETPLACE_ID},
+            )
+            items: list[dict] = (
+                (items_result.get("payload") or {}).get("ItemData") or []
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to fetch items for {shipment_id}: {exc}")
+            items = []
+            errors += 1
+
+        # Annotate items with derived fields
+        for item in items:
+            shipped = item.get("QuantityShipped", 0) or 0
+            received = item.get("QuantityReceived", 0) or 0
+            item["QuantityPending"] = max(0, shipped - received)
+            item["FullyInwarded"] = shipped > 0 and received >= shipped
+
+        doc = {
+            **shipment,
+            "items": items,
+            "total_skus": len(items),
+            "fully_inwarded_count": sum(1 for i in items if i.get("FullyInwarded")),
+            "pending_inward_count": sum(
+                1 for i in items if (i.get("QuantityPending") or 0) > 0
+            ),
+            "has_processing_upload": shipment_id in processing_ids,
+            "last_synced_at": now,
+        }
+
+        res = db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {"$set": doc},
+            upsert=True,
+        )
+        if res.upserted_id:
+            inserted += 1
+        else:
+            updated += 1
+
+    # ── 5. After any new processing upload, re-link existing DB shipments ─────
+    # (marks has_processing_upload=True on any DB shipment that now has a match)
+    newly_linked = db[FBA_SHIPMENTS_COLLECTION].update_many(
+        {"ShipmentId": {"$in": list(processing_ids)}, "has_processing_upload": {"$ne": True}},
+        {"$set": {"has_processing_upload": True}},
+    ).modified_count
+
+    # Ensure indexes exist (idempotent)
+    db[FBA_SHIPMENTS_COLLECTION].create_index("ShipmentId", unique=True)
+    db[FBA_SHIPMENTS_COLLECTION].create_index("ShipmentStatus")
+    db[FBA_SHIPMENTS_COLLECTION].create_index("last_synced_at")
+    db[FBA_SHIPMENTS_COLLECTION].create_index("has_processing_upload")
+
+    summary = {
+        "total": len(shipments),
+        "inserted": inserted,
+        "updated": updated,
+        "skipped_stable": skipped,
+        "errors": errors,
+        "newly_linked": newly_linked,
+    }
+    logger.info(f"_sync_shipments_to_db: done — {summary}")
+    return summary
+
+
+def _relink_processing_uploads(db) -> int:
+    """
+    Called after a processing upload to immediately set has_processing_upload=True
+    on any amazon_fba_shipments doc that matches. Fast and cheap.
+    Returns count of DB shipments newly linked.
+    """
+    processing_ids: set[str] = {
+        doc["shipment_id"]
+        for doc in db[PROCESSING_COLLECTION].find({}, {"shipment_id": 1, "_id": 0})
+        if doc.get("shipment_id")
+    }
+    if not processing_ids:
+        return 0
+    return db[FBA_SHIPMENTS_COLLECTION].update_many(
+        {"ShipmentId": {"$in": list(processing_ids)}, "has_processing_upload": {"$ne": True}},
+        {"$set": {"has_processing_upload": True}},
+    ).modified_count
+
+
+# ─── DB-backed read endpoints ─────────────────────────────────────────────────
+
+
+@router.get("/db/shipments")
+async def list_fba_shipments_from_db(
+    status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    database=Depends(get_database),
+):
+    """
+    Return FBA shipments stored in MongoDB (synced by cron).
+    Supports filtering by ShipmentStatus and pagination.
+    """
+    try:
+        match: dict = {}
+        if status:
+            match["ShipmentStatus"] = status.upper()
+
+        skip = (page - 1) * page_size
+
+        def _query(db):
+            total = db[FBA_SHIPMENTS_COLLECTION].count_documents(match)
+            docs = list(
+                db[FBA_SHIPMENTS_COLLECTION]
+                .find(match, {"_id": 0})
+                .sort([("ShipmentName", -1), ("ShipmentId", -1)])
+                .skip(skip)
+                .limit(page_size)
+            )
+            return total, docs
+
+        total, docs = await asyncio.to_thread(_query, database)
+        return {
+            "shipments": docs,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": -(-total // page_size),  # ceiling division
+        }
+    except Exception as e:
+        logger.error(f"Error listing FBA shipments from DB: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/db/shipments/{shipment_id}")
+async def get_fba_shipment_from_db(
+    shipment_id: str, database=Depends(get_database)
+):
+    """
+    Return a single FBA shipment (with embedded items) from MongoDB.
+    """
+    try:
+        def _query(db):
+            return db[FBA_SHIPMENTS_COLLECTION].find_one(
+                {"ShipmentId": shipment_id}, {"_id": 0}
+            )
+
+        doc = await asyncio.to_thread(_query, database)
+        if not doc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Shipment {shipment_id} not found in DB. Run /sp/shipments/sync first.",
+            )
+        return doc
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error fetching shipment {shipment_id} from DB: {e}", exc_info=True
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/sp/shipments/sync")
+async def trigger_fba_shipments_sync(
+    days: int = 365,
+    database=Depends(get_database),
+):
+    """
+    Manually trigger a full SP-API sync of FBA shipments + items into MongoDB.
+
+    - days=365 (default): full historical backfill — use this for the first run.
+    - days=90: same as the nightly cron window.
+
+    CLOSED shipments already synced within 7 days won't re-fetch items (skipped).
+    Returns insert/update/skipped/error counts.
+    """
+    try:
+        result = await asyncio.to_thread(_sync_shipments_to_db, database, days)
+        return {"success": True, **result}
+    except Exception as e:
+        logger.error(f"Error during manual FBA shipments sync: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sp/inbound-plans")
+async def list_inbound_plans(
+    page_size: Optional[int] = 20,
+    pagination_token: Optional[str] = None,
+    status: Optional[str] = None,
+    sort_by: Optional[str] = "LAST_UPDATED_TIME",
+    sort_order: Optional[str] = "DESC",
+):
+    """
+    List inbound plans via SP-API 2024-03-20.
+    Returns plan IDs, status, and whether shipments have been confirmed.
+    """
+    try:
+        params: dict = {"sortBy": sort_by, "sortOrder": sort_order}
+        if page_size is not None:
+            params["pageSize"] = page_size
+        if pagination_token:
+            params["paginationToken"] = pagination_token
+        if status:
+            params["status"] = status
+
+        def _call():
+            return make_sp_api_request(
+                endpoint=f"/inbound/fba/{FBA_INBOUND_API_VERSION}/inboundPlans",
+                method="GET",
+                params=params,
+            )
+
+        result = await asyncio.to_thread(_call)
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calling listInboundPlans: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sp/inbound-plans/{inbound_plan_id}")
+async def get_inbound_plan(inbound_plan_id: str):
+    """
+    Get full detail for a single inbound plan including shipments array.
+    shipments[] will be empty if placement was never confirmed in Seller Central.
+    """
+    try:
+        def _call():
+            return make_sp_api_request(
+                endpoint=f"/inbound/fba/{FBA_INBOUND_API_VERSION}/inboundPlans/{inbound_plan_id}",
+                method="GET",
+            )
+
+        result = await asyncio.to_thread(_call)
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calling getPlan {inbound_plan_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sp/inbound-plans/{inbound_plan_id}/items")
+async def get_inbound_plan_items(inbound_plan_id: str):
+    """
+    Get items (SKUs + quantities) for an inbound plan.
+    Returns msku, fnsku, asin, quantity per item.
+    """
+    try:
+        def _call():
+            return make_sp_api_request(
+                endpoint=f"/inbound/fba/{FBA_INBOUND_API_VERSION}/inboundPlans/{inbound_plan_id}/items",
+                method="GET",
+            )
+
+        result = await asyncio.to_thread(_call)
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calling getPlanItems {inbound_plan_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sp/shipments")
+async def list_fba_shipments(
+    days: Optional[int] = 365,
+    next_token: Optional[str] = None,
+):
+    """
+    List all FBA STA shipments via SP-API v0 using DATE_RANGE query.
+
+    - days: how many days back to look (default 365)
+    - next_token: pagination token from a previous response
+
+    STA shipments only appear via DATE_RANGE + CLOSED status — they are not
+    returned by simple ShipmentStatusList queries. Active statuses
+    (WORKING/SHIPPED/RECEIVING) are also checked and merged in.
+
+    Returns shipments sorted newest first with ShipmentId, ShipmentName,
+    ShipmentStatus, DestinationFulfillmentCenterId, ShipFromAddress.
+    """
+    from datetime import timezone
+
+    try:
+        after = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        before = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        all_statuses = ALL_SHIPMENT_STATUSES
+
+        def _fetch_all():
+            shipments = []
+            seen_ids = set()
+
+            for status in all_statuses:
+                params = {
+                    "MarketplaceId": SP_MARKETPLACE_ID,
+                    "QueryType": "DATE_RANGE",
+                    "ShipmentStatusList": status,
+                    "LastUpdatedAfter": after,
+                    "LastUpdatedBefore": before,
+                }
+                if next_token:
+                    params["NextToken"] = next_token
+                    params["QueryType"] = "NEXT_TOKEN"
+
+                while True:
+                    result = make_sp_api_request(
+                        endpoint="/fba/inbound/v0/shipments",
+                        method="GET",
+                        params=params,
+                    )
+                    payload = result.get("payload") or {}
+                    for s in payload.get("ShipmentData", []):
+                        sid = s.get("ShipmentId")
+                        if sid and sid not in seen_ids:
+                            seen_ids.add(sid)
+                            shipments.append(s)
+                    nt = payload.get("NextToken")
+                    if not nt:
+                        break
+                    params = {
+                        "MarketplaceId": SP_MARKETPLACE_ID,
+                        "QueryType": "NEXT_TOKEN",
+                        "NextToken": nt,
+                    }
+
+            return shipments
+
+        shipments = await asyncio.to_thread(_fetch_all)
+
+        # Sort newest first using ShipmentName date (fallback to ID)
+        shipments.sort(key=lambda s: s.get("ShipmentName", ""), reverse=True)
+
+        return {"shipments": shipments, "count": len(shipments)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calling listShipments v0: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sp/shipments/{shipment_id}/items")
+async def get_fba_shipment_items(shipment_id: str):
+    """
+    Get per-SKU inward status for a shipment via SP-API v0.
+
+    Key fields per item:
+      - SellerSKU           — your SKU code
+      - FulfillmentNetworkSKU — FNSKU
+      - QuantityShipped     — units you sent to Amazon
+      - QuantityReceived    — units Amazon has actually inwarded so far
+      - QuantityInCase      — case-pack qty (0 if not case-packed)
+
+    If QuantityShipped > QuantityReceived, those units are still pending inward.
+    """
+    try:
+        def _call():
+            return make_sp_api_request(
+                endpoint=f"/fba/inbound/v0/shipments/{shipment_id}/items",
+                method="GET",
+                params={"MarketplaceId": SP_MARKETPLACE_ID},
+            )
+
+        result = await asyncio.to_thread(_call)
+        items = (result.get("payload") or {}).get("ItemData", [])
+
+        # Annotate each item with pending qty for easy reading
+        for item in items:
+            shipped = item.get("QuantityShipped", 0) or 0
+            received = item.get("QuantityReceived", 0) or 0
+            item["QuantityPending"] = max(0, shipped - received)
+            item["FullyInwarded"] = (shipped > 0 and received >= shipped)
+
+        return {
+            "shipment_id": shipment_id,
+            "items": items,
+            "total_skus": len(items),
+            "fully_inwarded": sum(1 for i in items if i["FullyInwarded"]),
+            "pending_inward": sum(1 for i in items if i["QuantityPending"] > 0),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching items for shipment {shipment_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

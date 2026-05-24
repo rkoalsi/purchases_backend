@@ -434,6 +434,34 @@ class APIScheduler:
                     "Purchases Backend - Composite Items Sync", success=False, error_msg=str(e)
                 )
             raise
+    async def sync_fba_shipments(self, days: int = 3650, notify: bool = False):
+        """
+        Sync recent FBA shipments + items from SP-API into amazon_fba_shipments.
+        Default window is 90 days (catches new + recently-updated shipments).
+        CLOSED shipments already synced within 7 days are skipped for efficiency.
+        """
+        try:
+            logger.info(f"Starting FBA shipments sync (last {days} days)...")
+            from ..routes.amazon_fba_shipment import _sync_shipments_to_db
+            db = get_database()
+            summary = await asyncio.to_thread(_sync_shipments_to_db, db, days)
+            logger.info(f"FBA shipments sync complete: {summary}")
+            if notify:
+                send_slack_notification(
+                    "FBA Shipments Sync",
+                    success=True,
+                    details={
+                        "processed": summary.get("total", 0),
+                        "inserted": summary.get("inserted", 0),
+                    },
+                )
+            return summary
+        except Exception as e:
+            logger.error(f"FBA shipments sync failed: {e}")
+            if notify:
+                send_slack_notification("FBA Shipments Sync", success=False, error_msg=str(e))
+            raise
+
     async def get_settlements(self):
         try:
             logger.info("Executing Amazon Settlements API call...")
@@ -650,6 +678,11 @@ async def scheduled_draft_order_report():
     await generate_and_send_draft_order_slack_report()
 
 
+async def scheduled_fba_shipments_sync():
+    """Nightly FBA shipments sync — 10-year window, skips stable CLOSED shipments."""
+    await api_scheduler.sync_fba_shipments(days=3650, notify=False)
+
+
 def setup_scheduler():
     """Configure and start the scheduler"""
     # Daily tasks
@@ -692,7 +725,17 @@ def setup_scheduler():
         misfire_grace_time=300,
     )
 
+    # Nightly FBA shipments sync — 1:30 AM UTC (7:00 AM IST)
+    scheduler.add_job(
+        scheduled_fba_shipments_sync,
+        trigger=CronTrigger(hour=1, minute=30, timezone="UTC"),
+        id="fba_shipments_sync",
+        name="FBA Shipments Sync",
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
+
     logger.info(
-        "Scheduler configured successfully with daily, weekly, and composite items tasks"
+        "Scheduler configured successfully with daily, weekly, composite items, and FBA shipments tasks"
     )
 
