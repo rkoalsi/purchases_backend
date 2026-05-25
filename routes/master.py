@@ -456,6 +456,56 @@ class OptimizedMasterReportService:
             logger.error(f"Error fetching missed sales: {e}")
             return {}
 
+    async def fetch_latest_blinkit_inventory(self) -> Dict:
+        """Fetch the most recent Blinkit inventory snapshot per SKU from blinkit_inventory.
+        Returns {
+            "by_sku": {sku_code: total_warehouse_inventory},
+            "latest_date": "YYYY-MM-DD" | None,
+        }."""
+        try:
+            def _fetch():
+                db = self.database
+                inv_col = db["blinkit_inventory"]
+
+                # Find the latest date across all blinkit inventory records
+                latest_doc = inv_col.find_one({}, sort=[("date", -1)], projection={"date": 1})
+                if not latest_doc:
+                    return {"by_sku": {}, "latest_date": None}
+                latest_date = latest_doc["date"]
+
+                # Aggregate warehouse_inventory by sku_code for that date
+                pipeline = [
+                    {"$match": {"date": latest_date, "sku_code": {"$ne": None}}},
+                    {"$group": {
+                        "_id": "$sku_code",
+                        "total_inventory": {"$sum": "$warehouse_inventory"},
+                    }},
+                ]
+                by_sku: Dict[str, float] = {}
+                for doc in inv_col.aggregate(pipeline, allowDiskUse=True):
+                    sku = doc.get("_id")
+                    qty = float(doc.get("total_inventory", 0) or 0)
+                    if sku and qty > 0:
+                        by_sku[sku] = qty
+
+                latest_date_str = (
+                    latest_date.strftime("%Y-%m-%d")
+                    if hasattr(latest_date, "strftime")
+                    else str(latest_date)[:10]
+                )
+                return {"by_sku": by_sku, "latest_date": latest_date_str}
+
+            result = await asyncio.to_thread(_fetch)
+            logger.info(
+                f"Fetched latest Blinkit inventory for {len(result.get('by_sku', {}))} SKUs "
+                f"(date: {result.get('latest_date')})"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching latest Blinkit inventory: {e}")
+            return {"by_sku": {}, "latest_date": None}
+
     async def fetch_fba_closing_stock(self, end_date: str) -> Dict[str, float]:
         """Fetch FBA closing stock from amazon_ledger, mapped by SKU code.
         Returns dict of {sku_code: closing_stock}."""
@@ -1897,6 +1947,7 @@ async def _generate_master_report_data(
         # Note: create_task needs a coroutine, so we create one task per coroutine.
         _zoho_stock_task = asyncio.create_task(report_service.fetch_latest_zoho_wh_stock())
         _fba_stock_task = asyncio.create_task(report_service.fetch_latest_fba_stock())
+        _blinkit_inv_task = asyncio.create_task(report_service.fetch_latest_blinkit_inventory())
 
         # Step 1: Fetch Zoho report + composite products in parallel
         tasks = []
@@ -1976,8 +2027,10 @@ async def _generate_master_report_data(
         # Placeholders — filled after enrichment in a separate parallel step
         latest_zoho_by_sku: Dict[str, float] = {}
         latest_fba_by_sku: Dict[str, float] = {}
+        latest_blinkit_by_sku: Dict[str, float] = {}
         latest_zoho_date: str = ""
         latest_fba_date: str = ""
+        latest_blinkit_inv_date: str = ""
         prev_zoho_by_sku: Dict[str, float] = {}
         prev_zoho_date: str = ""
         prev_fba_by_sku: Dict[str, float] = {}
@@ -2345,8 +2398,8 @@ async def _generate_master_report_data(
             # function.  By now it has been running concurrently with all report processing,
             # so it should be close to (or already) complete.
             try:
-                lz_res, lf_res = await asyncio.wait_for(
-                    asyncio.gather(_zoho_stock_task, _fba_stock_task, return_exceptions=True),
+                lz_res, lf_res, lb_res = await asyncio.wait_for(
+                    asyncio.gather(_zoho_stock_task, _fba_stock_task, _blinkit_inv_task, return_exceptions=True),
                     timeout=45.0,
                 )
                 if not isinstance(lz_res, Exception):
@@ -2363,10 +2416,16 @@ async def _generate_master_report_data(
                     prev_fba_date = lf_res.get("prev_date") or ""
                 else:
                     logger.error(f"Latest FBA stock fetch failed: {lf_res}")
+                if not isinstance(lb_res, Exception):
+                    latest_blinkit_by_sku = lb_res.get("by_sku", {})
+                    latest_blinkit_inv_date = lb_res.get("latest_date") or ""
+                else:
+                    logger.error(f"Latest Blinkit inventory fetch failed: {lb_res}")
             except asyncio.TimeoutError:
                 logger.warning("Latest stock fetch timed out — latest stock columns will be empty")
                 _zoho_stock_task.cancel()
                 _fba_stock_task.cancel()
+                _blinkit_inv_task.cancel()
 
             # Inject stub rows for SKUs that have FBA stock but zero sales in this period.
             # These ASINs exist in amazon_sku_mapping but never appeared in any sales report,
@@ -2538,6 +2597,8 @@ async def _generate_master_report_data(
                 item["sub_category"] = _pdata.get("sub_category", "") or ""
                 item["series"] = _pdata.get("series", "") or ""
                 item["sku"] = _pdata.get("sku", "") or ""
+                # Blinkit inventory
+                item["blinkit_inventory"] = round(latest_blinkit_by_sku.get(sku, 0), 2)
                 # Etrade (Vendor Central) inventory
                 vc_data = vc_by_sku.get(sku, {})
                 vc_stock = round(vc_data.get("closing_stock", 0), 2)
@@ -2744,6 +2805,7 @@ async def _generate_master_report_data(
                 "fba": latest_fba_date,
                 "prev_fba": prev_fba_date,
                 "etrade": vc_latest_inv_date,
+                "blinkit": latest_blinkit_inv_date,
             },
             "meta": {
                 "execution_time_seconds": round(execution_time, 2),
@@ -3106,6 +3168,7 @@ async def download_master_report(
         _latest_total_label = _latest_fba_label if latest_stock_dates.get("fba", "") >= latest_stock_dates.get("zoho", "") else _latest_zoho_label
         _prev_total_label   = _prev_fba_label if latest_stock_dates.get("prev_fba", "") >= latest_stock_dates.get("prev_zoho", "") else _prev_zoho_label
         _etrade_inv_label = _fmt_date(latest_stock_dates.get("etrade", "")) or _end_date_label
+        _blinkit_inv_label = _fmt_date(latest_stock_dates.get("blinkit", "")) or _end_date_label
 
         # Create Excel file
         excel_buffer = io.BytesIO()
@@ -3198,6 +3261,8 @@ async def download_master_report(
                         "Total CBM": item.get("total_cbm", 0),
                         "Days Current Order Lasts": item.get("days_current_order_lasts", 0),
                         "Days Total Inventory Lasts": item.get("days_total_inventory_lasts", 0),
+                        f"FBA Inventory ({_latest_fba_label})": item.get("latest_fba_stock", 0),
+                        f"Blinkit Inventory ({_blinkit_inv_label})": item.get("blinkit_inventory", 0),
                         f"Etrade Inventory ({_etrade_inv_label})": metrics.get("etrade_inventory", 0),
                         "Etrade DRR": metrics.get("etrade_drr", 0),
                         "Days Total Inventory Lasts (Etrade)": 0,
