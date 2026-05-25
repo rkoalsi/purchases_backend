@@ -2905,6 +2905,7 @@ class EstimateCreateRequest(BaseModel):
     billing_address_id: str
     shipping_address_id: str
     date: Optional[str] = None  # YYYY-MM-DD; defaults to today
+    skip_inactive: bool = False  # If True, skip truly-inactive items instead of blocking
 
 
 class EstimateLinkRequest(BaseModel):
@@ -2980,9 +2981,8 @@ async def create_zoho_estimate(
         if not items:
             raise ValueError("PO has no active items")
 
-        # Batch-load zoho item_id: ASIN → sku_code (via amazon_sku_mapping) → item_id (via products)
+        # --- Step 1: ASIN → sku_code via amazon_sku_mapping ---
         model_numbers = [it["model_number"] for it in items if it.get("model_number")]
-        # asin_to_sku_code: maps ASIN → cf_sku_code
         asin_to_sku_code: dict[str, str] = {
             m["item_id"]: m["sku_code"]
             for m in db[SKU_MAPPING_COLLECTION].find(
@@ -2991,41 +2991,66 @@ async def create_zoho_estimate(
             )
             if m.get("item_id") and m.get("sku_code")
         }
-        sku_codes = list(asin_to_sku_code.values())
-        sku_to_zoho_item_id: dict[str, str] = {
-            p["cf_sku_code"]: p["item_id"]
-            for p in db[PRODUCTS_COLLECTION].find(
-                {"cf_sku_code": {"$in": sku_codes}},
-                {"cf_sku_code": 1, "item_id": 1},
-            )
-            if p.get("cf_sku_code") and p.get("item_id")
-        }
 
-        # Fallback: model_numbers not found as ASINs may be direct cf_sku_codes (VC POs).
-        # Prefer active products to handle dual 5%/12% GST variants where 12% are inactive.
-        direct_sku_codes = [mn for mn in model_numbers if mn not in asin_to_sku_code]
-        if direct_sku_codes:
-            for p in db[PRODUCTS_COLLECTION].find(
-                {"cf_sku_code": {"$in": direct_sku_codes}},
-                {"cf_sku_code": 1, "item_id": 1, "status": 1},
-            ):
-                sku = p.get("cf_sku_code")
-                item_id = p.get("item_id")
-                if not sku or not item_id:
-                    continue
-                # Active entry wins; only write inactive if nothing stored yet
-                if p.get("status") == "active" or sku not in sku_to_zoho_item_id:
-                    sku_to_zoho_item_id[sku] = item_id
+        # For each item, lookup_key = sku_code resolved from ASIN, or model_number used directly
+        all_lookup_keys = list({
+            asin_to_sku_code.get(mn, mn)
+            for mn in model_numbers
+        })
 
+        # --- Step 2: composite_products first (always active in Zoho Books) ---
+        sku_to_composite_id: dict[str, str] = {}
+        sku_to_composite_name: dict[str, str] = {}
+        for c in db["composite_products"].find(
+            {"sku_code": {"$in": all_lookup_keys}},
+            {"sku_code": 1, "composite_item_id": 1, "name": 1},
+        ):
+            if c.get("sku_code") and c.get("composite_item_id"):
+                sku_to_composite_id[c["sku_code"]] = c["composite_item_id"]
+                sku_to_composite_name[c["sku_code"]] = c.get("name", c["sku_code"])
+
+        # --- Step 3: products fallback for items not found in composite_products ---
+        # Prefer active products (dual 5%/12% GST variants — 12% are inactive)
+        non_composite_keys = [k for k in all_lookup_keys if k not in sku_to_composite_id]
+        sku_to_product_id: dict[str, str] = {}
+        sku_to_product_status: dict[str, str] = {}
+        sku_to_product_name: dict[str, str] = {}
+        for p in db[PRODUCTS_COLLECTION].find(
+            {"cf_sku_code": {"$in": non_composite_keys}},
+            {"cf_sku_code": 1, "item_id": 1, "status": 1, "name": 1},
+        ):
+            sku = p.get("cf_sku_code")
+            item_id = p.get("item_id")
+            if not sku or not item_id:
+                continue
+            status = p.get("status", "")
+            # Active entry wins; only write inactive if nothing stored yet
+            if status == "active" or sku not in sku_to_product_id:
+                sku_to_product_id[sku] = item_id
+                sku_to_product_status[sku] = status
+                sku_to_product_name[sku] = p.get("name", sku)
+
+        inactive_items: list[str] = []
         skipped: list[str] = []
         line_items: list[dict] = []
         for it in items:
-            sku_code = asin_to_sku_code.get(it.get("model_number", ""))
-            # For direct sku_code model_numbers, look up the model_number itself
-            zoho_item_id = sku_to_zoho_item_id.get(sku_code or it.get("model_number", ""))
+            mn = it.get("model_number", "")
+            lookup_key = asin_to_sku_code.get(mn, mn)  # sku_code if ASIN, else model_number direct
+
+            # Composite wins — always active in Zoho Books
+            zoho_item_id = sku_to_composite_id.get(lookup_key)
             if not zoho_item_id:
-                skipped.append(it.get("model_number", it.get("asin", "?")))
-                continue
+                # Fall back to regular product
+                zoho_item_id = sku_to_product_id.get(lookup_key)
+                if not zoho_item_id:
+                    skipped.append(mn or it.get("asin", "?"))
+                    continue
+                # Check if product is inactive/deleted in Zoho
+                item_status = sku_to_product_status.get(lookup_key, "active")
+                if item_status and item_status != "active":
+                    product_name = sku_to_product_name.get(lookup_key, lookup_key)
+                    inactive_items.append(f"{mn} — {product_name} (status: {item_status})")
+                    continue  # blocked below unless skip_inactive=True
             margin = it.get("margin")
             discount = round(margin * 100, 2) if margin is not None else 0
             qty = it.get("final_supply_fo")
@@ -3039,6 +3064,11 @@ async def create_zoho_estimate(
                     "unit": "pcs",
                     "hsn_or_sac": it.get("hsn", ""),
                 }
+            )
+
+        if inactive_items and not body.skip_inactive:
+            raise ValueError(
+                "INACTIVE_ITEMS:" + "\n".join(inactive_items)
             )
 
         if not line_items:
@@ -3162,12 +3192,19 @@ async def create_zoho_estimate(
             },
         )
 
-        return estimate, skipped
+        return estimate, skipped, inactive_items
 
     try:
-        estimate, skipped = await asyncio.to_thread(_create)
+        estimate, skipped, inactive_items = await asyncio.to_thread(_create)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        msg = str(e)
+        if msg.startswith("INACTIVE_ITEMS:"):
+            items_list = [line for line in msg[len("INACTIVE_ITEMS:"):].splitlines() if line]
+            raise HTTPException(
+                status_code=400,
+                detail={"type": "inactive_items", "items": items_list},
+            )
+        raise HTTPException(status_code=400, detail=msg)
     except requests.HTTPError as e:
         body_text = e.response.text if e.response is not None else ""
         raise HTTPException(
@@ -3182,6 +3219,8 @@ async def create_zoho_estimate(
     }
     if skipped:
         result["skipped_items"] = skipped
+    if inactive_items:
+        result["skipped_inactive"] = inactive_items
     return JSONResponse(status_code=201, content=result)
 
 
