@@ -3151,6 +3151,7 @@ async def download_master_report(
                         "Total Amount": f"₹{metrics.get('total_amount', 0)}",
                         "Total Units Sold": metrics.get("total_units_sold", 0),
                         "Total Units Returned": metrics.get("total_units_returned", 0),
+                        "Total Credit Notes": metrics.get("total_credit_notes", 0),
                         "Transfer Orders": metrics.get("transfer_orders", 0),
                         "Net Total Sales": metrics.get("total_sales", 0),
                         "Return %": item.get("return_pct", 0),
@@ -3232,6 +3233,7 @@ async def download_master_report(
                 _cv_col         = _col("Collection Value")
                 _F  = _col("Total Units Sold")
                 _G  = _col("Total Units Returned")
+                _credit_notes_col = _col("Total Credit Notes")
                 _I  = _col("Net Total Sales")
                 _J  = _col("Return %")
                 _N  = _col("Avg Daily Run Rate")
@@ -3268,6 +3270,13 @@ async def download_master_report(
                 _etrade_inv  = _col(f"Etrade Inventory ({_etrade_inv_label})")
                 _etrade_drr  = _col("Etrade DRR")
                 _etrade_days = _col("Days Total Inventory Lasts (Etrade)")
+                _transfer_col        = _col("Transfer Orders")
+                _days_in_stock_col   = _col(f"Days in Stock (Pupscribe Warehouse)")
+                _drr_src_col         = _col("DRR Source")
+                _lkbk_days_col       = _col("Lookback Days in Stock")
+                _lkbk_sales_col      = _col("Lookback Sales")
+                _lkbk_returns_col    = _col("Lookback Returns")
+                _net_lkbk_col        = _col("Net Lookback Sales")
 
                 drr_source_col_idx = cols_list.index("DRR Source") + 1  # 1-based
                 yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
@@ -3278,6 +3287,26 @@ async def download_master_report(
                 for row_idx in range(2, len(combined_df_data) + 2):  # Skip header row
                     r = row_idx
                     inactive = f'OR({_A}{r}="inactive",{_A}{r}="discontinued until stock lasts")'
+
+                    # Net Lookback Sales = MAX(0, Lookback Sales − Lookback Returns)
+                    ws[f"{_net_lkbk_col}{r}"] = (
+                        f"=MAX(0,{_lkbk_sales_col}{r}-{_lkbk_returns_col}{r})"
+                    )
+
+                    # Avg Daily Run Rate
+                    # • previous_period branch: use lookback data
+                    # • current / insufficient_stock: (Total Units Sold − Total Credit Notes) / Days in Stock
+                    #   falling back to period_days when days_in_stock = 0
+                    _gross_net = f"({_F}{r}-{_credit_notes_col}{r})"
+                    ws[f"{_N}{r}"] = (
+                        f'=IF({_drr_src_col}{r}="previous_period",'
+                        f'IF({_lkbk_days_col}{r}>0,MAX(0,{_lkbk_sales_col}{r}-{_lkbk_returns_col}{r})/{_lkbk_days_col}{r},0),'
+                        f'IF({_days_in_stock_col}{r}>0,{_gross_net}/{_days_in_stock_col}{r},'
+                        f'IF({_gross_net}=0,0,{_gross_net}/{_period_days})))'
+                    )
+
+                    # Net Total Sales = Total Units Sold − Total Credit Notes − Transfer Orders
+                    ws[f"{_I}{r}"] = f"={_F}{r}-{_credit_notes_col}{r}-{_transfer_col}{r}"
 
                     # Return %
                     ws[f"{_J}{r}"] = f"=IF({_F}{r}>0,{_G}{r}/{_F}{r}*100,0)"
