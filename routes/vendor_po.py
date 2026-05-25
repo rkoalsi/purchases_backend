@@ -1583,8 +1583,16 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
     rows = []
     for it in po_items:
         model = it.get("model_number") or ""
-        # Estimate is created with final_supply_fo (override takes precedence, same as create logic)
-        supply = it.get("final_supply_fo_override") if it.get("final_supply_fo_override") is not None else (it.get("final_supply_fo") if it.get("final_supply_fo") is not None else 0)
+        # Estimate is created with final_supply_fo (override takes precedence).
+        # Fall back to supply_qty for older POs that pre-date the final_supply_fo field.
+        if it.get("final_supply_fo_override") is not None:
+            supply = it["final_supply_fo_override"]
+        elif it.get("final_supply_fo") is not None:
+            supply = it["final_supply_fo"]
+        elif it.get("supply_qty_override") is not None:
+            supply = it["supply_qty_override"]
+        else:
+            supply = it.get("supply_qty") or 0
         mrp_wo_gst = it.get("mrp_wo_gst")
         margin = it.get("margin")
         gst = it.get("gst") or 0
