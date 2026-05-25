@@ -1,7 +1,9 @@
 import asyncio
+import io
 import logging
 import os
 import re
+import zipfile
 from datetime import datetime
 from typing import List, Optional
 
@@ -9,7 +11,7 @@ import boto3
 from botocore.config import Config as BotocoreConfig
 from bson import ObjectId
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from pymongo.errors import PyMongoError
 
@@ -79,11 +81,16 @@ def _s3_client():
     )
 
 
-def _presign_s3(s3_key: str, expires: int = ATTACHMENT_URL_EXPIRY) -> str:
-    """Generate a pre-signed GET URL valid for `expires` seconds (default 7 days)."""
+def _presign_s3(s3_key: str, expires: int = ATTACHMENT_URL_EXPIRY, download: bool = False, filename: str = "") -> str:
+    """Generate a pre-signed GET URL valid for `expires` seconds (default 7 days).
+    If download=True, adds Content-Disposition: attachment so the browser downloads the file."""
+    params: dict = {"Bucket": S3_BUCKET, "Key": s3_key}
+    if download:
+        safe_name = filename or s3_key.split("/")[-1]
+        params["ResponseContentDisposition"] = f'attachment; filename="{safe_name}"'
     return _s3_client().generate_presigned_url(
         "get_object",
-        Params={"Bucket": S3_BUCKET, "Key": s3_key},
+        Params=params,
         ExpiresIn=expires,
     )
 
@@ -658,30 +665,97 @@ async def upload_attachment(
 
 
 @router.get("/{task_id}/attachments/{file_id}/url")
-async def get_attachment_url(task_id: str, file_id: str, db=Depends(get_database)):
-    """Return a 7-day pre-signed S3 GET URL for the given attachment."""
+async def get_attachment_url(
+    task_id: str,
+    file_id: str,
+    download: bool = Query(False, description="If true, URL forces a file download instead of inline view"),
+    db=Depends(get_database),
+):
+    """Return a 7-day pre-signed S3 GET URL for the given attachment.
+    Pass ?download=true to get a URL that triggers a browser download (Content-Disposition: attachment)."""
     def _fetch():
         task = db[TASKS_COLLECTION].find_one(
             {"_id": ObjectId(task_id)},
             {"attachments": 1},
         )
         if not task:
-            return None
+            return None, None
         for att in task.get("attachments", []):
             if att.get("file_id") == file_id:
-                return att.get("s3_key")
-        return None
+                return att.get("s3_key"), att.get("filename", "")
+        return None, None
 
-    s3_key = await asyncio.to_thread(_fetch)
+    s3_key, filename = await asyncio.to_thread(_fetch)
     if not s3_key:
         raise HTTPException(status_code=404, detail="Attachment not found")
 
     try:
-        url = await asyncio.to_thread(_presign_s3, s3_key)
+        url = await asyncio.to_thread(_presign_s3, s3_key, ATTACHMENT_URL_EXPIRY, download, filename or "")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     return {"url": url, "expires_in_seconds": ATTACHMENT_URL_EXPIRY}
+
+
+@router.get("/{task_id}/attachments/download-all")
+async def download_all_attachments(task_id: str, db=Depends(get_database)):
+    """Download all attachments for a task as a single ZIP file streamed to the client."""
+    def _fetch_task():
+        return db[TASKS_COLLECTION].find_one(
+            {"_id": ObjectId(task_id)},
+            {"attachments": 1, "title": 1},
+        )
+
+    task = await asyncio.to_thread(_fetch_task)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    attachments = task.get("attachments", [])
+    if not attachments:
+        raise HTTPException(status_code=404, detail="No attachments found for this task")
+
+    s3 = _s3_client()
+
+    def _build_zip() -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            seen_names: dict[str, int] = {}
+            for att in attachments:
+                s3_key = att.get("s3_key")
+                original_name = att.get("filename") or s3_key.split("/")[-1] if s3_key else "file"
+                if not s3_key:
+                    continue
+                # De-duplicate filenames inside the ZIP
+                if original_name in seen_names:
+                    seen_names[original_name] += 1
+                    base, _, ext = original_name.rpartition(".")
+                    arc_name = f"{base}_{seen_names[original_name]}.{ext}" if ext else f"{original_name}_{seen_names[original_name]}"
+                else:
+                    seen_names[original_name] = 0
+                    arc_name = original_name
+                try:
+                    obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
+                    file_bytes = obj["Body"].read()
+                    zf.writestr(arc_name, file_bytes)
+                except Exception:
+                    logger.warning("Skipping attachment %s in download-all zip (S3 error)", s3_key)
+        buf.seek(0)
+        return buf.read()
+
+    try:
+        zip_bytes = await asyncio.to_thread(_build_zip)
+    except Exception as e:
+        logger.exception("download_all_attachments failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    task_title = re.sub(r"[^\w\s\-]", "", task.get("title", task_id))[:40].strip().replace(" ", "_")
+    zip_filename = f"{task_title}_attachments.zip" if task_title else f"task_{task_id}_attachments.zip"
+
+    return StreamingResponse(
+        io.BytesIO(zip_bytes),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_filename}"'},
+    )
 
 
 @router.delete("/{task_id}/attachments/{file_id}")
