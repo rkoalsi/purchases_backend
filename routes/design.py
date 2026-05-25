@@ -15,7 +15,7 @@ from openpyxl.utils import get_column_letter
 import boto3
 from botocore.config import Config as BotocoreConfig
 from bson import ObjectId
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from jose import jwt, JWTError
 from pydantic import BaseModel
@@ -49,6 +49,23 @@ PUBLIC_S3_URL = os.getenv("PUBLIC_S3_URL", "https://assets.pupscribe.in")
 
 class AddCategoryRequest(BaseModel):
     name: str
+
+
+class CreateFolderRequest(BaseModel):
+    name: str
+    parent_path: Optional[str] = ""
+
+
+class RenameFolderRequest(BaseModel):
+    name: str
+
+
+def _sanitize_folder_name(name: str) -> str:
+    """Convert folder name to a safe path segment (preserves readability)."""
+    name = name.strip()
+    safe = re.sub(r"[^\w\s.\-]", "", name)
+    safe = re.sub(r"\s+", "_", safe).strip("_")
+    return safe or "folder"
 
 
 def _slugify(text: str) -> str:
@@ -1273,6 +1290,28 @@ async def delete_designer_category(name: str, db=Depends(get_database)):
     return {"name": name, "deleted": True}
 
 
+@router.patch("/categories/{name}")
+async def rename_designer_category(name: str, request: Request, db=Depends(get_database)):
+    body = await request.json()
+    new_name = (body.get("new_name") or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="new_name required")
+    def _rename():
+        if db[CATEGORIES_COLLECTION].find_one({"name": new_name}):
+            raise HTTPException(status_code=409, detail="Category already exists")
+        result = db[CATEGORIES_COLLECTION].update_one({"name": name}, {"$set": {"name": new_name}})
+        if not result.matched_count:
+            raise HTTPException(status_code=404, detail="Category not found")
+        # Update all documents in orders that used the old category name
+        db[BRAND_ORDERS_COLLECTION].update_many(
+            {"designer_documents.category": name},
+            {"$set": {"designer_documents.$[elem].category": new_name}},
+            array_filters=[{"elem.category": name}]
+        )
+    await asyncio.to_thread(_rename)
+    return {"old_name": name, "new_name": new_name}
+
+
 @router.get("/{order_id}/line-items")
 async def get_order_line_items(order_id: str, db=Depends(get_database)):
     def _fetch():
@@ -1315,12 +1354,170 @@ async def get_order_line_items(order_id: str, db=Depends(get_database)):
     return serialize_mongo_document(items)
 
 
+# ─── designer folders ─────────────────────────────────────────────────────────
+
+@router.get("/{order_id}/designer-folders")
+async def list_designer_folders(order_id: str, db=Depends(get_database)):
+    def _fetch():
+        doc = db[BRAND_ORDERS_COLLECTION].find_one({"_id": ObjectId(order_id)}, {"designer_folders": 1})
+        if not doc:
+            raise ValueError("Order not found")
+        return doc.get("designer_folders", [])
+    try:
+        folders = await asyncio.to_thread(_fetch)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return serialize_mongo_document(folders)
+
+
+@router.post("/{order_id}/designer-folders")
+async def create_designer_folder(order_id: str, body: CreateFolderRequest, db=Depends(get_database)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Folder name required")
+    parent = (body.parent_path or "").strip().strip("/")
+    safe_name = _sanitize_folder_name(name)
+    path = f"{parent}/{safe_name}" if parent else safe_name
+
+    def _create():
+        doc = db[BRAND_ORDERS_COLLECTION].find_one({"_id": ObjectId(order_id)}, {"designer_folders": 1})
+        if not doc:
+            raise ValueError("Order not found")
+        if any(f.get("path") == path for f in doc.get("designer_folders", [])):
+            raise ValueError(f"A folder named '{name}' already exists here")
+        folder_entry = {
+            "folder_id": str(ObjectId()),
+            "name": name,
+            "path": path,
+            "parent_path": parent,
+            "created_at": datetime.now(),
+        }
+        db[BRAND_ORDERS_COLLECTION].update_one(
+            {"_id": ObjectId(order_id)},
+            {"$push": {"designer_folders": folder_entry}, "$set": {"updated_at": datetime.now()}},
+        )
+        return folder_entry
+
+    try:
+        folder = await asyncio.to_thread(_create)
+    except ValueError as e:
+        code = 409 if "already exists" in str(e) else 404
+        raise HTTPException(status_code=code, detail=str(e))
+    return serialize_mongo_document(folder)
+
+
+@router.patch("/{order_id}/designer-folders/{folder_id}")
+async def rename_designer_folder(order_id: str, folder_id: str, body: RenameFolderRequest, db=Depends(get_database)):
+    new_name = body.name.strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Folder name required")
+
+    def _rename():
+        doc = db[BRAND_ORDERS_COLLECTION].find_one(
+            {"_id": ObjectId(order_id)}, {"designer_folders": 1, "designer_documents": 1}
+        )
+        if not doc:
+            raise ValueError("Order not found")
+        folders = doc.get("designer_folders", [])
+        folder = next((f for f in folders if f.get("folder_id") == folder_id), None)
+        if not folder:
+            raise ValueError("Folder not found")
+
+        old_path = folder["path"]
+        parent = folder.get("parent_path", "")
+        safe_name = _sanitize_folder_name(new_name)
+        new_path = f"{parent}/{safe_name}" if parent else safe_name
+
+        if new_path == old_path:
+            return {**folder, "name": new_name, "path": new_path}
+
+        db[BRAND_ORDERS_COLLECTION].update_one(
+            {"_id": ObjectId(order_id), "designer_folders.folder_id": folder_id},
+            {"$set": {"designer_folders.$.name": new_name, "designer_folders.$.path": new_path, "updated_at": datetime.now()}},
+        )
+        for f in folders:
+            f_path = f.get("path", "")
+            if f_path.startswith(old_path + "/"):
+                new_child_path = new_path + f_path[len(old_path):]
+                new_parent = f.get("parent_path", "")
+                if new_parent.startswith(old_path):
+                    new_parent = new_path + new_parent[len(old_path):]
+                db[BRAND_ORDERS_COLLECTION].update_one(
+                    {"_id": ObjectId(order_id), "designer_folders.folder_id": f["folder_id"]},
+                    {"$set": {"designer_folders.$.path": new_child_path, "designer_folders.$.parent_path": new_parent}},
+                )
+        for d in doc.get("designer_documents", []):
+            d_folder = d.get("folder", "")
+            if d_folder == old_path:
+                db[BRAND_ORDERS_COLLECTION].update_one(
+                    {"_id": ObjectId(order_id), "designer_documents.doc_id": d["doc_id"]},
+                    {"$set": {"designer_documents.$.folder": new_path}},
+                )
+            elif d_folder.startswith(old_path + "/"):
+                db[BRAND_ORDERS_COLLECTION].update_one(
+                    {"_id": ObjectId(order_id), "designer_documents.doc_id": d["doc_id"]},
+                    {"$set": {"designer_documents.$.folder": new_path + d_folder[len(old_path):]}},
+                )
+        return {**folder, "name": new_name, "path": new_path}
+
+    try:
+        result = await asyncio.to_thread(_rename)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return serialize_mongo_document(result)
+
+
+@router.delete("/{order_id}/designer-folders/{folder_id}")
+async def delete_designer_folder(order_id: str, folder_id: str, db=Depends(get_database)):
+    """Delete a designer folder (and subfolders); documents inside are moved to parent."""
+    def _delete():
+        doc = db[BRAND_ORDERS_COLLECTION].find_one(
+            {"_id": ObjectId(order_id)}, {"designer_folders": 1, "designer_documents": 1}
+        )
+        if not doc:
+            raise ValueError("Order not found")
+        folders = doc.get("designer_folders", [])
+        folder = next((f for f in folders if f.get("folder_id") == folder_id), None)
+        if not folder:
+            raise ValueError("Folder not found")
+
+        path = folder["path"]
+        parent_path = folder.get("parent_path", "")
+
+        for d in doc.get("designer_documents", []):
+            d_folder = d.get("folder", "")
+            if d_folder == path or d_folder.startswith(path + "/"):
+                db[BRAND_ORDERS_COLLECTION].update_one(
+                    {"_id": ObjectId(order_id), "designer_documents.doc_id": d["doc_id"]},
+                    {"$set": {"designer_documents.$.folder": parent_path}},
+                )
+
+        ids_to_remove = [folder_id] + [
+            f["folder_id"] for f in folders if f.get("path", "").startswith(path + "/")
+        ]
+        db[BRAND_ORDERS_COLLECTION].update_one(
+            {"_id": ObjectId(order_id)},
+            {
+                "$pull": {"designer_folders": {"folder_id": {"$in": ids_to_remove}}},
+                "$set": {"updated_at": datetime.now()},
+            },
+        )
+        return True
+
+    try:
+        await asyncio.to_thread(_delete)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"folder_id": folder_id, "deleted": True}
+
+
 @router.post("/{order_id}/designer-documents")
 async def upload_designer_document(
     order_id: str,
     file: UploadFile = File(...),
     relative_path: Optional[str] = Form(None),
     category: Optional[str] = Form(None),
+    folder: Optional[str] = Form(None),
     item_id: Optional[str] = Form(None),
     item_name: Optional[str] = Form(None),
     db=Depends(get_database),
@@ -1329,6 +1526,7 @@ async def upload_designer_document(
     filename = file.filename or "file"
     content_type = file.content_type or "application/octet-stream"
     cat = (category or "general").strip()
+    folder_path = (folder or "").strip().strip("/")
 
     def _process():
         doc = db[BRAND_ORDERS_COLLECTION].find_one(
@@ -1344,11 +1542,19 @@ async def upload_designer_document(
         if relative_path:
             parts = relative_path.replace("\\", "/").strip("/").split("/")
             safe_parts = [re.sub(r"[^\w.\-]", "_", p) for p in parts if p]
-            s3_key = f"designer_uploads/{brand_slug}/{name_slug}/{cat_slug}/{'/'.join(safe_parts)}"
+            if folder_path:
+                safe_folder = "/".join(re.sub(r"[^\w.\-]", "_", p) for p in folder_path.split("/") if p)
+                s3_key = f"designer_uploads/{brand_slug}/{name_slug}/{safe_folder}/{'/'.join(safe_parts)}"
+            else:
+                s3_key = f"designer_uploads/{brand_slug}/{name_slug}/{cat_slug}/{'/'.join(safe_parts)}"
         else:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             safe_filename = re.sub(r"[^\w.\-]", "_", filename)
-            s3_key = f"designer_uploads/{brand_slug}/{name_slug}/{cat_slug}/{ts}_{safe_filename}"
+            if folder_path:
+                safe_folder = "/".join(re.sub(r"[^\w.\-]", "_", p) for p in folder_path.split("/") if p)
+                s3_key = f"designer_uploads/{brand_slug}/{name_slug}/{safe_folder}/{ts}_{safe_filename}"
+            else:
+                s3_key = f"designer_uploads/{brand_slug}/{name_slug}/{cat_slug}/{ts}_{safe_filename}"
 
         _upload_to_s3(file_bytes, s3_key, content_type)
 
@@ -1360,6 +1566,7 @@ async def upload_designer_document(
             "size": len(file_bytes),
             "uploaded_at": datetime.now(),
             "category": cat,
+            "folder": folder_path,
         }
         if item_id:
             doc_entry["item_id"] = item_id
@@ -1441,19 +1648,27 @@ async def download_designer_documents_zip(
 
 @router.patch("/{order_id}/designer-documents/{doc_id}")
 async def update_designer_document(order_id: str, doc_id: str, body: dict, db=Depends(get_database)):
+    updates: dict = {}
     category = (body.get("category") or "").strip()
-    if not category:
-        raise HTTPException(status_code=400, detail="category is required")
+    if category:
+        updates["designer_documents.$.category"] = category
+    if "folder" in body:
+        updates["designer_documents.$.folder"] = (body["folder"] or "").strip().strip("/")
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nothing to update — provide category or folder")
+    updates["updated_at"] = datetime.now()
+
     def _update():
         result = db[BRAND_ORDERS_COLLECTION].update_one(
             {"_id": ObjectId(order_id), "designer_documents.doc_id": doc_id},
-            {"$set": {"designer_documents.$.category": category, "updated_at": datetime.now()}},
+            {"$set": updates},
         )
         return result.matched_count
+
     matched = await asyncio.to_thread(_update)
     if not matched:
         raise HTTPException(status_code=404, detail="Document not found")
-    return {"doc_id": doc_id, "category": category}
+    return {"doc_id": doc_id, **{k.replace("designer_documents.$.", ""): v for k, v in updates.items() if k != "updated_at"}}
 
 
 @router.get("/{order_id}/designer-documents/{doc_id}/url")
