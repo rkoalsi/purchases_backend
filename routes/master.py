@@ -3245,6 +3245,7 @@ async def download_master_report(
                         "Stock in Transit 2": item.get("stock_in_transit_2", 0),
                         "Stock in Transit 3": item.get("stock_in_transit_3", 0),
                         "Total Stock in Transit": item.get("total_stock_in_transit", 0),
+                        "Net Total Stock": 0,  # formula: Total Stock (latest) + Total Stock in Transit
                         "Current Days Coverage": item.get("current_days_coverage", 0),
                         "Missed Sales": item.get("missed_sales", 0),
                         "Missed Sales DRR": item.get("missed_sales_drr", 0),
@@ -3317,6 +3318,7 @@ async def download_master_report(
                 _AG = _col("Stock in Transit 2")
                 _AH = _col("Stock in Transit 3")
                 _AI = _col("Total Stock in Transit")
+                _NTS = _col("Net Total Stock")
                 _AJ = _col("Current Days Coverage")
                 _AK = _col("Missed Sales")
                 _AL = _col("Missed Sales DRR")
@@ -3342,12 +3344,15 @@ async def download_master_report(
                 _lkbk_sales_col      = _col("Lookback Sales")
                 _lkbk_returns_col    = _col("Lookback Returns")
                 _net_lkbk_col        = _col("Net Lookback Sales")
+                _is_new_col          = _col("Is New")
 
                 drr_source_col_idx = cols_list.index("DRR Source") + 1  # 1-based
+                _v_col_idx = cols_list.index(f"Pupscribe WH Stock ({_latest_zoho_label})") + 1  # for neg-stock highlight
                 yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
                 orange_fill = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
                 red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
                 green_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
+                neg_stock_fill = PatternFill(start_color="FF4500", end_color="FF4500", fill_type="solid")
 
                 for row_idx in range(2, len(combined_df_data) + 2):  # Skip header row
                     r = row_idx
@@ -3358,20 +3363,30 @@ async def download_master_report(
                         f"=MAX(0,{_lkbk_sales_col}{r}-{_lkbk_returns_col}{r})"
                     )
 
-                    # Avg Daily Run Rate
-                    # • previous_period branch: use lookback data
-                    # • current / insufficient_stock: (Total Units Sold − Total Credit Notes) / Days in Stock
-                    #   falling back to period_days when days_in_stock = 0
-                    _gross_net = f"({_F}{r}-{_credit_notes_col}{r})"
-                    ws[f"{_N}{r}"] = (
-                        f'=IF({_drr_src_col}{r}="previous_period",'
-                        f'IF({_lkbk_days_col}{r}>0,MAX(0,{_lkbk_sales_col}{r}-{_lkbk_returns_col}{r})/{_lkbk_days_col}{r},0),'
-                        f'IF({_days_in_stock_col}{r}>0,{_gross_net}/{_days_in_stock_col}{r},'
-                        f'IF({_gross_net}=0,0,{_gross_net}/{_period_days})))'
-                    )
+                    # Net Total Sales = Total Units Sold − Total Units Returned − Transfer Orders
+                    # (Total Units Returned used instead of Total Credit Notes — values are equivalent)
+                    ws[f"{_I}{r}"] = f"={_F}{r}-{_G}{r}-{_transfer_col}{r}"
 
-                    # Net Total Sales = Total Units Sold − Total Credit Notes − Transfer Orders
-                    ws[f"{_I}{r}"] = f"={_F}{r}-{_credit_notes_col}{r}-{_transfer_col}{r}"
+                    # Avg Daily Run Rate — simple formula per row colour, injected via Python branching
+                    # • Green  (demand override):      =IF(DaysInStock>0, NTS/DaysInStock, IF(NTS=0,0, NTS/period_days))
+                    # • Yellow/Orange (prev_period):   =IF(LookbackDays>0, MAX(0, LkbkSales-LkbkReturns)/LookbackDays, 0)
+                    # • White  (current_period):       =IF(DaysInStock>0, NTS/DaysInStock, IF(NTS=0,0, NTS/period_days))
+                    # • Red    (insufficient_stock):   =IF(DaysInStock>0, NTS/DaysInStock, IF(NTS=0,0, NTS/period_days))
+                    #   Dampening for red rows is applied to Order Qty via confidence multiplier, not to DRR.
+                    _net_ts = f"{_I}{r}"  # Net Total Sales cell (formula already injected above)
+                    _data_row_drr_src = combined_df_data[row_idx - 2].get("DRR Source", "current_period")
+                    if (row_idx - 2) in demand_override_row_indices or _data_row_drr_src != "previous_period":
+                        # Green / White / Red: Net Total Sales / Days in Stock
+                        ws[f"{_N}{r}"] = (
+                            f'=IF({_days_in_stock_col}{r}>0,{_net_ts}/{_days_in_stock_col}{r},'
+                            f'IF({_net_ts}=0,0,{_net_ts}/{_period_days}))'
+                        )
+                    else:
+                        # Yellow / Orange: Net Lookback Sales / Lookback Days in Stock
+                        ws[f"{_N}{r}"] = (
+                            f'=IF({_lkbk_days_col}{r}>0,'
+                            f'MAX(0,{_lkbk_sales_col}{r}-{_lkbk_returns_col}{r})/{_lkbk_days_col}{r},0)'
+                        )
 
                     # Return %
                     ws[f"{_J}{r}"] = f"=IF({_F}{r}>0,{_G}{r}/{_F}{r}*100,0)"
@@ -3396,6 +3411,9 @@ async def download_master_report(
                     # Total Stock in Transit = sum of 3 transit cols
                     ws[f"{_AI}{r}"] = f"={_AF}{r}+{_AG}{r}+{_AH}{r}"
 
+                    # Net Total Stock = Total Stock (latest) + Total Stock in Transit
+                    ws[f"{_NTS}{r}"] = f"={_U}{r}+{_AI}{r}"
+
                     # Current Days Coverage = (Latest Total Stock + Total Transit) / DRR
                     ws[f"{_AJ}{r}"] = f"=IF({_N}{r}>0,({_U}{r}+{_AI}{r})/{_N}{r},0)"
 
@@ -3412,7 +3430,14 @@ async def download_master_report(
                     ws[f"{_AN}{r}"] = f"=IF({_AJ}{r}<{_AB}{r},{_AD}{r},{_AD}{r}-{_AJ}{r})"
 
                     # Excess / Order
-                    ws[f"{_AO}{r}"] = f'=IF({_N}{r}=0,"NO MOVEMENT",IF({_AJ}{r}<{_AD}{r},"ORDER","EXCESS"))'
+                    # New items (Is New = Yes) with no DRR show NO MOVEMENT; IFERROR catches any
+                    # residual #DIV/0! that could appear on new items with zero stock/sales.
+                    ws[f"{_AO}{r}"] = (
+                        f'=IFERROR('
+                        f'IF(OR({_N}{r}=0,AND({_is_new_col}{r}="Yes",{_N}{r}=0)),"NO MOVEMENT",'
+                        f'IF({_AJ}{r}<{_AD}{r},"ORDER","EXCESS")),'
+                        f'"NO MOVEMENT")'
+                    )
 
                     # Order Qty (0 for inactive/discontinued)
                     # For demand-override rows (green), use Net Total Sales × confidence multiplier
@@ -3467,6 +3492,18 @@ async def download_master_report(
 
                 # Hide the Confidence Multiplier column (used by Order Qty formula, not for display)
                 ws.column_dimensions[_AX].hidden = True
+
+                # Hide Total Credit Notes column — values are identical to Total Units Returned,
+                # so it is redundant for display; formulas that referenced it now use Total Units Returned.
+                ws.column_dimensions[_credit_notes_col].hidden = True
+
+                # Highlight individual cells where Pupscribe WH Stock (latest) is negative.
+                # The row-level fill has already been applied above; we re-apply to just this cell
+                # so the negative value stands out regardless of row colour.
+                for neg_row in range(2, len(combined_df_data) + 2):
+                    cell_val = ws.cell(row=neg_row, column=_v_col_idx).value
+                    if cell_val is not None and isinstance(cell_val, (int, float)) and cell_val < 0:
+                        ws.cell(row=neg_row, column=_v_col_idx).fill = neg_stock_fill
 
                 # Hide Brand column for individual brand reports (redundant when filtered to one brand)
                 if brand:
