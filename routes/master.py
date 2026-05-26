@@ -772,7 +772,9 @@ class OptimizedMasterReportService:
 
             products = await asyncio.to_thread(_fetch_all)
 
-            three_months_ago = datetime.utcnow() - timedelta(days=90)
+            from datetime import timezone as _tz
+            _now_utc = datetime.now(_tz.utc).replace(tzinfo=None)  # naive UTC
+            three_months_ago = _now_utc - timedelta(days=90)
 
             result = {}
             for product in products:
@@ -782,9 +784,17 @@ class OptimizedMasterReportService:
                 created_at = product.get("created_at")
                 if isinstance(created_at, str):
                     try:
-                        created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00")).replace(tzinfo=None)
+                        dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                        if dt.tzinfo is not None:
+                            # Convert to UTC naive so comparisons are always on the same basis
+                            created_at = dt.astimezone(_tz.utc).replace(tzinfo=None)
+                        else:
+                            created_at = dt
                     except (ValueError, AttributeError):
                         created_at = None
+                elif isinstance(created_at, datetime) and created_at.tzinfo is not None:
+                    # PyMongo may return tz-aware datetimes in some configurations
+                    created_at = created_at.astimezone(_tz.utc).replace(tzinfo=None)
                 is_new = isinstance(created_at, datetime) and created_at >= three_months_ago
                 result[sku_code] = {
                     "name": product.get("name"),
@@ -1194,17 +1204,24 @@ class OptimizedMasterReportService:
             data["sources"] = list(data["sources"])
             metrics = data["combined_metrics"]
 
-            # DRR based on Zoho sales / days in stock
+            # DRR based on net customer demand: units_sold − credit_notes − transfer_orders.
+            # Transfer orders are inter-warehouse replenishment sends (not end-customer demand)
+            # and must be excluded so DRR reflects true sell-through — matching the Excel formula
+            # which uses Net Total Sales (= units_sold − returns − transfers) as the numerator.
             zoho_units = data.pop("_zoho_units_sold")
             credit_notes = metrics.get("total_credit_notes", 0)
             zoho_stock = data.pop("_zoho_closing_stock")
             fba_stock = fba_stock_by_sku.get(sku, 0)
 
+            # Resolve transfer qty first so it feeds the DRR numerator
+            transfer_qty = transfer_orders_by_sku.get(sku, 0)
+            net_demand = round(metrics["total_units_sold"] - credit_notes - transfer_qty, 2)
+
             days_in_stock = metrics.get("total_days_in_stock", 0)
             if days_in_stock > 0:
-                metrics["avg_daily_run_rate"] = round(round(metrics["total_units_sold"] - credit_notes, 2) / days_in_stock, 2)
+                metrics["avg_daily_run_rate"] = round(net_demand / days_in_stock, 2)
             elif period_days > 0:
-                metrics["avg_daily_run_rate"] = round(round(metrics["total_units_sold"] - credit_notes, 2) / period_days, 2)
+                metrics["avg_daily_run_rate"] = round(net_demand / period_days, 2)
 
             # Closing stock = Pupscribe WH (Zoho) + FBA stock
             metrics["total_closing_stock"] = round(zoho_stock + fba_stock, 2)
@@ -1212,9 +1229,8 @@ class OptimizedMasterReportService:
             metrics["pupscribe_wh_stock"] = round(zoho_stock, 2)
 
             # Transfer orders and total sales
-            transfer_qty = transfer_orders_by_sku.get(sku, 0)
             metrics["transfer_orders"] = round(transfer_qty, 2)
-            metrics["total_sales"] = round(metrics["total_units_sold"] - credit_notes - transfer_qty, 2)
+            metrics["total_sales"] = round(net_demand, 2)
 
             if metrics["avg_daily_run_rate"] > 0:
                 metrics["avg_days_of_coverage"] = round(
@@ -1550,10 +1566,12 @@ class OptimizedMasterReportService:
             po_collection = self.database.get_collection("purchase_orders")
 
             def _fetch_open_pos():
+                # Sort by date ascending so transit_1 always corresponds to the
+                # earliest-dated open PO for each SKU (deterministic across runs).
                 return list(po_collection.find(
                     {"order_status_formatted": "Issued"},
-                    {"line_items": 1, "purchaseorder_number": 1, "_id": 0}
-                ))
+                    {"line_items": 1, "purchaseorder_number": 1, "date": 1, "_id": 0}
+                ).sort("date", 1))
 
             open_pos = await asyncio.to_thread(_fetch_open_pos)
 
@@ -1839,9 +1857,13 @@ class OptimizedMasterReportService:
             order_qty = max(0, net_target_days * drr)
 
             # Demand-based override: when current-period net sales exceed lookback net sales,
-            # use current-period sales as the order qty instead of DRR × target days
+            # use current-period sales as the order qty instead of DRR × target days.
+            # If coverage is already EXCESS, order nothing (matches Excel: IF(EXCESS, 0, ...)).
             if item.get("order_qty_demand_override"):
-                order_qty = round(item.get("current_period_sales_for_override", 0), 2)
+                if item.get("excess_or_order") == "EXCESS":
+                    order_qty = 0.0
+                else:
+                    order_qty = round(item.get("current_period_sales_for_override", 0), 2)
                 item["order_qty_basis"] = "Current Period Sales"
             else:
                 item["order_qty_basis"] = ""
@@ -1874,6 +1896,13 @@ class OptimizedMasterReportService:
                     item["order_qty_basis"] = drr_flag_label
             else:
                 item["confidence_multiplier"] = 1.0
+
+            # Append seasonal mismatch warning to DRR Flag when the lookback DRR
+            # comes from a different calendar quarter than the report period.
+            # Purely advisory — does not change order_qty.
+            if item.get("drr_lookback_seasonal_mismatch"):
+                existing = item.get("order_qty_basis", "")
+                item["order_qty_basis"] = f"{existing} · Seasonal mismatch" if existing else "Seasonal mismatch"
 
             item["order_qty"] = round(order_qty, 2)
 
@@ -2235,18 +2264,26 @@ async def _generate_master_report_data(
                                     item["drr_lookback_sales"] = lb["units_sold"]
                                     item["drr_lookback_returns"] = lb.get("returns", 0)
                                     item["drr_net_lookback_sales"] = lb.get("net_units_sold", 0)
-                                    # Flag if lookback period is > 180 days before report start
+                                    # Flag if lookback period is > 180 days before report start,
+                                    # and if it falls in a different calendar quarter (seasonal mismatch).
                                     lb_period = lb["lookback_period"]
                                     gt_180 = False
+                                    seasonal_mismatch = False
                                     if lb_period and " to " in lb_period:
                                         lb_start_str = lb_period.split(" to ")[0].strip()
                                         try:
                                             lb_start_dt = datetime.strptime(lb_start_str, "%Y-%m-%d")
                                             report_start_dt = datetime.strptime(start_date, "%Y-%m-%d")
                                             gt_180 = (report_start_dt - lb_start_dt).days > 180
+                                            # Different calendar quarter → potential seasonal demand mismatch
+                                            seasonal_mismatch = (
+                                                (lb_start_dt.month - 1) // 3
+                                                != (report_start_dt.month - 1) // 3
+                                            )
                                         except ValueError:
                                             pass
                                     item["drr_lookback_gt_180"] = gt_180
+                                    item["drr_lookback_seasonal_mismatch"] = seasonal_mismatch
                                     item["highlight"] = "orange" if gt_180 else "yellow"
                                     # If current-period sales exceed lookback net sales, flag for
                                     # demand-based order qty override (order qty = current sales)
@@ -2262,10 +2299,12 @@ async def _generate_master_report_data(
                                     item["drr_lookback_returns"] = 0
                                     item["drr_net_lookback_sales"] = 0
                                     item["drr_lookback_gt_180"] = False
+                                    item["drr_lookback_seasonal_mismatch"] = False
                                     item["highlight"] = "red"
                             else:
                                 item["drr_source"] = "current_period"
                                 item["drr_lookback_period"] = ""
+                                item["drr_lookback_seasonal_mismatch"] = False
                                 item["highlight"] = None
 
                         logger.info(
@@ -2615,15 +2654,21 @@ async def _generate_master_report_data(
                                     item["drr_net_lookback_sales"] = lb.get("net_units_sold", 0)
                                     lb_period = lb["lookback_period"]
                                     gt_180 = False
+                                    seasonal_mismatch = False
                                     if lb_period and " to " in lb_period:
                                         lb_start_str = lb_period.split(" to ")[0].strip()
                                         try:
                                             lb_start_dt = datetime.strptime(lb_start_str, "%Y-%m-%d")
                                             report_start_dt = datetime.strptime(start_date, "%Y-%m-%d")
                                             gt_180 = (report_start_dt - lb_start_dt).days > 180
+                                            seasonal_mismatch = (
+                                                (lb_start_dt.month - 1) // 3
+                                                != (report_start_dt.month - 1) // 3
+                                            )
                                         except ValueError:
                                             pass
                                     item["drr_lookback_gt_180"] = gt_180
+                                    item["drr_lookback_seasonal_mismatch"] = seasonal_mismatch
                                     item["highlight"] = "orange" if gt_180 else "yellow"
                                 else:
                                     item["drr_source"] = "insufficient_stock"
@@ -2633,6 +2678,7 @@ async def _generate_master_report_data(
                                     item["drr_lookback_returns"] = 0
                                     item["drr_net_lookback_sales"] = 0
                                     item["drr_lookback_gt_180"] = False
+                                    item["drr_lookback_seasonal_mismatch"] = False
                                     item["highlight"] = "red"
                             logger.info(
                                 f"Stub second-pass lookback complete: "
@@ -2659,12 +2705,12 @@ async def _generate_master_report_data(
             # Attach latest current stock, PO unit prices, manufacturer code, and Etrade VC data
             for item in combined_data:
                 sku = item.get("sku_code", "")
-                lz = round(latest_zoho_by_sku.get(sku, 0), 2)
+                lz = max(0, round(latest_zoho_by_sku.get(sku, 0), 2))
                 lf = round(latest_fba_by_sku.get(sku, 0), 2)
                 item["latest_zoho_stock"] = lz
                 item["latest_fba_stock"] = lf
                 item["latest_total_stock"] = round(lz + lf, 2)
-                item["prev_zoho_stock"] = round(prev_zoho_by_sku.get(sku, 0), 2)
+                item["prev_zoho_stock"] = max(0, round(prev_zoho_by_sku.get(sku, 0), 2))
                 item["prev_fba_stock"] = round(prev_fba_by_sku.get(sku, 0), 2)
                 _pdata = all_product_data.get(sku, {})
                 item["unit_price"] = _pdata.get("purchase_price", 0) or 0
@@ -2735,7 +2781,11 @@ async def _generate_master_report_data(
                 item["net_target_days"] = round(net_target_days, 2)
                 confidence_multiplier = item.get("confidence_multiplier", 1.0)
                 if item.get("order_qty_demand_override"):
-                    order_qty = item.get("current_period_sales_for_override", 0) * confidence_multiplier
+                    # Excess coverage → order nothing (matches Excel IF(EXCESS, 0, ...))
+                    if item.get("excess_or_order") == "EXCESS":
+                        order_qty = 0.0
+                    else:
+                        order_qty = item.get("current_period_sales_for_override", 0) * confidence_multiplier
                 else:
                     order_qty = max(0, net_target_days * drr) * confidence_multiplier
                 item["order_qty"] = round(order_qty, 2)
@@ -3426,12 +3476,10 @@ async def download_master_report(
                 _is_new_col          = _col("Is New")
 
                 drr_source_col_idx = cols_list.index("DRR Source") + 1  # 1-based
-                _v_col_idx = cols_list.index(f"Pupscribe WH Stock ({_latest_zoho_label})") + 1  # for neg-stock highlight
                 yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
                 orange_fill = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
                 red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
                 green_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
-                neg_stock_fill = PatternFill(start_color="FF4500", end_color="FF4500", fill_type="solid")
 
                 for row_idx in range(2, len(combined_df_data) + 2):  # Skip header row
                     r = row_idx
@@ -3576,13 +3624,6 @@ async def download_master_report(
                 # so it is redundant for display; formulas that referenced it now use Total Units Returned.
                 ws.column_dimensions[_credit_notes_col].hidden = True
 
-                # Highlight individual cells where Pupscribe WH Stock (latest) is negative.
-                # The row-level fill has already been applied above; we re-apply to just this cell
-                # so the negative value stands out regardless of row colour.
-                for neg_row in range(2, len(combined_df_data) + 2):
-                    cell_val = ws.cell(row=neg_row, column=_v_col_idx).value
-                    if cell_val is not None and isinstance(cell_val, (int, float)) and cell_val < 0:
-                        ws.cell(row=neg_row, column=_v_col_idx).fill = neg_stock_fill
 
                 # Hide Brand column for individual brand reports (redundant when filtered to one brand)
                 if brand:
