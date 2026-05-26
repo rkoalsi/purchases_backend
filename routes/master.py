@@ -1909,10 +1909,17 @@ class OptimizedMasterReportService:
             # Order Qty + Extra Qty
             item["order_qty_plus_extra_qty"] = round(order_qty + extra_qty, 2)
 
-            # Order Qty + Extra Qty rounded down to case pack
+            # Order Qty + Extra Qty rounded down to case pack.
+            # EXCESS → always 0 (no ordering even for extra/missed-sales qty).
+            # ORDER + rounded = 0 → bump to 1 case pack (minimum meaningful order).
             order_qty_plus_extra_qty = item["order_qty_plus_extra_qty"]
-            if case_pack > 0:
-                item["order_qty_plus_extra_qty_rounded"] = math.floor(order_qty_plus_extra_qty / case_pack) * case_pack
+            if item.get("excess_or_order") == "EXCESS":
+                item["order_qty_plus_extra_qty_rounded"] = 0
+            elif case_pack > 0:
+                rounded = math.floor(order_qty_plus_extra_qty / case_pack) * case_pack
+                if rounded == 0 and item.get("excess_or_order") == "ORDER":
+                    rounded = case_pack  # minimum 1 case pack
+                item["order_qty_plus_extra_qty_rounded"] = rounded
             else:
                 item["order_qty_plus_extra_qty_rounded"] = round(order_qty_plus_extra_qty, 0)
 
@@ -2793,8 +2800,13 @@ async def _generate_master_report_data(
 
                 case_pack = item.get("case_pack", 0)
                 order_qty_plus_extra_qty = item["order_qty_plus_extra_qty"]
-                if case_pack > 0:
-                    item["order_qty_plus_extra_qty_rounded"] = math.floor(order_qty_plus_extra_qty / case_pack) * case_pack
+                if item.get("excess_or_order") == "EXCESS":
+                    item["order_qty_plus_extra_qty_rounded"] = 0
+                elif case_pack > 0:
+                    rounded = math.floor(order_qty_plus_extra_qty / case_pack) * case_pack
+                    if rounded == 0 and item.get("excess_or_order") == "ORDER":
+                        rounded = case_pack  # minimum 1 case pack
+                    item["order_qty_plus_extra_qty_rounded"] = rounded
                 else:
                     item["order_qty_plus_extra_qty_rounded"] = round(order_qty_plus_extra_qty, 0)
 
@@ -3566,19 +3578,28 @@ async def download_master_report(
                         f'"NO MOVEMENT")'
                     )
 
-                    # Order Qty (0 for inactive/discontinued)
+                    # Order Qty (0 for inactive/discontinued, 0 for EXCESS)
                     # For demand-override rows (green), use Net Total Sales × confidence multiplier
                     # For all other rows: MAX(0, Net Target Days × DRR) × confidence multiplier
                     if (row_idx - 2) in demand_override_row_indices:
                         ws[f"{_AP}{r}"] = f'=IF({_AO}{r}="EXCESS",0,{_I}{r}*{_AX}{r})'
                     else:
-                        ws[f"{_AP}{r}"] = f"=IF({inactive},0,MAX(0,{_AN}{r}*{_N}{r})*{_AX}{r})"
+                        ws[f"{_AP}{r}"] = f'=IF({inactive},0,IF({_AO}{r}="EXCESS",0,MAX(0,{_AN}{r}*{_N}{r})*{_AX}{r}))'
 
-                    # Order Qty + Extra Qty (only Extra Qty for inactive/discontinued)
-                    ws[f"{_AQ}{r}"] = f"=IF({inactive},{_AM}{r},{_AP}{r}+{_AM}{r})"
+                    # Order Qty + Extra Qty (only Extra Qty for inactive/discontinued; 0 for EXCESS)
+                    ws[f"{_AQ}{r}"] = f'=IF({inactive},{_AM}{r},IF({_AO}{r}="EXCESS",0,{_AP}{r}+{_AM}{r}))'
 
-                    # Order Qty + Extra Qty (Rounded) — FLOOR to nearest case pack
-                    ws[f"{_AT}{r}"] = f"=IF({inactive},0,IF({_AS}{r}>0,FLOOR({_AQ}{r},{_AS}{r}),ROUND({_AQ}{r},0)))"
+                    # Order Qty + Extra Qty (Rounded):
+                    # • EXCESS → 0
+                    # • ORDER and FLOOR result = 0 → bump to 1 case pack (minimum meaningful order)
+                    # • Otherwise → FLOOR to nearest case pack
+                    ws[f"{_AT}{r}"] = (
+                        f'=IF({inactive},0,'
+                        f'IF({_AO}{r}="EXCESS",0,'
+                        f'IF({_AS}{r}>0,'
+                        f'IF(AND(FLOOR({_AQ}{r},{_AS}{r})=0,{_AO}{r}="ORDER"),{_AS}{r},FLOOR({_AQ}{r},{_AS}{r})),'
+                        f'ROUND({_AQ}{r},0))))'
+                    )
 
                     # Total CBM
                     ws[f"{_AU}{r}"] = f"=IF({inactive},0,IF({_AS}{r}>0,({_AT}{r}/{_AS}{r})*{_AR}{r},0))"
@@ -3623,6 +3644,11 @@ async def download_master_report(
                 # Hide Total Credit Notes column — values are identical to Total Units Returned,
                 # so it is redundant for display; formulas that referenced it now use Total Units Returned.
                 ws.column_dimensions[_credit_notes_col].hidden = True
+
+                # Hide previous-date stock snapshot columns (redundant — latest snapshots are shown)
+                ws.column_dimensions[_S].hidden = True   # Pupscribe WH Stock (prev)
+                ws.column_dimensions[_T].hidden = True   # FBA Stock (prev)
+                ws.column_dimensions[_R].hidden = True   # Total Stock (prev)
 
 
                 # Hide Brand column for individual brand reports (redundant when filtered to one brand)
