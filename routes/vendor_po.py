@@ -1928,26 +1928,45 @@ async def update_item_accepted_qty(
 async def update_item_received_qty(
     po_number: str, asin: str, received_qty: int, db=Depends(get_database)
 ):
-    """Update the received quantity for a specific item in a PO."""
+    """Update the received quantity for a specific item in a PO.
+    Only allowed when the PO status is 'delivered' or 'completed'.
+    Clears any PO-level received_qty override so the list total is derived from the item sum.
+    """
     if received_qty < 0:
         raise HTTPException(status_code=400, detail="received_qty must be >= 0")
 
-    def _update():
+    def _fetch_and_update():
+        doc = db[PO_COLLECTION].find_one(
+            {"po_number": po_number, "items.asin": asin},
+            {"po_status": 1},
+        )
+        if not doc:
+            return None, 0
+        status = doc.get("po_status", "pending")
+        if status not in ("delivered", "completed"):
+            return status, -1
         result = db[PO_COLLECTION].update_one(
             {"po_number": po_number, "items.asin": asin},
             {
                 "$set": {
                     "items.$.received_qty": received_qty,
                     "updated_at": datetime.now(),
-                }
+                },
+                # Clear the PO-level override so the list total sums from items
+                "$unset": {"received_qty": ""},
             },
         )
-        return result.matched_count
+        return status, result.matched_count
 
-    matched = await asyncio.to_thread(_update)
-    if not matched:
+    status, matched = await asyncio.to_thread(_fetch_and_update)
+    if matched is None or (status is None and matched == 0):
         raise HTTPException(
             status_code=404, detail=f"PO {po_number} / ASIN {asin} not found"
+        )
+    if matched == -1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Received qty can only be edited when PO status is 'delivered' or 'completed' (current: {status})",
         )
     return {"po_number": po_number, "asin": asin, "received_qty": received_qty}
 
