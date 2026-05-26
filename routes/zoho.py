@@ -1164,6 +1164,7 @@ def generate_brand_sales_report(
     request: BrandSalesReportRequest, db=Depends(get_database)
 ):
     try:
+        import calendar as _cal
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
         from openpyxl.utils import get_column_letter
@@ -1173,8 +1174,25 @@ def generate_brand_sales_report(
         end_date = datetime.strptime(request.end_date, "%Y-%m-%d")
         month_label = start_date.strftime("%B %Y")
 
-        # Fetch P&L charges from Zoho Books
-        pl = _fetch_pl_data_from_zoho(request.start_date, request.end_date)
+        # ── Auto-compute previous calendar month ─────────────────────────
+        if start_date.month == 1:
+            prev_month_num, prev_year = 12, start_date.year - 1
+        else:
+            prev_month_num, prev_year = start_date.month - 1, start_date.year
+
+        prev_start = start_date.replace(year=prev_year, month=prev_month_num)
+        last_day_prev = _cal.monthrange(prev_year, prev_month_num)[1]
+        prev_end = end_date.replace(
+            year=prev_year, month=prev_month_num,
+            day=min(end_date.day, last_day_prev)
+        )
+        prev_month_label = prev_start.strftime("%B %Y")
+        prev_start_str = prev_start.strftime("%Y-%m-%d")
+        prev_end_str = prev_end.strftime("%Y-%m-%d")
+
+        # Fetch P&L charges from Zoho Books for both months
+        pl_curr = _fetch_pl_data_from_zoho(request.start_date, request.end_date)
+        pl_prev = _fetch_pl_data_from_zoho(prev_start_str, prev_end_str)
 
         invoices_col = db.get_collection(INVOICES_COLLECTION)
         products_col = db.get_collection(PRODUCTS_COLLECTION)
@@ -1199,73 +1217,124 @@ def generate_brand_sales_report(
         def get_prod(item_name, item_sku):
             return sku_to_prod.get(item_sku) or name_to_prod.get(item_name) or {}
 
-        # Fetch all 3 line-item sets
-        all_items = _query_line_items_for_brand_report(
-            invoices_col, start_date, end_date, "all"
-        )
-        transfer_items = _query_line_items_for_brand_report(
-            invoices_col, start_date, end_date, "transfer_order"
-        )
-        customer_items = _query_line_items_for_brand_report(
-            invoices_col, start_date, end_date, "customer_only"
-        )
+        def _aggregate_month(s: datetime, e: datetime):
+            """Return (all_by_brand, transfer_by_brand, customer_by_brand, bwc, bwsc)."""
+            _all = _query_line_items_for_brand_report(invoices_col, s, e, "all")
+            _tr  = _query_line_items_for_brand_report(invoices_col, s, e, "transfer_order")
+            _cu  = _query_line_items_for_brand_report(invoices_col, s, e, "customer_only")
 
-        # Aggregate BWS: brand totals
-        all_by_brand = defaultdict(float)
-        for item in all_items:
-            brand = get_prod(item["item_name"], item["item_sku"]).get("brand", "Unknown")
-            all_by_brand[brand] += item.get("item_total") or 0
+            by_all = defaultdict(float)
+            by_tr  = defaultdict(float)
+            by_cu  = defaultdict(float)
+            _bwc   = defaultdict(lambda: defaultdict(float))
+            _bwsc  = defaultdict(lambda: defaultdict(float))
 
-        transfer_by_brand = defaultdict(float)
-        for item in transfer_items:
-            brand = get_prod(item["item_name"], item["item_sku"]).get("brand", "Unknown")
-            transfer_by_brand[brand] += item.get("item_total") or 0
+            for item in _all:
+                by_all[get_prod(item["item_name"], item["item_sku"]).get("brand", "Unknown")] += item.get("item_total") or 0
+            for item in _tr:
+                by_tr[get_prod(item["item_name"], item["item_sku"]).get("brand", "Unknown")] += item.get("item_total") or 0
+            for item in _cu:
+                prod    = get_prod(item["item_name"], item["item_sku"])
+                brand   = prod.get("brand", "Unknown")
+                cat     = prod.get("category") or "Uncategorized"
+                sub_cat = prod.get("sub_category") or "Uncategorized"
+                amt     = item.get("item_total") or 0
+                by_cu[brand]           += amt
+                _bwc[brand][cat]       += amt
+                _bwsc[brand][sub_cat]  += amt
 
-        # customer_by_brand: pure sales (matches BWC/BWSC exactly — excludes transfer + excluded customers)
-        customer_by_brand = defaultdict(float)
+            return by_all, by_tr, by_cu, _bwc, _bwsc
 
-        # Aggregate BWC/BWSC: customer-only sales by brand + category/sub_category
-        bwc: dict = defaultdict(lambda: defaultdict(float))
-        bwsc: dict = defaultdict(lambda: defaultdict(float))
-        for item in customer_items:
-            prod = get_prod(item["item_name"], item["item_sku"])
-            brand = prod.get("brand", "Unknown")
-            category = prod.get("category") or "Uncategorized"
-            sub_cat = prod.get("sub_category") or "Uncategorized"
-            amt = item.get("item_total") or 0
-            customer_by_brand[brand] += amt
-            bwc[brand][category] += amt
-            bwsc[brand][sub_cat] += amt
+        # Aggregate current and previous months
+        curr_all, curr_tr, curr_cu, curr_bwc, curr_bwsc = _aggregate_month(start_date, end_date)
+        prev_all, prev_tr, prev_cu, prev_bwc, prev_bwsc = _aggregate_month(prev_start, prev_end)
 
+        # Union of all brands across both months
         all_brands = sorted(
-            set(all_by_brand) | set(transfer_by_brand) | set(bwc) | set(bwsc)
+            set(curr_all) | set(curr_tr) | set(curr_bwc) | set(curr_bwsc) |
+            set(prev_all) | set(prev_tr) | set(prev_bwc) | set(prev_bwsc)
         )
 
         # ── Styles ──────────────────────────────────────────────────────────
-        header_fill = PatternFill("solid", fgColor="4472C4")
-        header_font = Font(bold=True, color="FFFFFF")
-        total_fill = PatternFill("solid", fgColor="D9E1F2")
-        total_font = Font(bold=True)
-        title_font = Font(bold=True, size=12)
-        thin = Side(style="thin")
-        thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        curr_header_fill = PatternFill("solid", fgColor="4472C4")   # blue  – current month
+        prev_header_fill = PatternFill("solid", fgColor="70AD47")   # green – previous month
+        header_font  = Font(bold=True, color="FFFFFF")
+        total_fill   = PatternFill("solid", fgColor="D9E1F2")
+        total_font   = Font(bold=True)
+        title_font   = Font(bold=True, size=12)
+        green_fill   = PatternFill("solid", fgColor="C6EFCE")
+        red_fill     = PatternFill("solid", fgColor="FFC7CE")
+        thin         = Side(style="thin")
+        thin_border  = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-        def style_header(cell):
-            cell.font = header_font
-            cell.fill = header_fill
+        def style_header(cell, fill=None):
+            cell.font      = header_font
+            cell.fill      = fill or curr_header_fill
             cell.alignment = Alignment(horizontal="center")
-            cell.border = thin_border
+            cell.border    = thin_border
 
         def style_total(cell):
-            cell.font = total_font
-            cell.fill = total_fill
+            cell.font   = total_font
+            cell.fill   = total_fill
             cell.border = thin_border
 
-        def fmt_num(ws, cell_ref, value):
-            ws[cell_ref] = round(value, 2) if value else 0
-            ws[cell_ref].number_format = "#,##0.00"
-
         wb = Workbook()
+
+        # ════════════════════════════════════════════════════════════════════
+        # Helper: write one BWS block starting at `row_offset`.
+        # Returns the row number of the first blank row after the block.
+        # ════════════════════════════════════════════════════════════════════
+        def _write_bws_block(ws, row_offset: int, by_all, by_tr, by_cu, pl, label: str, hdr_fill):
+            # Title
+            ws.cell(row=row_offset, column=1,
+                    value=f"{label} (Sales Data With Transfer Order and without Transfer order)").font = title_font
+            ws.merge_cells(f"A{row_offset}:D{row_offset}")
+
+            # Headers (row_offset + 2)
+            hrow = row_offset + 2
+            for col, h in enumerate(["Row Labels", "Sum of Amount", "Transfer Order Value", "Pure Sales"], 1):
+                style_header(ws.cell(row=hrow, column=col, value=h), hdr_fill)
+
+            data_start = hrow + 1
+            for r, brand in enumerate(all_brands, data_start):
+                ws.cell(row=r, column=1, value=brand).border = thin_border
+                total_val    = by_all.get(brand, 0)
+                transfer_val = by_tr.get(brand, 0)
+                pure_val     = by_cu.get(brand, 0)
+                ws.cell(row=r, column=2, value=round(total_val, 2)).number_format = "#,##0.00"
+                ws.cell(row=r, column=2).border = thin_border
+                if transfer_val:
+                    ws.cell(row=r, column=3, value=round(transfer_val, 2)).number_format = "#,##0.00"
+                ws.cell(row=r, column=3).border = thin_border
+                ws.cell(row=r, column=4, value=round(pure_val, 2)).number_format = "#,##0.00"
+                ws.cell(row=r, column=4).border = thin_border
+
+            grand_row = data_start + len(all_brands)
+            ws.cell(row=grand_row, column=1, value="Grand Total")
+            style_total(ws.cell(row=grand_row, column=1))
+            for col, letter in [(2, "B"), (3, "C"), (4, "D")]:
+                cell = ws.cell(row=grand_row, column=col,
+                               value=f"=SUM({letter}{data_start}:{letter}{grand_row - 1})")
+                cell.number_format = "#,##0.00"
+                style_total(cell)
+
+            charges = [
+                ("Other Charges (Sales)",   pl["other_charges"]),
+                ("Shipping Charges (Sales)", pl["shipping_charges"]),
+                ("Post Supply Discount",     pl["post_supply_discount"]),
+            ]
+            for i, (lbl, val) in enumerate(charges):
+                r = grand_row + 1 + i
+                ws.cell(row=r, column=1, value=lbl)
+                ws.cell(row=r, column=2, value=round(val, 2)).number_format = "#,##0.00"
+
+            pl_row = grand_row + 1 + len(charges)
+            ws.cell(row=pl_row, column=1, value="Total Sales as per P & l account").font = total_font
+            charge_sum = "+".join(f"B{grand_row + 1 + i}" for i in range(len(charges)))
+            ws.cell(row=pl_row, column=2,
+                    value=f"=B{grand_row}+{charge_sum}").number_format = "#,##0.00"
+
+            return pl_row + 3   # first blank row after this block
 
         # ════════════════════════════════════════════════════════════════════
         # SHEET 1: BWS
@@ -1273,88 +1342,32 @@ def generate_brand_sales_report(
         ws1 = wb.active
         ws1.title = f"(BWS) {month_label}"
 
-        ws1["A1"] = f"{month_label} (Sales Data With Transfer Order and without Transfer order)"
-        ws1["A1"].font = title_font
-        ws1.merge_cells("A1:D1")
+        next_row = _write_bws_block(ws1, 1, curr_all, curr_tr, curr_cu, pl_curr, month_label, curr_header_fill)
+        _write_bws_block(ws1, next_row, prev_all, prev_tr, prev_cu, pl_prev, prev_month_label, prev_header_fill)
 
-        headers = ["Row Labels", "Sum of Amount", "Transfer Order Value", "Pure Sales"]
-        for col, h in enumerate(headers, 1):
-            cell = ws1.cell(row=3, column=col, value=h)
-            style_header(cell)
-
-        data_start = 4
-        for r, brand in enumerate(all_brands, data_start):
-            ws1.cell(row=r, column=1, value=brand).border = thin_border
-            total_val = all_by_brand.get(brand, 0)
-            transfer_val = transfer_by_brand.get(brand, 0)
-            ws1.cell(row=r, column=2, value=round(total_val, 2)).number_format = "#,##0.00"
-            ws1.cell(row=r, column=2).border = thin_border
-            if transfer_val:
-                ws1.cell(row=r, column=3, value=round(transfer_val, 2)).number_format = "#,##0.00"
-            ws1.cell(row=r, column=3).border = thin_border
-            pure_val = customer_by_brand.get(brand, 0)
-            ws1.cell(row=r, column=4, value=round(pure_val, 2)).number_format = "#,##0.00"
-            ws1.cell(row=r, column=4).border = thin_border
-
-        grand_row = data_start + len(all_brands)
-        ws1.cell(row=grand_row, column=1, value="Grand Total")
-        style_total(ws1.cell(row=grand_row, column=1))
-        for col, letter in [(2, "B"), (3, "C"), (4, "D")]:
-            formula = f"=SUM({letter}{data_start}:{letter}{grand_row - 1})"
-            cell = ws1.cell(row=grand_row, column=col, value=formula)
-            cell.number_format = "#,##0.00"
-            style_total(cell)
-
-        # Below grand total: P&L charges (fetched from Zoho Books)
-        charges = [
-            ("Other Charges (Sales)", pl["other_charges"]),
-            ("Shipping Charges (Sales)", pl["shipping_charges"]),
-            ("Post Supply Discount", pl["post_supply_discount"]),
-        ]
-        for i, (label, val) in enumerate(charges):
-            r = grand_row + 1 + i
-            ws1.cell(row=r, column=1, value=label)
-            ws1.cell(row=r, column=2, value=round(val, 2)).number_format = "#,##0.00"
-
-        pl_row = grand_row + 1 + len(charges)
-        ws1.cell(row=pl_row, column=1, value="Total Sales as per P & l account").font = total_font
-        charge_rows = "+".join(
-            f"B{grand_row + 1 + i}" for i in range(len(charges))
-        )
-        ws1.cell(
-            row=pl_row, column=2,
-            value=f"=B{grand_row}+{charge_rows}"
-        ).number_format = "#,##0.00"
-
-        # Column widths
         ws1.column_dimensions["A"].width = 35
         for col in ["B", "C", "D"]:
             ws1.column_dimensions[col].width = 20
 
         # ════════════════════════════════════════════════════════════════════
-        # Helper: build pivot sheet (BWC or BWSC)
+        # Helper: build one pivot block (BWC or BWSC) starting at `row_offset`.
+        # Returns the row number of the first blank row after the block.
         # ════════════════════════════════════════════════════════════════════
-        def build_pivot_sheet(ws, pivot_data: dict, col_label: str, sheet_title: str):
-            all_cols = sorted(
-                {col for brand_dict in pivot_data.values() for col in brand_dict}
-            )
-            brands_in_pivot = [b for b in all_brands if b in pivot_data]
+        def _write_pivot_block(ws, row_offset: int, pivot_data: dict, all_cols: list,
+                               sheet_title: str, hdr_fill, brands_in_pivot: list):
+            n_data_cols = len(all_cols)
+            gt_col      = n_data_cols + 2   # col index of "Grand Total"
 
-            ws["A1"] = sheet_title
-            ws["A1"].font = title_font
-            ws.merge_cells(f"A1:{get_column_letter(len(all_cols) + 2)}1")
+            ws.cell(row=row_offset, column=1, value=sheet_title).font = title_font
+            ws.merge_cells(f"A{row_offset}:{get_column_letter(gt_col)}{row_offset}")
 
-            # Header row
-            ws.cell(row=3, column=1, value="Row Labels")
-            style_header(ws.cell(row=3, column=1))
+            hrow = row_offset + 2
+            style_header(ws.cell(row=hrow, column=1, value="Row Labels"), hdr_fill)
             for ci, col_name in enumerate(all_cols, 2):
-                cell = ws.cell(row=3, column=ci, value=col_name)
-                style_header(cell)
-            gt_col = len(all_cols) + 2
-            cell = ws.cell(row=3, column=gt_col, value="Grand Total")
-            style_header(cell)
+                style_header(ws.cell(row=hrow, column=ci, value=col_name), hdr_fill)
+            style_header(ws.cell(row=hrow, column=gt_col, value="Grand Total"), hdr_fill)
 
-            data_start = 4
+            data_start = hrow + 1
             for ri, brand in enumerate(brands_in_pivot, data_start):
                 ws.cell(row=ri, column=1, value=brand).border = thin_border
                 for ci, col_name in enumerate(all_cols, 2):
@@ -1362,12 +1375,9 @@ def generate_brand_sales_report(
                     c = ws.cell(row=ri, column=ci, value=round(val, 2) if val else None)
                     c.number_format = "#,##0.00"
                     c.border = thin_border
-                # Grand Total formula for this row
-                first = get_column_letter(2)
-                last = get_column_letter(len(all_cols) + 1)
                 gt_cell = ws.cell(
                     row=ri, column=gt_col,
-                    value=f"=SUM({first}{ri}:{last}{ri})"
+                    value=f"=SUM({get_column_letter(2)}{ri}:{get_column_letter(n_data_cols + 1)}{ri})"
                 )
                 gt_cell.number_format = "#,##0.00"
                 gt_cell.border = thin_border
@@ -1377,13 +1387,137 @@ def generate_brand_sales_report(
             style_total(ws.cell(row=grand_row, column=1))
             for ci in range(2, gt_col + 1):
                 letter = get_column_letter(ci)
-                formula = f"=SUM({letter}{data_start}:{letter}{grand_row - 1})"
-                cell = ws.cell(row=grand_row, column=ci, value=formula)
+                cell = ws.cell(row=grand_row, column=ci,
+                               value=f"=SUM({letter}{data_start}:{letter}{grand_row - 1})")
                 cell.number_format = "#,##0.00"
                 style_total(cell)
 
+            return grand_row + 3    # first blank row after this block
+
+        cmp_header_fill = PatternFill("solid", fgColor="7030A0")   # purple – comparison block
+
+        def _write_pivot_comparison_block(ws, row_offset: int, curr_pivot: dict, prev_pivot: dict,
+                                          all_cols: list, comp_title: str, brands_list: list):
+            """
+            Writes two stacked comparison sub-blocks (Growth ₹ then Growth %) for a
+            brand × category pivot.  Returns the first blank row after the block.
+            """
+            n_data_cols = len(all_cols)
+            gt_col      = n_data_cols + 2
+
+            def _pct(curr_val, prev_val):
+                if prev_val:
+                    return (curr_val - prev_val) / prev_val   # as fraction for "0.00%" format
+                return None
+
+            def _write_sub_block(ws, r0: int, title: str, mode: str):
+                """mode = 'abs' (₹) or 'pct' (%)"""
+                ws.cell(row=r0, column=1, value=title).font = title_font
+                ws.merge_cells(f"A{r0}:{get_column_letter(gt_col)}{r0}")
+
+                hrow = r0 + 2
+                style_header(ws.cell(row=hrow, column=1, value="Row Labels"), cmp_header_fill)
+                for ci, col_name in enumerate(all_cols, 2):
+                    style_header(ws.cell(row=hrow, column=ci, value=col_name), cmp_header_fill)
+                style_header(ws.cell(row=hrow, column=gt_col, value="Grand Total"), cmp_header_fill)
+
+                data_start = hrow + 1
+                for ri, brand in enumerate(brands_list, data_start):
+                    ws.cell(row=ri, column=1, value=brand).border = thin_border
+                    row_curr_total = 0.0
+                    row_prev_total = 0.0
+                    for ci, col_name in enumerate(all_cols, 2):
+                        cv = curr_pivot.get(brand, {}).get(col_name, 0) or 0
+                        pv = prev_pivot.get(brand, {}).get(col_name, 0) or 0
+                        row_curr_total += cv
+                        row_prev_total += pv
+                        if mode == "abs":
+                            diff = round(cv - pv, 2)
+                            c = ws.cell(row=ri, column=ci, value=diff if (cv or pv) else None)
+                            c.number_format = "#,##0.00"
+                        else:
+                            pct = _pct(cv, pv)
+                            if pct is not None:
+                                c = ws.cell(row=ri, column=ci, value=pct)
+                                c.number_format = "0.00%"
+                            else:
+                                c = ws.cell(row=ri, column=ci,
+                                            value="NEW" if cv else (None if not pv else None))
+                                c.alignment = Alignment(horizontal="center")
+                        c.border = thin_border
+                        if mode == "abs":
+                            val_for_color = cv - pv
+                        else:
+                            val_for_color = (cv - pv) if pv else (cv if cv else 0)
+                        if val_for_color > 0:
+                            c.fill = green_fill
+                        elif val_for_color < 0:
+                            c.fill = red_fill
+
+                    # Grand Total cell for this row
+                    if mode == "abs":
+                        gt_diff = round(row_curr_total - row_prev_total, 2)
+                        gt_c = ws.cell(row=ri, column=gt_col, value=gt_diff if (row_curr_total or row_prev_total) else None)
+                        gt_c.number_format = "#,##0.00"
+                    else:
+                        gt_pct = _pct(row_curr_total, row_prev_total)
+                        if gt_pct is not None:
+                            gt_c = ws.cell(row=ri, column=gt_col, value=gt_pct)
+                            gt_c.number_format = "0.00%"
+                        else:
+                            gt_c = ws.cell(row=ri, column=gt_col,
+                                           value="NEW" if row_curr_total else None)
+                            gt_c.alignment = Alignment(horizontal="center")
+                    gt_c.border = thin_border
+                    if mode == "abs":
+                        gt_val_color = row_curr_total - row_prev_total
+                    else:
+                        gt_val_color = (row_curr_total - row_prev_total) if row_prev_total else (row_curr_total if row_curr_total else 0)
+                    if gt_val_color > 0:
+                        gt_c.fill = green_fill
+                    elif gt_val_color < 0:
+                        gt_c.fill = red_fill
+
+                # Grand Total column totals row
+                grand_row = data_start + len(brands_list)
+                ws.cell(row=grand_row, column=1, value="Grand Total")
+                style_total(ws.cell(row=grand_row, column=1))
+                for ci in range(2, gt_col + 1):
+                    letter = get_column_letter(ci)
+                    if mode == "abs":
+                        cell = ws.cell(row=grand_row, column=ci,
+                                       value=f"=SUM({letter}{data_start}:{letter}{grand_row - 1})")
+                        cell.number_format = "#,##0.00"
+                    else:
+                        # For %, grand total = average of non-N/A rows would be misleading;
+                        # recalculate from raw totals stored as SUM of curr / SUM of prev
+                        # We don't have those here, so just leave it empty for the column footer
+                        cell = ws.cell(row=grand_row, column=ci, value=None)
+                    style_total(cell)
+
+                return grand_row + 3   # first blank row after sub-block
+
+            # Sub-block 1: Growth ₹
+            next_r = _write_sub_block(ws, row_offset, f"{comp_title} — Growth (₹)", "abs")
+            # Sub-block 2: Growth %
+            next_r = _write_sub_block(ws, next_r, f"{comp_title} — Growth (%)", "pct")
+            return next_r
+
+        def build_pivot_sheet(ws, curr_pivot: dict, prev_pivot: dict, curr_title: str, prev_title: str, comp_title: str):
+            # Union of categories/sub-cats across both months (consistent columns in all blocks)
+            all_cols = sorted(
+                {col for d in curr_pivot.values() for col in d} |
+                {col for d in prev_pivot.values() for col in d}
+            )
+            brands_list = [b for b in all_brands if b in curr_pivot or b in prev_pivot]
+
+            next_r = _write_pivot_block(ws, 1, curr_pivot, all_cols, curr_title, curr_header_fill, brands_list)
+            next_r = _write_pivot_block(ws, next_r, prev_pivot, all_cols, prev_title, prev_header_fill, brands_list)
+            _write_pivot_comparison_block(ws, next_r, curr_pivot, prev_pivot, all_cols, comp_title, brands_list)
+
             ws.column_dimensions["A"].width = 30
-            for ci in range(2, gt_col + 1):
+            n_cols = len(all_cols) + 2
+            for ci in range(2, n_cols + 1):
                 ws.column_dimensions[get_column_letter(ci)].width = 18
 
         # ════════════════════════════════════════════════════════════════════
@@ -1391,9 +1525,10 @@ def generate_brand_sales_report(
         # ════════════════════════════════════════════════════════════════════
         ws2 = wb.create_sheet(title=f"(BWC) {month_label}")
         build_pivot_sheet(
-            ws2, bwc,
-            col_label="item.CF.Category",
-            sheet_title=f"item.CF.Category ({month_label})"
+            ws2, curr_bwc, prev_bwc,
+            curr_title=f"item.CF.Category ({month_label})",
+            prev_title=f"item.CF.Category ({prev_month_label})",
+            comp_title=f"item.CF.Category ({prev_month_label} → {month_label})",
         )
 
         # ════════════════════════════════════════════════════════════════════
@@ -1401,11 +1536,99 @@ def generate_brand_sales_report(
         # ════════════════════════════════════════════════════════════════════
         ws3 = wb.create_sheet(title=f"(BWSC) {month_label}")
         build_pivot_sheet(
-            ws3, bwsc,
-            col_label="item.CF.Sub Category",
-            sheet_title=f"item.CF.Sub Category ({month_label})"
+            ws3, curr_bwsc, prev_bwsc,
+            curr_title=f"item.CF.Sub Category ({month_label})",
+            prev_title=f"item.CF.Sub Category ({prev_month_label})",
+            comp_title=f"item.CF.Sub Category ({prev_month_label} → {month_label})",
         )
 
+        # ════════════════════════════════════════════════════════════════════
+        # SHEET 4: Summary — month-over-month growth by brand
+        # ════════════════════════════════════════════════════════════════════
+        ws4 = wb.create_sheet(title="Summary")
+
+        ws4.cell(row=1, column=1,
+                 value=f"Brand Sales Summary — {prev_month_label} vs {month_label}").font = Font(bold=True, size=13)
+        ws4.merge_cells("A1:E1")
+
+        sum_headers = [
+            "Brand",
+            f"{prev_month_label}\nPure Sales (₹)",
+            f"{month_label}\nPure Sales (₹)",
+            "Growth (₹)",
+            "Growth (%)",
+        ]
+        for ci, h in enumerate(sum_headers, 1):
+            cell = ws4.cell(row=3, column=ci, value=h)
+            style_header(cell, curr_header_fill)
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        ws4.row_dimensions[3].height = 30
+
+        data_start = 4
+        for ri, brand in enumerate(all_brands, data_start):
+            prev_val = round(prev_cu.get(brand, 0), 2)
+            curr_val = round(curr_cu.get(brand, 0), 2)
+            growth_abs = round(curr_val - prev_val, 2)
+            if prev_val:
+                growth_pct = round((curr_val - prev_val) / prev_val * 100, 2)
+            else:
+                growth_pct = None   # N/A when no prior-month sales
+
+            ws4.cell(row=ri, column=1, value=brand).border = thin_border
+
+            c2 = ws4.cell(row=ri, column=2, value=prev_val)
+            c2.number_format = "#,##0.00"
+            c2.border = thin_border
+
+            c3 = ws4.cell(row=ri, column=3, value=curr_val)
+            c3.number_format = "#,##0.00"
+            c3.border = thin_border
+
+            c4 = ws4.cell(row=ri, column=4, value=growth_abs)
+            c4.number_format = "#,##0.00"
+            c4.border = thin_border
+            if growth_abs > 0:
+                c4.fill = green_fill
+            elif growth_abs < 0:
+                c4.fill = red_fill
+
+            if growth_pct is not None:
+                c5 = ws4.cell(row=ri, column=5, value=growth_pct / 100)
+                c5.number_format = "0.00%"
+                c5.border = thin_border
+                if growth_pct > 0:
+                    c5.fill = green_fill
+                elif growth_pct < 0:
+                    c5.fill = red_fill
+            else:
+                c5 = ws4.cell(row=ri, column=5, value="N/A")
+                c5.border = thin_border
+                c5.alignment = Alignment(horizontal="center")
+
+        # Grand Total row
+        grand_row = data_start + len(all_brands)
+        ws4.cell(row=grand_row, column=1, value="Grand Total")
+        style_total(ws4.cell(row=grand_row, column=1))
+
+        for col, letter in [(2, "B"), (3, "C"), (4, "D")]:
+            cell = ws4.cell(row=grand_row, column=col,
+                            value=f"=SUM({letter}{data_start}:{letter}{grand_row - 1})")
+            cell.number_format = "#,##0.00"
+            style_total(cell)
+
+        # Grand total growth %: (C_total - B_total) / B_total
+        pct_cell = ws4.cell(
+            row=grand_row, column=5,
+            value=f"=IF(B{grand_row}<>0,(C{grand_row}-B{grand_row})/B{grand_row},\"N/A\")"
+        )
+        pct_cell.number_format = "0.00%"
+        style_total(pct_cell)
+
+        ws4.column_dimensions["A"].width = 32
+        for col in ["B", "C", "D", "E"]:
+            ws4.column_dimensions[col].width = 22
+
+        # ── Stream response ─────────────────────────────────────────────────
         buf = io.BytesIO()
         wb.save(buf)
         buf.seek(0)
