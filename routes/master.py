@@ -3329,7 +3329,247 @@ async def download_master_report(
         _DEFAULT_NUMBER_FMT = "#,##0.00"
 
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            # Master Sheet
+            # ── Instructions Sheet (first sheet) ─────────────────────────────────
+            from openpyxl import Workbook as _OWB
+            from openpyxl.styles import (
+                Font as _IFont,
+                PatternFill as _IPF,
+                Alignment as _IAlign,
+                Border as _IBorder,
+                Side as _ISide,
+            )
+            from openpyxl.utils import get_column_letter as _gcl
+
+            _instr_ws = writer.book.create_sheet("Instructions", 0)
+
+            # ── colour palette ────────────────────────────────────────────────────
+            _hdr_fill   = _IPF(start_color="1F4E79", end_color="1F4E79", fill_type="solid")   # dark blue
+            _sec_fill   = _IPF(start_color="2E75B6", end_color="2E75B6", fill_type="solid")   # mid blue
+            _alt_fill   = _IPF(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")   # light blue
+            _grn_fill   = _IPF(start_color="90EE90", end_color="90EE90", fill_type="solid")
+            _yel_fill   = _IPF(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+            _org_fill   = _IPF(start_color="FFA500", end_color="FFA500", fill_type="solid")
+            _red_fill   = _IPF(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
+            _wht_fill   = _IPF(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+
+            _thin  = _ISide(style="thin",   color="AAAAAA")
+            _thick = _ISide(style="medium", color="1F4E79")
+            _border_all = _IBorder(left=_thin, right=_thin, top=_thin, bottom=_thin)
+
+            def _iw(row, col, value, bold=False, italic=False, size=11,
+                    color="000000", fill=None, wrap=True, align="left", border=True):
+                cell = _instr_ws.cell(row=row, column=col, value=value)
+                cell.font = _IFont(bold=bold, italic=italic, size=size, color=color)
+                cell.alignment = _IAlign(wrap_text=wrap, vertical="top", horizontal=align)
+                if fill:
+                    cell.fill = fill
+                if border:
+                    cell.border = _border_all
+                return cell
+
+            # ── column widths ─────────────────────────────────────────────────────
+            _instr_ws.column_dimensions["A"].width = 28
+            _instr_ws.column_dimensions["B"].width = 70
+            _instr_ws.column_dimensions["C"].width = 18
+
+            # ── merge A1:C1 for the main title ────────────────────────────────────
+            _instr_ws.merge_cells("A1:C1")
+            _iw(1, 1, "📦  Pupscribe Master Purchase Report — How to Read This File",
+                bold=True, size=14, color="FFFFFF", fill=_hdr_fill, align="center", border=False)
+            _instr_ws.row_dimensions[1].height = 30
+
+            # ── Section 1: Overview ───────────────────────────────────────────────
+            _instr_ws.merge_cells("A2:C2")
+            _iw(2, 1, "OVERVIEW", bold=True, size=11, color="FFFFFF", fill=_sec_fill, align="center")
+
+            _overview_rows = [
+                ("What this report does",
+                 "Shows sales, stock, and recommended order quantities for every active SKU "
+                 "across Zoho (Pupscribe WH), Amazon FBA, and Blinkit for the selected date range. "
+                 "Each row is one SKU. The rightmost columns contain the system-calculated Order Qty."),
+                ("Date range",
+                 f"Report period: {start_date} → {end_date}  ({_period_days} days)"),
+                ("Sheets in this file",
+                 "Instructions (this sheet) · Master data sheet (named after the date range) · "
+                 "Draft Order sheet (when a Brand filter is active)"),
+            ]
+            for _ri, (_lbl, _desc) in enumerate(_overview_rows, start=3):
+                _fill = _alt_fill if _ri % 2 == 1 else _wht_fill
+                _iw(_ri, 1, _lbl, bold=True, fill=_fill)
+                _iw(_ri, 2, _desc, fill=_fill)
+                _instr_ws.merge_cells(f"B{_ri}:C{_ri}")
+                _instr_ws.row_dimensions[_ri].height = 40
+
+            _next_row = 3 + len(_overview_rows)
+
+            # ── Section 2: Row colour legend ──────────────────────────────────────
+            _instr_ws.merge_cells(f"A{_next_row}:C{_next_row}")
+            _iw(_next_row, 1, "ROW COLOUR LEGEND", bold=True, size=11,
+                color="FFFFFF", fill=_sec_fill, align="center")
+            _next_row += 1
+
+            _colour_rows = [
+                (_wht_fill, "000000", "White",  "current_period",
+                 "DRR is calculated from current-period sales (normal). "
+                 "Item was in Pupscribe WH ≥ 60 days."),
+                (_yel_fill, "000000", "Yellow", "previous_period (≤ 180 days ago)",
+                 "Item was in stock < 60 days this period. DRR is taken from a recent lookback "
+                 "window (within the last 180 days). Use with moderate confidence."),
+                (_org_fill, "000000", "Orange", "previous_period (> 180 days ago)",
+                 "Lookback window is older than 180 days. DRR may not reflect current demand. "
+                 "Review manually before ordering."),
+                (_grn_fill, "000000", "Green",  "demand_override",
+                 "Current-period sales exceed the lookback DRR, so the Order Qty is set to "
+                 "current-period Net Sales rather than DRR × Target Days. Demand is accelerating."),
+                (_red_fill, "000000", "Red",    "insufficient_stock",
+                 "Insufficient stock history to compute a reliable DRR. "
+                 "A confidence dampening multiplier is applied to the Order Qty (see DRR Flag column)."),
+            ]
+            for _cr in _colour_rows:
+                _cfill, _cfont, _cname, _csrc, _cdesc = _cr
+                _iw(_next_row, 1, _cname, bold=True, fill=_cfill, color=_cfont)
+                _iw(_next_row, 2, f"DRR Source: {_csrc}", fill=_cfill, color=_cfont, italic=True)
+                _iw(_next_row, 3, "", fill=_cfill, border=True)
+                _instr_ws.merge_cells(f"B{_next_row}:C{_next_row}")
+                _next_row += 1
+                _iw(_next_row, 1, "", fill=_cfill, border=True)
+                _instr_ws.cell(row=_next_row, column=1).fill = _cfill
+                _iw(_next_row, 2, _cdesc, fill=_wht_fill, wrap=True)
+                _instr_ws.merge_cells(f"B{_next_row}:C{_next_row}")
+                _instr_ws.row_dimensions[_next_row].height = 45
+                _next_row += 1
+
+            # ── Section 3: Key column guide ───────────────────────────────────────
+            _instr_ws.merge_cells(f"A{_next_row}:C{_next_row}")
+            _iw(_next_row, 1, "KEY COLUMN GUIDE", bold=True, size=11,
+                color="FFFFFF", fill=_sec_fill, align="center")
+            _next_row += 1
+
+            _col_guide = [
+                ("Purchase Status",        "active / inactive / discontinued until stock lasts. "
+                                           "Inactive/discontinued rows get Order Qty = 0 (except Missed Sales extra qty)."),
+                ("Is New",                 "Yes = item launched within this report period. "
+                                           "New items with zero sales show 'NO MOVEMENT'."),
+                ("Avg Daily Run Rate",     "Units sold per day. "
+                                           "White/Green/Red rows: Net Total Sales ÷ Days in Stock. "
+                                           "Yellow/Orange rows: Net Lookback Sales ÷ Lookback Days in Stock."),
+                ("Net Total Sales",        "Total Units Sold − Total Units Returned − Transfer Orders. "
+                                           "This is the demand figure used for White/Red DRR."),
+                ("Net Lookback Sales",     "MAX(0, Lookback Sales − Lookback Returns). "
+                                           "Used as the numerator for DRR on Yellow/Orange rows."),
+                ("DRR Source",             "current_period · previous_period · insufficient_stock. "
+                                           "Drives both the row colour and the DRR formula used."),
+                ("DRR Lookback Period",    "Date range of the lookback window used for Yellow/Orange rows."),
+                ("Days in Stock (PW)",     "Number of days the item was physically in stock at Pupscribe WH "
+                                           "during this report period. Used as the DRR denominator for White rows."),
+                ("Lookback Days in Stock", "Days in stock during the lookback period. DRR denominator for Yellow/Orange rows."),
+                ("On-Hand Days Coverage",  "Latest Total Stock ÷ DRR. How many days the current physical stock will last."),
+                ("Current Days Coverage",  "(Latest Total Stock + Total Stock in Transit) ÷ DRR."),
+                ("Target Days",            "Lead Time + Safety Days + Order Processing (days). "
+                                           "The coverage target the order is sized to achieve."),
+                ("Net Target Days",        "IF(Current Coverage < Lead Time, Target Days, Target Days − Current Coverage). "
+                                           "The shortfall in days that needs to be replenished."),
+                ("Missed Sales",           "Units estimated as lost due to stockouts during this period."),
+                ("Missed Sales DRR",       "MIN(Missed Sales ÷ Period Days, 0.5 × DRR). "
+                                           "Caps missed-sales uplift at 50 % of DRR to prevent over-ordering."),
+                ("Extra Qty",              "Missed Sales DRR × Lead Time. Added on top of Order Qty."),
+                ("Excess / Order",         "ORDER = stock below target; EXCESS = already covered; NO MOVEMENT = DRR is 0."),
+                ("Order Qty",              "For EXCESS rows: 0. For ORDER rows: MAX(0, Net Target Days × DRR) × Confidence Multiplier. "
+                                           "Green rows use Net Total Sales × Confidence Multiplier."),
+                ("Confidence Multiplier",  "1.0 for normal rows. Reduced (0 %, 50 %, 75 %) for Red rows based on "
+                                           "how little stock history is available (see DRR Flag)."),
+                ("DRR Flag",               "Empty for normal rows. Shows dampening label and/or seasonal mismatch warning "
+                                           "for Red/uncertain rows."),
+                ("Order Qty + Extra Qty (Rounded)", "Final recommended order quantity, floored to the nearest Case Pack. "
+                                           "If the floor would round to 0 and status is ORDER, bumped to 1 case pack."),
+                ("Etrade DRR",             "Vendor Central (Etrade) sell-through DRR for the same period."),
+                ("Days Total Inventory Lasts (Etrade)", "Etrade Inventory ÷ Etrade DRR. Etrade channel cover in days."),
+                ("Total CBM",              "Cubic metres for the rounded order: (Order Rounded ÷ Case Pack) × CBM per case."),
+            ]
+            for _ri2, (_col_name, _col_desc) in enumerate(_col_guide, start=0):
+                _rr = _next_row + _ri2
+                _cfill2 = _alt_fill if _ri2 % 2 == 0 else _wht_fill
+                _iw(_rr, 1, _col_name, bold=True, fill=_cfill2)
+                _iw(_rr, 2, _col_desc, fill=_cfill2, wrap=True)
+                _instr_ws.merge_cells(f"B{_rr}:C{_rr}")
+                _instr_ws.row_dimensions[_rr].height = 45
+            _next_row += len(_col_guide)
+
+            # ── Section 4: Ordering logic summary ────────────────────────────────
+            _instr_ws.merge_cells(f"A{_next_row}:C{_next_row}")
+            _iw(_next_row, 1, "ORDERING LOGIC SUMMARY", bold=True, size=11,
+                color="FFFFFF", fill=_sec_fill, align="center")
+            _next_row += 1
+
+            _logic_rows = [
+                ("Step 1 – Compute DRR",
+                 "White/Green/Red: Net Total Sales ÷ Days in Stock (or ÷ Period Days if no stock days). "
+                 "Yellow/Orange: Net Lookback Sales ÷ Lookback Days in Stock."),
+                ("Step 2 – Check coverage",
+                 "Current Days Coverage = (Latest Stock + Transit) ÷ DRR. "
+                 "If Coverage ≥ Target Days → EXCESS (no order needed)."),
+                ("Step 3 – Size order",
+                 "Net Target Days = Target Days − Current Coverage (min: 0 when coverage ≥ Lead Time). "
+                 "Order Qty = Net Target Days × DRR × Confidence Multiplier."),
+                ("Step 4 – Add missed-sales buffer",
+                 "Extra Qty = Missed Sales DRR × Lead Time. "
+                 "Final qty = Order Qty + Extra Qty, floored to Case Pack."),
+                ("Step 5 – Demand override (Green rows)",
+                 "If current-period Net Sales > lookback DRR × period days, the order is set to "
+                 "Net Total Sales × Confidence Multiplier instead — demand acceleration takes precedence."),
+                ("Inactive / discontinued",
+                 "Order Qty is forced to 0. Only the Missed Sales Extra Qty is preserved for "
+                 "'discontinued until stock lasts' items."),
+            ]
+            for _ri3, (_step, _desc3) in enumerate(_logic_rows, start=0):
+                _rr3 = _next_row + _ri3
+                _cfill3 = _alt_fill if _ri3 % 2 == 0 else _wht_fill
+                _iw(_rr3, 1, _step, bold=True, fill=_cfill3)
+                _iw(_rr3, 2, _desc3, fill=_cfill3, wrap=True)
+                _instr_ws.merge_cells(f"B{_rr3}:C{_rr3}")
+                _instr_ws.row_dimensions[_rr3].height = 45
+            _next_row += len(_logic_rows)
+
+            # ── Section 5: Stock sources ──────────────────────────────────────────
+            _instr_ws.merge_cells(f"A{_next_row}:C{_next_row}")
+            _iw(_next_row, 1, "STOCK DATA SOURCES", bold=True, size=11,
+                color="FFFFFF", fill=_sec_fill, align="center")
+            _next_row += 1
+
+            _stock_rows = [
+                ("Pupscribe WH Stock",   "Closing stock from Zoho Inventory at the latest available snapshot date."),
+                ("FBA Stock",            "Amazon FBA inventory from the latest FBA snapshot."),
+                ("Total Stock",          "Pupscribe WH Stock + FBA Stock."),
+                ("Blinkit Inventory",    "Latest Blinkit dark-store inventory (date shown in column header)."),
+                ("Etrade Inventory",     "Vendor Central closing stock at the end of the period."),
+                ("Stock in Transit 1–3", "Open purchase orders / shipments in transit (up to 3 future PO dates). "
+                                         "Sorted by expected delivery date, earliest first."),
+                ("Total Stock in Transit", "Sum of the three transit columns."),
+                ("Net Total Stock",      "Total Stock (latest) + Total Stock in Transit."),
+            ]
+            for _ri4, (_src, _desc4) in enumerate(_stock_rows, start=0):
+                _rr4 = _next_row + _ri4
+                _cfill4 = _alt_fill if _ri4 % 2 == 0 else _wht_fill
+                _iw(_rr4, 1, _src, bold=True, fill=_cfill4)
+                _iw(_rr4, 2, _desc4, fill=_cfill4, wrap=True)
+                _instr_ws.merge_cells(f"B{_rr4}:C{_rr4}")
+                _instr_ws.row_dimensions[_rr4].height = 35
+            _next_row += len(_stock_rows)
+
+            # ── Footer note ───────────────────────────────────────────────────────
+            _instr_ws.merge_cells(f"A{_next_row}:C{_next_row}")
+            _iw(_next_row, 1,
+                "ℹ️  Formula cells in the master sheet reference each other — do not delete "
+                "intermediate columns (e.g. Net Lookback Sales, Net Total Sales) even if they appear "
+                "redundant. Hidden columns (Credit Notes, Confidence Multiplier, prev-date stock) "
+                "are also referenced by formulas.",
+                italic=True, size=10, fill=_alt_fill, wrap=True, align="center", bold=False)
+            _instr_ws.row_dimensions[_next_row].height = 50
+
+            # freeze the header row
+            _instr_ws.freeze_panes = "A2"
+
+            # ── Master Sheet ──────────────────────────────────────────────────────
             combined_df_data = []
             _master_unit_price_currencies: list = []
             for item in combined_data:
@@ -3522,9 +3762,10 @@ async def download_master_report(
                         )
                     else:
                         # Yellow / Orange: Net Lookback Sales / Lookback Days in Stock
+                        # Use the Net Lookback Sales cell directly (already = MAX(0, LkbkSales - LkbkReturns))
                         ws[f"{_N}{r}"] = (
                             f'=IF({_lkbk_days_col}{r}>0,'
-                            f'MAX(0,{_lkbk_sales_col}{r}-{_lkbk_returns_col}{r})/{_lkbk_days_col}{r},0)'
+                            f'{_net_lkbk_col}{r}/{_lkbk_days_col}{r},0)'
                         )
 
                     # Return %
