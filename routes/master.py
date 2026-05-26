@@ -3290,8 +3290,10 @@ async def download_master_report(
                 _sheet_name = f"{_sd.strftime('%d %b %Y')} - {_ed.strftime('%d %b %Y')}"
             _sheet_name = _sheet_name[:31]
             _end_date_label = _ed.strftime("%d %b %Y")
+            _period_days = (_ed - _sd).days + 1
         except Exception:
             _sheet_name = "Master Sheet"
+            _period_days = 30
             _end_date_label = end_date
 
         # Latest stock column labels from the actual latest dates in the DB
@@ -3656,12 +3658,6 @@ async def download_master_report(
             if combined_df_data:
                 combined_df = pd.DataFrame(combined_df_data)
                 combined_df.to_excel(writer, sheet_name=_sheet_name, index=False)
-
-                # period_days for Missed Sales DRR formula
-                try:
-                    _period_days = (_ed - _sd).days + 1
-                except Exception:
-                    _period_days = 30
 
                 # Inject Excel formulas for all computed columns
                 from openpyxl.utils import get_column_letter
