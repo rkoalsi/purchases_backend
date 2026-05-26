@@ -2563,6 +2563,85 @@ async def _generate_master_report_data(
                         injected += 1
                     logger.info(f"Injected {injected} zero-activity brand stub items into combined_data")
 
+            # ── Second-pass DRR lookback for stub items ──────────────────────────────
+            # FBA-only and brand stubs are injected AFTER the first lookback pass, so
+            # they never enter skus_needing_lookback_list.  Run a targeted lookback now
+            # for any stub with days_in_stock < 60 (which is all of them).
+            if period_days >= 90 and not dashboard_mode:
+                stub_skus_needing_lookback = [
+                    item.get("sku_code", "")
+                    for item in combined_data
+                    if item.get("sku_code")
+                    and item.get("combined_metrics", {}).get("total_days_in_stock", 0) < 60
+                    and item.get("drr_source") == "current_period"
+                    # Only target items that were never included in the first lookback
+                    and item.get("sku_code") not in set(skus_needing_lookback_list)
+                ]
+                if stub_skus_needing_lookback:
+                    logger.info(
+                        f"Second-pass DRR lookback for {len(stub_skus_needing_lookback)} stub SKUs "
+                        f"(injected after first lookback)"
+                    )
+                    try:
+                        stub_sku_to_item_id = await report_service.fetch_sku_to_item_id_map(
+                            set(stub_skus_needing_lookback)
+                        )
+                        stub_skus_with_ids = {
+                            sku: stub_sku_to_item_id[sku]
+                            for sku in stub_skus_needing_lookback
+                            if sku in stub_sku_to_item_id
+                        }
+                        if stub_skus_with_ids:
+                            stub_lookback_results = await report_service.fetch_previous_period_drr(
+                                stub_skus_with_ids, start_date, period_days
+                            )
+                            for item in combined_data:
+                                sku = item.get("sku_code", "")
+                                if sku not in stub_lookback_results:
+                                    continue
+                                lb = stub_lookback_results[sku]
+                                metrics = item.get("combined_metrics", {})
+                                if lb["found"]:
+                                    metrics["avg_daily_run_rate"] = lb["drr"]
+                                    if lb["drr"] > 0:
+                                        metrics["avg_days_of_coverage"] = round(
+                                            metrics.get("total_closing_stock", 0) / lb["drr"], 2
+                                        )
+                                    item["drr_source"] = "previous_period"
+                                    item["drr_lookback_period"] = lb["lookback_period"]
+                                    item["drr_lookback_days_in_stock"] = lb["days_in_stock"]
+                                    item["drr_lookback_sales"] = lb["units_sold"]
+                                    item["drr_lookback_returns"] = lb.get("returns", 0)
+                                    item["drr_net_lookback_sales"] = lb.get("net_units_sold", 0)
+                                    lb_period = lb["lookback_period"]
+                                    gt_180 = False
+                                    if lb_period and " to " in lb_period:
+                                        lb_start_str = lb_period.split(" to ")[0].strip()
+                                        try:
+                                            lb_start_dt = datetime.strptime(lb_start_str, "%Y-%m-%d")
+                                            report_start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                                            gt_180 = (report_start_dt - lb_start_dt).days > 180
+                                        except ValueError:
+                                            pass
+                                    item["drr_lookback_gt_180"] = gt_180
+                                    item["highlight"] = "orange" if gt_180 else "yellow"
+                                else:
+                                    item["drr_source"] = "insufficient_stock"
+                                    item["drr_lookback_period"] = ""
+                                    item["drr_lookback_days_in_stock"] = 0
+                                    item["drr_lookback_sales"] = 0
+                                    item["drr_lookback_returns"] = 0
+                                    item["drr_net_lookback_sales"] = 0
+                                    item["drr_lookback_gt_180"] = False
+                                    item["highlight"] = "red"
+                            logger.info(
+                                f"Stub second-pass lookback complete: "
+                                f"{sum(1 for r in stub_lookback_results.values() if r['found'])} found, "
+                                f"{sum(1 for r in stub_lookback_results.values() if not r['found'])} not found"
+                            )
+                    except Exception as _e:
+                        logger.error(f"Stub second-pass DRR lookback error: {_e}")
+
             # Classify movement and compute order metrics now that all items — including
             # FBA-only stubs — have been added.  Running here ensures every product is
             # ranked within its own brand group rather than across all brands.
