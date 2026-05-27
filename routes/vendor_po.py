@@ -1115,6 +1115,12 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "_est": {"$arrayElemAt": ["$_est", 0]},
                 }
             },
+            {
+                "$addFields": {
+                    # Last SO entry recorded on the estimate (Zoho keeps a salesorders[] array)
+                    "_est_last_so": {"$arrayElemAt": ["$_est.salesorders", -1]},
+                }
+            },
             # Join sales order by estimate_id to derive packages automatically
             {
                 "$lookup": {
@@ -1146,6 +1152,9 @@ async def list_vendor_pos(db=Depends(get_database)):
                         }
                     },
                     "so_number": "$_so.salesorder_number",
+                    # Derived from the estimate's salesorders[] — the SO Zoho auto-created from the estimate
+                    "estimate_linked_so_number": "$_est_last_so.salesorder_number",
+                    "estimate_linked_so_status": "$_est_last_so.salesorder_order_status",
                 }
             },
             {
@@ -1184,6 +1193,8 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "sales_order_no": 1,
                     "so_packages": 1,
                     "so_number": 1,
+                    "estimate_linked_so_number": 1,
+                    "estimate_linked_so_status": 1,
                     "_id": 0,
                 }
             },
@@ -1493,9 +1504,59 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
                     it["dispatched_qty"] = d["qty"]
                     it["total_cost_dispatched"] = d["item_total"]
                     it["total_cost_dispatched_gst"] = d["item_total_gst"]
-        return enriched, inv_date, zoho_date
 
-    enriched, live_inv_date, live_zoho_date = await asyncio.to_thread(_fetch)
+        # Derive linked SO from the estimate's salesorders array
+        est_linked_so: dict | None = None
+        est_id = doc.get("zoho_estimate_id")
+        est_num = doc.get("estimate_number")
+        if est_id or est_num:
+            est_query = {"estimate_id": est_id} if est_id else {"estimate_number": est_num}
+            est_doc = db[ESTIMATES_COLLECTION].find_one(est_query, {"salesorders": 1})
+            if est_doc:
+                salesorders_arr = est_doc.get("salesorders") or []
+                if salesorders_arr:
+                    last_entry = salesorders_arr[-1]
+                    so_id = last_entry.get("salesorder_id")
+                    so_num = last_entry.get("salesorder_number")
+                    # Look up in sales_orders for current status
+                    so_query: dict = {}
+                    if so_id:
+                        so_query["salesorder_id"] = so_id
+                    elif so_num:
+                        so_query["salesorder_number"] = so_num
+                    if so_query:
+                        so_doc = db[SALES_ORDERS_COLLECTION].find_one(
+                            so_query,
+                            {
+                                "salesorder_id": 1,
+                                "salesorder_number": 1,
+                                "order_status": 1,
+                                "date": 1,
+                                "total": 1,
+                                "_id": 0,
+                            },
+                        )
+                        if so_doc:
+                            est_linked_so = {
+                                "salesorder_id": so_doc.get("salesorder_id"),
+                                "salesorder_number": so_doc.get("salesorder_number"),
+                                "order_status": so_doc.get("order_status"),
+                                "date": str(so_doc["date"])[:10] if so_doc.get("date") else last_entry.get("date"),
+                                "total": so_doc.get("total"),
+                            }
+                        else:
+                            # Not yet synced to our DB — use data from estimate's salesorders entry
+                            est_linked_so = {
+                                "salesorder_id": last_entry.get("salesorder_id"),
+                                "salesorder_number": last_entry.get("salesorder_number"),
+                                "order_status": last_entry.get("salesorder_order_status"),
+                                "date": last_entry.get("date"),
+                                "total": last_entry.get("total"),
+                            }
+
+        return enriched, inv_date, zoho_date, est_linked_so
+
+    enriched, live_inv_date, live_zoho_date, est_linked_so = await asyncio.to_thread(_fetch)
 
     # Write computed total_cost / total_cost_fo back to each item in the DB so the list aggregation reflects it.
     def _write_back_costs():
@@ -1538,6 +1599,7 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
         "assembly_numbers": doc.get("assembly_numbers") or [],
         "packages": doc.get("packages") or [],
         "sales_order_no": doc.get("sales_order_no"),
+        "estimate_linked_so": est_linked_so,
         "items": serialize_mongo_document(enriched),
     }
 
