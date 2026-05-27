@@ -1964,14 +1964,42 @@ def get_ledger_summary(
 
 
 @router.get("/get_amazon_sku_mapping")
-def get_sku_mapping(database=Depends(get_database)):
+async def get_sku_mapping(database=Depends(get_database)):
     try:
-        sku_collection = database.get_collection(SKU_COLLECTION)
-        sku_documents = serialize_mongo_document(
-            list(sku_collection.find({}).sort("item_name", -1))
-        )
+        def _fetch():
+            sku_collection = database.get_collection(SKU_COLLECTION)
+            docs = list(sku_collection.find({}).sort("item_name", -1))
+            if not docs:
+                return []
 
-        return JSONResponse(content=sku_documents)
+            # Batch-lookup the most recent fnsku for each ASIN from amazon_ledger
+            asins = [d["item_id"] for d in docs if d.get("item_id")]
+            ledger_collection = database.get_collection("amazon_ledger")
+            pipeline = [
+                {
+                    "$match": {
+                        "asin": {"$in": asins},
+                        "fnsku": {"$exists": True, "$nin": [None, ""]},
+                    }
+                },
+                {"$sort": {"date": -1}},
+                {"$group": {"_id": "$asin", "fnsku": {"$first": "$fnsku"}}},
+            ]
+            fnsku_map = {
+                d["_id"]: d["fnsku"]
+                for d in ledger_collection.aggregate(pipeline)
+            }
+
+            for doc in docs:
+                ledger_fnsku = fnsku_map.get(doc.get("item_id"))
+                if ledger_fnsku:
+                    doc["fnsku"] = ledger_fnsku
+                # else keep whatever is already stored in the mapping doc
+
+            return docs
+
+        docs = await asyncio.to_thread(_fetch)
+        return JSONResponse(content=serialize_mongo_document(docs))
 
     except PyMongoError as e:  # Catch database-specific errors
         logger.info(f"Database error retrieving SKU mapping: {e}", exc_info=True)
@@ -1985,6 +2013,34 @@ def get_sku_mapping(database=Depends(get_database)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {e}",
         )
+
+
+_VALID_AMAZON_STATUSES = {"Active", "Inactive", "Discontinued on Amazon"}
+
+
+@router.put("/sku-mapping/{asin}/status")
+async def update_sku_amazon_status(
+    asin: str,
+    amazon_status: str = Query(...),
+    database=Depends(get_database),
+):
+    """Update the amazon_status field on an amazon_sku_mapping document."""
+    if amazon_status not in _VALID_AMAZON_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid status. Must be one of: {', '.join(_VALID_AMAZON_STATUSES)}",
+        )
+
+    def _update():
+        return database.get_collection(SKU_COLLECTION).update_one(
+            {"item_id": asin},
+            {"$set": {"amazon_status": amazon_status}},
+        )
+
+    result = await asyncio.to_thread(_update)
+    if result.matched_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ASIN not found")
+    return {"message": "Status updated"}
 
 
 @router.post("/upload-sku-mapping")
@@ -2071,14 +2127,34 @@ async def upload_sku_mapping(
 MARGINS_COLLECTION = "vendor_margins"
 
 
+@router.put("/sku-mapping/{asin}/fnsku")
+async def update_sku_fnsku(
+    asin: str,
+    fnsku: str = Query(...),
+    database=Depends(get_database),
+):
+    """Update the fnsku field on an amazon_sku_mapping document."""
+    def _update():
+        return database.get_collection(SKU_COLLECTION).update_one(
+            {"item_id": asin},
+            {"$set": {"fnsku": fnsku.strip()}},
+        )
+
+    result = await asyncio.to_thread(_update)
+    if result.matched_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ASIN not found")
+    return {"message": "FNSKU updated"}
+
+
 @router.post("/upload-etrade-margins")
 async def upload_etrade_margins(
     file: UploadFile = File(...), database=Depends(get_database)
 ):
     """
-    Upload Etrade margin & ASP data from an Excel file.
-    Expected columns: ASIN, ASP, New Margin, Cost Price w/o Tax.
-    Upserts into vendor_margins collection by ASIN.
+    Upload Amazon item data from an Excel file.
+    Handles: FNSKU, Amazon Status (→ amazon_sku_mapping)
+             ASP, New Margin, Cost Price w/o Tax, Etrade PO, Etrade DF (→ vendor_margins)
+    ASIN column is required. All other columns are optional — blank cells are skipped.
     """
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(
@@ -2090,12 +2166,10 @@ async def upload_etrade_margins(
         file_content = await file.read()
         df = pd.read_excel(BytesIO(file_content), sheet_name=0)
 
-        required_cols = ["ASIN", "ASP", "New Margin", "Cost Price w/o Tax"]
-        missing = [col for col in required_cols if col not in df.columns]
-        if missing:
+        if "ASIN" not in df.columns:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Missing required columns: {', '.join(missing)}",
+                detail="Missing required column: ASIN",
             )
 
         def _parse_bool(val) -> bool | None:
@@ -2108,7 +2182,8 @@ async def upload_etrade_margins(
                 return False
             return None
 
-        collection = database.get_collection(MARGINS_COLLECTION)
+        margins_collection = database.get_collection(MARGINS_COLLECTION)
+        sku_collection = database.get_collection(SKU_COLLECTION)
         upserted = 0
         skipped = 0
 
@@ -2118,35 +2193,54 @@ async def upload_etrade_margins(
                 skipped += 1
                 continue
 
-            update_fields = {}
-            if pd.notna(row["ASP"]):
-                update_fields["etrade_asp"] = float(row["ASP"])
-            if pd.notna(row["New Margin"]):
-                update_fields["margin"] = float(row["New Margin"])
-            if pd.notna(row["Cost Price w/o Tax"]):
-                update_fields["cost_price_wo_tax"] = float(row["Cost Price w/o Tax"])
+            # ── vendor_margins fields ──────────────────────────────────────────
+            margin_fields: dict = {}
+            if "ASP" in df.columns and pd.notna(row["ASP"]):
+                margin_fields["etrade_asp"] = float(row["ASP"])
+            if "New Margin" in df.columns and pd.notna(row["New Margin"]):
+                margin_fields["margin"] = float(row["New Margin"])
+            if "Cost Price w/o Tax" in df.columns and pd.notna(row["Cost Price w/o Tax"]):
+                margin_fields["cost_price_wo_tax"] = float(row["Cost Price w/o Tax"])
             if "Etrade PO" in df.columns:
                 v = _parse_bool(row["Etrade PO"])
                 if v is not None:
-                    update_fields["etrade_po"] = v
+                    margin_fields["etrade_po"] = v
             if "Etrade DF" in df.columns:
                 v = _parse_bool(row["Etrade DF"])
                 if v is not None:
-                    update_fields["etrade_df"] = v
+                    margin_fields["etrade_df"] = v
 
-            if not update_fields:
+            if margin_fields:
+                margins_collection.update_one(
+                    {"asin": asin},
+                    {"$set": {"asin": asin, **margin_fields}},
+                    upsert=True,
+                )
+
+            # ── amazon_sku_mapping fields ──────────────────────────────────────
+            sku_fields: dict = {}
+            if "FNSKU" in df.columns and pd.notna(row["FNSKU"]):
+                fnsku_val = str(row["FNSKU"]).strip()
+                if fnsku_val:
+                    sku_fields["fnsku"] = fnsku_val
+            if "Amazon Status" in df.columns and pd.notna(row["Amazon Status"]):
+                status_val = str(row["Amazon Status"]).strip()
+                if status_val in _VALID_AMAZON_STATUSES:
+                    sku_fields["amazon_status"] = status_val
+
+            if sku_fields:
+                sku_collection.update_one(
+                    {"item_id": asin},
+                    {"$set": sku_fields},
+                )
+
+            if margin_fields or sku_fields:
+                upserted += 1
+            else:
                 skipped += 1
-                continue
-
-            collection.update_one(
-                {"asin": asin},
-                {"$set": {"asin": asin, **update_fields}},
-                upsert=True,
-            )
-            upserted += 1
 
         return {
-            "message": f"Successfully upserted {upserted} margin records.",
+            "message": f"Successfully updated {upserted} records.",
             "upserted": upserted,
             "skipped": skipped,
         }
@@ -2154,7 +2248,7 @@ async def upload_etrade_margins(
     except HTTPException:
         raise
     except Exception as e:
-        logger.info(f"Error uploading etrade margins: {e}")
+        logger.info(f"Error uploading amazon item data: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred processing the file: {e}",
@@ -2164,8 +2258,9 @@ async def upload_etrade_margins(
 @router.get("/download-etrade-margins-template")
 def download_etrade_margins_template(database=Depends(get_database)):
     """
-    Download an Excel template pre-filled with existing SKU names and margin data.
-    Columns: ASIN, Item Name, ASP, New Margin, Cost Price w/o Tax.
+    Download an Excel template pre-filled with existing item data.
+    Columns: ASIN, Item Name, SKU Code, FNSKU, Amazon Status,
+             ASP, New Margin, Cost Price w/o Tax, Etrade PO, Etrade DF.
     """
     try:
         import openpyxl
@@ -2174,15 +2269,24 @@ def download_etrade_margins_template(database=Depends(get_database)):
         sku_collection = database.get_collection(SKU_COLLECTION)
         margins_collection = database.get_collection(MARGINS_COLLECTION)
 
-        skus = list(sku_collection.find({}, {"item_id": 1, "item_name": 1, "_id": 0}))
-        margins_list = list(margins_collection.find({}, {"asin": 1, "etrade_asp": 1, "margin": 1, "cost_price_wo_tax": 1, "etrade_po": 1, "etrade_df": 1, "_id": 0}))
+        skus = list(sku_collection.find(
+            {},
+            {"item_id": 1, "item_name": 1, "sku_code": 1, "fnsku": 1, "amazon_status": 1, "_id": 0},
+        ))
+        margins_list = list(margins_collection.find(
+            {},
+            {"asin": 1, "etrade_asp": 1, "margin": 1, "cost_price_wo_tax": 1, "etrade_po": 1, "etrade_df": 1, "_id": 0},
+        ))
         margins_by_asin = {m["asin"]: m for m in margins_list}
 
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.title = "eTrade Margins"
+        ws.title = "Amazon Items"
 
-        headers = ["ASIN", "Item Name", "ASP", "New Margin", "Cost Price w/o Tax", "Etrade PO", "Etrade DF"]
+        headers = [
+            "ASIN", "Item Name", "SKU Code", "FNSKU", "Amazon Status",
+            "ASP", "New Margin", "Cost Price w/o Tax", "Etrade PO", "Etrade DF",
+        ]
         header_fill = PatternFill("solid", fgColor="1E3A5F")
         header_font = Font(bold=True, color="FFFFFF")
         for col, h in enumerate(headers, 1):
@@ -2194,17 +2298,20 @@ def download_etrade_margins_template(database=Depends(get_database)):
         for row_idx, sku in enumerate(skus, 2):
             asin = sku.get("item_id", "")
             m = margins_by_asin.get(asin, {})
-            ws.cell(row=row_idx, column=1, value=asin)
-            ws.cell(row=row_idx, column=2, value=sku.get("item_name", ""))
-            ws.cell(row=row_idx, column=3, value=m.get("etrade_asp"))
-            ws.cell(row=row_idx, column=4, value=m.get("margin"))
-            ws.cell(row=row_idx, column=5, value=m.get("cost_price_wo_tax"))
-            ws.cell(row=row_idx, column=6, value="Yes" if m.get("etrade_po") else ("No" if "etrade_po" in m else ""))
-            ws.cell(row=row_idx, column=7, value="Yes" if m.get("etrade_df") else ("No" if "etrade_df" in m else ""))
+            ws.cell(row=row_idx, column=1,  value=asin)
+            ws.cell(row=row_idx, column=2,  value=sku.get("item_name", ""))
+            ws.cell(row=row_idx, column=3,  value=sku.get("sku_code", ""))
+            ws.cell(row=row_idx, column=4,  value=sku.get("fnsku") or "")
+            ws.cell(row=row_idx, column=5,  value=sku.get("amazon_status") or "")
+            ws.cell(row=row_idx, column=6,  value=m.get("etrade_asp"))
+            ws.cell(row=row_idx, column=7,  value=m.get("margin"))
+            ws.cell(row=row_idx, column=8,  value=m.get("cost_price_wo_tax"))
+            ws.cell(row=row_idx, column=9,  value="Yes" if m.get("etrade_po") else ("No" if "etrade_po" in m else ""))
+            ws.cell(row=row_idx, column=10, value="Yes" if m.get("etrade_df") else ("No" if "etrade_df" in m else ""))
 
-        for col in ws.columns:
-            max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col)
-            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+        col_widths = [16, 45, 18, 14, 26, 10, 12, 22, 10, 10]
+        for col_idx, width in enumerate(col_widths, 1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
 
         buf = BytesIO()
         wb.save(buf)
@@ -2213,10 +2320,10 @@ def download_etrade_margins_template(database=Depends(get_database)):
         return StreamingResponse(
             buf,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=etrade_margins_template.xlsx"},
+            headers={"Content-Disposition": "attachment; filename=amazon_items_template.xlsx"},
         )
     except Exception as e:
-        logger.info(f"Error generating etrade margins template: {e}")
+        logger.info(f"Error generating amazon items template: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred generating the template: {e}",
@@ -2320,6 +2427,7 @@ async def sync_sku_mapping(database=Depends(get_database)):
     """
     Syncs amazon_sku_mapping from SP-API + Google Sheet.
     SP-API provides item_name; Google Sheet provides sku_code.
+    Also backfills fnsku from amazon_ledger for docs that don't have one yet.
     """
     try:
         sp_listings, sheet_by_asin = await asyncio.gather(
@@ -2359,7 +2467,40 @@ async def sync_sku_mapping(database=Depends(get_database)):
                     unchanged += 1
             return inserted, modified, unchanged
 
+        def _backfill_fnsku():
+            """
+            Build ASIN→FNSKU map from amazon_ledger, then update amazon_sku_mapping docs
+            that are missing fnsku (preserving any manually-set values).
+            Returns count of docs updated.
+            """
+            ledger_col = database.get_collection(INVENTORY_COLLECTION)
+            pipeline = [
+                {"$match": {"fnsku": {"$exists": True, "$nin": [None, ""]}}},
+                {"$group": {"_id": "$asin", "fnsku": {"$first": "$fnsku"}}},
+            ]
+            fnsku_map = {
+                doc["_id"]: doc["fnsku"]
+                for doc in ledger_col.aggregate(pipeline)
+                if doc.get("_id") and doc.get("fnsku")
+            }
+            if not fnsku_map:
+                return 0
+            # Update only docs where fnsku is not yet set
+            updated = 0
+            for asin, fnsku in fnsku_map.items():
+                result = collection.update_one(
+                    {
+                        "item_id": asin,
+                        "$or": [{"fnsku": {"$exists": False}}, {"fnsku": None}, {"fnsku": ""}],
+                    },
+                    {"$set": {"fnsku": fnsku}},
+                )
+                if result.modified_count:
+                    updated += 1
+            return updated
+
         inserted, modified, unchanged = await asyncio.to_thread(_upsert)
+        fnsku_backfilled = await asyncio.to_thread(_backfill_fnsku)
 
         return {
             "message": "Sync complete",
@@ -2367,6 +2508,7 @@ async def sync_sku_mapping(database=Depends(get_database)):
             "updated": modified,
             "unchanged": unchanged,
             "total_sp_listings": len(sp_listings),
+            "fnsku_backfilled": fnsku_backfilled,
         }
 
     except Exception as e:

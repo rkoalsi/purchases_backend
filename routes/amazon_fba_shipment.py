@@ -41,13 +41,6 @@ MONTH_NAMES = {
 }
 
 EXCLUDED_ASINS = [
-    "B0GP69VJM2",
-    "B0FCSGCBNC",
-    "B0FCS6K9SP",
-    "B0FCSCFSZY",
-    "B0H1JMTWVV",
-    "B0GP6PNJN6",
-    "B08RNHT15R",
     "B0FRLVMP6V",
     "B0C5HPTBMH",
     "B09V2XYPX1",
@@ -59,20 +52,14 @@ EXCLUDED_ASINS = [
     "B0FMS1Z318",
     "B0B7XWXZRF",
     "B0B7S3WVXD",
-    "B09ZLLMQ2K",
     "B0CDH72346",
-    "B0B9GR9SP1",
-    "B098LNZVNR",
     "B0B7X8BZ5M",
-    "B09ZLQBTBW",
     "B0DDGT97VL",
     "B0CNPXH2J9",
     "B09B2TMGCM",
     "B0GLHNX5SP",
     "B0BJ8ZRHGW",
-    "B09Y9914KG",
     "B0FZB5JXJZ",
-    "B098LNZBMY",
     "B0B7S1F22L",
     "B09GR818PH",
     "B0B31VDTRT",
@@ -81,17 +68,9 @@ EXCLUDED_ASINS = [
     "B0FDKSXXND",
     "B0GXSQ9HTT",
     "B0C555B1MP",
-    "B098LQGWTY",
-    "B09YH9RNLC",
-    "B0B31VLXBM",
-    "B08RNH1DKP",
-    "B09ZLLTQDJ",
     "B08KJ2G1Z3",
     "B0CNXMVPLH",
-    "B0B9GRBMG6",
     "B09PV8KR9F",
-    "B0B31MBBHD",
-    "B09ZLLGFVR",
     "B0GVQB9K99",
     "B0GMPTX2Y3",
     "B0DHD7PB5G",
@@ -106,7 +85,6 @@ EXCLUDED_ASINS = [
     "B0FV3JVBBH",
     "B0DKBKWKDL",
     "B0DDKHZKL3",
-    "B098LMHMVD",
     "B0D33YLBNR",
     "B0FVXX3JB7",
     "B093C6V33C",
@@ -114,26 +92,18 @@ EXCLUDED_ASINS = [
     "B0G2WW1NN5",
     "B0B7S2VHGX",
     "B0GMPHHFKV",
-    "B08BX1ZLGY",
-    "B08RN5C43N",
     "B09FZL1L5Z",
     "B0FPDCDLGC",
-    "B09Y98LLVZ",
     "B0D4JKYYX6",
-    "B09ZJ5KRFJ",
     "B093CB5XV2",
     "B0GPXT2VPD",
     "B0FM8QH3FF",
     "B0CC53TTFM",
     "B093C8RDD2",
-    "B09ZLMJHT4",
-    "B09ZJ3HR6M",
     "B08WPX98XR",
     "B0C6R272BG",
     "B0DDT9HMMW",
-    "B09PLCLNHD",
     "B0FXVMFC9C",
-    "B09ZJ3727L",
     "B0B81VHB39",
     "B0DD48LN2S",
     "B0G7VZDHR4",
@@ -141,7 +111,6 @@ EXCLUDED_ASINS = [
     "B09RK8Y73J",
     "B09RK9VZQS",
     "B0DF7H32XY",
-    "B08RZ9CJ9R",
     "B0B7XWSYSN",
     "B08XMMVSGB",
     "B09FGH6K7Y",
@@ -151,13 +120,10 @@ EXCLUDED_ASINS = [
     "B0CNTH2NLK",
     "B0FV3HD63F",
     "B0GTFV7BPC",
-    "B09PLBQWCL",
-    "B09ZJ5CDG1",
     "B0F484C9V3",
     "B0BJ8ZNVDW",
     "B09RPT5XF9",
     "B0DKBKXNXC",
-    "B09ZJ4GZSF",
     "B0G5YFSBG5",
     "B09FZKX8XF",
     "B0DKFRSWZS",
@@ -175,19 +141,13 @@ EXCLUDED_ASINS = [
     "B0GFNFBJX9",
     "B09RPTM16Y",
     "B093C8P9M8",
-    "B09ZJ4N8LV",
     "B09HNKH3GB",
     "B0FDB7HYGH",
     "B09XV6QFH8",
-    "B09Y9CDR44",
-    "B0B9GSFP63",
     "B0C69GBXVP",
     "B0DDH9X9P1",
     "B0C3MB3826",
     "B0GRRVZB91",
-    "B0855K8X8B",
-    "B09PLC4196",
-    "B09PLD3N53",
     "B0D949FQ6F",
     "B09RH62YRR",
     "B0GLDVBWTG",
@@ -195,25 +155,17 @@ EXCLUDED_ASINS = [
     "B09FGKFS4T",
     "B0FXVP9ZBM",
     "B09P85TSJB",
-    "B09ZLK1W8F",
-    "B09ZJ4SXD6",
-    "B09ZJ3D9GY",
     "B0C69JWS33",
     "B09W5PFJWW",
-    "B0B9GSPCDS",
     "B0C23K137X",
-    "B09ZJ44PJK",
     "B0CPSFFWSH",
     "B0G1GYW6P3",
     "B08WPFCXGY",
-    "B08DJ7J6T6",
     "B0B7RSDK88",
-    "B08RMSTGQ8",
     "B0DM5932LJ",
     "B09P874YBJ",
     "B0GVG639SP",
     "B0GN2M9824",
-    "B09ZJ3GX5Z",
 ]
 
 # ─── Pydantic models ──────────────────────────────────────────────────────────
@@ -292,7 +244,7 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
     # 1. All ASINs from amazon_sku_mapping
     sku_map_docs = list(
         db[SKU_MAPPING_COLLECTION].find(
-            {}, {"item_id": 1, "sku_code": 1, "fnsku": 1, "_id": 0}
+            {}, {"item_id": 1, "sku_code": 1, "fnsku": 1, "amazon_status": 1, "_id": 0}
         )
     )
     if not sku_map_docs:
@@ -306,6 +258,9 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
     }
     asin_to_fnsku_default: dict[str, str] = {
         d["item_id"]: d.get("fnsku", "") for d in sku_map_docs if d.get("item_id")
+    }
+    asin_to_amazon_status: dict[str, str] = {
+        d["item_id"]: d.get("amazon_status", "") for d in sku_map_docs if d.get("item_id")
     }
 
     # Platform derived from vendor_margins flags
@@ -334,6 +289,8 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
             "rate": 1,
             "item_tax_preferences": 1,
             "status": 1,
+            "purchase_status": 1,
+            "item_id": 1,  # needed for zoho_warehouse_stock lookup
             "_id": 0,
         },
     ):
@@ -616,12 +573,13 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
             else (prod.get("rate") or 0)
         )
 
-        # Status: use override if present
+        # Status: use override if present (falls back to product status for legacy compatibility)
         status = (
             override["status_override"]
             if override.get("status_override") is not None
             else prod.get("status", "")
         )
+        purchase_status = prod.get("purchase_status", "")
 
         current_fba_inv = fba_inv_by_asin.get(asin, 0)
 
@@ -691,6 +649,7 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
                     "sku_code": sku,
                     "fnsku": override.get("fnsku")
                     or asin_to_fnsku_default.get(asin, ""),
+                    "amazon_status": asin_to_amazon_status.get(asin, "") or None,
                     "item_name": prod.get("name", ""),
                     "mrp": mrp,
                     "sp": sp,
@@ -707,6 +666,7 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
                     "final_units_to_send": max(0, final_units),
                     "zoho_stock": zoho_stock,
                     "status": status,
+                    "purchase_status": purchase_status,
                     "platform": override.get("platform")
                     or (
                         "Etrade - PO & DF"
@@ -819,14 +779,14 @@ def _generate_planning_excel(
 
     month_labels = rows[0].get("month_labels", [])
 
-    # Column layout (FNSKU removed):
-    # A(1) ASIN  B(2) SKU  C(3) Item Name  D(4) MRP  E(5) SP
-    # F(6) FBA Inv  G(7) Open Shipment  H(8)=F+G Total Inv
-    # I(9) DRR  J(10)=H/I Net Days  K(11) Lead  L(12) Coverage
-    # M(13)=K+L Target Days  N(14)=I*M Target Stock  O(15) Final Units
-    # P(16) Zoho  Q(17) Status  R(18) Platform
-    # S(19) Etrade Inv  T(20) Open PO  U(21)=S+T Total Qty
-    # V+(22+) Monthly Sales
+    # Column layout:
+    # A(1) ASIN  B(2) FNSKU  C(3) Amazon Status  D(4) SKU  E(5) Item Name
+    # F(6) MRP  G(7) SP  H(8) FBA Inv  I(9) Open Shipment  J(10)=H+I Total Inv
+    # K(11) DRR  L(12)=J/K Net Days  M(13) Lead  N(14) Coverage
+    # O(15)=M+N Target Days  P(16)=K*O Target Stock  Q(17) Final Units
+    # R(18) Zoho  S(19) Status  T(20) Platform
+    # U(21) Etrade Inv  V(22) Open PO  W(23)=U+V Total Qty
+    # X+(24+) Monthly Sales
 
     fba_inv_label = (
         f"Current FBA\nInventory\n({fba_inv_date})"
@@ -842,28 +802,30 @@ def _generate_planning_excel(
     )
 
     headers = [
-        "ASIN",
-        "SKU Code",
-        "Item Name",
-        "MRP",
-        "SP",
-        fba_inv_label,
-        "Open Shipment\nQty",
-        "Total Inventory\n(FBA + Open Shipment)",
-        drr_label,
-        "Net Total Days\n(=Total Inv ÷ DRR)",
-        "Lead Time",
-        "Coverage Days",
-        "Total Target Days\n(=Lead + Coverage)",
-        "Target Stock\n(=DRR × Total Target Days)",
-        "Final Units\n(under-ordering formula)",
-        zoho_label,
-        "Status",
-        "Platform",
-        etrade_label,
-        "Open PO",
-        "Total Qty\n(Etrade + Open PO)",
-    ] + [f"{label}\nUnits Sold" for label in month_labels]
+        "ASIN",                                          # A  1
+        "FNSKU",                                         # B  2
+        "Amazon Status",                                 # C  3
+        "SKU Code",                                      # D  4
+        "Item Name",                                     # E  5
+        "MRP",                                           # F  6
+        "SP",                                            # G  7
+        fba_inv_label,                                   # H  8
+        "Open Shipment\nQty",                            # I  9
+        "Total Inventory\n(FBA + Open Shipment)",        # J 10  =H+I
+        drr_label,                                       # K 11
+        "Net Total Days\n(=Total Inv ÷ DRR)",            # L 12  =J/K
+        "Lead Time",                                     # M 13
+        "Coverage Days",                                 # N 14
+        "Total Target Days\n(=Lead + Coverage)",         # O 15  =M+N
+        "Target Stock\n(=DRR × Total Target Days)",      # P 16  =K*O
+        "Final Units\n(under-ordering formula)",         # Q 17
+        zoho_label,                                      # R 18
+        "Purchase Status",                               # S 19
+        "Platform",                                      # T 20
+        etrade_label,                                    # U 21
+        "Open PO",                                       # V 22
+        "Total Qty\n(Etrade + Open PO)",                 # W 23  =U+V
+    ] + [f"{label}\nUnits Sold" for label in month_labels]  # X+ 24+
 
     header_fill = PatternFill("solid", fgColor="4472C4")
     header_font = Font(bold=True, color="FFFFFF")
@@ -878,74 +840,77 @@ def _generate_planning_excel(
 
     ws.row_dimensions[1].height = 55
 
+    def _num(v):
+        """Return numeric value as-is (including 0); return None only for None/missing."""
+        return v if v is not None else None
+
     for row_idx, row in enumerate(rows, 2):
         r = row_idx
-        drr_val = row.get("drr") or None
+        drr_val = row.get("drr")  # keep 0.0 — formulas depend on it
 
-        ws.cell(row=r, column=1, value=row.get("asin", ""))
-        ws.cell(row=r, column=2, value=row.get("sku_code", ""))
-        c = ws.cell(row=r, column=3, value=row.get("item_name", "") or None)
+        ws.cell(row=r, column=1,  value=row.get("asin", ""))                        # A ASIN
+        ws.cell(row=r, column=2,  value=row.get("fnsku") or None)                   # B FNSKU
+        ws.cell(row=r, column=3,  value=row.get("amazon_status") or None)           # C Amazon Status
+        ws.cell(row=r, column=4,  value=row.get("sku_code", ""))                    # D SKU Code
+        c = ws.cell(row=r, column=5, value=row.get("item_name") or None)            # E Item Name
         c.alignment = left_wrap
-        ws.cell(row=r, column=4, value=row.get("mrp") or None)
-        ws.cell(row=r, column=5, value=row.get("sp") or None)
-        ws.cell(row=r, column=6, value=row.get("current_fba_inventory") or None)
-        ws.cell(row=r, column=7, value=row.get("open_shipment_qty") or None)
-        ws.cell(row=r, column=8, value=f"=F{r}+G{r}")  # H: Total Inv
-        ws.cell(row=r, column=9, value=drr_val)  # I: DRR
+        ws.cell(row=r, column=6,  value=_num(row.get("mrp")))                       # F MRP
+        ws.cell(row=r, column=7,  value=_num(row.get("sp")))                        # G SP
+        ws.cell(row=r, column=8,  value=_num(row.get("current_fba_inventory")))     # H FBA Inv
+        ws.cell(row=r, column=9,  value=_num(row.get("open_shipment_qty")))         # I Open Shipment
+        ws.cell(row=r, column=10, value=f"=H{r}+I{r}")                             # J Total Inv
+        ws.cell(row=r, column=11, value=drr_val)                                    # K DRR
+        ws.cell(row=r, column=12, value=f'=IF(K{r}=0,"",ROUND(J{r}/K{r},2))')     # L Net Days
+        ws.cell(row=r, column=13, value=row.get("lead_time", DEFAULT_LEAD_TIME))    # M Lead Time
+        ws.cell(row=r, column=14, value=row.get("coverage_days", DEFAULT_COVERAGE_DAYS))  # N Coverage
+        ws.cell(row=r, column=15, value=f"=M{r}+N{r}")                             # O Target Days
+        ws.cell(row=r, column=16, value=f"=IF(K{r}=0,0,ROUND(K{r}*O{r},0))")      # P Target Stock
         ws.cell(
-            row=r, column=10, value=f'=IF(I{r}=0,"",ROUND(H{r}/I{r},2))'
-        )  # J: Net Days
-        ws.cell(row=r, column=11, value=row.get("lead_time", DEFAULT_LEAD_TIME))
-        ws.cell(row=r, column=12, value=row.get("coverage_days", DEFAULT_COVERAGE_DAYS))
-        ws.cell(row=r, column=13, value=f"=K{r}+L{r}")  # M: Total Target Days
-        ws.cell(
-            row=r, column=14, value=f"=IF(I{r}=0,0,ROUND(I{r}*M{r},0))"
-        )  # N: Target Stock
-        ws.cell(
-            row=r,
-            column=15,
-            value=f'=IF(I{r}=0,"",IF(J{r}<K{r},ROUND(I{r}*M{r},0),IF(J{r}>M{r},0,MAX(0,ROUND((M{r}-J{r})*I{r},0)))))',
-        )  # O: Final Units
-        ws.cell(row=r, column=16, value=row.get("zoho_stock") or None)
-        ws.cell(row=r, column=17, value=row.get("status") or None)
-        ws.cell(row=r, column=18, value=row.get("platform") or None)
-        ws.cell(row=r, column=19, value=row.get("current_inventory_etrade") or None)
-        ws.cell(row=r, column=20, value=row.get("open_po") or None)
-        ws.cell(row=r, column=21, value=f"=S{r}+T{r}")  # U: Total Qty
+            row=r, column=17,
+            value=f'=IF(K{r}=0,"",IF(L{r}<M{r},ROUND(K{r}*O{r},0),IF(L{r}>O{r},0,MAX(0,ROUND((O{r}-L{r})*K{r},0)))))',
+        )                                                                            # Q Final Units
+        ws.cell(row=r, column=18, value=_num(row.get("zoho_stock")))                # R Zoho Stock
+        ws.cell(row=r, column=19, value=row.get("purchase_status") or None)         # S Purchase Status
+        ws.cell(row=r, column=20, value=row.get("platform") or None)                # T Platform
+        ws.cell(row=r, column=21, value=_num(row.get("current_inventory_etrade")))  # U Etrade Inv
+        ws.cell(row=r, column=22, value=_num(row.get("open_po")))                   # V Open PO
+        ws.cell(row=r, column=23, value=f"=U{r}+V{r}")                             # W Total Qty
 
         monthly_sales = row.get("monthly_sales", {})
         for offset, label in enumerate(month_labels):
             val = monthly_sales.get(label)
-            ws.cell(row=r, column=22 + offset, value=val if val else None)
+            ws.cell(row=r, column=24 + offset, value=_num(val))                    # X+ Monthly Sales
 
     col_widths = [
-        14,
-        18,
-        50,
-        8,
-        8,
-        12,
-        12,
-        14,
-        10,
-        12,
-        9,
-        10,
-        14,
-        14,
-        14,
-        10,
-        12,
-        12,
-        15,
-        9,
-        12,
+        14,  # A ASIN
+        14,  # B FNSKU
+        22,  # C Amazon Status
+        18,  # D SKU Code
+        50,  # E Item Name
+        8,   # F MRP
+        8,   # G SP
+        12,  # H FBA Inv
+        12,  # I Open Shipment
+        14,  # J Total Inv
+        10,  # K DRR
+        12,  # L Net Days
+        9,   # M Lead Time
+        10,  # N Coverage
+        14,  # O Target Days
+        14,  # P Target Stock
+        14,  # Q Final Units
+        10,  # R Zoho Stock
+        12,  # S Status
+        12,  # T Platform
+        15,  # U Etrade Inv
+        9,   # V Open PO
+        12,  # W Total Qty
     ]
     col_widths += [14] * len(month_labels)
     for col_idx, width in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
-    ws.freeze_panes = "D2"
+    ws.freeze_panes = "F2"
 
     buf = io.BytesIO()
     wb.save(buf)
