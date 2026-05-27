@@ -193,8 +193,10 @@ def _get_dispatched_costs_by_asin(package_number: str, db) -> dict:
         if m.get("cost_price_wo_tax") is not None:
             asin_to_cost_price[m["asin"]] = float(m["cost_price_wo_tax"])
     sku_to_gst: dict[str, float] = {}
-    for p in db[PRODUCTS_COLLECTION].find({"cf_sku_code": {"$in": skus}}, {"cf_sku_code": 1, "item_tax_preferences": 1}):
-        sku_to_gst[p["cf_sku_code"]] = _extract_gst(p.get("item_tax_preferences") or [])
+    for p in db[PRODUCTS_COLLECTION].find({"cf_sku_code": {"$in": skus}}, {"cf_sku_code": 1, "status": 1, "item_tax_preferences": 1}):
+        sku = p["cf_sku_code"]
+        if sku not in sku_to_gst or p.get("status") == "active":
+            sku_to_gst[sku] = _extract_gst(p.get("item_tax_preferences") or [])
     missing = [s for s in skus if s not in sku_to_gst]
     if missing:
         comp_ids = {c["sku_code"]: c["composite_item_id"] for c in db["composite_products"].find({"sku_code": {"$in": missing}}, {"sku_code": 1, "composite_item_id": 1}) if c.get("sku_code") and c.get("composite_item_id")}
@@ -309,9 +311,11 @@ def _compute_package_accepted_costs(
     sku_to_gst: dict[str, float] = {}
     for p in db[PRODUCTS_COLLECTION].find(
         {"cf_sku_code": {"$in": skus}},
-        {"cf_sku_code": 1, "item_tax_preferences": 1},
+        {"cf_sku_code": 1, "status": 1, "item_tax_preferences": 1},
     ):
-        sku_to_gst[p["cf_sku_code"]] = _extract_gst(p.get("item_tax_preferences") or [])
+        sku = p["cf_sku_code"]
+        if sku not in sku_to_gst or p.get("status") == "active":
+            sku_to_gst[sku] = _extract_gst(p.get("item_tax_preferences") or [])
 
     accepted_total_cost = 0.0
     accepted_total_cost_gst = 0.0
@@ -472,10 +476,13 @@ def _enrich_items(
             "rate": 1,
             "item_tax_preferences": 1,
             "hsn_or_sac": 1,
+            "status": 1,
             "purchase_status": 1,
         },
     ):
-        products_by_model[p["cf_sku_code"]] = p
+        sku = p["cf_sku_code"]
+        if sku not in products_by_model or p.get("status") == "active":
+            products_by_model[sku] = p
 
     # --- batch load sku mapping for ASIN → sku_code fallback ---
     sku_map_by_asin: dict[str, str] = {}
@@ -498,10 +505,13 @@ def _enrich_items(
                 "rate": 1,
                 "item_tax_preferences": 1,
                 "hsn_or_sac": 1,
+                "status": 1,
                 "purchase_status": 1,
             },
         ):
-            products_by_model[p["cf_sku_code"]] = p
+            sku = p["cf_sku_code"]
+            if sku not in products_by_model or p.get("status") == "active":
+                products_by_model[sku] = p
 
     products_by_asin: dict[str, dict] = {}
     for asin in asins:
