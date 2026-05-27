@@ -847,7 +847,6 @@ async def create_draft_order_po(
                 "rate": it["unit_price"],
                 "account_id": it.get("purchase_account_id") or DEFAULT_ACCOUNT_ID,
                 "hsn_or_sac": it.get("hsn_or_sac", ""),
-                "warehouse_id": DEFAULT_WAREHOUSE_ID,
                 "unit": "pcs",
                 "tags": [],
                 "item_custom_fields": [],
