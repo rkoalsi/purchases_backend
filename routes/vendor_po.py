@@ -1150,13 +1150,10 @@ async def list_vendor_pos(db=Depends(get_database)):
             },
             {
                 "$addFields": {
-                    # Use estimate sub_total/total when available, else fall back to item sums
-                    "total_cost": {
-                        "$ifNull": ["$_est.sub_total", "$_items_cost"]
-                    },
-                    "total_cost_gst": {
-                        "$ifNull": ["$_est.total", "$_items_cost_gst"]
-                    },
+                    # Always use computed item sums so the portal total matches the XLSX
+                    # (Zoho estimate sub_total can be stale if product GST/pricing changed after estimate creation)
+                    "total_cost": "$_items_cost",
+                    "total_cost_gst": "$_items_cost_gst",
                 }
             },
             {
