@@ -1152,8 +1152,8 @@ async def list_vendor_pos(db=Depends(get_database)):
                 "$addFields": {
                     # Always use computed item sums so the portal total matches the XLSX
                     # (Zoho estimate sub_total can be stale if product GST/pricing changed after estimate creation)
-                    "total_cost": "$_items_cost",
-                    "total_cost_gst": "$_items_cost_gst",
+                    "total_cost": {"$round": ["$_items_cost", 2]},
+                    "total_cost_gst": {"$round": ["$_items_cost_gst", 2]},
                 }
             },
             {
@@ -1497,13 +1497,18 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
 
     enriched, live_inv_date, live_zoho_date = await asyncio.to_thread(_fetch)
 
-    # Write computed total_cost back to each item in the DB so the list aggregation reflects it.
+    # Write computed total_cost / total_cost_fo back to each item in the DB so the list aggregation reflects it.
     def _write_back_costs():
         for it in enriched:
             asin = it.get("asin")
             db[PO_COLLECTION].update_one(
                 {"po_number": po_number, "items.asin": asin},
-                {"$set": {"items.$.total_cost": it.get("total_cost"), "items.$.total_cost_gst": it.get("total_cost_gst")}},
+                {"$set": {
+                    "items.$.total_cost": it.get("total_cost"),
+                    "items.$.total_cost_gst": it.get("total_cost_gst"),
+                    "items.$.total_cost_fo": it.get("total_cost_fo"),
+                    "items.$.total_cost_fo_gst": it.get("total_cost_fo_gst"),
+                }},
             )
 
     asyncio.create_task(asyncio.to_thread(_write_back_costs))
@@ -1604,7 +1609,27 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
         margin = it.get("margin")
         gst = it.get("gst") or 0
 
-        if mrp_wo_gst is not None and margin is not None:
+        # Prefer stored total_cost_fo (written back by XLSX download / enrichment)
+        # so the comparison always reflects the same number as the XLSX.
+        # Stored mrp_wo_gst / gst may be stale (e.g. GST changed after PO upload).
+        if it.get("total_cost_fo") is not None:
+            po_item_total = it["total_cost_fo"]
+            # Rate: cost_price_wo_tax is the unit cost used to derive total_cost_fo
+            if it.get("cost_price_wo_tax") is not None:
+                rate = it["cost_price_wo_tax"]
+            elif supply:
+                rate = round(po_item_total / supply, 4)
+            else:
+                rate = None
+        elif it.get("total_cost") is not None:
+            po_item_total = it["total_cost"]
+            if it.get("cost_price_wo_tax") is not None:
+                rate = it["cost_price_wo_tax"]
+            elif supply:
+                rate = round(po_item_total / supply, 4)
+            else:
+                rate = None
+        elif mrp_wo_gst is not None and margin is not None:
             rate = round(mrp_wo_gst, 2)
             disc = round(margin * 100, 2) / 100
             po_item_total = round(rate * supply * (1 - disc), 2)
@@ -1623,6 +1648,16 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
         est_rate = eli.get("rate") if eli else None
         est_item_total = eli.get("item_total") if eli else None
 
+        # po_item_total_gst: prefer stored total_cost_fo_gst; fall back to computing from gst
+        if it.get("total_cost_fo_gst") is not None:
+            po_item_total_gst = it["total_cost_fo_gst"]
+        elif it.get("total_cost_gst") is not None:
+            po_item_total_gst = it["total_cost_gst"]
+        elif po_item_total is not None and gst:
+            po_item_total_gst = round(po_item_total * (1 + gst / 100), 2)
+        else:
+            po_item_total_gst = po_item_total
+
         rows.append({
             "model_number": model,
             "title": it.get("title") or "",
@@ -1633,6 +1668,7 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
             "gst": gst,
             "po_rate": rate,
             "po_item_total": po_item_total,
+            "po_item_total_gst": po_item_total_gst,
             "in_estimate": in_estimate,
             "estimate_qty": est_qty,
             "estimate_rate": est_rate,
@@ -1652,10 +1688,7 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
     ]
 
     po_total = round(sum(r["po_item_total"] for r in rows if r["po_item_total"] is not None), 2)
-    po_total_gst = round(sum(
-        round(r["po_item_total"] * (1 + r["gst"] / 100), 2) if r["gst"] else r["po_item_total"]
-        for r in rows if r["po_item_total"] is not None
-    ), 2)
+    po_total_gst = round(sum(r["po_item_total_gst"] for r in rows if r["po_item_total_gst"] is not None), 2)
 
     return {
         "po_number": po_number,
