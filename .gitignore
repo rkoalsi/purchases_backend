@@ -6,3 +6,6 @@ creds.json
 scripts/import_po_history.py
 .gitignore
 scripts/
+graphify-out/
+CLAUDE.md
+settings.json
