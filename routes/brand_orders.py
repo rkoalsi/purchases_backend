@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, Request, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from ..database import get_database, serialize_mongo_document
 import asyncio
@@ -668,7 +668,7 @@ async def update_order(
                     },
                     {
                         "type": "context",
-                        "elements": [{"type": "mrkdwn", "text": f"{subtitle}  ·  {datetime.now().strftime('%d %b %Y, %H:%M')}"}],
+                        "elements": [{"type": "mrkdwn", "text": f"{subtitle}  ·  {datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30))).strftime('%d %b %Y, %H:%M')} IST"}],
                     },
                 ]
                 for url in urls:
