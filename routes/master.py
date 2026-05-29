@@ -9,6 +9,7 @@ import json
 import math
 from collections import defaultdict
 from ..database import get_database
+from .amazon import generate_report_by_date_range as amazon_generate_report
 import logging
 import traceback
 
@@ -697,6 +698,49 @@ class OptimizedMasterReportService:
 
         except Exception as e:
             logger.error(f"Error fetching vendor central by SKU: {e}")
+            return {}
+
+    async def fetch_amazon_sku_set(self) -> Set[str]:
+        """Return set of all sku_codes present in amazon_sku_mapping (Live on Amazon)."""
+        try:
+            col = self.database.get_collection("amazon_sku_mapping")
+            def _query():
+                return {doc["sku_code"] for doc in col.find({}, {"sku_code": 1, "_id": 0}) if doc.get("sku_code")}
+            return await asyncio.to_thread(_query)
+        except Exception as e:
+            logger.error(f"Error fetching amazon sku set: {e}")
+            return set()
+
+    async def fetch_blinkit_sku_set(self) -> Set[str]:
+        """Return set of all sku_codes present in blinkit_sku_mapping (Live on Blinkit)."""
+        try:
+            col = self.database.get_collection("blinkit_sku_mapping")
+            def _query():
+                return {doc["sku_code"] for doc in col.find({}, {"sku_code": 1, "_id": 0}) if doc.get("sku_code")}
+            return await asyncio.to_thread(_query)
+        except Exception as e:
+            logger.error(f"Error fetching blinkit sku set: {e}")
+            return set()
+
+    async def fetch_amazon_final_drr_by_sku(self, start_date: str, end_date: str) -> Dict[str, float]:
+        """Fetch Amazon PSR Final DRR per SKU using the exact same computation as the PSR API (VC + FBA combined)."""
+        try:
+            items = await amazon_generate_report(
+                start_date=start_date,
+                end_date=end_date,
+                database=self.database,
+                report_type="all",
+            )
+            result: Dict[str, float] = {}
+            for item in items:
+                sku = item.get("sku_code")
+                if not sku:
+                    continue
+                drr = item.get("drr", 0)
+                result[sku] = round(float(drr), 4) if isinstance(drr, (int, float)) else 0.0
+            return result
+        except Exception as e:
+            logger.error(f"Error fetching Amazon final DRR by SKU: {e}")
             return {}
 
     async def batch_load_product_names(self, sku_codes: Set[str]) -> Dict[str, str]:
@@ -1984,6 +2028,9 @@ async def _generate_master_report_data(
         _zoho_stock_task = asyncio.create_task(report_service.fetch_latest_zoho_wh_stock())
         _fba_stock_task = asyncio.create_task(report_service.fetch_latest_fba_stock())
         _blinkit_inv_task = asyncio.create_task(report_service.fetch_latest_blinkit_inventory())
+        _amazon_sku_task = asyncio.create_task(report_service.fetch_amazon_sku_set())
+        _blinkit_sku_task = asyncio.create_task(report_service.fetch_blinkit_sku_set())
+        _amazon_drr_task = asyncio.create_task(report_service.fetch_amazon_final_drr_by_sku(start_date, end_date))
 
         # Step 1: Fetch Zoho report + composite products in parallel
         tasks = []
@@ -2071,6 +2118,9 @@ async def _generate_master_report_data(
         prev_zoho_date: str = ""
         prev_fba_by_sku: Dict[str, float] = {}
         prev_fba_date: str = ""
+        amazon_sku_set: Set[str] = set()
+        blinkit_sku_set: Set[str] = set()
+        amazon_final_drr_by_sku: Dict[str, float] = {}
 
         # Process results
         individual_reports = {}
@@ -2444,9 +2494,9 @@ async def _generate_master_report_data(
             # function.  By now it has been running concurrently with all report processing,
             # so it should be close to (or already) complete.
             try:
-                lz_res, lf_res, lb_res = await asyncio.wait_for(
-                    asyncio.gather(_zoho_stock_task, _fba_stock_task, _blinkit_inv_task, return_exceptions=True),
-                    timeout=45.0,
+                lz_res, lf_res, lb_res, amz_sku_res, blk_sku_res, amz_drr_res = await asyncio.wait_for(
+                    asyncio.gather(_zoho_stock_task, _fba_stock_task, _blinkit_inv_task, _amazon_sku_task, _blinkit_sku_task, _amazon_drr_task, return_exceptions=True),
+                    timeout=60.0,
                 )
                 if not isinstance(lz_res, Exception):
                     latest_zoho_by_sku = lz_res.get("by_sku", {})
@@ -2467,11 +2517,26 @@ async def _generate_master_report_data(
                     latest_blinkit_inv_date = lb_res.get("latest_date") or ""
                 else:
                     logger.error(f"Latest Blinkit inventory fetch failed: {lb_res}")
+                if not isinstance(amz_sku_res, Exception):
+                    amazon_sku_set = amz_sku_res
+                else:
+                    logger.error(f"Amazon SKU set fetch failed: {amz_sku_res}")
+                if not isinstance(blk_sku_res, Exception):
+                    blinkit_sku_set = blk_sku_res
+                else:
+                    logger.error(f"Blinkit SKU set fetch failed: {blk_sku_res}")
+                if not isinstance(amz_drr_res, Exception):
+                    amazon_final_drr_by_sku = amz_drr_res
+                else:
+                    logger.error(f"Amazon final DRR fetch failed: {amz_drr_res}")
             except asyncio.TimeoutError:
                 logger.warning("Latest stock fetch timed out — latest stock columns will be empty")
                 _zoho_stock_task.cancel()
                 _fba_stock_task.cancel()
                 _blinkit_inv_task.cancel()
+                _amazon_sku_task.cancel()
+                _blinkit_sku_task.cancel()
+                _amazon_drr_task.cancel()
 
             # Inject stub rows for SKUs that have FBA stock but zero sales in this period.
             # These ASINs exist in amazon_sku_mapping but never appeared in any sales report,
@@ -2731,6 +2796,10 @@ async def _generate_master_report_data(
                 item["sku"] = _pdata.get("sku", "") or ""
                 # Blinkit inventory
                 item["blinkit_inventory"] = round(latest_blinkit_by_sku.get(sku, 0), 2)
+                # Platform live flags
+                item["live_on_amazon"] = sku in amazon_sku_set
+                item["live_on_blinkit"] = sku in blinkit_sku_set
+                item["amazon_final_drr"] = amazon_final_drr_by_sku.get(sku, 0.0)
                 # Etrade (Vendor Central) inventory
                 vc_data = vc_by_sku.get(sku, {})
                 vc_stock = round(vc_data.get("closing_stock", 0), 2)
@@ -2861,6 +2930,12 @@ async def _generate_master_report_data(
                 _zoho_stock_task.cancel()
             if not _fba_stock_task.done():
                 _fba_stock_task.cancel()
+            if not _amazon_sku_task.done():
+                _amazon_sku_task.cancel()
+            if not _blinkit_sku_task.done():
+                _blinkit_sku_task.cancel()
+            if not _amazon_drr_task.done():
+                _amazon_drr_task.cancel()
 
         # Step 5: Calculate summary statistics
         total_skus = len(combined_data)
@@ -3484,8 +3559,12 @@ async def download_master_report(
                                            "for Red/uncertain rows."),
                 ("Order Qty + Extra Qty (Rounded)", "Final recommended order quantity, floored to the nearest Case Pack. "
                                            "If the floor would round to 0 and status is ORDER, bumped to 1 case pack."),
-                ("Etrade DRR",             "Vendor Central (Etrade) sell-through DRR for the same period."),
-                ("Days Total Inventory Lasts (Etrade)", "Etrade Inventory ÷ Etrade DRR. Etrade channel cover in days."),
+                ("Amazon DRR",             "Final DRR (units/day) from the Amazon PSR report for the same date range — "
+                                           "identical to the 'Final DRR' column in the Amazon Sales vs Inventory report. "
+                                           "Combines VC + FBA sales. 0 when the SKU has no Amazon sales history."),
+                ("Days Total Inventory Lasts (Amazon)", "Amazon Total Inventory ÷ Amazon DRR. "
+                                           "How many days the combined Amazon stock (VC + FBA) covers at the PSR DRR. "
+                                           "0 when Amazon DRR is 0."),
                 ("Total CBM",              "Cubic metres for the rounded order: (Order Rounded ÷ Case Pack) × CBM per case."),
             ]
             for _ri2, (_col_name, _col_desc) in enumerate(_col_guide, start=0):
@@ -3588,6 +3667,8 @@ async def download_master_report(
                     {
                         "Purchase Status": item.get("purchase_status", ""),
                         "Is New": "Yes" if item.get("is_new", False) else "No",
+                        "Live on Amazon": "Yes" if item.get("live_on_amazon", False) else "No",
+                        "Live on Blinkit": "Yes" if item.get("live_on_blinkit", False) else "No",
                         "SKU Code": item.get("sku_code", ""),
                         "Brand": item.get("brand", ""),
                         "Item Name": item.get("item_name", ""),
@@ -3644,12 +3725,19 @@ async def download_master_report(
                         "Order Qty + Extra Qty (Rounded)": item.get("order_qty_plus_extra_qty_rounded", 0),
                         "Total CBM": item.get("total_cbm", 0),
                         "Days Current Order Lasts": item.get("days_current_order_lasts", 0),
+                        "Current Days Coverage (copy)": 0,  # formula: mirrors Current Days Coverage
                         "Days Total Inventory Lasts": item.get("days_total_inventory_lasts", 0),
-                        f"FBA Inventory ({_latest_fba_label})": item.get("latest_fba_stock", 0),
+                        "Additional Carton (Round up)": None,
+                        "Amazon Quantity (New Listing)": None,
+                        "Blinkit Quantity (New Listing)": None,
+                        "Super Tails Quantity (New Listing)": None,
+                        "Other Additional Quantity": None,
+                        "Final order Qty": None,  # formula injected below
+                        "Final CBM": None,         # formula injected below
+                        f"Amazon Total Inventory ({_latest_fba_label})": round(item.get("latest_fba_stock", 0) + metrics.get("etrade_inventory", 0), 2),
                         f"Blinkit Inventory ({_blinkit_inv_label})": item.get("blinkit_inventory", 0),
-                        f"Etrade Inventory ({_etrade_inv_label})": metrics.get("etrade_inventory", 0),
-                        "Etrade DRR": metrics.get("etrade_drr", 0),
-                        "Days Total Inventory Lasts (Etrade)": 0,
+                        "Amazon DRR": item.get("amazon_final_drr", 0.0),
+                        "Days Total Inventory Lasts (Amazon)": 0,  # formula: Amazon Total Inv / Amazon DRR
                         "Total MRP": 0,
                         "Collection Value": 0,
                     }
@@ -3710,10 +3798,22 @@ async def download_master_report(
                 _AT = _col("Order Qty + Extra Qty (Rounded)")
                 _AU = _col("Total CBM")
                 _AV = _col("Days Current Order Lasts")
+                _cdc_copy    = _col("Current Days Coverage (copy)")
                 _AW = _col("Days Total Inventory Lasts")
-                _etrade_inv  = _col(f"Etrade Inventory ({_etrade_inv_label})")
-                _etrade_drr  = _col("Etrade DRR")
-                _etrade_days = _col("Days Total Inventory Lasts (Etrade)")
+                _add_carton  = _col("Additional Carton (Round up)")
+                _amz_new_qty = _col("Amazon Quantity (New Listing)")
+                _blk_new_qty = _col("Blinkit Quantity (New Listing)")
+                _st_new_qty  = _col("Super Tails Quantity (New Listing)")
+                _other_qty   = _col("Other Additional Quantity")
+                _final_qty   = _col("Final order Qty")
+                _final_cbm   = _col("Final CBM")
+                _amz_total_inv = _col(f"Amazon Total Inventory ({_latest_fba_label})")
+                _etrade_drr  = _col("Amazon DRR")
+                _etrade_days = _col("Days Total Inventory Lasts (Amazon)")
+
+                # Rename the "Current Days Coverage (copy)" header to "Current Days Coverage"
+                _cdc_copy_col_idx = cols_list.index("Current Days Coverage (copy)") + 1
+                ws.cell(row=1, column=_cdc_copy_col_idx).value = "Current Days Coverage"
                 _transfer_col        = _col("Transfer Orders")
                 _days_in_stock_col   = _col(f"Days in Stock (Pupscribe Warehouse)")
                 _drr_src_col         = _col("DRR Source")
@@ -3844,11 +3944,23 @@ async def download_master_report(
                     # Days Current Order Lasts
                     ws[f"{_AV}{r}"] = f"=IF({inactive},0,IF({_N}{r}>0,{_AT}{r}/{_N}{r},0))"
 
+                    # Current Days Coverage (copy) — duplicate of Current Days Coverage for reference
+                    ws[f"{_cdc_copy}{r}"] = f"={_AJ}{r}"
+
                     # Days Total Inventory Lasts = Current Days Coverage + Days Current Order Lasts
                     ws[f"{_AW}{r}"] = f"=IF({inactive},{_AJ}{r},{_AJ}{r}+{_AV}{r})"
 
-                    # Days Total Inventory Lasts (Etrade) = Etrade Inventory / Etrade DRR
-                    ws[f"{_etrade_days}{r}"] = f"=IF({_etrade_drr}{r}>0,{_etrade_inv}{r}/{_etrade_drr}{r},0)"
+                    # Final order Qty = Additional Carton + Order Rounded + Amazon/Blinkit/Supertails New Listing + Other Additional
+                    # Blank manual cells are treated as 0 by Excel arithmetic — no guards needed
+                    ws[f"{_final_qty}{r}"] = (
+                        f"={_add_carton}{r}+{_AT}{r}+{_amz_new_qty}{r}+{_blk_new_qty}{r}+{_st_new_qty}{r}+{_other_qty}{r}"
+                    )
+
+                    # Final CBM = (Final order Qty / Case Pack) × CBM
+                    ws[f"{_final_cbm}{r}"] = f"=IF({inactive},0,IF({_AS}{r}>0,({_final_qty}{r}/{_AS}{r})*{_AR}{r},0))"
+
+                    # Days Total Inventory Lasts (Amazon) = Amazon Total Inventory / Amazon DRR
+                    ws[f"{_etrade_days}{r}"] = f"=IF({_etrade_drr}{r}>0,{_amz_total_inv}{r}/{_etrade_drr}{r},0)"
 
                     # Apply row highlighting based on DRR source / demand override
                     # row_idx is 1-based (row 2 = first data row); convert to 0-based for the set
@@ -3981,11 +4093,15 @@ async def download_master_report(
                             ws_draft[f"{_dqty}{r}"] = (
                                 f"=_xlfn.XLOOKUP({_dbbcode}{r},"
                                 f"'{_master_sheet_ref}'!{_master_sku_col}:{_master_sku_col},"
-                                f"'{_master_sheet_ref}'!{_AT}:{_AT},0)"
+                                f"'{_master_sheet_ref}'!{_final_qty}:{_final_qty},0)"
                             )
                             ws_draft[f"{_dtot}{r}"]  = f"={_dqty}{r}*{_dup}{r}"
                             ws_draft[f"{_dcar}{r}"]  = f"=IF({_dcp}{r}>0,{_dqty}{r}/{_dcp}{r},0)"
-                            ws_draft[f"{_dtcbm}{r}"] = f"={_dcbm}{r}*{_dcar}{r}"
+                            ws_draft[f"{_dtcbm}{r}"] = (
+                                f"=_xlfn.XLOOKUP({_dbbcode}{r},"
+                                f"'{_master_sheet_ref}'!{_master_sku_col}:{_master_sku_col},"
+                                f"'{_master_sheet_ref}'!{_final_cbm}:{_final_cbm},0)"
+                            )
 
                             currency_code = row.get("_currency", "") or ""
                             num_fmt = _CURRENCY_FORMATS.get(currency_code.upper(), _DEFAULT_NUMBER_FMT)
