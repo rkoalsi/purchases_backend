@@ -870,23 +870,10 @@ def query_invoices_for_item_names(
 
 def build_summary_data(
     invoice_data: List[dict],
-    start_date: datetime,
-    end_date: datetime,
 ) -> List[dict]:
     """
-    Build the reorder-trigger summary: one row per (SKU, Customer) where the
-    customer's total quantity for the period >= item DRR × 3.
-    DRR is computed from total units sold across ALL customers in this dataset.
+    Build the summary: one row per (SKU, Customer), all combinations included.
     """
-    period_days = max((end_date - start_date).days, 1)
-
-    # Per-SKU totals across all customers → DRR
-    sku_units: dict = {}
-    for row in invoice_data:
-        sku = row.get("SKU Code") or ""
-        sku_units[sku] = sku_units.get(sku, 0.0) + float(row.get("Quantity") or 0)
-    sku_drr = {sku: total / period_days for sku, total in sku_units.items()}
-
     # Aggregate by (SKU, Customer)
     agg: dict = {}
     for row in invoice_data:
@@ -910,22 +897,20 @@ def build_summary_data(
 
     summary_rows = []
     for key, entry in agg.items():
-        drr = sku_drr.get(key[0], 0.0)
-        if drr > 0 and entry["Total Quantity"] >= drr * 3:
-            summary_rows.append(
-                {
-                    "SKU Code": entry["SKU Code"],
-                    "Item": entry["Item"],
-                    "Customer": entry["Customer"],
-                    "Total Quantity": round(entry["Total Quantity"], 2),
-                    "Total Amount": round(entry["Total Amount"], 2),
-                    "Total no. of orders in current period": len(entry["_invoices"]),
-                    "Status": entry["Status"],
-                    "Purchase Status": entry["Purchase Status"],
-                    "Remark": "Check with sales team",
-                    "Sales Confirmation - Reorder Expected?": "",
-                }
-            )
+        summary_rows.append(
+            {
+                "SKU Code": entry["SKU Code"],
+                "Item": entry["Item"],
+                "Customer": entry["Customer"],
+                "Total Quantity": round(entry["Total Quantity"], 2),
+                "Total Amount": round(entry["Total Amount"], 2),
+                "Total no. of orders in current period": len(entry["_invoices"]),
+                "Status": entry["Status"],
+                "Purchase Status": entry["Purchase Status"],
+                "Remark": "",
+                "Sales Confirmation - Reorder Expected?": "",
+            }
+        )
 
     # Sort by Total Quantity descending
     summary_rows.sort(key=lambda r: r["Total Quantity"], reverse=True)
@@ -1057,9 +1042,8 @@ def generate_invoice_report(
                 status_code=404, detail="No invoices found for the specified criteria"
             )
 
-        # Build summary before min_quantity filter so DRR reflects full picture
-        summary_data = build_summary_data(invoice_data, start_date, end_date)
-        logger.info(f"Summary sheet: {len(summary_data)} reorder-trigger rows")
+        summary_data = build_summary_data(invoice_data)
+        logger.info(f"Summary sheet: {len(summary_data)} rows")
 
         # Filter by min_quantity: keep only rows where quantity >= threshold
         if request.min_quantity is not None and request.min_quantity > 0:
