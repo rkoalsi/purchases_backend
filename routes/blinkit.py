@@ -489,6 +489,41 @@ def get_sku_mapping(database=Depends(get_database)):
         )
 
 
+@router.get("/sku-mapping-template")
+def download_sku_mapping_template():
+    """Download a blank Excel template with columns: Item ID, Item Name, SKU Code."""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(columns=["Item ID", "Item Name", "SKU Code"]).to_excel(
+            writer, index=False, sheet_name="SKU Mapping"
+        )
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=blinkit_sku_mapping_template.xlsx"},
+    )
+
+
+def _find_header_row(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Auto-detect the header row in an Excel file.
+    Scans up to 5 rows looking for either Blinkit export columns or template columns.
+    Returns the DataFrame read with the correct header row.
+    """
+    blinkit_sentinel = "UPC/EAN/UPC Exemption Code"
+    template_sentinel = "SKU Code"
+
+    raw = pd.read_excel(BytesIO(file_bytes), header=None)
+    for i in range(min(5, len(raw))):
+        row_vals = [str(v).strip() for v in raw.iloc[i].tolist() if pd.notna(v)]
+        if blinkit_sentinel in row_vals or template_sentinel in row_vals:
+            return pd.read_excel(BytesIO(file_bytes), header=i)
+
+    # Fallback: return with default header
+    return pd.read_excel(BytesIO(file_bytes))
+
+
 @router.post("/upload-sku-mapping")
 async def upload_sku_mapping(
     file: UploadFile = File(...), database=Depends(get_database)
@@ -496,7 +531,13 @@ async def upload_sku_mapping(
     """
     Uploads SKU mapping data from an Excel file (.xlsx).
     Clears existing mapping and inserts new data.
-    Expected columns: 'Item ID', 'SKU Code', 'Item Name'.
+
+    Accepts two formats:
+      1. Template format — columns: 'Item ID', 'Item Name', 'SKU Code'
+      2. Blinkit product listing export — columns: 'Product name', 'Item ID', 'UPC/EAN/UPC Exemption Code'
+         (SKU code is resolved by looking up the UPC in the products collection)
+
+    Multi-row headers (as in Blinkit exports) are auto-detected.
     """
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(
@@ -506,61 +547,128 @@ async def upload_sku_mapping(
 
     try:
         file_content = await file.read()
-        df = pd.read_excel(BytesIO(file_content))
+        df = _find_header_row(file_content)
 
-        # Validate required columns
-        required_cols = ["Item ID", "SKU Code", "Item Name"]
-        if not all(col in df.columns for col in required_cols):
-            missing = [col for col in required_cols if col not in df.columns]
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Missing required columns: {', '.join(missing)}",
-            )
+        cols = set(df.columns.tolist())
+        is_blinkit_format = "UPC/EAN/UPC Exemption Code" in cols
+
+        if is_blinkit_format:
+            # Blinkit export: 'Product name', 'Item ID', 'UPC/EAN/UPC Exemption Code'
+            required_cols = ["Product name", "Item ID", "UPC/EAN/UPC Exemption Code"]
+            if not all(col in cols for col in required_cols):
+                missing = [col for col in required_cols if col not in cols]
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Missing required columns for Blinkit format: {', '.join(missing)}",
+                )
+        else:
+            required_cols = ["Item ID", "Item Name", "SKU Code"]
+            if not all(col in cols for col in required_cols):
+                missing = [col for col in required_cols if col not in cols]
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Missing required columns: {', '.join(missing)}. "
+                           f"Expected either template format (Item ID, Item Name, SKU Code) "
+                           f"or Blinkit export format (Product name, Item ID, UPC/EAN/UPC Exemption Code).",
+                )
 
         sku_collection = database.get_collection(SKU_COLLECTION)
-
-        # Optional: Clear existing mapping or implement upsert logic
-        delete_result = sku_collection.delete_many({})
-        logger.info(f"Deleted {delete_result.deleted_count} existing SKU mappings.")
-
+        products_collection = database.get_collection("products")
         data_to_insert = []
-        for _, row in df.iterrows():
-            item_id = str(row["Item ID"]).strip() if pd.notna(row["Item ID"]) else None
-            sku_code = (
-                str(row["SKU Code"]).strip() if pd.notna(row["SKU Code"]) else None
-            )
-            item_name = (
-                str(row["Item Name"]).strip() if pd.notna(row["Item Name"]) else None
-            )
+        skipped_no_upc = 0
+        skipped_no_match = []
 
-            if (
-                item_id and sku_code and item_name
-            ):  # Ensure essential fields are present
-                data_to_insert.append(
-                    {
-                        "item_id": item_id,
-                        "sku_code": sku_code,
-                        "item_name": item_name,
-                    }
-                )
-            else:
-                logger.info(f"Skipping SKU row due to missing data: {row.to_dict()}")
+        if is_blinkit_format:
+            # Batch-lookup UPC → cf_sku_code from products collection
+            upcs = [
+                str(row["UPC/EAN/UPC Exemption Code"]).strip()
+                for _, row in df.iterrows()
+                if pd.notna(row["UPC/EAN/UPC Exemption Code"])
+                and str(row["UPC/EAN/UPC Exemption Code"]).strip()
+            ]
+            upc_to_sku = {}
+            if upcs:
+                for prod in products_collection.find(
+                    {"sku": {"$in": upcs}, "cf_sku_code": {"$exists": True, "$ne": ""}},
+                    {"sku": 1, "cf_sku_code": 1},
+                ):
+                    upc_to_sku[prod["sku"]] = prod["cf_sku_code"]
+
+            for _, row in df.iterrows():
+                raw_id = row.get("Item ID")
+                raw_name = row.get("Product name")
+                raw_upc = row.get("UPC/EAN/UPC Exemption Code")
+
+                item_id = str(raw_id).strip() if pd.notna(raw_id) else None
+                item_name = str(raw_name).strip() if pd.notna(raw_name) else None
+                upc = str(raw_upc).strip() if pd.notna(raw_upc) else None
+
+                if not item_id or not item_name or not upc:
+                    skipped_no_upc += 1
+                    continue
+
+                sku_code = upc_to_sku.get(upc)
+                if not sku_code:
+                    skipped_no_match.append(f"{item_name} (UPC: {upc})")
+                    continue
+
+                try:
+                    item_id_val = int(float(item_id))
+                except (ValueError, OverflowError):
+                    item_id_val = item_id
+
+                data_to_insert.append({
+                    "item_id": item_id_val,
+                    "sku_code": sku_code,
+                    "item_name": item_name,
+                })
+
+        else:
+            for _, row in df.iterrows():
+                item_id = str(row["Item ID"]).strip() if pd.notna(row["Item ID"]) else None
+                sku_code = str(row["SKU Code"]).strip() if pd.notna(row["SKU Code"]) else None
+                item_name = str(row["Item Name"]).strip() if pd.notna(row["Item Name"]) else None
+
+                if not (item_id and sku_code and item_name):
+                    skipped_no_upc += 1
+                    continue
+
+                try:
+                    item_id_val = int(float(item_id))
+                except (ValueError, OverflowError):
+                    item_id_val = item_id
+
+                data_to_insert.append({
+                    "item_id": item_id_val,
+                    "sku_code": sku_code,
+                    "item_name": item_name,
+                })
 
         if not data_to_insert:
             return {"message": "No valid SKU mapping data found to insert."}
 
+        delete_result = sku_collection.delete_many({})
+        logger.info(f"Deleted {delete_result.deleted_count} existing SKU mappings.")
+
         insert_result = sku_collection.insert_many(data_to_insert)
         logger.info(f"Inserted {len(insert_result.inserted_ids)} new SKU mappings.")
 
-        # Create index for efficient lookup
         sku_collection.create_index([("item_id", ASCENDING)], unique=True)
 
+        msg = f"Successfully uploaded {len(insert_result.inserted_ids)} SKU mappings."
+        if skipped_no_match:
+            msg += f" {len(skipped_no_match)} row(s) skipped (UPC not found in products)."
+        if skipped_no_upc:
+            msg += f" {skipped_no_upc} row(s) skipped (missing data)."
+
         return {
-            "message": f"Successfully uploaded and stored {len(insert_result.inserted_ids)} SKU mappings."
+            "message": msg,
+            "inserted": len(insert_result.inserted_ids),
+            "skipped_no_match": skipped_no_match,
         }
 
     except HTTPException as e:
-        raise e  # Re-raise intended HTTP exceptions
+        raise e
     except Exception as e:
         logger.info(f"Error uploading SKU mapping: {e}")
         raise HTTPException(
