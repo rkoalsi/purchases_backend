@@ -649,8 +649,8 @@ async def update_order(
     }
     if order_doc:
         def _notify_dates(brand: str, order_name: str, notifications: list):
-            url = os.getenv("SLACK_URL_DESIGN")
-            if not url:
+            urls = [u for u in [os.getenv("SLACK_URL_DESIGN"), os.getenv("SLACK_URL_PURCHASE")] if u]
+            if not urls:
                 return
             for title, subtitle, date_val in notifications:
                 blocks = [
@@ -671,10 +671,11 @@ async def update_order(
                         "elements": [{"type": "mrkdwn", "text": f"{subtitle}  ·  {datetime.now().strftime('%d %b %Y, %H:%M')}"}],
                     },
                 ]
-                try:
-                    requests.post(url, json={"blocks": blocks}, timeout=10)
-                except Exception as exc:
-                    logger.warning("Brand order Slack notification failed: %s", exc)
+                for url in urls:
+                    try:
+                        requests.post(url, json={"blocks": blocks}, timeout=10)
+                    except Exception as exc:
+                        logger.warning("Brand order Slack notification failed: %s", exc)
 
         notifications_to_send = []
         for field, (title, subtitle) in _DATE_NOTIFICATIONS.items():
