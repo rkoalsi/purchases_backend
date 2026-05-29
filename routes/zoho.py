@@ -34,6 +34,7 @@ class ReportRequest(BaseModel):
     exclude_customers: bool = False
     min_quantity: float = None
     report_type: str = "customer"  # "customer" or "transfer_order"
+    buffer_days: int = 3
 
     @validator("start_date", "end_date")
     def validate_date_format(cls, v):
@@ -867,7 +868,81 @@ def query_invoices_for_item_names(
         raise HTTPException(status_code=500, detail="Error querying invoice data")
 
 
-def create_excel_file(data: List[dict]) -> io.BytesIO:
+def build_summary_data(
+    invoice_data: List[dict],
+    start_date: datetime,
+    end_date: datetime,
+    buffer_days: int = 3,
+) -> List[dict]:
+    """
+    Build the reorder-trigger summary: one row per (SKU, Customer) where the
+    customer's total quantity for the period >= item DRR × buffer_days.
+    DRR is computed from total units sold across ALL customers in this dataset.
+    """
+    period_days = max((end_date - start_date).days, 1)
+
+    # Per-SKU totals across all customers → DRR
+    sku_units: dict = {}
+    for row in invoice_data:
+        sku = row.get("SKU Code") or ""
+        sku_units[sku] = sku_units.get(sku, 0.0) + float(row.get("Quantity") or 0)
+    sku_drr = {sku: total / period_days for sku, total in sku_units.items()}
+
+    # Aggregate by (SKU, Customer)
+    agg: dict = {}
+    for row in invoice_data:
+        sku = row.get("SKU Code") or ""
+        customer = row.get("Customer") or ""
+        key = (sku, customer)
+        if key not in agg:
+            agg[key] = {
+                "SKU Code": sku,
+                "Item": row.get("Item", ""),
+                "Customer": customer,
+                "Total Quantity": 0.0,
+                "Total Amount": 0.0,
+                "_invoices": set(),
+                "Status": row.get("Status", ""),
+                "Purchase Status": row.get("Purchase Status", ""),
+            }
+        agg[key]["Total Quantity"] += float(row.get("Quantity") or 0)
+        agg[key]["Total Amount"] += float(row.get("Total Amount") or 0)
+        agg[key]["_invoices"].add(row.get("Invoice Number"))
+
+    trigger_col = (
+        f"Trigger (If customer order quantity >= DRR x {buffer_days}, "
+        "then check with sales team if reorder is expected)"
+    )
+
+    summary_rows = []
+    for key, entry in agg.items():
+        drr = sku_drr.get(key[0], 0.0)
+        trigger_val = drr * buffer_days
+        if drr > 0 and entry["Total Quantity"] >= trigger_val:
+            summary_rows.append(
+                {
+                    "SKU Code": entry["SKU Code"],
+                    "Item": entry["Item"],
+                    "Customer": entry["Customer"],
+                    "Total Quantity": round(entry["Total Quantity"], 2),
+                    "Total Amount": round(entry["Total Amount"], 2),
+                    "Total no. of orders in current period": len(entry["_invoices"]),
+                    "Status": entry["Status"],
+                    "Purchase Status": entry["Purchase Status"],
+                    "DRR": round(drr, 6),
+                    "Buffer days": buffer_days,
+                    trigger_col: round(trigger_val, 6),
+                    "Remark": "Check with sales team",
+                    "Sales Confirmation - Reorder Expected?": "",
+                }
+            )
+
+    # Sort by Total Quantity descending
+    summary_rows.sort(key=lambda r: r["Total Quantity"], reverse=True)
+    return summary_rows
+
+
+def create_excel_file(data: List[dict], summary_data: List[dict] = None) -> io.BytesIO:
     """
     Create Excel file with parallel processing for large datasets.
     """
@@ -910,21 +985,32 @@ def create_excel_file(data: List[dict]) -> io.BytesIO:
         # Create Excel file in memory
         excel_buffer = io.BytesIO()
 
-        # Use xlsxwriter for better performance on large files
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="Invoice Report", index=False)
 
-            # Optional: Add formatting for better presentation
             workbook = writer.book
             worksheet = writer.sheets["Invoice Report"]
 
-            # Auto-adjust column widths
             for column in df:
                 column_length = max(df[column].astype(str).map(len).max(), len(column))
                 col_idx = df.columns.get_loc(column)
                 worksheet.column_dimensions[chr(65 + col_idx)].width = min(
                     column_length + 2, 50
                 )
+
+            # Summary / reorder-trigger sheet
+            if summary_data:
+                from openpyxl.utils import get_column_letter
+                summary_df = pd.DataFrame(summary_data)
+                summary_df.to_excel(writer, sheet_name="Summary Report", index=False)
+                ws_summary = writer.sheets["Summary Report"]
+                for col_idx, column in enumerate(summary_df.columns, start=1):
+                    col_letter = get_column_letter(col_idx)
+                    col_width = max(
+                        summary_df[column].astype(str).map(len).max(),
+                        len(column),
+                    )
+                    ws_summary.column_dimensions[col_letter].width = min(col_width + 2, 60)
 
         excel_buffer.seek(0)
         logger.info("Excel file created successfully")
@@ -981,6 +1067,12 @@ def generate_invoice_report(
                 status_code=404, detail="No invoices found for the specified criteria"
             )
 
+        # Build summary before min_quantity filter so DRR reflects full picture
+        summary_data = build_summary_data(
+            invoice_data, start_date, end_date, request.buffer_days
+        )
+        logger.info(f"Summary sheet: {len(summary_data)} reorder-trigger rows")
+
         # Filter by min_quantity: keep only rows where quantity >= threshold
         if request.min_quantity is not None and request.min_quantity > 0:
             before_count = len(invoice_data)
@@ -1001,7 +1093,7 @@ def generate_invoice_report(
 
         # STEP 3: Create Excel file (parallel processing for large datasets)
         excel_start = datetime.now()
-        excel_file = create_excel_file(invoice_data)
+        excel_file = create_excel_file(invoice_data, summary_data)
         excel_duration = (datetime.now() - excel_start).total_seconds()
         logger.info(f"Excel generation took {excel_duration:.2f} seconds")
 
