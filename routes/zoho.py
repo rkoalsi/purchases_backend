@@ -34,7 +34,7 @@ class ReportRequest(BaseModel):
     exclude_customers: bool = False
     min_quantity: float = None
     report_type: str = "customer"  # "customer" or "transfer_order"
-    buffer_days: int = 3
+
 
     @validator("start_date", "end_date")
     def validate_date_format(cls, v):
@@ -872,11 +872,10 @@ def build_summary_data(
     invoice_data: List[dict],
     start_date: datetime,
     end_date: datetime,
-    buffer_days: int = 3,
 ) -> List[dict]:
     """
     Build the reorder-trigger summary: one row per (SKU, Customer) where the
-    customer's total quantity for the period >= item DRR × buffer_days.
+    customer's total quantity for the period >= item DRR × 3.
     DRR is computed from total units sold across ALL customers in this dataset.
     """
     period_days = max((end_date - start_date).days, 1)
@@ -909,16 +908,10 @@ def build_summary_data(
         agg[key]["Total Amount"] += float(row.get("Total Amount") or 0)
         agg[key]["_invoices"].add(row.get("Invoice Number"))
 
-    trigger_col = (
-        f"Trigger (If customer order quantity >= DRR x {buffer_days}, "
-        "then check with sales team if reorder is expected)"
-    )
-
     summary_rows = []
     for key, entry in agg.items():
         drr = sku_drr.get(key[0], 0.0)
-        trigger_val = drr * buffer_days
-        if drr > 0 and entry["Total Quantity"] >= trigger_val:
+        if drr > 0 and entry["Total Quantity"] >= drr * 3:
             summary_rows.append(
                 {
                     "SKU Code": entry["SKU Code"],
@@ -929,9 +922,6 @@ def build_summary_data(
                     "Total no. of orders in current period": len(entry["_invoices"]),
                     "Status": entry["Status"],
                     "Purchase Status": entry["Purchase Status"],
-                    "DRR": round(drr, 6),
-                    "Buffer days": buffer_days,
-                    trigger_col: round(trigger_val, 6),
                     "Remark": "Check with sales team",
                     "Sales Confirmation - Reorder Expected?": "",
                 }
@@ -1068,9 +1058,7 @@ def generate_invoice_report(
             )
 
         # Build summary before min_quantity filter so DRR reflects full picture
-        summary_data = build_summary_data(
-            invoice_data, start_date, end_date, request.buffer_days
-        )
+        summary_data = build_summary_data(invoice_data, start_date, end_date)
         logger.info(f"Summary sheet: {len(summary_data)} reorder-trigger rows")
 
         # Filter by min_quantity: keep only rows where quantity >= threshold
