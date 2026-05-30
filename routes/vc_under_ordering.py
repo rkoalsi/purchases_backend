@@ -175,7 +175,7 @@ def _fetch_data(db, drr_map: dict) -> tuple:
         if latest_zoho_date:
             zoho_date_str = latest_zoho_date.strftime("%-d %b %Y") if isinstance(latest_zoho_date, datetime) else str(latest_zoho_date)
 
-    # 8. Monthly sales — last 4 calendar months from amazon_vendor_sales
+    # 8. Monthly sales — last 4 calendar months (FBA + VC combined, matching Amazon PSR)
     months: list[tuple[int, int]] = []
     ref = today.replace(day=1)
     for _ in range(4):
@@ -183,20 +183,40 @@ def _fetch_data(db, drr_map: dict) -> tuple:
         months.append((ref.year, ref.month))
     months.reverse()
 
-    def month_bounds(y: int, m: int):
-        s = datetime(y, m, 1)
-        e = datetime(y + 1, 1, 1) if m == 12 else datetime(y, m + 1, 1)
-        return s, e
+    earliest = datetime(months[0][0], months[0][1], 1)
+    months_set = set(months)
 
     monthly_sales: dict[str, dict] = {a: {} for a in asins}
-    for (y, m) in months:
-        label = f"{MONTH_NAMES[m]} {y}"
-        ms, me = month_bounds(y, m)
-        for doc in db[SALES_COLLECTION].aggregate([
-            {"$match": {"asin": {"$in": asins}, "date": {"$gte": ms, "$lt": me}}},
-            {"$group": {"_id": "$asin", "total": {"$sum": "$orderedUnits"}}},
-        ]):
-            monthly_sales[doc["_id"]][label] = int(doc["total"] or 0)
+
+    # FBA sales (Seller Central / amazon_sales_traffic)
+    for doc in db["amazon_sales_traffic"].aggregate([
+        {"$match": {"parentAsin": {"$in": asins}, "date": {"$gte": earliest}}},
+        {"$group": {
+            "_id": {"asin": "$parentAsin", "year": {"$year": "$date"}, "month": {"$month": "$date"}},
+            "total": {"$sum": "$salesByAsin.unitsOrdered"},
+        }},
+    ]):
+        a = doc["_id"]["asin"]
+        y, m = doc["_id"]["year"], doc["_id"]["month"]
+        if (y, m) in months_set:
+            label = f"{MONTH_NAMES[m]} {y}"
+            monthly_sales.setdefault(a, {})
+            monthly_sales[a][label] = monthly_sales[a].get(label, 0) + int(doc["total"] or 0)
+
+    # VC sales (Vendor Central / amazon_vendor_sales)
+    for doc in db[SALES_COLLECTION].aggregate([
+        {"$match": {"asin": {"$in": asins}, "date": {"$gte": earliest}}},
+        {"$group": {
+            "_id": {"asin": "$asin", "year": {"$year": "$date"}, "month": {"$month": "$date"}},
+            "total": {"$sum": "$orderedUnits"},
+        }},
+    ]):
+        a = doc["_id"]["asin"]
+        y, m = doc["_id"]["year"], doc["_id"]["month"]
+        if (y, m) in months_set:
+            label = f"{MONTH_NAMES[m]} {y}"
+            monthly_sales.setdefault(a, {})
+            monthly_sales[a][label] = monthly_sales[a].get(label, 0) + int(doc["total"] or 0)
 
     month_labels = [f"{MONTH_NAMES[m]} {y}" for (y, m) in months]
 
