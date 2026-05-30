@@ -4317,3 +4317,47 @@ def get_estimates_vs_invoices(
         raise HTTPException(
             status_code=500, detail=f"Failed to generate report: {str(e)}"
         )
+
+
+def _check_invoice_recency_sync(db) -> dict:
+    """
+    Check whether the invoices collection has data for the last 15 days.
+    Returns a dict with keys: missing (bool), latest_date (str|None), days_behind (int|None).
+    Invoice dates are stored as strings in YYYY-MM-DD format.
+    """
+    invoices_col = db[INVOICES_COLLECTION]
+    latest_doc = invoices_col.find_one(
+        {"date": {"$type": "string"}},
+        sort=[("date", -1)],
+        projection={"date": 1},
+    )
+    if not latest_doc:
+        return {"missing": True, "latest_date": None, "days_behind": None}
+
+    latest_date_str = latest_doc["date"]
+    try:
+        latest_dt = datetime.strptime(latest_date_str[:10], "%Y-%m-%d")
+    except ValueError:
+        return {"missing": True, "latest_date": latest_date_str, "days_behind": None}
+
+    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    days_behind = (today - latest_dt).days
+    return {
+        "missing": days_behind > 15,
+        "latest_date": latest_date_str[:10],
+        "days_behind": days_behind,
+    }
+
+
+@router.get("/invoice-sync-status")
+async def get_invoice_sync_status(db=Depends(get_database)):
+    """
+    Returns whether the invoices collection is missing the last 15 days of data.
+    Used by report pages to warn users when invoices may be re-syncing.
+    """
+    try:
+        result = await asyncio.to_thread(_check_invoice_recency_sync, db)
+        return result
+    except Exception as e:
+        logger.error(f"Error checking invoice sync status: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to check invoice sync status")
