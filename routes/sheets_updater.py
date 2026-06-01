@@ -62,6 +62,7 @@ SKU_COL_CANDIDATES = [
 ]
 
 _ZOHO_TOKEN_URL    = "https://accounts.zoho.com/oauth/v2/token"
+_PUPSCRIBE_WAREHOUSE_ID = "3220178000000403010"
 _WAREHOUSE_URL     = (
     "https://inventory.zoho.com/api/v1/reports/warehouse"
     "?page={page}&per_page=2000&sort_column=item_name&sort_order=A"
@@ -135,7 +136,8 @@ def _get_inventory_token() -> str:
 def _fetch_live_zoho_stock(db) -> tuple[dict[str, int], str]:
     """
     Fetch today's Zoho Inventory warehouse stock via the live API.
-    Uses top-level quantity_available_for_sale (aggregate across all warehouses).
+    Reads quantity_available_for_sale from the Pupscribe Enterprises Private Limited (Warehouse)
+    sub-entry in each item's warehouse_stock array.
     Returns ({cf_sku_code: qty}, date_str).
     """
     import requests as _req
@@ -172,13 +174,18 @@ def _fetch_live_zoho_stock(db) -> tuple[dict[str, int], str]:
                 if not isinstance(item, dict):
                     continue
                 item_id = item.get("group_name") or ""
-                if not item_id:
-                    sub = item.get("warehouse_stock", [])
-                    if sub:
-                        item_id = sub[0].get("item_id", "")
+                wh_entries = item.get("warehouse_stock", [])
+                if not item_id and wh_entries:
+                    item_id = wh_entries[0].get("item_id", "")
                 if not item_id:
                     continue
-                qty = int(item.get("quantity_available_for_sale", 0) or 0)
+                pupscribe_entry = next(
+                    (w for w in wh_entries if str(w.get("warehouse_id", "")) == _PUPSCRIBE_WAREHOUSE_ID),
+                    None,
+                )
+                if pupscribe_entry is None:
+                    continue
+                qty = int(pupscribe_entry.get("quantity_available_for_sale", 0) or 0)
                 stock_by_item_id[str(item_id)] = qty
 
     logger.info("Live Zoho stock: %d item_ids fetched", len(stock_by_item_id))
