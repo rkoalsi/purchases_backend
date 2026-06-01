@@ -2472,10 +2472,17 @@ async def _generate_master_report_data(
                     }
 
                 if brand:
-                    combined_data = [
-                        item for item in combined_data
-                        if product_brands.get(item.get("sku_code", ""), "").lower() == brand.lower()
-                    ]
+                    if brand.lower() == "petfest":
+                        petfest_brands = {"dogfest", "catfest"}
+                        combined_data = [
+                            item for item in combined_data
+                            if product_brands.get(item.get("sku_code", ""), "").lower() in petfest_brands
+                        ]
+                    else:
+                        combined_data = [
+                            item for item in combined_data
+                            if product_brands.get(item.get("sku_code", ""), "").lower() == brand.lower()
+                        ]
                     logger.info(f"Filtered to {len(combined_data)} items for brand '{brand}'")
 
                 for item in combined_data:
@@ -2558,8 +2565,12 @@ async def _generate_master_report_data(
                         pdata = fba_only_product_data.get(sku, {})
                         # Respect brand filter if active
                         stub_brand = pdata.get("brand", "") or ""
-                        if brand and stub_brand.lower() != brand.lower():
-                            continue
+                        if brand:
+                            if brand.lower() == "petfest":
+                                if stub_brand.lower() not in {"dogfest", "catfest"}:
+                                    continue
+                            elif stub_brand.lower() != brand.lower():
+                                continue
                         name = pdata.get("name") or "Unknown Item"
                         fba_end_stock = round(fba_stock_by_sku.get(sku, 0), 2)
                         # Register stub in product_brands so classify_movement can group it correctly,
@@ -2609,8 +2620,12 @@ async def _generate_master_report_data(
 
                 def _fetch_brand_skus():
                     products_collection = report_service.database.get_collection("products")
+                    if brand.lower() == "petfest":
+                        brand_filter = {"brand": {"$in": ["Dogfest", "Catfest"]}}
+                    else:
+                        brand_filter = {"brand": {"$regex": f"^{brand}$", "$options": "i"}}
                     return list(products_collection.find(
-                        {"brand": {"$regex": f"^{brand}$", "$options": "i"}},
+                        brand_filter,
                         {"cf_sku_code": 1, "_id": 0},
                     ))
 
@@ -3295,7 +3310,7 @@ async def download_master_report(
       then multiplied by the confidence multiplier for `insufficient_stock` items
     - `Order Qty + Extra Qty` – order_qty + extra_qty
     - `CBM`, `Case Pack`
-    - `Order Qty + Extra Qty (Rounded)` – floored to nearest case pack multiple (green fill when
+    - `Order Qty + Extra Qty (Rounded down)` – floored to nearest case pack multiple (green fill when
       demand override was applied)
     - `Total CBM` – (rounded_qty ÷ case_pack) × CBM per case
     - `Days Current Order Lasts` – rounded_qty ÷ DRR
@@ -3328,7 +3343,7 @@ async def download_master_report(
     - `Net Target Days` = Target Days − Current Days Coverage
     - `Order Qty` = max(0, Net Target Days × Avg DRR)
     - `Order Qty + Extra Qty` = Order Qty + Extra Qty
-    - `Order Qty + Extra Qty (Rounded)` = FLOOR to case pack
+    - `Order Qty + Extra Qty (Rounded down)` = FLOOR to case pack
     - `Total CBM` = (Rounded Qty ÷ Case Pack) × CBM
     - `Days Current Order Lasts` = Rounded Qty ÷ DRR
     - `Days Total Inventory Lasts` = Current Days Coverage + Days Current Order Lasts
@@ -3557,7 +3572,7 @@ async def download_master_report(
                                            "how little stock history is available (see DRR Flag)."),
                 ("DRR Flag",               "Empty for normal rows. Shows dampening label and/or seasonal mismatch warning "
                                            "for Red/uncertain rows."),
-                ("Order Qty + Extra Qty (Rounded)", "Final recommended order quantity, floored to the nearest Case Pack. "
+                ("Order Qty + Extra Qty (Rounded down)", "Final recommended order quantity, floored to the nearest Case Pack. "
                                            "If the floor would round to 0 and status is ORDER, bumped to 1 case pack."),
                 ("Amazon DRR",             "Final DRR (units/day) from the Amazon PSR report for the same date range — "
                                            "identical to the 'Final DRR' column in the Amazon Sales vs Inventory report. "
@@ -3722,7 +3737,7 @@ async def download_master_report(
                         "Order Qty + Extra Qty": item.get("order_qty_plus_extra_qty", 0),
                         "CBM": item.get("cbm", 0),
                         "Case Pack": item.get("case_pack", 0),
-                        "Order Qty + Extra Qty (Rounded)": item.get("order_qty_plus_extra_qty_rounded", 0),
+                        "Order Qty + Extra Qty (Rounded down)": item.get("order_qty_plus_extra_qty_rounded", 0),
                         "Total CBM": item.get("total_cbm", 0),
                         "Days Current Order Lasts": item.get("days_current_order_lasts", 0),
                         "Current Days Coverage (copy)": 0,  # formula: mirrors Current Days Coverage
@@ -3733,6 +3748,7 @@ async def download_master_report(
                         "Super Tails Quantity (New Listing)": None,
                         "Other Additional Quantity": None,
                         "Final order Qty": None,  # formula injected below
+                        "Final order Qty (rounded up/down)": None,  # formula injected below
                         "Final CBM": None,         # formula injected below
                         f"Amazon Total Inventory ({_latest_fba_label})": round(item.get("latest_fba_stock", 0) + metrics.get("etrade_inventory", 0), 2),
                         f"Blinkit Inventory ({_blinkit_inv_label})": item.get("blinkit_inventory", 0),
@@ -3795,7 +3811,7 @@ async def download_master_report(
                 _AQ = _col("Order Qty + Extra Qty")
                 _AR = _col("CBM")
                 _AS = _col("Case Pack")
-                _AT = _col("Order Qty + Extra Qty (Rounded)")
+                _AT = _col("Order Qty + Extra Qty (Rounded down)")
                 _AU = _col("Total CBM")
                 _AV = _col("Days Current Order Lasts")
                 _cdc_copy    = _col("Current Days Coverage (copy)")
@@ -3806,6 +3822,7 @@ async def download_master_report(
                 _st_new_qty  = _col("Super Tails Quantity (New Listing)")
                 _other_qty   = _col("Other Additional Quantity")
                 _final_qty   = _col("Final order Qty")
+                _final_qty_rounded = _col("Final order Qty (rounded up/down)")
                 _final_cbm   = _col("Final CBM")
                 _amz_total_inv = _col(f"Amazon Total Inventory ({_latest_fba_label})")
                 _etrade_drr  = _col("Amazon DRR")
@@ -3956,6 +3973,9 @@ async def download_master_report(
                         f"={_add_carton}{r}+{_AT}{r}+{_amz_new_qty}{r}+{_blk_new_qty}{r}+{_st_new_qty}{r}+{_other_qty}{r}"
                     )
 
+                    # Final order Qty (rounded up/down) — standard half-up rounding of Final order Qty
+                    ws[f"{_final_qty_rounded}{r}"] = f"=ROUND({_final_qty}{r},0)"
+
                     # Final CBM = (Final order Qty / Case Pack) × CBM
                     ws[f"{_final_cbm}{r}"] = f"=IF({inactive},0,IF({_AS}{r}>0,({_final_qty}{r}/{_AS}{r})*{_AR}{r},0))"
 
@@ -4047,6 +4067,8 @@ async def download_master_report(
                         "Cartons": None,
                         "CBM": item.get("cbm", 0),
                         "Total CBM": None,
+                        "Final order Qty (rounded up/down)": None,
+                        "Final CBM": None,
                         "_currency": item.get("unit_price_currency", ""),
                     })
 
@@ -4087,6 +4109,8 @@ async def download_master_report(
                         _dcbm    = _dcol("CBM")
                         _dtcbm   = _dcol("Total CBM")
                         _dmrp    = _dcol("MRP")
+                        _dfinalqty_rounded = _dcol("Final order Qty (rounded up/down)")
+                        _dfinal_cbm        = _dcol("Final CBM")
 
                         for r_idx, row in enumerate(_group_rows):
                             r = r_idx + 2  # 1-based, skip header
@@ -4101,6 +4125,14 @@ async def download_master_report(
                                 f"=_xlfn.XLOOKUP({_dbbcode}{r},"
                                 f"'{_master_sheet_ref}'!{_master_sku_col}:{_master_sku_col},"
                                 f"'{_master_sheet_ref}'!{_final_cbm}:{_final_cbm},0)"
+                            )
+                            ws_draft[f"{_dfinalqty_rounded}{r}"] = (
+                                f"=_xlfn.XLOOKUP({_dbbcode}{r},"
+                                f"'{_master_sheet_ref}'!{_master_sku_col}:{_master_sku_col},"
+                                f"'{_master_sheet_ref}'!{_final_qty_rounded}:{_final_qty_rounded},0)"
+                            )
+                            ws_draft[f"{_dfinal_cbm}{r}"] = (
+                                f"=IF({_dcp}{r}>0,({_dfinalqty_rounded}{r}/{_dcp}{r})*{_dcbm}{r},0)"
                             )
 
                             currency_code = row.get("_currency", "") or ""
@@ -4125,10 +4157,12 @@ async def download_master_report(
                         _sum_currency_fmt = _CURRENCY_FORMATS.get(_ckey.upper(), _DEFAULT_NUMBER_FMT)
 
                         _totals_spec: list[tuple[str, str, str]] = [
-                            (_dqty,  f"=SUM({_dqty}{2}:{_dqty}{_last_data_row})",    "#,##0"),
-                            (_dtot,  f"=SUM({_dtot}{2}:{_dtot}{_last_data_row})",    None),
-                            (_dcar,  f"=SUM({_dcar}{2}:{_dcar}{_last_data_row})",    "#,##0.00"),
-                            (_dtcbm, f"=SUM({_dtcbm}{2}:{_dtcbm}{_last_data_row})", '#,##0.00 "m³"'),
+                            (_dqty,             f"=SUM({_dqty}{2}:{_dqty}{_last_data_row})",                         "#,##0"),
+                            (_dtot,             f"=SUM({_dtot}{2}:{_dtot}{_last_data_row})",                         None),
+                            (_dcar,             f"=SUM({_dcar}{2}:{_dcar}{_last_data_row})",                         "#,##0.00"),
+                            (_dtcbm,            f"=SUM({_dtcbm}{2}:{_dtcbm}{_last_data_row})",                       '#,##0.00 "m³"'),
+                            (_dfinalqty_rounded,f"=SUM({_dfinalqty_rounded}{2}:{_dfinalqty_rounded}{_last_data_row})","#,##0"),
+                            (_dfinal_cbm,       f"=SUM({_dfinal_cbm}{2}:{_dfinal_cbm}{_last_data_row})",             '#,##0.00 "m³"'),
                         ]
                         for _col_ltr, _formula, _fmt in _totals_spec:
                             _c = ws_draft[f"{_col_ltr}{_total_row}"]
@@ -4142,7 +4176,7 @@ async def download_master_report(
 
                         for _dc in draft_cols:
                             _cl = _dcol(_dc)
-                            if _cl in {_item_col, _dqty, _dtot, _dcar, _dtcbm}:
+                            if _cl in {_item_col, _dqty, _dtot, _dcar, _dtcbm, _dfinalqty_rounded, _dfinal_cbm}:
                                 continue
                             ws_draft[f"{_cl}{_total_row}"].border = _thick_top
 

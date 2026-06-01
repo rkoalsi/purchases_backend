@@ -688,7 +688,12 @@ def get_item_names_by_brand(db, brand: str) -> tuple:
     try:
         products_collection = db.get_collection(PRODUCTS_COLLECTION)
 
-        match_stage = {"$match": {"brand": brand}} if brand else {"$match": {}}
+        if brand and brand.lower() == "petfest":
+            match_stage = {"$match": {"brand": {"$in": ["Dogfest", "Catfest"]}}}
+        elif brand:
+            match_stage = {"$match": {"brand": brand}}
+        else:
+            match_stage = {"$match": {}}
         pipeline = [
             match_stage,
             {"$project": {"name": 1, "sku": 1, "_id": 0}},
