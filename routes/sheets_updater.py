@@ -62,18 +62,12 @@ SKU_COL_CANDIDATES = [
 ]
 
 _ZOHO_TOKEN_URL    = "https://accounts.zoho.com/oauth/v2/token"
-_PUPSCRIBE_WAREHOUSE_ID = "3220178000000403010"
-_WAREHOUSE_URL     = (
-    "https://inventory.zoho.com/api/v1/reports/warehouse"
-    "?page={page}&per_page=2000&sort_column=item_name&sort_order=A"
-    "&response_option=1&filter_by=TransactionDate.CustomDate"
-    "&show_actual_stock=false&to_date={date1}&organization_id={org_id}"
-)
-_TOTAL_WAREHOUSE_URL = (
-    "https://inventory.zoho.com/api/v1/reports/warehouse"
-    "?page=1&per_page=2000&sort_column=item_name&sort_order=A"
-    "&response_option=2&filter_by=TransactionDate.CustomDate"
-    "&show_actual_stock=false&to_date={date1}&organization_id={org_id}"
+_PUPSCRIBE_LOCATION_ID = "3220178000000403010"
+_INV_SUMMARY_URL = (
+    "https://inventory.zoho.com/api/v1/reports/inventorysummary"
+    "?page={page}&per_page=200&filter_by=TransactionDate.CustomDate"
+    "&show_actual_stock=false&to_date={to_date}"
+    "&organization_id={org_id}&location_id={location_id}"
 )
 _ZOHO_ORG_ID = os.getenv("ZOHO_ORG_ID", "776755316")
 
@@ -135,83 +129,56 @@ def _get_inventory_token() -> str:
 
 def _fetch_live_zoho_stock(db) -> tuple[dict[str, int], str]:
     """
-    Fetch today's Zoho Inventory warehouse stock via the live API.
-    Reads quantity_available_for_sale from the Pupscribe Enterprises Private Limited (Warehouse)
-    sub-entry in each item's warehouse_stock array.
+    Fetch Pupscribe Enterprises Private Limited stock via the inventorysummary API.
+    quantity_available_for_sale from inventorysummary is location-specific (unlike the
+    items list API which always returns global totals regardless of location_id).
     Returns ({cf_sku_code: qty}, date_str).
     """
     import requests as _req
 
-    date1 = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
     token = _get_inventory_token()
     headers = {"Authorization": f"Zoho-oauthtoken {token}"}
 
-    total_resp = _req.get(
-        _TOTAL_WAREHOUSE_URL.format(date1=date1, org_id=_ZOHO_ORG_ID),
-        headers=headers,
-        timeout=60,
-    )
-    total_resp.raise_for_status()
-    total_pages = total_resp.json().get("page_context", {}).get("total_pages", 1)
-    logger.info("Live Zoho stock: %d pages to fetch for %s", total_pages, date1)
-
-    def _fetch_page(page: int) -> list[dict]:
+    # Step 1: fetch inventorysummary for Pupscribe WH → {item_id: qty}
+    item_id_to_qty: dict[str, int] = {}
+    page = 1
+    while True:
         resp = _req.get(
-            _WAREHOUSE_URL.format(page=page, date1=date1, org_id=_ZOHO_ORG_ID),
+            _INV_SUMMARY_URL.format(
+                page=page, to_date=today,
+                org_id=_ZOHO_ORG_ID, location_id=_PUPSCRIBE_LOCATION_ID,
+            ),
             headers=headers,
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json().get("warehouse_stock_info", [])
+        data = resp.json()
+        if not data.get("inventory"):
+            break
+        for item in data["inventory"][0].get("item_details", []):
+            iid = str(item.get("item_id") or "")
+            if iid:
+                item_id_to_qty[iid] = int(item.get("quantity_available_for_sale") or 0)
+        logger.info("inventorysummary: page %d fetched (%d items so far)", page, len(item_id_to_qty))
+        if not data.get("page_context", {}).get("has_more_page"):
+            break
+        page += 1
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    stock_by_item_id: dict[str, int] = {}
-    logger.info("Live Zoho stock: fetching %d pages in parallel for %s", total_pages, date1)
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(_fetch_page, page): page for page in range(1, total_pages + 1)}
-        for future in as_completed(futures):
-            for item in future.result():
-                if not isinstance(item, dict):
-                    continue
-                item_id = item.get("group_name") or ""
-                wh_entries = item.get("warehouse_stock", [])
-                if not item_id and wh_entries:
-                    item_id = wh_entries[0].get("item_id", "")
-                if not item_id:
-                    continue
-                pupscribe_entry = next(
-                    (w for w in wh_entries if str(w.get("warehouse_id", "")) == _PUPSCRIBE_WAREHOUSE_ID),
-                    None,
-                )
-                if pupscribe_entry is None:
-                    continue
-                qty = int(pupscribe_entry.get("quantity_available_for_sale", 0) or 0)
-                stock_by_item_id[str(item_id)] = qty
-
-    logger.info("Live Zoho stock: %d item_ids fetched", len(stock_by_item_id))
-
-    if not stock_by_item_id:
-        return {}, date1
-
-    products_col = db["products"]
-    item_id_to_sku: dict[str, str] = {}
-    for doc in products_col.find(
-        {"item_id": {"$in": list(stock_by_item_id.keys())}},
-        {"item_id": 1, "cf_sku_code": 1, "_id": 0},
-    ):
-        iid = str(doc.get("item_id", ""))
-        sku = doc.get("cf_sku_code", "")
-        if iid and sku:
-            item_id_to_sku[iid] = sku
-
+    # Step 2: map item_id -> cf_sku_code via products collection
     sku_stock: dict[str, int] = {}
-    for iid, qty in stock_by_item_id.items():
-        sku = item_id_to_sku.get(iid)
-        if sku:
-            sku_stock[sku] = sku_stock.get(sku, 0) + qty
+    item_ids = list(item_id_to_qty.keys())
+    for prod in db["products"].find(
+        {"item_id": {"$in": item_ids}},
+        {"item_id": 1, "cf_sku_code": 1},
+    ):
+        iid = str(prod.get("item_id") or "")
+        sku = prod.get("cf_sku_code") or ""
+        if iid and sku:
+            sku_stock[sku] = item_id_to_qty.get(iid, 0)
 
-    logger.info("Live Zoho stock: %d SKUs resolved from %d item_ids", len(sku_stock), len(stock_by_item_id))
-    return sku_stock, date1
+    logger.info("Live Zoho stock (Pupscribe WH): %d SKUs for %s", len(sku_stock), today)
+    return sku_stock, today
 
 
 def _open_sheet(sheet_id: str, writable: bool = True):
