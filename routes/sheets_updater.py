@@ -153,27 +153,33 @@ def _fetch_live_zoho_stock(db) -> tuple[dict[str, int], str]:
     total_pages = total_resp.json().get("page_context", {}).get("total_pages", 1)
     logger.info("Live Zoho stock: %d pages to fetch for %s", total_pages, date1)
 
-    stock_by_item_id: dict[str, int] = {}
-    for page in range(1, total_pages + 1):
-        logger.info("Live Zoho stock: fetching page %d / %d", page, total_pages)
+    def _fetch_page(page: int) -> list[dict]:
         resp = _req.get(
             _WAREHOUSE_URL.format(page=page, date1=date1, org_id=_ZOHO_ORG_ID),
             headers=headers,
             timeout=60,
         )
         resp.raise_for_status()
-        for item in resp.json().get("warehouse_stock_info", []):
-            if not isinstance(item, dict):
-                continue
-            item_id = item.get("group_name") or ""
-            if not item_id:
-                sub = item.get("warehouse_stock", [])
-                if sub:
-                    item_id = sub[0].get("item_id", "")
-            if not item_id:
-                continue
-            qty = int(item.get("quantity_available_for_sale", 0) or 0)
-            stock_by_item_id[str(item_id)] = qty
+        return resp.json().get("warehouse_stock_info", [])
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    stock_by_item_id: dict[str, int] = {}
+    logger.info("Live Zoho stock: fetching %d pages in parallel for %s", total_pages, date1)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_fetch_page, page): page for page in range(1, total_pages + 1)}
+        for future in as_completed(futures):
+            for item in future.result():
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("group_name") or ""
+                if not item_id:
+                    sub = item.get("warehouse_stock", [])
+                    if sub:
+                        item_id = sub[0].get("item_id", "")
+                if not item_id:
+                    continue
+                qty = int(item.get("quantity_available_for_sale", 0) or 0)
+                stock_by_item_id[str(item_id)] = qty
 
     logger.info("Live Zoho stock: %d item_ids fetched", len(stock_by_item_id))
 
