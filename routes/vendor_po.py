@@ -1065,6 +1065,7 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "total_received_qty": {
                         "$ifNull": ["$received_qty", {"$sum": "$items.received_qty"}]
                     },
+                    "total_final_supply_qty": {"$sum": "$items.final_supply_fo"},
                     # Supply Qty mirrors Excel col I: supply_qty_override if set, else final_supply_fo
                     "total_supply_qty": {
                         "$sum": {
@@ -1178,6 +1179,7 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "total_accepted_qty": 1,
                     "total_received_qty": 1,
                     "total_supply_qty": 1,
+                    "total_final_supply_qty": 1,
                     "total_cost": 1,
                     "total_cost_gst": 1,
                     "estimate_number": 1,
