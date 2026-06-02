@@ -1101,7 +1101,13 @@ async def list_vendor_pos(db=Depends(get_database)):
                             "$map": {
                                 "input": "$items",
                                 "as": "it",
-                                "in": {"$ifNull": ["$$it.total_cost_fo", {"$ifNull": ["$$it.total_cost", 0]}]},
+                                "in": {
+                                    "$cond": [
+                                        {"$ne": ["$$it.supply_qty_override", None]},
+                                        {"$ifNull": ["$$it.total_cost", 0]},
+                                        {"$ifNull": ["$$it.total_cost_fo", {"$ifNull": ["$$it.total_cost", 0]}]},
+                                    ]
+                                },
                             }
                         }
                     },
@@ -1110,7 +1116,13 @@ async def list_vendor_pos(db=Depends(get_database)):
                             "$map": {
                                 "input": "$items",
                                 "as": "it",
-                                "in": {"$ifNull": ["$$it.total_cost_fo_gst", {"$ifNull": ["$$it.total_cost_gst", 0]}]},
+                                "in": {
+                                    "$cond": [
+                                        {"$ne": ["$$it.supply_qty_override", None]},
+                                        {"$ifNull": ["$$it.total_cost_gst", 0]},
+                                        {"$ifNull": ["$$it.total_cost_fo_gst", {"$ifNull": ["$$it.total_cost_gst", 0]}]},
+                                    ]
+                                },
                             }
                         }
                     },
@@ -3409,6 +3421,200 @@ async def create_zoho_estimate(
     if inactive_items:
         result["skipped_inactive"] = inactive_items
     return JSONResponse(status_code=201, content=result)
+
+
+@router.put("/{po_number}/estimate")
+async def update_zoho_estimate(
+    po_number: str, body: EstimateCreateRequest, db=Depends(get_database)
+):
+    """Update the line items of the linked Zoho Books estimate to match current PO data."""
+
+    def _update():
+        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
+        if not doc:
+            raise ValueError(f"PO {po_number} not found")
+        estimate_id = doc.get("zoho_estimate_id")
+        if not estimate_id:
+            raise ValueError("No estimate linked to this PO — create one first")
+
+        items = [
+            it
+            for it in doc.get("items", [])
+            if (it.get("status") or "").lower() != "inactive"
+        ]
+        if not items:
+            raise ValueError("PO has no active items")
+
+        # ASIN → sku_code
+        model_numbers = [it["model_number"] for it in items if it.get("model_number")]
+        asin_to_sku_code: dict[str, str] = {
+            m["item_id"]: m["sku_code"]
+            for m in db[SKU_MAPPING_COLLECTION].find(
+                {"item_id": {"$in": model_numbers}},
+                {"item_id": 1, "sku_code": 1},
+            )
+            if m.get("item_id") and m.get("sku_code")
+        }
+        all_lookup_keys = list({asin_to_sku_code.get(mn, mn) for mn in model_numbers})
+
+        # composite_products first
+        sku_to_composite_id: dict[str, str] = {}
+        for c in db["composite_products"].find(
+            {"sku_code": {"$in": all_lookup_keys}},
+            {"sku_code": 1, "composite_item_id": 1},
+        ):
+            if c.get("sku_code") and c.get("composite_item_id"):
+                sku_to_composite_id[c["sku_code"]] = c["composite_item_id"]
+
+        # products fallback
+        non_composite_keys = [k for k in all_lookup_keys if k not in sku_to_composite_id]
+        sku_to_product_id: dict[str, str] = {}
+        sku_to_product_status: dict[str, str] = {}
+        sku_to_product_name: dict[str, str] = {}
+        for p in db[PRODUCTS_COLLECTION].find(
+            {"cf_sku_code": {"$in": non_composite_keys}},
+            {"cf_sku_code": 1, "item_id": 1, "status": 1, "name": 1},
+        ):
+            sku = p.get("cf_sku_code")
+            item_id = p.get("item_id")
+            if not sku or not item_id:
+                continue
+            status = p.get("status", "")
+            if status == "active" or sku not in sku_to_product_id:
+                sku_to_product_id[sku] = item_id
+                sku_to_product_status[sku] = status
+                sku_to_product_name[sku] = p.get("name", sku)
+
+        inactive_items: list[str] = []
+        skipped: list[str] = []
+        line_items: list[dict] = []
+        for it in items:
+            mn = it.get("model_number", "")
+            lookup_key = asin_to_sku_code.get(mn, mn)
+
+            zoho_item_id = sku_to_composite_id.get(lookup_key)
+            if not zoho_item_id:
+                zoho_item_id = sku_to_product_id.get(lookup_key)
+                if not zoho_item_id:
+                    skipped.append(mn or it.get("asin", "?"))
+                    continue
+                item_status = sku_to_product_status.get(lookup_key, "active")
+                if item_status and item_status != "active":
+                    product_name = sku_to_product_name.get(lookup_key, lookup_key)
+                    inactive_items.append(f"{mn} — {product_name} (status: {item_status})")
+                    continue
+
+            margin = it.get("margin")
+            discount = round(margin * 100, 2) if margin is not None else 0
+            if it.get("supply_qty_override") is not None:
+                qty = it["supply_qty_override"]
+            elif it.get("final_supply_fo") is not None:
+                qty = it["final_supply_fo"]
+            else:
+                qty = 0
+            line_items.append(
+                {
+                    "item_id": zoho_item_id,
+                    "quantity": qty,
+                    "rate": round(it.get("mrp_wo_gst") or 0, 2),
+                    "discount": f"{discount}%",
+                    "unit": "pcs",
+                    "hsn_or_sac": it.get("hsn", ""),
+                }
+            )
+
+        if inactive_items and not body.skip_inactive:
+            raise ValueError("INACTIVE_ITEMS:" + "\n".join(inactive_items))
+
+        if not line_items:
+            raise ValueError(
+                f"No line items could be built — missing Zoho item_id for all items: {', '.join(skipped)}"
+            )
+
+        customer = db[CUSTOMERS_COLLECTION].find_one(
+            {"contact_name": {"$regex": "ETRADE", "$options": "i"}},
+            {"contact_id": 1},
+        )
+        if not customer:
+            raise ValueError("ETRADE customer not found")
+
+        token = _get_zoho_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+
+        estimate_date = body.date or datetime.now().strftime("%Y-%m-%d")
+        payload: dict = {
+            "customer_id": customer["contact_id"],
+            "reference_number": po_number,
+            "date": estimate_date,
+            "place_of_supply": "MH",
+            "billing_address_id": body.billing_address_id,
+            "shipping_address_id": body.shipping_address_id,
+            "is_inclusive_tax": False,
+            "line_items": line_items,
+            "branch_id": "3220178000156681877",
+            "branch_name": "Amazon (Mumbai Branch)",
+            "salesperson_id": "3220178000000692003",
+            "dispatch_from_address": {
+                "zip": "401208",
+                "country": "India",
+                "address": "Gala No. 5 & 7, 1st Floor, Survey No 68, Building No 3",
+                "city": "Palghar",
+                "address_id": "3220178000541133001",
+                "attention": "Mr Akshay Mayekar",
+                "street2": "Near Meenakshi Inds. Estate, Naik Pada, Waliv Naka, Vasai E",
+                "state": "Maharashtra",
+                "state_code": "MH",
+            },
+        }
+
+        logger.info("Zoho estimate update payload for %s: %s", estimate_id, payload)
+        r = requests.put(
+            f"{ZOHO_BOOKS_BASE}/estimates/{estimate_id}",
+            headers=headers,
+            json=payload,
+            params={"organization_id": ORGANIZATION_ID},
+            timeout=30,
+        )
+        logger.info("Zoho estimate update response %s: %s", r.status_code, r.text)
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("code") != 0:
+            raise ValueError(f"Zoho error: {data.get('message', 'Unknown error')}")
+
+        db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {"$set": {"updated_at": datetime.now()}},
+        )
+
+        return data["estimate"], skipped, inactive_items
+
+    try:
+        estimate, skipped, inactive_items = await asyncio.to_thread(_update)
+    except ValueError as e:
+        msg = str(e)
+        if msg.startswith("INACTIVE_ITEMS:"):
+            items_list = [line for line in msg[len("INACTIVE_ITEMS:"):].splitlines() if line]
+            raise HTTPException(
+                status_code=400,
+                detail={"type": "inactive_items", "items": items_list},
+            )
+        raise HTTPException(status_code=400, detail=msg)
+    except requests.HTTPError as e:
+        body_text = e.response.text if e.response is not None else ""
+        raise HTTPException(status_code=502, detail=f"Zoho API error: {e} — {body_text}")
+
+    result = {
+        "estimate_id": estimate["estimate_id"],
+        "estimate_number": estimate["estimate_number"],
+        "total": estimate.get("total"),
+        "status": estimate.get("status"),
+    }
+    if skipped:
+        result["skipped_items"] = skipped
+    if inactive_items:
+        result["skipped_inactive"] = inactive_items
+    return result
 
 
 @router.patch("/{po_number}/estimate")
