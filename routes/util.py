@@ -485,3 +485,11 @@ async def upload_template(file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
+
+@router.post("/trigger-draft-order-report")
+async def trigger_draft_order_report():
+    """Manually trigger the daily draft order Slack report."""
+    from ..helpers.scheduler import generate_and_send_draft_order_slack_report
+    await generate_and_send_draft_order_slack_report()
+    return {"status": "ok"}
