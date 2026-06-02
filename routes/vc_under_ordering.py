@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from ..database import get_database
 import asyncio
 import io
+import re
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -175,7 +176,55 @@ def _fetch_data(db, drr_map: dict) -> tuple:
         if latest_zoho_date:
             zoho_date_str = latest_zoho_date.strftime("%-d %b %Y") if isinstance(latest_zoho_date, datetime) else str(latest_zoho_date)
 
-    # 8. Monthly sales — last 4 calendar months (FBA + VC combined, matching Amazon PSR)
+    # 8. Stock in transit from regular purchase_orders (Zoho POs, status "Issued")
+    #    SKU → ASIN via amazon_sku_mapping (sku_code → item_id)
+    sku_to_asin: dict[str, str] = {v: k for k, v in asin_to_sku.items()}
+
+    def _build_sit() -> tuple[dict[str, float], dict[str, list[str]]]:
+        sit_qty: dict[str, float] = {}
+        sit_brands_map: dict[str, set[str]] = {}
+        open_pos = list(db["purchase_orders"].find(
+            {"order_status_formatted": "Issued"},
+            {"purchaseorder_number": 1, "line_items": 1, "vendor_name": 1, "date": 1, "_id": 0},
+        ))
+        # Deduplicate Zoho-amended POs: PO-XYZ and PO-XYZ-1 are amendments of the
+        # same shipment — keep only the latest by date to avoid double-counting.
+        def _po_date_str(po: dict) -> str:
+            d = po.get("date")
+            if isinstance(d, datetime):
+                return d.strftime("%Y-%m-%d")
+            return str(d) if d else ""
+
+        base_to_best: dict[str, dict] = {}
+        for po in open_pos:
+            base = re.sub(r"-\d+$", "", po.get("purchaseorder_number", ""))
+            existing = base_to_best.get(base)
+            if existing is None or _po_date_str(po) > _po_date_str(existing):
+                base_to_best[base] = po
+        for po in base_to_best.values():
+            vendor = po.get("vendor_name", "")
+            for li in po.get("line_items", []):
+                sku_code = ""
+                for cf in li.get("item_custom_fields", []):
+                    if cf.get("api_name") == "cf_sku_code":
+                        sku_code = cf.get("value", "")
+                        break
+                if not sku_code:
+                    continue
+                asin = sku_to_asin.get(sku_code)
+                if not asin:
+                    continue
+                qty = float(li.get("quantity") or 0)
+                qty_received = float(li.get("quantity_received") or 0)
+                transit = qty - qty_received
+                if transit > 0:
+                    sit_qty[asin] = sit_qty.get(asin, 0) + transit
+                    sit_brands_map.setdefault(asin, set()).add(vendor)
+        return sit_qty, {a: sorted(b) for a, b in sit_brands_map.items()}
+
+    sit_qty_by_asin, sit_brands_by_asin = _build_sit()
+
+    # 9. Monthly sales — last 4 calendar months (FBA + VC combined, matching Amazon PSR)
     months: list[tuple[int, int]] = []
     ref = today.replace(day=1)
     for _ in range(4):
@@ -220,12 +269,12 @@ def _fetch_data(db, drr_map: dict) -> tuple:
 
     month_labels = [f"{MONTH_NAMES[m]} {y}" for (y, m) in months]
 
-    # 9. Load overrides
+    # 10. Load overrides
     overrides: dict[str, dict] = {}
     for doc in db[OVERRIDES_COLLECTION].find({"asin": {"$in": asins}}):
         overrides[doc["asin"]] = doc
 
-    # 10. Assemble rows
+    # 11. Assemble rows
     rows = []
     for asin in sorted(asins):
         sku = asin_to_sku.get(asin, "")
@@ -275,6 +324,13 @@ def _fetch_data(db, drr_map: dict) -> tuple:
         item_id = item_id_by_sku.get(sku, "")
         zoho_stock = zoho_latest.get(item_id, 0)
 
+        # If no Zoho warehouse stock, nothing to ship — force final units to 0
+        if zoho_stock == 0 and final_units_override is None:
+            final_units = 0
+
+        sit_total = sit_qty_by_asin.get(asin, 0)
+        sit_brands = ", ".join(sit_brands_by_asin.get(asin, []))
+
         rows.append({
             "asin": asin,
             "sku_code": sku,
@@ -296,6 +352,8 @@ def _fetch_data(db, drr_map: dict) -> tuple:
             "final_units": final_units,
             "final_units_overridden": final_units_override is not None,
             "zoho_stock": zoho_stock,
+            "sit_total": round(sit_total, 2),
+            "sit_brands": sit_brands,
             "status": prod.get("purchase_status") or prod.get("status") or "",
             "etrade_asp": etrade_asp_by_asin.get(asin),
             "monthly_sales": monthly_sales.get(asin, {}),
@@ -418,7 +476,10 @@ async def download_xlsx(db=Depends(get_database)):
         "Total Target Days\n(=Lead + Coverage)",
         "Target Stock\n(=DRR × Total Target Days)",
         "Final Units\n(under-ordering formula)",
-        zoho_label, "Status",
+        zoho_label,
+        "Stock in Transit\n(Open Zoho POs)",
+        "SIT Brands",
+        "Status",
     ] + month_labels
 
     # Row 1: headers
@@ -462,31 +523,30 @@ async def download_xlsx(db=Depends(get_database)):
         # L: Target Stock = DRR × Total Target Days
         ws.cell(r, 12, f"=IF(G{r}=0,0,ROUND(G{r}*K{r},0))").fill = formula_fill
 
-        # M: Final Units — keep override as hard value; otherwise use under-ordering formula:
-        #   if DRR=0          → ""
-        #   if Net Days < LT  → DRR × TotalTargetDays   (urgent: order full cover)
-        #   if Net Days > TTD → 0                         (well stocked)
-        #   else              → (TotalTargetDays - NetDays) × DRR
+        # M: Final Units — override as hard value, or formula (0 if Zoho stock=0 or DRR=0)
         if row.get("final_units_overridden") and row.get("final_units") is not None:
             ws.cell(r, 13, row["final_units"])
         else:
             ws.cell(r, 13,
-                f'=IF(G{r}=0,"",'
+                f'=IF(N{r}=0,0,'
+                f'IF(G{r}=0,"",'
                 f'IF(H{r}<I{r},ROUND(G{r}*K{r},0),'
                 f'IF(H{r}>K{r},0,'
-                f'MAX(0,ROUND((K{r}-H{r})*G{r},0)))))'
+                f'MAX(0,ROUND((K{r}-H{r})*G{r},0))))))'
             ).fill = formula_fill
 
-        # N, O: Zoho Stock, Status
+        # N: Zoho Stock  O: Stock in Transit  P: SIT Brands  Q: Status
         ws.cell(r, 14, row["zoho_stock"])
-        ws.cell(r, 15, row["status"])
+        ws.cell(r, 15, row["sit_total"])
+        ws.cell(r, 16, row["sit_brands"]).alignment = left_wrap
+        ws.cell(r, 17, row["status"])
 
         # Monthly sales
         for lbl_idx, lbl in enumerate(month_labels):
-            ws.cell(r, 16 + lbl_idx, ms.get(lbl, 0))
+            ws.cell(r, 18 + lbl_idx, ms.get(lbl, 0))
 
     # Column widths
-    col_widths = [14, 14, 42, 12, 10, 14, 10, 14, 10, 12, 16, 18, 18, 10, 12] + [12] * len(month_labels)
+    col_widths = [14, 14, 42, 12, 10, 14, 10, 14, 10, 12, 16, 18, 18, 10, 14, 36, 12] + [12] * len(month_labels)
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
