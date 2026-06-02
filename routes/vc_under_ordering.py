@@ -508,7 +508,12 @@ async def download_xlsx(db=Depends(get_database)):
         ws.cell(r, 6,  f"=D{r}+E{r}").fill = formula_fill
 
         # G: DRR (algorithmically computed — raw value)
-        ws.cell(r, 7,  row["drr"] if row.get("drr_flag", "").startswith("OK") else row.get("drr_flag", ""))
+        if row.get("drr", 0) == 0:
+            ws.cell(r, 7, "Manual input required")
+        elif row.get("drr_flag", "").startswith("OK"):
+            ws.cell(r, 7, row["drr"])
+        else:
+            ws.cell(r, 7, row.get("drr_flag", ""))
 
         # H: Net Total Days = Total Inv / DRR  (blank if DRR=0)
         ws.cell(r, 8,  f'=IF(G{r}=0,"",ROUND(F{r}/G{r},2))').fill = formula_fill
