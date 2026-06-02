@@ -1065,7 +1065,21 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "total_received_qty": {
                         "$ifNull": ["$received_qty", {"$sum": "$items.received_qty"}]
                     },
-                    "total_final_supply_qty": {"$sum": "$items.final_supply_fo"},
+                    "total_final_supply_qty": {
+                        "$sum": {
+                            "$map": {
+                                "input": "$items",
+                                "as": "it",
+                                "in": {
+                                    "$cond": [
+                                        {"$ne": ["$$it.supply_qty_override", None]},
+                                        "$$it.supply_qty_override",
+                                        {"$ifNull": ["$$it.final_supply_fo", 0]},
+                                    ]
+                                },
+                            }
+                        }
+                    },
                     # Supply Qty mirrors Excel col I: supply_qty_override if set, else final_supply_fo
                     "total_supply_qty": {
                         "$sum": {
@@ -1659,14 +1673,13 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
     rows = []
     for it in po_items:
         model = it.get("model_number") or ""
-        # Estimate is created with final_supply_fo (override takes precedence).
-        # Fall back to supply_qty for older POs that pre-date the final_supply_fo field.
+        # Priority: final_supply_fo_override → supply_qty_override → final_supply_fo → supply_qty
         if it.get("final_supply_fo_override") is not None:
             supply = it["final_supply_fo_override"]
-        elif it.get("final_supply_fo") is not None:
-            supply = it["final_supply_fo"]
         elif it.get("supply_qty_override") is not None:
             supply = it["supply_qty_override"]
+        elif it.get("final_supply_fo") is not None:
+            supply = it["final_supply_fo"]
         else:
             supply = it.get("supply_qty") or 0
         mrp_wo_gst = it.get("mrp_wo_gst")
@@ -2140,6 +2153,7 @@ async def update_item_supply_qty(
             {
                 "$set": {
                     "items.$.supply_qty_override": override_value,
+                    "items.$.final_supply_fo_override": override_value,
                     "updated_at": datetime.now(),
                 }
             },
@@ -3185,8 +3199,12 @@ async def create_zoho_estimate(
                     continue  # blocked below unless skip_inactive=True
             margin = it.get("margin")
             discount = round(margin * 100, 2) if margin is not None else 0
-            qty = it.get("final_supply_fo")
-            qty = qty if qty is not None else 0
+            if it.get("supply_qty_override") is not None:
+                qty = it["supply_qty_override"]
+            elif it.get("final_supply_fo") is not None:
+                qty = it["final_supply_fo"]
+            else:
+                qty = 0
             line_items.append(
                 {
                     "item_id": zoho_item_id,
