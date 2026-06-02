@@ -595,6 +595,8 @@ async def generate_and_send_draft_order_slack_report():
             if not isinstance(item, dict):
                 continue
             brand = item.get("brand") or "Unknown"
+            if brand in ("Dogfest", "Catfest"):
+                brand = "Petfest"
             total_cbm = float(item.get("total_cbm") or 0)
             qty_rounded = float(item.get("order_qty_plus_extra_qty_rounded") or 0)
             unit_price = float(item.get("unit_price") or 0)
