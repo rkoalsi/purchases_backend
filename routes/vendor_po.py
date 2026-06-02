@@ -1686,10 +1686,15 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
         margin = it.get("margin")
         gst = it.get("gst") or 0
 
-        # Prefer stored total_cost_fo (written back by XLSX download / enrichment)
-        # so the comparison always reflects the same number as the XLSX.
-        # Stored mrp_wo_gst / gst may be stale (e.g. GST changed after PO upload).
-        if it.get("total_cost_fo") is not None:
+        # When an override is active the stored total_cost_fo was computed from the
+        # old (possibly zero) final_supply_fo, so skip it and recompute from scratch.
+        has_override = (
+            it.get("final_supply_fo_override") is not None
+            or it.get("supply_qty_override") is not None
+        )
+
+        # Prefer stored total_cost_fo only when no override is active.
+        if not has_override and it.get("total_cost_fo") is not None:
             po_item_total = it["total_cost_fo"]
             # Rate: cost_price_wo_tax is the unit cost used to derive total_cost_fo
             if it.get("cost_price_wo_tax") is not None:
@@ -1698,7 +1703,7 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
                 rate = round(po_item_total / supply, 4)
             else:
                 rate = None
-        elif it.get("total_cost") is not None:
+        elif not has_override and it.get("total_cost") is not None:
             po_item_total = it["total_cost"]
             if it.get("cost_price_wo_tax") is not None:
                 rate = it["cost_price_wo_tax"]
@@ -1725,10 +1730,10 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
         est_rate = eli.get("rate") if eli else None
         est_item_total = eli.get("item_total") if eli else None
 
-        # po_item_total_gst: prefer stored total_cost_fo_gst; fall back to computing from gst
-        if it.get("total_cost_fo_gst") is not None:
+        # po_item_total_gst: skip stored values when override is active (same stale-data reason)
+        if not has_override and it.get("total_cost_fo_gst") is not None:
             po_item_total_gst = it["total_cost_fo_gst"]
-        elif it.get("total_cost_gst") is not None:
+        elif not has_override and it.get("total_cost_gst") is not None:
             po_item_total_gst = it["total_cost_gst"]
         elif po_item_total is not None and gst:
             po_item_total_gst = round(po_item_total * (1 + gst / 100), 2)
