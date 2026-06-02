@@ -6,11 +6,13 @@ import io, logging, math, json, re
 from fastapi import (
     APIRouter,
     File,
+    UploadFile,
     HTTPException,
     status,
     Depends,
     Query,
     BackgroundTasks,
+    Body,
 )
 import threading
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -1228,6 +1230,51 @@ def _query_line_items_for_brand_report(
     return list(invoices_col.aggregate(pipeline, allowDiskUse=True))
 
 
+def _query_credit_notes_for_brand_report(
+    credit_notes_col, start_date: datetime, end_date: datetime, filter_type: str
+) -> list:
+    """
+    filter_type: 'all' | 'customer_only'
+    'all'          — all credit notes excluding transfer order customers (matches Zoho P&L behaviour)
+    'customer_only' — credit notes excluding transfer orders AND excluded customers
+    Returns list of {item_name, item_sku, item_total} for credit notes in the period.
+    credit_notes stores date as ISODate or string — both are handled.
+    """
+    cn_end = end_date.replace(hour=23, minute=59, second=59)
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+    match: dict = {
+        "$or": [
+            {"date": {"$gte": start_str, "$lte": end_str}},
+            {"date": {"$gte": start_date, "$lte": cn_end}},
+        ],
+        "status": {"$nin": ["draft", "void"]},
+    }
+    if filter_type == "customer_only":
+        match["$nor"] = [
+            {"customer_name": {"$in": EXCLUDED_CUSTOMERS_LIST}},
+            {"customer_name": {"$regex": "pupscribe", "$options": "i"}},
+        ]
+    else:
+        # 'all': exclude transfer order customers — Zoho doesn't net internal transfer CNs against revenue
+        match["customer_name"] = {"$not": {"$regex": "pupscribe", "$options": "i"}}
+
+    pipeline = [
+        {"$match": match},
+        {"$unwind": "$line_items"},
+        {"$match": {"line_items.name": {"$exists": True, "$nin": [None, ""]}}},
+        {
+            "$project": {
+                "_id": 0,
+                "item_name": "$line_items.name",
+                "item_sku": {"$toString": "$line_items.sku"},
+                "item_total": "$line_items.item_total",
+            }
+        },
+    ]
+    return list(credit_notes_col.aggregate(pipeline, allowDiskUse=True))
+
+
 @router.post("/generate-brand-sales-report")
 def generate_brand_sales_report(
     request: BrandSalesReportRequest, db=Depends(get_database)
@@ -1249,12 +1296,9 @@ def generate_brand_sales_report(
         else:
             prev_month_num, prev_year = start_date.month - 1, start_date.year
 
-        prev_start = start_date.replace(year=prev_year, month=prev_month_num)
+        prev_start = start_date.replace(year=prev_year, month=prev_month_num, day=1)
         last_day_prev = _cal.monthrange(prev_year, prev_month_num)[1]
-        prev_end = end_date.replace(
-            year=prev_year, month=prev_month_num,
-            day=min(end_date.day, last_day_prev)
-        )
+        prev_end = prev_start.replace(day=last_day_prev)
         prev_month_label = prev_start.strftime("%B %Y")
         prev_start_str = prev_start.strftime("%Y-%m-%d")
         prev_end_str = prev_end.strftime("%Y-%m-%d")
@@ -1264,6 +1308,7 @@ def generate_brand_sales_report(
         pl_prev = _fetch_pl_data_from_zoho(prev_start_str, prev_end_str)
 
         invoices_col = db.get_collection(INVOICES_COLLECTION)
+        credit_notes_col = db.get_collection("credit_notes")
         products_col = db.get_collection(PRODUCTS_COLLECTION)
 
         # Load product catalog: name/sku → {brand, category, sub_category}
@@ -1292,6 +1337,11 @@ def generate_brand_sales_report(
             _tr  = _query_line_items_for_brand_report(invoices_col, s, e, "transfer_order")
             _cu  = _query_line_items_for_brand_report(invoices_col, s, e, "customer_only")
 
+            # Credit notes reduce revenue — subtract them to match Zoho's Total Operating Income.
+            # Transfer order CNs are excluded (Zoho doesn't net internal transfer CNs against revenue).
+            _cn_all = _query_credit_notes_for_brand_report(credit_notes_col, s, e, "all")
+            _cn_cu  = _query_credit_notes_for_brand_report(credit_notes_col, s, e, "customer_only")
+
             by_all = defaultdict(float)
             by_tr  = defaultdict(float)
             by_cu  = defaultdict(float)
@@ -1300,8 +1350,12 @@ def generate_brand_sales_report(
 
             for item in _all:
                 by_all[get_prod(item["item_name"], item["item_sku"]).get("brand", "Unknown")] += item.get("item_total") or 0
+            for item in _cn_all:
+                by_all[get_prod(item["item_name"], item["item_sku"]).get("brand", "Unknown")] -= item.get("item_total") or 0
+
             for item in _tr:
                 by_tr[get_prod(item["item_name"], item["item_sku"]).get("brand", "Unknown")] += item.get("item_total") or 0
+
             for item in _cu:
                 prod    = get_prod(item["item_name"], item["item_sku"])
                 brand   = prod.get("brand", "Unknown")
@@ -1311,6 +1365,15 @@ def generate_brand_sales_report(
                 by_cu[brand]           += amt
                 _bwc[brand][cat]       += amt
                 _bwsc[brand][sub_cat]  += amt
+            for item in _cn_cu:
+                prod    = get_prod(item["item_name"], item["item_sku"])
+                brand   = prod.get("brand", "Unknown")
+                cat     = prod.get("category") or "Uncategorized"
+                sub_cat = prod.get("sub_category") or "Uncategorized"
+                amt     = item.get("item_total") or 0
+                by_cu[brand]           -= amt
+                _bwc[brand][cat]       -= amt
+                _bwsc[brand][sub_cat]  -= amt
 
             return by_all, by_tr, by_cu, _bwc, _bwsc
 
@@ -4366,3 +4429,350 @@ async def get_invoice_sync_status(db=Depends(get_database)):
     except Exception as e:
         logger.error(f"Error checking invoice sync status: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to check invoice sync status")
+
+
+# ─── Composite Item Bulk Upload ────────────────────────────────────────────────
+
+_INVENTORY_REFRESH_TOKEN = os.getenv("INVENTORY_REFRESH_TOKEN")
+_INVENTORY_ORGANIZATION_ID = os.getenv(
+    "INVENTORY_ORGANIZATION_ID", os.getenv("ORGANIZATION_ID", "776755316")
+)
+_ZOHO_INVENTORY_BASE = "https://www.zohoapis.com/inventory/v1"
+_MAX_COMPOSITE_COMPONENTS = 5
+
+
+def _get_zoho_inventory_token() -> str:
+    url = _BOOKS_URL.format(
+        clientId=_BOOKS_CLIENT_ID,
+        clientSecret=_BOOKS_CLIENT_SECRET,
+        grantType="refresh_token",
+        books_refresh_token=_INVENTORY_REFRESH_TOKEN,
+    )
+    r = requests.post(url, timeout=30)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def _create_composite_item_in_zoho(
+    name: str, sku: str, rate: float, components: list
+) -> dict:
+    token = _get_zoho_inventory_token()
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "name": name,
+        "sku": sku,
+        "sales_rate": rate,
+        "item_type":"inventory",
+        "is_combo_product": True,
+        "mapped_items": [
+            {"item_id": c["item_id"], "quantity": c["quantity"]}
+            for c in components
+        ],
+    }
+    logger.info(f"Zoho Inventory create composite payload: {json.dumps(payload)}")
+    r = requests.post(
+        f"{_ZOHO_INVENTORY_BASE}/compositeitems",
+        headers=headers,
+        params={"organization_id": _INVENTORY_ORGANIZATION_ID},
+        json=payload,
+        timeout=30,
+    )
+    logger.info(f"Zoho Inventory response {r.status_code}: {r.text[:500]}")
+    if not r.ok:
+        raise ValueError(f"Zoho Inventory HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    if data.get("code") != 0:
+        raise ValueError(f"Zoho Inventory error {data.get('code')}: {data.get('message')}")
+    return data["composite_item"]
+
+
+def _parse_composite_template(file_bytes: bytes) -> list:
+    """
+    Parse the composite items template Excel.
+    Returns list of raw row dicts.
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(filename=io.BytesIO(file_bytes), data_only=True)
+    ws = wb.active
+
+    # Find header row (contains "Composite Name")
+    header_row_idx = None
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True), 1):
+        if row[0] and str(row[0]).strip().lower() == "composite name":
+            header_row_idx = i
+            break
+
+    if header_row_idx is None:
+        raise ValueError("Could not find header row (expected 'Composite Name' in column A)")
+
+    rows = []
+    for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+        name = row[0]
+        if name is None or str(name).strip() == "":
+            continue
+        sku_code = row[1]
+        rate = row[2]
+        components_raw = []
+        for i in range(_MAX_COMPOSITE_COMPONENTS):
+            col_sku = 3 + i * 2
+            col_qty = 4 + i * 2
+            c_sku = row[col_sku] if col_sku < len(row) else None
+            c_qty = row[col_qty] if col_qty < len(row) else None
+            if c_sku and str(c_sku).strip():
+                components_raw.append({
+                    "sku_code": str(c_sku).strip(),
+                    "quantity": float(c_qty) if c_qty is not None else 1.0,
+                })
+        rows.append({
+            "name": str(name).strip(),
+            "sku_code": str(sku_code).strip() if sku_code else "",
+            "rate": float(rate) if rate is not None else 0.0,
+            "components_raw": components_raw,
+        })
+    return rows
+
+
+def _validate_composite_rows(rows: list, db) -> dict:
+    """
+    Validate parsed rows against the products collection.
+    Returns {rows: [...], valid_count, error_count, total_count}.
+    """
+    # Collect all component SKUs to batch-fetch
+    all_skus = set()
+    for row in rows:
+        for c in row["components_raw"]:
+            all_skus.add(c["sku_code"])
+
+    products_col = db[PRODUCTS_COLLECTION]
+    product_docs = list(products_col.find(
+        {"cf_sku_code": {"$in": list(all_skus)}},
+        {"_id": 1, "cf_sku_code": 1, "name": 1, "item_id": 1},
+    ))
+    sku_map = {p["cf_sku_code"]: p for p in product_docs}
+
+    # Also check if composite SKU already exists
+    comp_col = db[COMPOSITE_COLLECTION]
+    composite_skus_raw = rows
+    existing_skus = set(
+        d["sku_code"]
+        for d in comp_col.find(
+            {"sku_code": {"$in": [r["sku_code"] for r in composite_skus_raw]}},
+            {"sku_code": 1},
+        )
+    )
+
+    result_rows = []
+    for i, row in enumerate(rows):
+        errors = []
+        warnings = []
+
+        if not row["name"]:
+            errors.append("Composite Name is required")
+        if not row["sku_code"]:
+            errors.append("Composite SKU Code is required")
+        elif row["sku_code"] in existing_skus:
+            errors.append(f"Composite SKU '{row['sku_code']}' already exists in the database")
+        if row["rate"] <= 0:
+            warnings.append("Rate is 0 or negative")
+        if not row["components_raw"]:
+            errors.append("At least one component is required")
+
+        resolved_components = []
+        for c in row["components_raw"]:
+            prod = sku_map.get(c["sku_code"])
+            if prod:
+                resolved_components.append({
+                    "sku_code": c["sku_code"],
+                    "quantity": c["quantity"],
+                    "name": prod.get("name", ""),
+                    "item_id": prod.get("item_id", ""),
+                    "product_id": str(prod["_id"]),
+                })
+            else:
+                errors.append(f"Component SKU '{c['sku_code']}' not found in products")
+                resolved_components.append({
+                    "sku_code": c["sku_code"],
+                    "quantity": c["quantity"],
+                    "name": None,
+                    "item_id": None,
+                    "product_id": None,
+                })
+
+        result_rows.append({
+            "row": i + 2,  # 1-based + header
+            "name": row["name"],
+            "sku_code": row["sku_code"],
+            "rate": row["rate"],
+            "components": resolved_components,
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings,
+        })
+
+    valid_count = sum(1 for r in result_rows if r["valid"])
+    return {
+        "rows": result_rows,
+        "valid_count": valid_count,
+        "error_count": len(result_rows) - valid_count,
+        "total_count": len(result_rows),
+    }
+
+
+@router.get("/composite-upload/template")
+def download_composite_template():
+    """Download the Excel template for bulk composite item creation."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Composite Items"
+
+    header_fill = PatternFill("solid", fgColor="1E40AF")
+    comp_fill = PatternFill("solid", fgColor="1D4ED8")
+    header_font = Font(bold=True, color="FFFFFF", size=10)
+    note_fill = PatternFill("solid", fgColor="EFF6FF")
+    note_font = Font(italic=True, color="1E3A8A", size=9)
+    thin = Side(style="thin", color="CBD5E1")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Instruction row
+    note_cols = 3 + _MAX_COMPOSITE_COMPONENTS * 2
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=note_cols)
+    note_cell = ws.cell(row=1, column=1,
+        value=(
+            "Fill in Composite Name, SKU Code, Rate, then Component SKU + Qty for each component "
+            "(up to 5). Leave unused component columns blank. Component SKUs must match existing "
+            "product SKU codes exactly."
+        )
+    )
+    note_cell.fill = note_fill
+    note_cell.font = note_font
+    note_cell.alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    # Headers row 2
+    fixed_headers = ["Composite Name", "Composite SKU Code", "Rate (MRP)"]
+    comp_headers = []
+    for i in range(1, _MAX_COMPOSITE_COMPONENTS + 1):
+        comp_headers += [f"Component {i} SKU", f"Component {i} Qty"]
+    headers = fixed_headers + comp_headers
+
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=2, column=col, value=h)
+        cell.fill = comp_fill if col > 3 else header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+    ws.row_dimensions[2].height = 20
+
+    # Column widths
+    ws.column_dimensions["A"].width = 48
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 12
+    for i in range(_MAX_COMPOSITE_COMPONENTS):
+        col_letter_sku = chr(ord("D") + i * 2)
+        col_letter_qty = chr(ord("E") + i * 2)
+        ws.column_dimensions[col_letter_sku].width = 22
+        ws.column_dimensions[col_letter_qty].width = 10
+
+    # Freeze header rows
+    ws.freeze_panes = "A3"
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="composite_items_template.xlsx"'},
+    )
+
+
+@router.post("/composite-upload/validate")
+async def validate_composite_upload(file: UploadFile = File(...)):
+    """
+    Parse and validate an uploaded composite items Excel file.
+    Returns rows with validation status; valid rows include resolved component details.
+    """
+    try:
+        file_bytes = await file.read()
+        rows = _parse_composite_template(file_bytes)
+        if not rows:
+            raise HTTPException(status_code=400, detail="No data rows found in the uploaded file")
+        db = get_database()
+        result = await asyncio.to_thread(_validate_composite_rows, rows, db)
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Composite upload validate error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CompositeCreateRequest(BaseModel):
+    items: List[dict]
+
+
+@router.post("/composite-upload/create")
+async def create_composite_items(payload: CompositeCreateRequest):
+    """
+    Create validated composite items in Zoho Inventory and save to MongoDB.
+    Expects items from the validate endpoint (valid=True rows only).
+    Returns per-item results with success/failure.
+    """
+    db = get_database()
+    results = []
+    created_count = 0
+
+    for item in payload.items:
+        name = item.get("name", "")
+        sku_code = item.get("sku_code", "")
+        rate = item.get("rate", 0.0)
+        components = item.get("components", [])
+
+        try:
+            zoho_item = await asyncio.to_thread(
+                _create_composite_item_in_zoho, name, sku_code, rate, components
+            )
+            composite_item_id = zoho_item.get("composite_item_id") or zoho_item.get("item_id", "")
+
+            now = datetime.utcnow()
+            doc = {
+                "composite_item_id": str(composite_item_id),
+                "name": name,
+                "sku_code": sku_code,
+                "rate": rate,
+                "components": [
+                    {
+                        "name": c.get("name", ""),
+                        "quantity": c.get("quantity", 1.0),
+                        "item_id": c.get("item_id", ""),
+                        "sku_code": c.get("sku_code", ""),
+                        "product_id": c.get("product_id", ""),
+                    }
+                    for c in components
+                ],
+                "last_updated": now,
+                "created_at": now,
+            }
+            await asyncio.to_thread(
+                db[COMPOSITE_COLLECTION].insert_one, doc
+            )
+            results.append({"sku_code": sku_code, "name": name, "success": True, "composite_item_id": str(composite_item_id)})
+            created_count += 1
+        except Exception as e:
+            logger.error(f"Failed to create composite item '{sku_code}': {e}")
+            results.append({"sku_code": sku_code, "name": name, "success": False, "error": str(e)})
+
+    return JSONResponse(content={
+        "results": results,
+        "created_count": created_count,
+        "failed_count": len(results) - created_count,
+    })
