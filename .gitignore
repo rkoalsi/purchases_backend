@@ -9,3 +9,4 @@ scripts/
 graphify-out/
 CLAUDE.md
 settings.json
+.claude/
