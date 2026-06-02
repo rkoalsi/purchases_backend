@@ -1292,11 +1292,26 @@ async def download_shipment_summary(db=Depends(get_database)):
     """Download the Etrade Shipment Summary as an XLSX file."""
 
     def _fetch():
+        supply_qty_expr = {
+            "$sum": {
+                "$map": {
+                    "input": "$items",
+                    "as": "it",
+                    "in": {
+                        "$cond": [
+                            {"$ne": ["$$it.supply_qty_override", None]},
+                            "$$it.supply_qty_override",
+                            {"$ifNull": ["$$it.final_supply_fo", 0]},
+                        ]
+                    },
+                }
+            }
+        }
         pipeline = [
             {
                 "$addFields": {
                     "total_requested_qty": {"$sum": "$items.requested_qty"},
-                    "total_supply_qty": {"$sum": "$items.final_supply_fo"},
+                    "total_supply_qty": supply_qty_expr,
                     "total_accepted_qty": {"$sum": "$items.accepted_qty"},
                     "location": {"$arrayElemAt": ["$items.ship_to_location", 0]},
                 }
@@ -2810,11 +2825,26 @@ async def get_shipment_summary(db=Depends(get_database)):
     """Return one row per PO with shipment summary columns for the Etrade Shipment Summary page."""
 
     def _fetch():
+        supply_qty_expr = {
+            "$sum": {
+                "$map": {
+                    "input": "$items",
+                    "as": "it",
+                    "in": {
+                        "$cond": [
+                            {"$ne": ["$$it.supply_qty_override", None]},
+                            "$$it.supply_qty_override",
+                            {"$ifNull": ["$$it.final_supply_fo", 0]},
+                        ]
+                    },
+                }
+            }
+        }
         pipeline = [
             {
                 "$addFields": {
                     "total_requested_qty": {"$sum": "$items.requested_qty"},
-                    "total_supply_qty": {"$sum": "$items.final_supply_fo"},
+                    "total_supply_qty": supply_qty_expr,
                     "total_accepted_qty": {"$sum": "$items.accepted_qty"},
                     "location": {"$arrayElemAt": ["$items.ship_to_location", 0]},
                 }
