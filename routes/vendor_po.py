@@ -2426,7 +2426,9 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
         }
         if supply_qty_override is not None:
             formulas.pop(9, None)
+            formulas.pop(39, None)
             static[9] = supply_qty_override
+            static[39] = supply_qty_override
         if final_units_override is not None:
             formulas.pop(38, None)
             static[38] = final_units_override
