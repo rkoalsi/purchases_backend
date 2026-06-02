@@ -508,10 +508,8 @@ async def download_xlsx(db=Depends(get_database)):
         ws.cell(r, 6,  f"=D{r}+E{r}").fill = formula_fill
 
         # G: DRR (algorithmically computed — raw value)
-        if row.get("drr", 0) == 0:
-            ws.cell(r, 7, "Manual input required")
-        elif row.get("drr_flag", "").startswith("OK"):
-            ws.cell(r, 7, row["drr"])
+        if row.get("drr_flag", "").startswith("OK"):
+            ws.cell(r, 7, "Manual input required" if row.get("drr", 0) == 0 else row["drr"])
         else:
             ws.cell(r, 7, row.get("drr_flag", ""))
 
