@@ -4,14 +4,16 @@ import logging
 import os
 import re
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 import boto3
+import openpyxl
 from botocore.config import Config as BotocoreConfig
 from bson import ObjectId
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from openpyxl.styles import Alignment, Font, PatternFill
 from pydantic import BaseModel
 from pymongo.errors import PyMongoError
 
@@ -59,6 +61,7 @@ class UpdateTaskRequest(BaseModel):
     assigned_to_departments: Optional[List[str]] = None
     deadline: Optional[str] = None
     tags: Optional[List[str]] = None
+    is_hidden: Optional[bool] = None
     actor_id: Optional[str] = None
     actor_name: Optional[str] = None
     notify_assignees: Optional[bool] = False
@@ -157,10 +160,11 @@ async def list_tasks(
     search: Optional[str] = Query(None),
     sort_by: Optional[str] = Query("created_at", description="created_at | updated_at | deadline | priority | title"),
     sort_dir: Optional[str] = Query("desc", description="asc | desc"),
+    show_hidden: bool = Query(False),
     db=Depends(get_database),
 ):
     def _fetch():
-        query: dict = {**_visibility_filter(viewer_id, viewer_role)}
+        query: dict = {**_visibility_filter(viewer_id, viewer_role), "is_deleted": {"$ne": True}}
         if status_filter and status_filter in VALID_STATUSES:
             query["status"] = status_filter
         if priority and priority in VALID_PRIORITIES:
@@ -188,6 +192,19 @@ async def list_tasks(
                 query["$and"] = [{"$or": existing_or}, {"$or": search_or}]
             else:
                 query["$or"] = search_or
+
+        if not show_hidden:
+            two_days_ago = (datetime.utcnow() - timedelta(days=2)).isoformat()
+            hide_extra = [
+                # Exclude manually hidden tasks
+                {"is_hidden": {"$ne": True}},
+                # Exclude done tasks whose updated_at is older than 2 days (auto-hidden)
+                {"$or": [{"status": {"$ne": "done"}}, {"updated_at": {"$gt": two_days_ago}}]},
+            ]
+            if "$and" in query:
+                query["$and"].extend(hide_extra)
+            else:
+                query["$and"] = hide_extra
 
         direction = -1 if sort_dir == "desc" else 1
 
@@ -228,7 +245,7 @@ async def get_task_stats(
     viewer_role: Optional[str] = Query(None),
     db=Depends(get_database),
 ):
-    vis = _visibility_filter(viewer_id, viewer_role)
+    vis = {**_visibility_filter(viewer_id, viewer_role), "is_deleted": {"$ne": True}}
 
     def _fetch():
         now = datetime.utcnow().isoformat()
@@ -400,12 +417,291 @@ async def create_task(request: CreateTaskRequest, db=Depends(get_database)):
     return JSONResponse(status_code=201, content=serialize_mongo_document(task))
 
 
+# ── Activity Report download ──────────────────────────────────────────────────
+
+@router.get("/report/download")
+async def download_task_report(
+    start_date: str = Query(..., description="YYYY-MM-DD"),
+    end_date: str = Query(..., description="YYYY-MM-DD"),
+    department: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
+    db=Depends(get_database),
+):
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates must be YYYY-MM-DD")
+
+    def _fetch():
+        query: dict = {
+            "$or": [
+                {"created_at": {"$gte": start_dt, "$lte": end_dt}},
+                {"updated_at": {"$gte": start_dt, "$lte": end_dt}},
+            ]
+        }
+        if department:
+            dept_cond = [
+                {"creator_department": department},
+                {"assigned_to_departments": department},
+            ]
+            query = {"$and": [query, {"$or": dept_cond}]}
+        if user_id:
+            user_cond = [{"assigned_to": user_id}, {"created_by": user_id}]
+            existing_and = query.get("$and")
+            if existing_and:
+                query["$and"].append({"$or": user_cond})
+            else:
+                query = {"$and": [query, {"$or": user_cond}]}
+        return list(db[TASKS_COLLECTION].find(query).sort("created_at", -1))
+
+    tasks = await asyncio.to_thread(_fetch)
+
+    # ── Build Excel workbook ──────────────────────────────────────────────────
+    wb = openpyxl.Workbook()
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    header_fill   = PatternFill("solid", fgColor="1E3A5F")
+    summary_fill  = PatternFill("solid", fgColor="2563EB")
+    alt_fill      = PatternFill("solid", fgColor="EFF6FF")
+    done_fill     = PatternFill("solid", fgColor="D1FAE5")
+    overdue_fill  = PatternFill("solid", fgColor="FEE2E2")
+    header_font   = Font(bold=True, color="FFFFFF", size=10)
+    bold_font     = Font(bold=True, size=10)
+    center_align  = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left_align    = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    def _header_row(ws, cols: list[tuple[str, int]]):
+        for ci, (label, width) in enumerate(cols, 1):
+            cell = ws.cell(row=1, column=ci, value=label)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_align
+            ws.column_dimensions[openpyxl.utils.get_column_letter(ci)].width = width
+        ws.row_dimensions[1].height = 22
+
+    def _fmt_dt(val) -> str:
+        if not val:
+            return ""
+        if isinstance(val, str):
+            try:
+                val = datetime.fromisoformat(val)
+            except ValueError:
+                return val
+        return val.strftime("%d %b %Y %H:%M")
+
+    def _fmt_date(val) -> str:
+        if not val:
+            return ""
+        if isinstance(val, str):
+            try:
+                val = datetime.fromisoformat(val[:10])
+            except ValueError:
+                return val
+        return val.strftime("%d %b %Y")
+
+    now_iso = datetime.utcnow().isoformat()
+
+    # ── Sheet 1: Summary per assignee ─────────────────────────────────────────
+    ws_sum = wb.active
+    ws_sum.title = "Summary"
+
+    sum_cols = [
+        ("Name", 22), ("Department", 18), ("Total Assigned", 14),
+        ("To Do", 10), ("In Progress", 12), ("Review", 10), ("Done", 10),
+        ("Completion %", 13), ("Overdue", 10),
+    ]
+    _header_row(ws_sum, sum_cols)
+
+    # Build per-assignee stats
+    assignee_stats: dict = {}
+    for task in tasks:
+        for uid, name, dept in zip(
+            task.get("assigned_to", []),
+            task.get("assigned_to_names", []),
+            task.get("assigned_to_departments", []),
+        ):
+            if uid not in assignee_stats:
+                assignee_stats[uid] = {
+                    "name": name, "department": dept or "",
+                    "total": 0, "todo": 0, "in_progress": 0, "review": 0,
+                    "done": 0, "overdue": 0,
+                }
+            s = assignee_stats[uid]
+            s["total"] += 1
+            st = task.get("status", "todo")
+            if st in s:
+                s[st] += 1
+            deadline = task.get("deadline")
+            if deadline and st != "done" and deadline < now_iso:
+                s["overdue"] += 1
+
+    rows = sorted(assignee_stats.values(), key=lambda x: (x["department"], x["name"]))
+    for ri, r in enumerate(rows, 2):
+        completion = round(r["done"] / r["total"] * 100, 1) if r["total"] else 0
+        values = [
+            r["name"], r["department"], r["total"],
+            r["todo"], r["in_progress"], r["review"], r["done"],
+            f"{completion}%", r["overdue"],
+        ]
+        fill = alt_fill if ri % 2 == 0 else None
+        for ci, val in enumerate(values, 1):
+            cell = ws_sum.cell(row=ri, column=ci, value=val)
+            cell.alignment = center_align if ci > 2 else left_align
+            if fill:
+                cell.fill = fill
+        ws_sum.row_dimensions[ri].height = 18
+
+    # Totals row
+    if rows:
+        tr = len(rows) + 2
+        total_tasks = sum(r["total"] for r in rows)
+        total_done  = sum(r["done"] for r in rows)
+        total_comp  = round(total_done / total_tasks * 100, 1) if total_tasks else 0
+        totals = [
+            "TOTAL", "",
+            total_tasks,
+            sum(r["todo"] for r in rows),
+            sum(r["in_progress"] for r in rows),
+            sum(r["review"] for r in rows),
+            total_done,
+            f"{total_comp}%",
+            sum(r["overdue"] for r in rows),
+        ]
+        for ci, val in enumerate(totals, 1):
+            cell = ws_sum.cell(row=tr, column=ci, value=val)
+            cell.font = bold_font
+            cell.fill = summary_fill
+            cell.font = Font(bold=True, color="FFFFFF", size=10)
+            cell.alignment = center_align if ci > 2 else left_align
+
+    ws_sum.freeze_panes = "A2"
+
+    # ── Sheet 2: Tasks Detail ─────────────────────────────────────────────────
+    ws_det = wb.create_sheet("Tasks Detail")
+
+    det_cols = [
+        ("Title", 36), ("Status", 13), ("Priority", 11),
+        ("Assigned To", 28), ("Department(s)", 22),
+        ("Created By", 18), ("Created Date", 18), ("Updated Date", 18),
+        ("Deadline", 14), ("Overdue", 10),
+        ("Tags", 22), ("Description", 40),
+    ]
+    _header_row(ws_det, det_cols)
+
+    STATUS_LABELS = {
+        "todo": "To Do", "in_progress": "In Progress",
+        "review": "Review", "done": "Done",
+    }
+    PRIORITY_LABELS = {
+        "urgent": "Urgent", "high": "High", "medium": "Medium", "low": "Low",
+    }
+
+    for ri, task in enumerate(tasks, 2):
+        st = task.get("status", "")
+        deadline = task.get("deadline", "")
+        overdue = bool(deadline and st != "done" and deadline < now_iso)
+
+        depts = list(dict.fromkeys(
+            [d for d in task.get("assigned_to_departments", []) if d]
+            or ([task.get("creator_department")] if task.get("creator_department") else [])
+        ))
+
+        values = [
+            task.get("title", ""),
+            STATUS_LABELS.get(st, st),
+            PRIORITY_LABELS.get(task.get("priority", ""), task.get("priority", "")),
+            ", ".join(task.get("assigned_to_names", [])),
+            ", ".join(depts),
+            task.get("created_by_name", ""),
+            _fmt_dt(task.get("created_at")),
+            _fmt_dt(task.get("updated_at")),
+            _fmt_date(deadline),
+            "Yes" if overdue else "No",
+            ", ".join(task.get("tags", [])),
+            task.get("description", ""),
+        ]
+
+        row_fill = (
+            done_fill if st == "done"
+            else overdue_fill if overdue
+            else (alt_fill if ri % 2 == 0 else None)
+        )
+
+        for ci, val in enumerate(values, 1):
+            cell = ws_det.cell(row=ri, column=ci, value=val)
+            cell.alignment = left_align
+            if row_fill:
+                cell.fill = row_fill
+        ws_det.row_dimensions[ri].height = 18
+
+    ws_det.freeze_panes = "A2"
+
+    # ── Sheet 3: Department Summary ───────────────────────────────────────────
+    ws_dept = wb.create_sheet("By Department")
+
+    dept_cols = [
+        ("Department", 22), ("Total Tasks", 13), ("To Do", 10),
+        ("In Progress", 13), ("Review", 10), ("Done", 10),
+        ("Completion %", 14), ("Overdue", 10),
+    ]
+    _header_row(ws_dept, dept_cols)
+
+    dept_stats: dict = {}
+    for task in tasks:
+        depts = list(dict.fromkeys(
+            [d for d in task.get("assigned_to_departments", []) if d]
+            or ([task.get("creator_department")] if task.get("creator_department") else ["No Department"])
+        ))
+        st = task.get("status", "todo")
+        deadline = task.get("deadline", "")
+        overdue = bool(deadline and st != "done" and deadline < now_iso)
+        for dept in depts:
+            if dept not in dept_stats:
+                dept_stats[dept] = {"total": 0, "todo": 0, "in_progress": 0, "review": 0, "done": 0, "overdue": 0}
+            dept_stats[dept]["total"] += 1
+            if st in dept_stats[dept]:
+                dept_stats[dept][st] += 1
+            if overdue:
+                dept_stats[dept]["overdue"] += 1
+
+    for ri, (dept, ds) in enumerate(sorted(dept_stats.items()), 2):
+        comp = round(ds["done"] / ds["total"] * 100, 1) if ds["total"] else 0
+        values = [
+            dept, ds["total"], ds["todo"], ds["in_progress"],
+            ds["review"], ds["done"], f"{comp}%", ds["overdue"],
+        ]
+        fill = alt_fill if ri % 2 == 0 else None
+        for ci, val in enumerate(values, 1):
+            cell = ws_dept.cell(row=ri, column=ci, value=val)
+            cell.alignment = center_align if ci > 1 else left_align
+            if fill:
+                cell.fill = fill
+        ws_dept.row_dimensions[ri].height = 18
+
+    ws_dept.freeze_panes = "A2"
+
+    # ── Stream response ───────────────────────────────────────────────────────
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    period_label = f"{start_date}_to_{end_date}"
+    filename = f"tasks_report_{period_label}.xlsx"
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # ── Get single task ───────────────────────────────────────────────────────────
 
 @router.get("/{task_id}")
 async def get_task(task_id: str, db=Depends(get_database)):
     def _fetch():
-        return db[TASKS_COLLECTION].find_one({"_id": ObjectId(task_id)})
+        return db[TASKS_COLLECTION].find_one({"_id": ObjectId(task_id), "is_deleted": {"$ne": True}})
 
     task = await asyncio.to_thread(_fetch)
     if not task:
@@ -511,19 +807,15 @@ async def update_task(task_id: str, request: UpdateTaskRequest, db=Depends(get_d
 @router.delete("/{task_id}")
 async def delete_task(task_id: str, db=Depends(get_database)):
     def _delete():
-        task = db[TASKS_COLLECTION].find_one({"_id": ObjectId(task_id)}, {"attachments": 1, "status": 1})
+        task = db[TASKS_COLLECTION].find_one({"_id": ObjectId(task_id), "is_deleted": {"$ne": True}}, {"status": 1})
         if not task:
             return False
         if task.get("status") == "done":
             raise HTTPException(status_code=403, detail="Completed tasks cannot be deleted")
-        for att in task.get("attachments", []):
-            s3_key = att.get("s3_key")
-            if s3_key:
-                try:
-                    _delete_from_s3(s3_key)
-                except Exception:
-                    logger.warning("Failed to delete S3 key %s during task deletion", s3_key)
-        db[TASKS_COLLECTION].delete_one({"_id": ObjectId(task_id)})
+        db[TASKS_COLLECTION].update_one(
+            {"_id": ObjectId(task_id)},
+            {"$set": {"is_deleted": True, "deleted_at": datetime.utcnow().isoformat()}},
+        )
         return True
 
     deleted = await asyncio.to_thread(_delete)
