@@ -26,6 +26,7 @@ COLLECTION = "brand_orders"
 PO_COLLECTION = "purchase_orders"
 VENDORS_COLLECTION = "vendors"
 CATEGORIES_COLLECTION = "brand_order_upload_categories"
+NOTIFICATIONS_COLLECTION = "notifications"
 S3_BUCKET = os.getenv("S3_BUCKET", "pupscribe-purchases")
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 DEFAULT_CATEGORIES = ["PI", "CL", "Bill of Lading", "Bill of Entry", "Insurance"]
@@ -186,6 +187,45 @@ async def create_order(
         order_id, doc = await asyncio.to_thread(_insert)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
+
+    async def _notify_brand_order():
+        def _fan_out():
+            recipients = list(db["purchase_users"].find(
+                {"department": {"$in": ["purchases", "design"]}, "status": "active"},
+                {"_id": 1},
+            ))
+            if not recipients:
+                return
+            now = datetime.utcnow()
+            brand_name = doc["brand"]
+            order_name = doc["name"]
+            po_num = doc.get("purchaseorder_number")
+            snippet = f"created {brand_name} — {order_name}"
+            if po_num:
+                snippet += f" (PO {po_num})"
+            notif_docs = [
+                {
+                    "user_id": str(r["_id"]),
+                    "source": "brand_order",
+                    "order_id": order_id,
+                    "brand": brand_name,
+                    "order_name": order_name,
+                    "type": "brand_order_created",
+                    "actor_name": "System",
+                    "snippet": snippet,
+                    "read": False,
+                    "created_at": now,
+                }
+                for r in recipients
+            ]
+            db[NOTIFICATIONS_COLLECTION].insert_many(notif_docs)
+        try:
+            await asyncio.to_thread(_fan_out)
+        except Exception as _e:
+            logger.warning(f"Brand order notification fan-out failed: {_e}")
+
+    asyncio.create_task(_notify_brand_order())
+
     return JSONResponse(status_code=201, content={"_id": order_id, **serialize_mongo_document(doc)})
 
 

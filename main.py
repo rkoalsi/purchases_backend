@@ -29,6 +29,7 @@ from .routes.design import router as design_router
 from .routes.amazon_fba_shipment import router as amazon_fba_shipment_router
 from .routes.blinkit_shipment import router as blinkit_shipment_router
 from .routes.tasks import router as tasks_router
+from .routes.notifications import router as notifications_router
 from .routes.vc_under_ordering import router as vc_under_ordering_router
 from .routes.sheets_updater import router as sheets_updater_router
 from .database import connect_db, close_db, get_database
@@ -137,6 +138,7 @@ app.include_router(brand_orders_router, prefix="/brand_orders", tags=["brand_ord
 app.include_router(design_router, prefix="/design", tags=["design"])
 app.include_router(amazon_fba_shipment_router, prefix="/amazon_fba_shipment", tags=["amazon_fba_shipment"])
 app.include_router(tasks_router, prefix="/tasks", tags=["tasks"])
+app.include_router(notifications_router, prefix="/notifications", tags=["notifications"])
 app.include_router(vc_under_ordering_router, prefix="/vc_under_ordering", tags=["vc_under_ordering"])
 app.include_router(blinkit_shipment_router, prefix="/blinkit_shipment", tags=["blinkit_shipment"])
 app.include_router(sheets_updater_router, prefix="/sheets", tags=["sheets"])

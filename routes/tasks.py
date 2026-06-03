@@ -24,6 +24,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 TASKS_COLLECTION = "tasks"
+NOTIFICATIONS_COLLECTION = "notifications"
 S3_BUCKET = os.getenv("S3_BUCKET", "pupscribe-purchases")
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 # Pre-signed URLs valid for 7 days — only the s3_key is persisted in MongoDB
@@ -135,6 +136,41 @@ def _activity_entry(
         "detail": detail,
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+def _fan_out_sync(
+    db,
+    task_id: str,
+    task_title: str,
+    activity_id: str,
+    activity_type: str,
+    actor_id: str,
+    actor_name: str,
+    recipient_ids: list,
+    snippet: str,
+) -> None:
+    """Insert one notification per unique recipient, excluding the actor."""
+    now = datetime.utcnow()
+    seen = set()
+    docs = []
+    for uid in recipient_ids:
+        if not uid or uid == actor_id or uid in seen:
+            continue
+        seen.add(uid)
+        docs.append({
+            "user_id": uid,
+            "source": "task",
+            "task_id": task_id,
+            "task_title": task_title,
+            "activity_id": activity_id,
+            "type": activity_type,
+            "actor_name": actor_name,
+            "snippet": snippet,
+            "read": False,
+            "created_at": now,
+        })
+    if docs:
+        db[NOTIFICATIONS_COLLECTION].insert_many(docs)
 
 
 def _visibility_filter(viewer_id: Optional[str], viewer_role: Optional[str]) -> dict:
@@ -272,7 +308,7 @@ async def get_task_stats(
                         {"$count": "count"},
                     ],
                     "by_assignee": [
-                        {"$unwind": {"path": "$assigned_to", "preserveNullAndEmptyArrays": False}},
+                        {"$unwind": {"path": "$assigned_to", "preserveNullAndEmptyArrays": False, "includeArrayIndex": "_assignee_idx"}},
                         {
                             "$group": {
                                 "_id": {
@@ -280,12 +316,7 @@ async def get_task_stats(
                                     "status": "$status",
                                 },
                                 "count": {"$sum": 1},
-                                "name": {"$first": {
-                                    "$arrayElemAt": [
-                                        "$assigned_to_names",
-                                        {"$indexOfArray": ["$assigned_to", "$assigned_to"]},
-                                    ]
-                                }},
+                                "name": {"$first": {"$arrayElemAt": ["$assigned_to_names", "$_assignee_idx"]}},
                             }
                         },
                     ],
@@ -769,6 +800,24 @@ async def update_task(task_id: str, request: UpdateTaskRequest, db=Depends(get_d
             ops["$push"] = {"activity": {"$each": activities}}
 
         db[TASKS_COLLECTION].update_one({"_id": ObjectId(task_id)}, ops)
+
+        # Fan-out notifications for meaningful changes
+        title = existing.get("title", "")
+        created_by = existing.get("created_by", "")
+        current_assignees = list(existing.get("assigned_to") or [])
+        for act in activities:
+            if act["type"] == "status_changed":
+                recipients = [*current_assignees, created_by]
+                _fan_out_sync(db, task_id, title, act["activity_id"], act["type"],
+                              actor_id, actor_name, recipients,
+                              f"changed status to {act['new_value']}")
+            elif act["type"] == "assigned_to_names_changed":
+                old_ids = set(existing.get("assigned_to") or [])
+                added_ids = [uid for uid in (update_fields.get("assigned_to") or []) if uid not in old_ids]
+                _fan_out_sync(db, task_id, title, act["activity_id"], act["type"],
+                              actor_id, actor_name, added_ids,
+                              "assigned you to")
+
         return db[TASKS_COLLECTION].find_one({"_id": ObjectId(task_id)})
 
     task = await asyncio.to_thread(_update)
@@ -843,14 +892,25 @@ async def add_comment(task_id: str, request: AddCommentRequest, db=Depends(get_d
     )
 
     def _add():
-        result = db[TASKS_COLLECTION].update_one(
+        task = db[TASKS_COLLECTION].find_one(
+            {"_id": ObjectId(task_id)},
+            {"assigned_to": 1, "created_by": 1, "title": 1},
+        )
+        if not task:
+            return False
+        db[TASKS_COLLECTION].update_one(
             {"_id": ObjectId(task_id)},
             {
                 "$push": {"comments": comment, "activity": activity},
                 "$set": {"updated_at": datetime.utcnow()},
             },
         )
-        return result.matched_count
+        snippet = f'commented: {request.text[:60]}{"…" if len(request.text) > 60 else ""}'
+        recipients = [*(task.get("assigned_to") or []), task.get("created_by", "")]
+        _fan_out_sync(db, task_id, task.get("title", ""), activity["activity_id"],
+                      activity["type"], request.author_id, request.author_name,
+                      recipients, snippet)
+        return True
 
     matched = await asyncio.to_thread(_add)
     if not matched:
