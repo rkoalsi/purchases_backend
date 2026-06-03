@@ -4333,37 +4333,11 @@ async def create_transfer_order(
             raise ValueError("No valid line items found in package")
 
         # Compute next transfer order number (numeric sort, not lexicographic)
-        agg = list(
-            db[TRANSFER_ORDERS_COLLECTION].aggregate(
-                [
-                    {"$match": {"transfer_order_number": {"$regex": r"^TO-\d+"}}},
-                    {
-                        "$addFields": {
-                            "_to_num": {
-                                "$toInt": {
-                                    "$arrayElemAt": [
-                                        {"$split": ["$transfer_order_number", "-"]},
-                                        1,
-                                    ]
-                                }
-                            }
-                        }
-                    },
-                    {"$sort": {"_to_num": -1}},
-                    {"$limit": 1},
-                    {"$project": {"_to_num": 1}},
-                ]
-            )
-        )
-        last_num = agg[0]["_to_num"] if agg else 0
-        new_to_number = f"TO-{last_num + 1}"
-
         token = _get_inventory_token()
         headers = {"Authorization": f"Zoho-oauthtoken {token}"}
 
         to_date = body.date or datetime.now().strftime("%Y-%m-%d")
         payload: dict = {
-            "transfer_order_number": new_to_number,
             "date": to_date,
             "from_warehouse_id": body.from_warehouse_id or TO_FROM_WAREHOUSE_ID,
             "from_location_id": body.from_warehouse_id or TO_FROM_WAREHOUSE_ID,
@@ -4374,51 +4348,38 @@ async def create_transfer_order(
             "description": po_number,
         }
 
-        import logging
-
-        logger = logging.getLogger(__name__)
-        logger.info(
-            "TO payload → from=%s to=%s items=%d",
-            payload["from_warehouse_id"],
-            payload["to_warehouse_id"],
-            len(line_items),
-        )
-
         r = requests.post(
             f"{ZOHO_INVENTORY_BASE}/transferorders",
             headers=headers,
             json=payload,
-            params={
-                "organization_id": ORGANIZATION_ID,
-                "ignore_auto_number_generation": "true",
-            },
+            params={"organization_id": ORGANIZATION_ID},
             timeout=30,
         )
         data = r.json()
-        logger.info("Zoho TO response: %s", data)
 
         if not r.ok or data.get("code") != 0:
             msg = data.get("message", "Unknown error")
             bad_ids = data.get("error_info") or []
             if bad_ids:
-                # Map error item_ids back to names from the line items we built
-                id_to_name = {
-                    li["item_id"]: li.get("name") or li["item_id"] for li in line_items
-                }
+                id_to_name = {li["item_id"]: li.get("name") or li["item_id"] for li in line_items}
                 bad_names = [id_to_name.get(iid, iid) for iid in bad_ids]
                 msg = f"{msg} — items: {', '.join(bad_names)}"
             raise ValueError(f"Zoho error {data.get('code')}: {msg}")
 
         to = data["transfer_order"]
+        now = datetime.now()
+        db[TRANSFER_ORDERS_COLLECTION].update_one(
+            {"transfer_order_id": to["transfer_order_id"]},
+            {"$set": {**to, "created_at": now, "updated_at": now}},
+            upsert=True,
+        )
         db[PO_COLLECTION].update_one(
             {"po_number": po_number},
-            {
-                "$set": {
-                    "transfer_order_id": to["transfer_order_id"],
-                    "transfer_order_number": to["transfer_order_number"],
-                    "updated_at": datetime.now(),
-                }
-            },
+            {"$set": {
+                "transfer_order_id": to["transfer_order_id"],
+                "transfer_order_number": to["transfer_order_number"],
+                "updated_at": now,
+            }},
         )
         return to
 
