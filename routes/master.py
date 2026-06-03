@@ -2488,11 +2488,20 @@ async def _generate_master_report_data(
 
                 for item in combined_data:
                     metrics = item.get("combined_metrics", {})
-                    if metrics.get("total_amount", 0) == 0 and metrics.get("total_units_sold", 0) > 0:
-                        sku = item.get("sku_code", "")
+                    sku = item.get("sku_code", "")
+                    net_sales = metrics.get("total_sales", 0)
+                    gross_units = metrics.get("total_units_sold", 0)
+                    gross_amount = metrics.get("total_amount", 0)
+                    if gross_units > 0 and gross_amount > 0:
+                        # Derive avg selling rate from Zoho invoice data, apply to net sales
+                        avg_rate = gross_amount / gross_units
+                        metrics["total_amount"] = round(avg_rate * net_sales, 2)
+                    elif net_sales > 0:
                         rate = product_rates.get(sku, 0)
                         if rate > 0:
-                            metrics["total_amount"] = round(rate * metrics["total_units_sold"], 2)
+                            metrics["total_amount"] = round(rate * net_sales, 2)
+                    else:
+                        metrics["total_amount"] = 0.0
 
             except Exception as e:
                 logger.error(f"Error enriching data: {e}")
