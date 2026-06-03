@@ -4333,11 +4333,22 @@ async def create_transfer_order(
             raise ValueError("No valid line items found in package")
 
         # Compute next transfer order number (numeric sort, not lexicographic)
+        agg = list(db[TRANSFER_ORDERS_COLLECTION].aggregate([
+            {"$match": {"transfer_order_number": {"$regex": r"^TO-\d+"}}},
+            {"$addFields": {"_to_num": {"$toInt": {"$arrayElemAt": [{"$split": ["$transfer_order_number", "-"]}, 1]}}}},
+            {"$sort": {"_to_num": -1}},
+            {"$limit": 1},
+            {"$project": {"_to_num": 1}},
+        ]))
+        last_num = agg[0]["_to_num"] if agg else 0
+        new_to_number = f"TO-{last_num + 1}"
+
         token = _get_inventory_token()
         headers = {"Authorization": f"Zoho-oauthtoken {token}"}
 
         to_date = body.date or datetime.now().strftime("%Y-%m-%d")
         payload: dict = {
+            "transfer_order_number": new_to_number,
             "date": to_date,
             "from_warehouse_id": body.from_warehouse_id or TO_FROM_WAREHOUSE_ID,
             "from_location_id": body.from_warehouse_id or TO_FROM_WAREHOUSE_ID,
@@ -4352,7 +4363,7 @@ async def create_transfer_order(
             f"{ZOHO_INVENTORY_BASE}/transferorders",
             headers=headers,
             json=payload,
-            params={"organization_id": ORGANIZATION_ID},
+            params={"organization_id": ORGANIZATION_ID, "ignore_auto_number_generation": "true"},
             timeout=30,
         )
         data = r.json()
