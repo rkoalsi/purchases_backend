@@ -511,9 +511,11 @@ async def update_task(task_id: str, request: UpdateTaskRequest, db=Depends(get_d
 @router.delete("/{task_id}")
 async def delete_task(task_id: str, db=Depends(get_database)):
     def _delete():
-        task = db[TASKS_COLLECTION].find_one({"_id": ObjectId(task_id)}, {"attachments": 1})
+        task = db[TASKS_COLLECTION].find_one({"_id": ObjectId(task_id)}, {"attachments": 1, "status": 1})
         if not task:
             return False
+        if task.get("status") == "done":
+            raise HTTPException(status_code=403, detail="Completed tasks cannot be deleted")
         for att in task.get("attachments", []):
             s3_key = att.get("s3_key")
             if s3_key:
