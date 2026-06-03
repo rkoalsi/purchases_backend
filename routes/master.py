@@ -94,6 +94,7 @@ class OptimizedMasterReportService:
                 cn_start = datetime.strptime(start_date, "%Y-%m-%d")
                 cn_end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
 
+                _transfer_customers_lower = [n.lower() for n in self.TRANSFER_ORDER_CUSTOMERS]
                 pipeline = [
                     {
                         "$match": {
@@ -102,7 +103,7 @@ class OptimizedMasterReportService:
                                 {"date": {"$gte": cn_start, "$lte": cn_end}},
                             ],
                             "status": {"$nin": ["void"]},
-                            "customer_name": {"$in": self.TRANSFER_ORDER_CUSTOMERS},
+                            "$expr": {"$in": [{"$toLower": "$customer_name"}, _transfer_customers_lower]},
                         }
                     },
                     {"$addFields": {"doc_type": "invoice"}},
@@ -116,7 +117,7 @@ class OptimizedMasterReportService:
                                             {"date": {"$gte": start_date, "$lte": end_date}},
                                             {"date": {"$gte": cn_start, "$lte": cn_end}},
                                         ],
-                                        "customer_name": {"$in": self.TRANSFER_ORDER_CUSTOMERS},
+                                        "$expr": {"$in": [{"$toLower": "$customer_name"}, _transfer_customers_lower]},
                                     }
                                 },
                                 {"$addFields": {"doc_type": "credit_note"}},
