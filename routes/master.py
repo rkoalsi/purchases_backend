@@ -2008,13 +2008,26 @@ class OptimizedMasterReportService:
         """
         try:
             def _fetch():
-                # Build sku → cf_sku_code map from products collection
+                # Build two lookup maps from products collection:
+                #   sku (EAN/barcode) → cf_sku_code
+                #   item_id (Zoho Books item ID) → cf_sku_code  (primary, more reliable)
                 sku_to_cf: Dict[str, str] = {}
+                item_id_to_cf: Dict[str, str] = {}
                 for p in self.database["products"].find(
-                    {"sku": {"$exists": True, "$ne": ""}, "cf_sku_code": {"$exists": True, "$ne": ""}},
-                    {"sku": 1, "cf_sku_code": 1, "_id": 0},
+                    {"cf_sku_code": {"$exists": True, "$ne": ""}},
+                    {"sku": 1, "cf_sku_code": 1, "item_id": 1, "status": 1, "_id": 0},
                 ):
-                    sku_to_cf[p["sku"]] = p["cf_sku_code"]
+                    cf = p.get("cf_sku_code", "")
+                    if not cf:
+                        continue
+                    # Prefer active entries so they win on duplicate cf_sku_code
+                    is_active = p.get("status") == "active"
+                    sku_val = p.get("sku", "") or ""
+                    item_id_val = str(p.get("item_id", "") or "")
+                    if sku_val and (is_active or sku_val not in sku_to_cf):
+                        sku_to_cf[sku_val] = cf
+                    if item_id_val and (is_active or item_id_val not in item_id_to_cf):
+                        item_id_to_cf[item_id_val] = cf
 
                 # Get Zoho Books access token
                 auth_url = _IV_BOOKS_URL.format(
@@ -2062,18 +2075,25 @@ class OptimizedMasterReportService:
                         raise ValueError(f"Zoho Books IV API error: {data.get('message')}")
 
                     for row in data["inventory_valuation"][0]["item_details"]:
-                        sku = row.get("sku") or row.get("item", {}).get("sku", "")
-                        cf_sku = sku_to_cf.get(sku)
+                        # Match by item_id first (most reliable), fall back to EAN sku
+                        row_item_id = str(row.get("item_id") or row.get("item", {}).get("item_id") or "")
+                        row_sku = row.get("sku") or row.get("item", {}).get("sku", "") or ""
+                        cf_sku = item_id_to_cf.get(row_item_id) or sku_to_cf.get(row_sku)
                         if not cf_sku:
+                            asset_val_check = row.get("asset_value", 0.0) or 0.0
+                            if asset_val_check > 0:
+                                logger.warning(f"IV unmatched: item_id={row_item_id!r} sku={row_sku!r} name={row.get('item_name')!r} asset_value={asset_val_check}")
                             continue
                         qty = row.get("quantity_available", 0) or 0
                         asset_val = row.get("asset_value", 0.0) or 0.0
                         unit_cost = round(asset_val / qty, 2) if qty > 0 else 0.0
-                        by_sku[cf_sku] = {
-                            "unit_cost": unit_cost,
-                            "asset_value": round(asset_val, 2),
-                            "qty": qty,
-                        }
+                        existing = by_sku.get(cf_sku)
+                        if existing is None or asset_val > existing.get("asset_value", 0):
+                            by_sku[cf_sku] = {
+                                "unit_cost": unit_cost,
+                                "asset_value": round(asset_val, 2),
+                                "qty": qty,
+                            }
 
                     if not data["page_context"]["has_more_page"]:
                         break
