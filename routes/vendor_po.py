@@ -4586,6 +4586,7 @@ async def create_assemblies(po_number: str, db=Depends(get_database)):
                         "name": c.get("name", ""),
                         "quantity_consumed": comp_qty * qty,
                         "warehouse_id": TO_FROM_WAREHOUSE_ID,
+                        "location_id": TO_FROM_WAREHOUSE_ID,
                     }
                 )
 
@@ -4595,6 +4596,7 @@ async def create_assemblies(po_number: str, db=Depends(get_database)):
                 "date": today,
                 "quantity_to_bundle": qty,
                 "warehouse_id": TO_FROM_WAREHOUSE_ID,
+                "location_id": TO_FROM_WAREHOUSE_ID,
                 "line_items": bundle_line_items,
             }
             r = requests.post(
