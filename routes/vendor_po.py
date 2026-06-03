@@ -4370,7 +4370,8 @@ async def create_transfer_order(
             "to_warehouse_id": body.to_warehouse_id or TO_TO_WAREHOUSE_ID,
             "to_location_id": body.to_warehouse_id or TO_TO_WAREHOUSE_ID,
             "line_items": line_items,
-            "is_intransit_order": False,
+            "status": "draft",
+            "description": po_number,
         }
 
         import logging
