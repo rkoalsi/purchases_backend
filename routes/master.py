@@ -7,6 +7,9 @@ import pandas as pd
 import io
 import json
 import math
+import os
+import requests
+import time
 from collections import defaultdict
 from ..database import get_database
 from .amazon import generate_report_by_date_range as amazon_generate_report
@@ -16,6 +19,13 @@ import traceback
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_IV_BOOKS_URL = os.getenv("BOOKS_URL")
+_IV_CLIENT_ID = os.getenv("CLIENT_ID")
+_IV_CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+_IV_BOOKS_REFRESH_TOKEN = os.getenv("BOOKS_REFRESH_TOKEN")
+_IV_ORG_ID = os.getenv("ORGANIZATION_ID", "776755316")
+_PUPSCRIBE_WH_LOCATION_ID = "3220178000143298047"
 
 
 class OptimizedMasterReportService:
@@ -1989,6 +1999,94 @@ class OptimizedMasterReportService:
 
         return combined_data
 
+    async def fetch_inventory_valuation_cogs(self) -> Dict:
+        """Fetch inventory valuation from Zoho Books for Pupscribe WH only.
+        Returns {
+            "by_sku": {cf_sku_code: {"unit_cost": float, "asset_value": float, "qty": int}},
+            "as_of_date": "YYYY-MM-DD",
+        }
+        """
+        try:
+            def _fetch():
+                # Build sku → cf_sku_code map from products collection
+                sku_to_cf: Dict[str, str] = {}
+                for p in self.database["products"].find(
+                    {"sku": {"$exists": True, "$ne": ""}, "cf_sku_code": {"$exists": True, "$ne": ""}},
+                    {"sku": 1, "cf_sku_code": 1, "_id": 0},
+                ):
+                    sku_to_cf[p["sku"]] = p["cf_sku_code"]
+
+                # Get Zoho Books access token
+                auth_url = _IV_BOOKS_URL.format(
+                    books_refresh_token=_IV_BOOKS_REFRESH_TOKEN,
+                    clientId=_IV_CLIENT_ID,
+                    clientSecret=_IV_CLIENT_SECRET,
+                    grantType="refresh_token",
+                )
+                r = requests.post(auth_url, timeout=30)
+                r.raise_for_status()
+                token = r.json()["access_token"]
+                headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+
+                as_of_date = datetime.now().strftime("%Y-%m-%d")
+                rule = json.dumps({
+                    "columns": [{"index": 1, "field": "location_name", "value": [_PUPSCRIBE_WH_LOCATION_ID], "comparator": "in", "group": "branch"}],
+                    "criteria_string": "1",
+                })
+
+                by_sku: Dict[str, Dict] = {}
+                page = 1
+                while True:
+                    params = {
+                        "organization_id": _IV_ORG_ID,
+                        "filter_by": "TransactionDate.CustomDate",
+                        "to_date": as_of_date,
+                        "rule": rule,
+                        "select_columns": '[{"field":"item_name","group":"report"},{"field":"quantity_available","group":"report"},{"field":"asset_value","group":"report"},{"field":"sku","group":"item"}]',
+                        "group_by": '[{"field":"none","group":"report"}]',
+                        "sort_column": "quantity_available",
+                        "sort_order": "D",
+                        "response_option": "1",
+                        "page": page,
+                        "per_page": 200,
+                    }
+                    resp = requests.get(
+                        "https://books.zoho.com/api/v3/reports/inventoryvaluation",
+                        headers=headers,
+                        params=params,
+                        timeout=30,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if data.get("code") != 0:
+                        raise ValueError(f"Zoho Books IV API error: {data.get('message')}")
+
+                    for row in data["inventory_valuation"][0]["item_details"]:
+                        sku = row.get("sku") or row.get("item", {}).get("sku", "")
+                        cf_sku = sku_to_cf.get(sku)
+                        if not cf_sku:
+                            continue
+                        qty = row.get("quantity_available", 0) or 0
+                        asset_val = row.get("asset_value", 0.0) or 0.0
+                        unit_cost = round(asset_val / qty, 2) if qty > 0 else 0.0
+                        by_sku[cf_sku] = {
+                            "unit_cost": unit_cost,
+                            "asset_value": round(asset_val, 2),
+                            "qty": qty,
+                        }
+
+                    if not data["page_context"]["has_more_page"]:
+                        break
+                    page += 1
+                    time.sleep(0.3)
+
+                return {"by_sku": by_sku, "as_of_date": as_of_date}
+
+            return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            logger.error(f"Error fetching inventory valuation COGS: {e}")
+            return {"by_sku": {}, "as_of_date": ""}
+
 
 async def _generate_master_report_data(
     start_date: str,
@@ -1997,6 +2095,7 @@ async def _generate_master_report_data(
     db,
     brand: str = None,
     dashboard_mode: bool = False,
+    include_cogs: bool = False,
 ):
     """
     Internal function that generates full master report data (with raw individual_reports).
@@ -2032,6 +2131,7 @@ async def _generate_master_report_data(
         _amazon_sku_task = asyncio.create_task(report_service.fetch_amazon_sku_set())
         _blinkit_sku_task = asyncio.create_task(report_service.fetch_blinkit_sku_set())
         _amazon_drr_task = asyncio.create_task(report_service.fetch_amazon_final_drr_by_sku(start_date, end_date))
+        _cogs_task = asyncio.create_task(report_service.fetch_inventory_valuation_cogs()) if include_cogs else None
 
         # Step 1: Fetch Zoho report + composite products in parallel
         tasks = []
@@ -2122,6 +2222,8 @@ async def _generate_master_report_data(
         amazon_sku_set: Set[str] = set()
         blinkit_sku_set: Set[str] = set()
         amazon_final_drr_by_sku: Dict[str, float] = {}
+        cogs_by_sku: Dict[str, Dict] = {}
+        cogs_date: str = ""
 
         # Process results
         individual_reports = {}
@@ -2555,6 +2657,17 @@ async def _generate_master_report_data(
                 _blinkit_sku_task.cancel()
                 _amazon_drr_task.cancel()
 
+            # Await COGS task separately (only when requested; it calls Zoho Books API)
+            if _cogs_task is not None:
+                try:
+                    cogs_res = await asyncio.wait_for(_cogs_task, timeout=120.0)
+                    cogs_by_sku = cogs_res.get("by_sku", {})
+                    cogs_date = cogs_res.get("as_of_date", "")
+                except Exception as e:
+                    logger.error(f"COGS fetch failed: {e}")
+                    if not _cogs_task.done():
+                        _cogs_task.cancel()
+
             # Inject stub rows for SKUs that have FBA stock but zero sales in this period.
             # These ASINs exist in amazon_sku_mapping but never appeared in any sales report,
             # so combine_data_by_sku_optimized never created an entry for them.
@@ -2821,6 +2934,11 @@ async def _generate_master_report_data(
                 item["sku"] = _pdata.get("sku", "") or ""
                 # Blinkit inventory
                 item["blinkit_inventory"] = round(latest_blinkit_by_sku.get(sku, 0), 2)
+                # COGS / inventory valuation (Pupscribe WH, Zoho Books)
+                _cogs = cogs_by_sku.get(sku, {})
+                item["cogs_unit_cost"] = _cogs.get("unit_cost", 0.0)
+                item["cogs_asset_value"] = _cogs.get("asset_value", 0.0)
+                item["cogs_qty"] = _cogs.get("qty", 0)
                 # Platform live flags
                 item["live_on_amazon"] = sku in amazon_sku_set
                 item["live_on_blinkit"] = sku in blinkit_sku_set
@@ -3047,6 +3165,7 @@ async def _generate_master_report_data(
                 "prev_fba": prev_fba_date,
                 "etrade": vc_latest_inv_date,
                 "blinkit": latest_blinkit_inv_date,
+                "cogs": cogs_date,
             },
             "meta": {
                 "execution_time_seconds": round(execution_time, 2),
@@ -3246,6 +3365,7 @@ async def download_master_report(
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
     include_zoho: bool = Query(True, description="Include Zoho data"),
     brand: str = Query(None, description="Filter by brand name (e.g. 'Truelove'). Omit for all brands."),
+    include_cogs: bool = Query(False, description="Include COGS columns (Unit Cost, Pupscribe Stock Value, Pupscribe Stock on Hand) from Zoho Books inventory valuation"),
     db=Depends(get_database),
 ):
     """
@@ -3370,6 +3490,7 @@ async def download_master_report(
             include_zoho=include_zoho,
             db=db,
             brand=brand,
+            include_cogs=include_cogs,
         )
 
         combined_data = content.get("combined_data", [])
@@ -3412,6 +3533,7 @@ async def download_master_report(
         _prev_total_label   = _prev_fba_label if latest_stock_dates.get("prev_fba", "") >= latest_stock_dates.get("prev_zoho", "") else _prev_zoho_label
         _etrade_inv_label = _fmt_date(latest_stock_dates.get("etrade", "")) or _end_date_label
         _blinkit_inv_label = _fmt_date(latest_stock_dates.get("blinkit", "")) or _end_date_label
+        _cogs_date_label = _fmt_date(latest_stock_dates.get("cogs", "")) or _end_date_label
 
         # Create Excel file
         excel_buffer = io.BytesIO()
@@ -3700,6 +3822,15 @@ async def download_master_report(
                         "Manufacturer Code": item.get("manufacturer_code", ""),
                         "MRP": item.get("mrp") or 0,
                         "Unit Price": item.get("unit_price", 0),
+                        **(
+                            {
+                                "Unit Cost (COGS)": item.get("cogs_unit_cost", 0),
+                                f"Pupscribe WH Stock Value ({_cogs_date_label})": item.get("cogs_asset_value", 0),
+                                f"Pupscribe WH Stock on Hand ({_cogs_date_label})": item.get("cogs_qty", 0),
+                            }
+                            if include_cogs
+                            else {}
+                        ),
                         "Total Amount": f"₹{metrics.get('total_amount', 0)}",
                         "Total Units Sold": metrics.get("total_units_sold", 0),
                         "Total Units Returned": metrics.get("total_units_returned", 0),
