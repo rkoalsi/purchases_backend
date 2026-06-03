@@ -41,12 +41,14 @@ ASSEMBLIES_COLLECTION = "assemblies"
 SALES_ORDERS_COLLECTION = "sales_orders"
 
 ZOHO_BOOKS_BASE = "https://books.zoho.com/api/v3"
-ZOHO_INVENTORY_BASE = os.getenv("ZOHO_INVENTORY_BASE", "https://www.zohoapis.com/inventory/v1")
+ZOHO_INVENTORY_BASE = os.getenv(
+    "ZOHO_INVENTORY_BASE", "https://www.zohoapis.com/inventory/v1"
+)
 ORGANIZATION_ID = os.getenv("ORGANIZATION_ID", "776755316")
 
 # Fixed warehouse IDs for vendor PO transfer orders
 TO_FROM_WAREHOUSE_ID = "3220178000000403010"  # Pupscribe Enterprises Private Limited
-TO_TO_WAREHOUSE_ID = "3220178000156676949"    # Mumbai (Amazon)
+TO_TO_WAREHOUSE_ID = "3220178000156676949"  # Mumbai (Amazon)
 BOOKS_URL = os.getenv("BOOKS_URL")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
@@ -116,6 +118,7 @@ def _fetch_monthly_amazon_sales(db, asins: list, num_months: int = 5):
     """
     import calendar as _cal
     from datetime import date
+
     today = date.today()
     months = []
     for i in range(1, num_months + 1):
@@ -135,10 +138,16 @@ def _fetch_monthly_amazon_sales(db, asins: list, num_months: int = 5):
     # FBA sales (Seller Central / Seller Partner API)
     fba_pipeline = [
         {"$match": {"parentAsin": {"$in": asins}, "date": {"$gte": earliest}}},
-        {"$group": {
-            "_id": {"asin": "$parentAsin", "year": {"$year": "$date"}, "month": {"$month": "$date"}},
-            "units_sold": {"$sum": "$salesByAsin.unitsOrdered"},
-        }},
+        {
+            "$group": {
+                "_id": {
+                    "asin": "$parentAsin",
+                    "year": {"$year": "$date"},
+                    "month": {"$month": "$date"},
+                },
+                "units_sold": {"$sum": "$salesByAsin.unitsOrdered"},
+            }
+        },
     ]
     for doc in db["amazon_sales_traffic"].aggregate(fba_pipeline):
         a = doc["_id"]["asin"]
@@ -149,10 +158,16 @@ def _fetch_monthly_amazon_sales(db, asins: list, num_months: int = 5):
     # VC sales (Vendor Central)
     vc_pipeline = [
         {"$match": {"asin": {"$in": asins}, "date": {"$gte": earliest}}},
-        {"$group": {
-            "_id": {"asin": "$asin", "year": {"$year": "$date"}, "month": {"$month": "$date"}},
-            "units_sold": {"$sum": "$orderedUnits"},
-        }},
+        {
+            "$group": {
+                "_id": {
+                    "asin": "$asin",
+                    "year": {"$year": "$date"},
+                    "month": {"$month": "$date"},
+                },
+                "units_sold": {"$sum": "$orderedUnits"},
+            }
+        },
     ]
     for doc in db["amazon_vendor_sales"].aggregate(vc_pipeline):
         a = doc["_id"]["asin"]
@@ -160,7 +175,9 @@ def _fetch_monthly_amazon_sales(db, asins: list, num_months: int = 5):
         by_asin.setdefault(a, {})
         by_asin[a][key] = by_asin[a].get(key, 0) + int(doc["units_sold"])
 
-    result = {a: [by_asin.get(a, {}).get((y, m), 0) for (y, m, _) in months] for a in asins}
+    result = {
+        a: [by_asin.get(a, {}).get((y, m), 0) for (y, m, _) in months] for a in asins
+    }
     return result, months
 
 
@@ -182,10 +199,18 @@ def _get_dispatched_costs_by_asin(package_number: str, db) -> dict:
     if not sku_rows:
         return {}
     skus = [r["sku"] for r in sku_rows]
-    sku_to_asin = {m["sku_code"]: m["item_id"] for m in db[SKU_MAPPING_COLLECTION].find({"sku_code": {"$in": skus}}, {"sku_code": 1, "item_id": 1})}
+    sku_to_asin = {
+        m["sku_code"]: m["item_id"]
+        for m in db[SKU_MAPPING_COLLECTION].find(
+            {"sku_code": {"$in": skus}}, {"sku_code": 1, "item_id": 1}
+        )
+    }
     asins = list(set(sku_to_asin.values()))
     asin_to_margin, asin_to_cost_price, asin_to_etrade = {}, {}, {}
-    for m in db[MARGINS_COLLECTION].find({"asin": {"$in": asins}}, {"asin": 1, "etrade_asp": 1, "margin": 1, "cost_price_wo_tax": 1}):
+    for m in db[MARGINS_COLLECTION].find(
+        {"asin": {"$in": asins}},
+        {"asin": 1, "etrade_asp": 1, "margin": 1, "cost_price_wo_tax": 1},
+    ):
         if m.get("etrade_asp") is not None:
             asin_to_etrade[m["asin"]] = float(m["etrade_asp"])
         if m.get("margin") is not None:
@@ -193,18 +218,32 @@ def _get_dispatched_costs_by_asin(package_number: str, db) -> dict:
         if m.get("cost_price_wo_tax") is not None:
             asin_to_cost_price[m["asin"]] = float(m["cost_price_wo_tax"])
     sku_to_gst: dict[str, float] = {}
-    for p in db[PRODUCTS_COLLECTION].find({"cf_sku_code": {"$in": skus}}, {"cf_sku_code": 1, "status": 1, "item_tax_preferences": 1}):
+    for p in db[PRODUCTS_COLLECTION].find(
+        {"cf_sku_code": {"$in": skus}},
+        {"cf_sku_code": 1, "status": 1, "item_tax_preferences": 1},
+    ):
         sku = p["cf_sku_code"]
         if sku not in sku_to_gst or p.get("status") == "active":
             sku_to_gst[sku] = _extract_gst(p.get("item_tax_preferences") or [])
     missing = [s for s in skus if s not in sku_to_gst]
     if missing:
-        comp_ids = {c["sku_code"]: c["composite_item_id"] for c in db["composite_products"].find({"sku_code": {"$in": missing}}, {"sku_code": 1, "composite_item_id": 1}) if c.get("sku_code") and c.get("composite_item_id")}
+        comp_ids = {
+            c["sku_code"]: c["composite_item_id"]
+            for c in db["composite_products"].find(
+                {"sku_code": {"$in": missing}}, {"sku_code": 1, "composite_item_id": 1}
+            )
+            if c.get("sku_code") and c.get("composite_item_id")
+        }
         if comp_ids:
-            for p in db[PRODUCTS_COLLECTION].find({"item_id": {"$in": list(comp_ids.values())}}, {"item_id": 1, "item_tax_preferences": 1}):
+            for p in db[PRODUCTS_COLLECTION].find(
+                {"item_id": {"$in": list(comp_ids.values())}},
+                {"item_id": 1, "item_tax_preferences": 1},
+            ):
                 for sku, iid in comp_ids.items():
                     if p.get("item_id") == iid:
-                        sku_to_gst[sku] = _extract_gst(p.get("item_tax_preferences") or [])
+                        sku_to_gst[sku] = _extract_gst(
+                            p.get("item_tax_preferences") or []
+                        )
     result: dict = {}
     for r in sku_rows:
         sku, qty = r["sku"], r["qty"]
@@ -214,20 +253,38 @@ def _get_dispatched_costs_by_asin(package_number: str, db) -> dict:
         gst = sku_to_gst.get(sku, 0.0)
         etrade_asp = asin_to_etrade.get(asin)
         margin = asin_to_margin.get(asin)
-        mrp_wo_gst = round(etrade_asp / (1 + gst / 100), 2) if (etrade_asp and gst) else etrade_asp
+        mrp_wo_gst = (
+            round(etrade_asp / (1 + gst / 100), 2)
+            if (etrade_asp and gst)
+            else etrade_asp
+        )
         item_cost = None
         if mrp_wo_gst is not None and margin is not None:
-            unit_cost = round(round(mrp_wo_gst, 2) * (1 - round(margin * 100, 2) / 100), 4)
+            unit_cost = round(
+                round(mrp_wo_gst, 2) * (1 - round(margin * 100, 2) / 100), 4
+            )
             item_cost = round(unit_cost * qty, 2)
         elif asin in asin_to_cost_price:
             item_cost = round(asin_to_cost_price[asin] * qty, 2)
-        item_cost_gst = round(item_cost * (1 + gst / 100), 2) if (item_cost is not None and gst) else item_cost
+        item_cost_gst = (
+            round(item_cost * (1 + gst / 100), 2)
+            if (item_cost is not None and gst)
+            else item_cost
+        )
         if asin in result:
             result[asin]["qty"] = result[asin]["qty"] + qty
-            result[asin]["item_total"] = round((result[asin]["item_total"] or 0) + (item_cost or 0), 2)
-            result[asin]["item_total_gst"] = round((result[asin]["item_total_gst"] or 0) + (item_cost_gst or 0), 2)
+            result[asin]["item_total"] = round(
+                (result[asin]["item_total"] or 0) + (item_cost or 0), 2
+            )
+            result[asin]["item_total_gst"] = round(
+                (result[asin]["item_total_gst"] or 0) + (item_cost_gst or 0), 2
+            )
         else:
-            result[asin] = {"qty": qty, "item_total": item_cost, "item_total_gst": item_cost_gst}
+            result[asin] = {
+                "qty": qty,
+                "item_total": item_cost,
+                "item_total_gst": item_cost_gst,
+            }
     return result
 
 
@@ -286,7 +343,9 @@ def _compute_package_accepted_costs(
 
     # SKU → ASIN
     sku_to_asin: dict[str, str] = {}
-    for m in db[SKU_MAPPING_COLLECTION].find({"sku_code": {"$in": skus}}, {"sku_code": 1, "item_id": 1}):
+    for m in db[SKU_MAPPING_COLLECTION].find(
+        {"sku_code": {"$in": skus}}, {"sku_code": 1, "item_id": 1}
+    ):
         sku_to_asin[m["sku_code"]] = m["item_id"]
 
     asins = list(sku_to_asin.values())
@@ -331,8 +390,10 @@ def _compute_package_accepted_costs(
         # Use etrade_asp as the base rate (same as _enrich_items: asp_base → mrp_wo_gst)
         asp_base = etrade_asp
         mrp_wo_gst = (
-            round(asp_base / (1 + gst / 100), 2) if (asp_base and gst) else asp_base
-        ) if asp_base is not None else None
+            (round(asp_base / (1 + gst / 100), 2) if (asp_base and gst) else asp_base)
+            if asp_base is not None
+            else None
+        )
 
         # Mirror the total_cost formula exactly
         if mrp_wo_gst is not None and margin is not None:
@@ -344,9 +405,7 @@ def _compute_package_accepted_costs(
         else:
             continue
 
-        item_cost_gst = (
-            round(item_cost * (1 + gst / 100), 2) if gst else item_cost
-        )
+        item_cost_gst = round(item_cost * (1 + gst / 100), 2) if gst else item_cost
         accepted_total_cost += item_cost
         accepted_total_cost_gst += item_cost_gst
         has_any = True
@@ -402,7 +461,9 @@ async def _compute_drr_for_po_async(db, po_date_str: str, asins: list[str]) -> d
         return {}
     # Use same 30-day window as a typical PSR run ending on the PO date
     start_date = (po_dt - timedelta(days=30)).strftime("%Y-%m-%d")
-    report = await generate_report_by_date_range(start_date, po_date_str, db, report_type="all")
+    report = await generate_report_by_date_range(
+        start_date, po_date_str, db, report_type="all"
+    )
     asin_set = set(asins)
     result = {
         item["asin"]: {"drr": item.get("drr", 0), "drr_flag": item.get("drr_flag", "")}
@@ -414,7 +475,9 @@ async def _compute_drr_for_po_async(db, po_date_str: str, asins: list[str]) -> d
     missing = [a for a in asins if a not in result]
     if missing:
         end_dt = po_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
-        fallback = await asyncio.to_thread(compute_drr_for_asins_sync, db, end_dt, missing)
+        fallback = await asyncio.to_thread(
+            compute_drr_for_asins_sync, db, end_dt, missing
+        )
         result.update(fallback)
     return result
 
@@ -621,17 +684,67 @@ def _enrich_items(
                                     "if": {"$eq": ["$po_status", "processing"]},
                                     "then": {
                                         "$cond": {
-                                            "if": {"$ne": [{"$ifNull": ["$items.supply_qty_override", None]}, None]},
-                                            "then": {"$ifNull": ["$items.supply_qty_override", 0]},
+                                            "if": {
+                                                "$ne": [
+                                                    {
+                                                        "$ifNull": [
+                                                            "$items.supply_qty_override",
+                                                            None,
+                                                        ]
+                                                    },
+                                                    None,
+                                                ]
+                                            },
+                                            "then": {
+                                                "$ifNull": [
+                                                    "$items.supply_qty_override",
+                                                    0,
+                                                ]
+                                            },
                                             "else": {
                                                 "$cond": {
-                                                    "if": {"$ne": [{"$ifNull": ["$items.final_supply_fo", None]}, None]},
-                                                    "then": {"$ifNull": ["$items.final_supply_fo", 0]},
+                                                    "if": {
+                                                        "$ne": [
+                                                            {
+                                                                "$ifNull": [
+                                                                    "$items.final_supply_fo",
+                                                                    None,
+                                                                ]
+                                                            },
+                                                            None,
+                                                        ]
+                                                    },
+                                                    "then": {
+                                                        "$ifNull": [
+                                                            "$items.final_supply_fo",
+                                                            0,
+                                                        ]
+                                                    },
                                                     "else": {
                                                         "$cond": {
-                                                            "if": {"$gt": [{"$ifNull": ["$items.supply_qty", 0]}, 0]},
-                                                            "then": {"$ifNull": ["$items.supply_qty", 0]},
-                                                            "else": {"$ifNull": ["$items.requested_qty", 0]},
+                                                            "if": {
+                                                                "$gt": [
+                                                                    {
+                                                                        "$ifNull": [
+                                                                            "$items.supply_qty",
+                                                                            0,
+                                                                        ]
+                                                                    },
+                                                                    0,
+                                                                ]
+                                                            },
+                                                            "then": {
+                                                                "$ifNull": [
+                                                                    "$items.supply_qty",
+                                                                    0,
+                                                                ]
+                                                            },
+                                                            "else": {
+                                                                "$ifNull": [
+                                                                    "$items.requested_qty",
+                                                                    0,
+                                                                ]
+                                                            },
                                                         }
                                                     },
                                                 }
@@ -811,10 +924,16 @@ def _enrich_items(
             _rate = round(mrp_wo_gst, 2)
             _discount_factor = 1 - round(margin * 100, 2) / 100
             total_cost = round(_rate * supply_qty * _discount_factor, 2)
-            total_cost_accepted = round(_rate * accepted_qty * _discount_factor, 2) if accepted_qty else None
+            total_cost_accepted = (
+                round(_rate * accepted_qty * _discount_factor, 2)
+                if accepted_qty
+                else None
+            )
         elif cost_price_wo_tax is not None:
             total_cost = round(cost_price_wo_tax * supply_qty, 2)
-            total_cost_accepted = round(cost_price_wo_tax * accepted_qty, 2) if accepted_qty else None
+            total_cost_accepted = (
+                round(cost_price_wo_tax * accepted_qty, 2) if accepted_qty else None
+            )
         else:
             total_cost = None
             total_cost_accepted = None
@@ -851,14 +970,16 @@ def _enrich_items(
         elif final_drr and net_total_days is not None:
             if net_total_days < lead_time:
                 final_units = int(
-                    (Decimal(str(final_drr)) * Decimal(str(total_target_days))).quantize(
-                        Decimal("1"), rounding=ROUND_HALF_UP
-                    )
+                    (
+                        Decimal(str(final_drr)) * Decimal(str(total_target_days))
+                    ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
                 )
             elif net_total_days > total_target_days:
                 final_units = 0
             else:
-                diff_days = Decimal(str(total_target_days)) - Decimal(str(net_total_days))
+                diff_days = Decimal(str(total_target_days)) - Decimal(
+                    str(net_total_days)
+                )
                 final_units = int(
                     (diff_days * Decimal(str(final_drr))).quantize(
                         Decimal("1"), rounding=ROUND_HALF_UP
@@ -971,7 +1092,9 @@ async def upload_vendor_po(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not po_number:
-        raise HTTPException(status_code=400, detail="Could not extract PO number from file")
+        raise HTTPException(
+            status_code=400, detail="Could not extract PO number from file"
+        )
 
     # Compute DRR using same async path as PSR report
     asins = [it["asin"] for it in items if it.get("asin")]
@@ -1105,7 +1228,12 @@ async def list_vendor_pos(db=Depends(get_database)):
                                     "$cond": [
                                         {"$ne": ["$$it.supply_qty_override", None]},
                                         {"$ifNull": ["$$it.total_cost", 0]},
-                                        {"$ifNull": ["$$it.total_cost_fo", {"$ifNull": ["$$it.total_cost", 0]}]},
+                                        {
+                                            "$ifNull": [
+                                                "$$it.total_cost_fo",
+                                                {"$ifNull": ["$$it.total_cost", 0]},
+                                            ]
+                                        },
                                     ]
                                 },
                             }
@@ -1120,7 +1248,12 @@ async def list_vendor_pos(db=Depends(get_database)):
                                     "$cond": [
                                         {"$ne": ["$$it.supply_qty_override", None]},
                                         {"$ifNull": ["$$it.total_cost_gst", 0]},
-                                        {"$ifNull": ["$$it.total_cost_fo_gst", {"$ifNull": ["$$it.total_cost_gst", 0]}]},
+                                        {
+                                            "$ifNull": [
+                                                "$$it.total_cost_fo_gst",
+                                                {"$ifNull": ["$$it.total_cost_gst", 0]},
+                                            ]
+                                        },
                                     ]
                                 },
                             }
@@ -1530,7 +1663,9 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
             drr_map=_drr_map,
         )
         # Attach per-item dispatched costs from all linked packages (if any)
-        pkg_numbers = doc.get("packages") or ([doc["package_number"]] if doc.get("package_number") else [])
+        pkg_numbers = doc.get("packages") or (
+            [doc["package_number"]] if doc.get("package_number") else []
+        )
         if pkg_numbers:
             merged: dict = {}
             for pn in pkg_numbers:
@@ -1553,7 +1688,9 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
         est_id = doc.get("zoho_estimate_id")
         est_num = doc.get("estimate_number")
         if est_id or est_num:
-            est_query = {"estimate_id": est_id} if est_id else {"estimate_number": est_num}
+            est_query = (
+                {"estimate_id": est_id} if est_id else {"estimate_number": est_num}
+            )
             est_doc = db[ESTIMATES_COLLECTION].find_one(est_query, {"salesorders": 1})
             if est_doc:
                 salesorders_arr = est_doc.get("salesorders") or []
@@ -1584,22 +1721,32 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
                                 "salesorder_id": so_doc.get("salesorder_id"),
                                 "salesorder_number": so_doc.get("salesorder_number"),
                                 "order_status": so_doc.get("order_status"),
-                                "date": str(so_doc["date"])[:10] if so_doc.get("date") else last_entry.get("date"),
+                                "date": (
+                                    str(so_doc["date"])[:10]
+                                    if so_doc.get("date")
+                                    else last_entry.get("date")
+                                ),
                                 "total": so_doc.get("total"),
                             }
                         else:
                             # Not yet synced to our DB — use data from estimate's salesorders entry
                             est_linked_so = {
                                 "salesorder_id": last_entry.get("salesorder_id"),
-                                "salesorder_number": last_entry.get("salesorder_number"),
-                                "order_status": last_entry.get("salesorder_order_status"),
+                                "salesorder_number": last_entry.get(
+                                    "salesorder_number"
+                                ),
+                                "order_status": last_entry.get(
+                                    "salesorder_order_status"
+                                ),
                                 "date": last_entry.get("date"),
                                 "total": last_entry.get("total"),
                             }
 
         return enriched, inv_date, zoho_date, est_linked_so
 
-    enriched, live_inv_date, live_zoho_date, est_linked_so = await asyncio.to_thread(_fetch)
+    enriched, live_inv_date, live_zoho_date, est_linked_so = await asyncio.to_thread(
+        _fetch
+    )
 
     # Write computed total_cost / total_cost_fo back to each item in the DB so the list aggregation reflects it.
     def _write_back_costs():
@@ -1607,12 +1754,14 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
             asin = it.get("asin")
             db[PO_COLLECTION].update_one(
                 {"po_number": po_number, "items.asin": asin},
-                {"$set": {
-                    "items.$.total_cost": it.get("total_cost"),
-                    "items.$.total_cost_gst": it.get("total_cost_gst"),
-                    "items.$.total_cost_fo": it.get("total_cost_fo"),
-                    "items.$.total_cost_fo_gst": it.get("total_cost_fo_gst"),
-                }},
+                {
+                    "$set": {
+                        "items.$.total_cost": it.get("total_cost"),
+                        "items.$.total_cost_gst": it.get("total_cost_gst"),
+                        "items.$.total_cost_fo": it.get("total_cost_fo"),
+                        "items.$.total_cost_fo_gst": it.get("total_cost_fo_gst"),
+                    }
+                },
             )
 
     asyncio.create_task(asyncio.to_thread(_write_back_costs))
@@ -1657,9 +1806,13 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
             return None, None
         est = None
         if doc.get("zoho_estimate_id"):
-            est = db[ESTIMATES_COLLECTION].find_one({"estimate_id": doc["zoho_estimate_id"]})
+            est = db[ESTIMATES_COLLECTION].find_one(
+                {"estimate_id": doc["zoho_estimate_id"]}
+            )
         if not est and doc.get("estimate_number"):
-            est = db[ESTIMATES_COLLECTION].find_one({"estimate_number": doc["estimate_number"]})
+            est = db[ESTIMATES_COLLECTION].find_one(
+                {"estimate_number": doc["estimate_number"]}
+            )
         return doc, est
 
     doc, est = await asyncio.to_thread(_fetch)
@@ -1682,10 +1835,15 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
             est_by_sku[sku] = li
 
     # Compute PO item totals using the estimate formula
-    po_items = [it for it in doc.get("items", []) if (it.get("status") or "").lower() != "inactive"]
+    po_items = [
+        it
+        for it in doc.get("items", [])
+        if (it.get("status") or "").lower() != "inactive"
+    ]
 
     # Build ASIN → cf_sku_code map so PO items with ASINs as model_number can match estimate line items keyed by cf_sku_code
     po_model_numbers = [it["model_number"] for it in po_items if it.get("model_number")]
+
     def _fetch_sku_map():
         return {
             m["item_id"]: m["sku_code"]
@@ -1695,6 +1853,7 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
             )
             if m.get("item_id") and m.get("sku_code")
         }
+
     asin_to_sku_diff: dict[str, str] = await asyncio.to_thread(_fetch_sku_map)
 
     rows = []
@@ -1767,37 +1926,69 @@ async def get_estimate_diff(po_number: str, db=Depends(get_database)):
         else:
             po_item_total_gst = po_item_total
 
-        rows.append({
-            "model_number": model,
-            "title": it.get("title") or "",
-            "asin": it.get("asin") or "",
-            "supply_qty": supply,
-            "mrp_wo_gst": mrp_wo_gst,
-            "margin": margin,
-            "gst": gst,
-            "po_rate": rate,
-            "po_item_total": po_item_total,
-            "po_item_total_gst": po_item_total_gst,
-            "in_estimate": in_estimate,
-            "estimate_qty": est_qty,
-            "estimate_rate": est_rate,
-            "estimate_item_total": est_item_total,
-            "qty_diff": (supply - est_qty) if (in_estimate and est_qty is not None) else None,
-            "rate_diff": round(rate - est_rate, 4) if (in_estimate and rate is not None and est_rate is not None) else None,
-            "total_diff": round(po_item_total - est_item_total, 2) if (in_estimate and po_item_total is not None and est_item_total is not None) else None,
-        })
+        rows.append(
+            {
+                "model_number": model,
+                "title": it.get("title") or "",
+                "asin": it.get("asin") or "",
+                "supply_qty": supply,
+                "mrp_wo_gst": mrp_wo_gst,
+                "margin": margin,
+                "gst": gst,
+                "po_rate": rate,
+                "po_item_total": po_item_total,
+                "po_item_total_gst": po_item_total_gst,
+                "in_estimate": in_estimate,
+                "estimate_qty": est_qty,
+                "estimate_rate": est_rate,
+                "estimate_item_total": est_item_total,
+                "qty_diff": (
+                    (supply - est_qty)
+                    if (in_estimate and est_qty is not None)
+                    else None
+                ),
+                "rate_diff": (
+                    round(rate - est_rate, 4)
+                    if (in_estimate and rate is not None and est_rate is not None)
+                    else None
+                ),
+                "total_diff": (
+                    round(po_item_total - est_item_total, 2)
+                    if (
+                        in_estimate
+                        and po_item_total is not None
+                        and est_item_total is not None
+                    )
+                    else None
+                ),
+            }
+        )
 
     # Items in estimate but not in PO
     # Resolve ASIN model_numbers to cf_sku_codes so the comparison uses the same key as est_by_sku
-    po_skus = {asin_to_sku_diff.get(it.get("model_number", ""), it.get("model_number", "")) for it in po_items}
+    po_skus = {
+        asin_to_sku_diff.get(it.get("model_number", ""), it.get("model_number", ""))
+        for it in po_items
+    }
     only_in_estimate = [
-        {"sku": _cf_sku(li), "name": li.get("name", ""), "quantity": li.get("quantity"), "rate": li.get("rate"), "item_total": li.get("item_total")}
+        {
+            "sku": _cf_sku(li),
+            "name": li.get("name", ""),
+            "quantity": li.get("quantity"),
+            "rate": li.get("rate"),
+            "item_total": li.get("item_total"),
+        }
         for li in est.get("line_items", [])
         if _cf_sku(li) and _cf_sku(li) not in po_skus
     ]
 
-    po_total = round(sum(r["po_item_total"] for r in rows if r["po_item_total"] is not None), 2)
-    po_total_gst = round(sum(r["po_item_total_gst"] for r in rows if r["po_item_total_gst"] is not None), 2)
+    po_total = round(
+        sum(r["po_item_total"] for r in rows if r["po_item_total"] is not None), 2
+    )
+    po_total_gst = round(
+        sum(r["po_item_total_gst"] for r in rows if r["po_item_total_gst"] is not None),
+        2,
+    )
 
     return {
         "po_number": po_number,
@@ -1823,12 +2014,20 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
         est_id = doc.get("zoho_estimate_id")
         pkg_numbers: list[str] = []
         if est_id:
-            so = db[SALES_ORDERS_COLLECTION].find_one({"estimate_id": est_id}, {"packages": 1})
+            so = db[SALES_ORDERS_COLLECTION].find_one(
+                {"estimate_id": est_id}, {"packages": 1}
+            )
             if so:
-                pkg_numbers = [p["package_number"] for p in (so.get("packages") or []) if p.get("package_number")]
+                pkg_numbers = [
+                    p["package_number"]
+                    for p in (so.get("packages") or [])
+                    if p.get("package_number")
+                ]
         # Fall back to manually linked packages for backward compatibility
         if not pkg_numbers:
-            pkg_numbers = doc.get("packages") or ([doc["package_number"]] if doc.get("package_number") else [])
+            pkg_numbers = doc.get("packages") or (
+                [doc["package_number"]] if doc.get("package_number") else []
+            )
         if not pkg_numbers:
             return doc, None, []
         pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_numbers[0]})
@@ -1852,11 +2051,13 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
                 sku = cf.get("value")
                 break
         if sku:
-            sku_rows.append({
-                "sku": sku,
-                "name": li.get("name") or "",
-                "qty": float(li.get("quantity") or 0),
-            })
+            sku_rows.append(
+                {
+                    "sku": sku,
+                    "name": li.get("name") or "",
+                    "qty": float(li.get("quantity") or 0),
+                }
+            )
 
     if not sku_rows:
         return {
@@ -1870,7 +2071,9 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
     def _enrich():
         skus = [r["sku"] for r in sku_rows]
         sku_to_asin: dict[str, str] = {}
-        for m in db[SKU_MAPPING_COLLECTION].find({"sku_code": {"$in": skus}}, {"sku_code": 1, "item_id": 1}):
+        for m in db[SKU_MAPPING_COLLECTION].find(
+            {"sku_code": {"$in": skus}}, {"sku_code": 1, "item_id": 1}
+        ):
             sku_to_asin[m["sku_code"]] = m["item_id"]
         asins = list(sku_to_asin.values())
         asin_to_margin: dict[str, float] = {}
@@ -1892,7 +2095,9 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
             {"cf_sku_code": {"$in": skus}, "status": "active"},
             {"cf_sku_code": 1, "item_tax_preferences": 1},
         ):
-            sku_to_gst[p["cf_sku_code"]] = _extract_gst(p.get("item_tax_preferences") or [])
+            sku_to_gst[p["cf_sku_code"]] = _extract_gst(
+                p.get("item_tax_preferences") or []
+            )
         missing_gst_skus = [s for s in skus if s not in sku_to_gst]
         if missing_gst_skus:
             composite_item_ids = {
@@ -1910,10 +2115,20 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
                 ):
                     for sku, iid in composite_item_ids.items():
                         if p.get("item_id") == iid:
-                            sku_to_gst[sku] = _extract_gst(p.get("item_tax_preferences") or [])
-        return sku_to_asin, asin_to_etrade, asin_to_margin, asin_to_cost_price, sku_to_gst
+                            sku_to_gst[sku] = _extract_gst(
+                                p.get("item_tax_preferences") or []
+                            )
+        return (
+            sku_to_asin,
+            asin_to_etrade,
+            asin_to_margin,
+            asin_to_cost_price,
+            sku_to_gst,
+        )
 
-    sku_to_asin, asin_to_etrade, asin_to_margin, asin_to_cost_price, sku_to_gst = await asyncio.to_thread(_enrich)
+    sku_to_asin, asin_to_etrade, asin_to_margin, asin_to_cost_price, sku_to_gst = (
+        await asyncio.to_thread(_enrich)
+    )
 
     items = []
     total_cost = 0.0
@@ -1933,31 +2148,41 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
         item_cost: float | None = None
         unit_cost: float | None = None
         if mrp_wo_gst is not None and margin is not None:
-            unit_cost = round(round(mrp_wo_gst, 2) * (1 - round(margin * 100, 2) / 100), 4)
+            unit_cost = round(
+                round(mrp_wo_gst, 2) * (1 - round(margin * 100, 2) / 100), 4
+            )
             item_cost = round(unit_cost * qty, 2)
         elif asin and asin in asin_to_cost_price:
             unit_cost = asin_to_cost_price[asin]
             item_cost = round(unit_cost * qty, 2)
 
-        item_cost_gst = round(item_cost * (1 + gst / 100), 2) if (item_cost is not None and gst) else item_cost
+        item_cost_gst = (
+            round(item_cost * (1 + gst / 100), 2)
+            if (item_cost is not None and gst)
+            else item_cost
+        )
 
         if item_cost is not None:
             total_cost += item_cost
             total_cost_gst += item_cost_gst or item_cost
 
-        items.append({
-            "sku": sku,
-            "name": r["name"],
-            "qty": qty,
-            "asin": asin,
-            "etrade_asp": etrade_asp,
-            "gst": gst,
-            "mrp_wo_gst": mrp_wo_gst,
-            "margin": round(margin * 100, 2) if margin is not None else None,  # as percentage
-            "unit_cost": unit_cost,
-            "item_total": item_cost,
-            "item_total_gst": item_cost_gst,
-        })
+        items.append(
+            {
+                "sku": sku,
+                "name": r["name"],
+                "qty": qty,
+                "asin": asin,
+                "etrade_asp": etrade_asp,
+                "gst": gst,
+                "mrp_wo_gst": mrp_wo_gst,
+                "margin": (
+                    round(margin * 100, 2) if margin is not None else None
+                ),  # as percentage
+                "unit_cost": unit_cost,
+                "item_total": item_cost,
+                "item_total_gst": item_cost_gst,
+            }
+        )
 
     return {
         "po_number": po_number,
@@ -2014,7 +2239,9 @@ async def update_po_status(po_number: str, po_status: str, db=Depends(get_databa
     if po_status in FREEZE_ON_STATUS and doc.get("po_status") not in FREEZE_ON_STATUS:
         _freeze_asins = [it["asin"] for it in doc.get("items", []) if it.get("asin")]
         if _freeze_asins and doc.get("po_date"):
-            _freeze_drr_map = await _compute_drr_for_po_async(db, doc.get("po_date", ""), _freeze_asins)
+            _freeze_drr_map = await _compute_drr_for_po_async(
+                db, doc.get("po_date", ""), _freeze_asins
+            )
 
     def _update():
         update_fields: dict = {"po_status": po_status, "updated_at": datetime.now()}
@@ -2214,14 +2441,25 @@ async def update_item_lead_time(
         override_value = None if lead_time < 0 else lead_time
         result = db[PO_COLLECTION].update_one(
             {"po_number": po_number, "items.asin": asin},
-            {"$set": {"items.$.lead_time_override": override_value, "updated_at": datetime.now()}},
+            {
+                "$set": {
+                    "items.$.lead_time_override": override_value,
+                    "updated_at": datetime.now(),
+                }
+            },
         )
         return result.matched_count
 
     matched = await asyncio.to_thread(_update)
     if not matched:
-        raise HTTPException(status_code=404, detail=f"PO {po_number} / ASIN {asin} not found")
-    return {"po_number": po_number, "asin": asin, "lead_time": None if lead_time < 0 else lead_time}
+        raise HTTPException(
+            status_code=404, detail=f"PO {po_number} / ASIN {asin} not found"
+        )
+    return {
+        "po_number": po_number,
+        "asin": asin,
+        "lead_time": None if lead_time < 0 else lead_time,
+    }
 
 
 @router.patch("/{po_number}/items/{asin}/coverage_days")
@@ -2234,14 +2472,25 @@ async def update_item_coverage_days(
         override_value = None if coverage_days < 0 else coverage_days
         result = db[PO_COLLECTION].update_one(
             {"po_number": po_number, "items.asin": asin},
-            {"$set": {"items.$.coverage_days_override": override_value, "updated_at": datetime.now()}},
+            {
+                "$set": {
+                    "items.$.coverage_days_override": override_value,
+                    "updated_at": datetime.now(),
+                }
+            },
         )
         return result.matched_count
 
     matched = await asyncio.to_thread(_update)
     if not matched:
-        raise HTTPException(status_code=404, detail=f"PO {po_number} / ASIN {asin} not found")
-    return {"po_number": po_number, "asin": asin, "coverage_days": None if coverage_days < 0 else coverage_days}
+        raise HTTPException(
+            status_code=404, detail=f"PO {po_number} / ASIN {asin} not found"
+        )
+    return {
+        "po_number": po_number,
+        "asin": asin,
+        "coverage_days": None if coverage_days < 0 else coverage_days,
+    }
 
 
 @router.patch("/{po_number}/items/{asin}/final_units")
@@ -2254,14 +2503,25 @@ async def update_item_final_units(
         override_value = None if final_units < 0 else final_units
         result = db[PO_COLLECTION].update_one(
             {"po_number": po_number, "items.asin": asin},
-            {"$set": {"items.$.final_units_override": override_value, "updated_at": datetime.now()}},
+            {
+                "$set": {
+                    "items.$.final_units_override": override_value,
+                    "updated_at": datetime.now(),
+                }
+            },
         )
         return result.matched_count
 
     matched = await asyncio.to_thread(_update)
     if not matched:
-        raise HTTPException(status_code=404, detail=f"PO {po_number} / ASIN {asin} not found")
-    return {"po_number": po_number, "asin": asin, "final_units": None if final_units < 0 else final_units}
+        raise HTTPException(
+            status_code=404, detail=f"PO {po_number} / ASIN {asin} not found"
+        )
+    return {
+        "po_number": po_number,
+        "asin": asin,
+        "final_units": None if final_units < 0 else final_units,
+    }
 
 
 @router.patch("/{po_number}/items/{asin}/final_supply_fo")
@@ -2274,14 +2534,25 @@ async def update_item_final_supply_fo(
         override_value = None if final_supply_fo < 0 else final_supply_fo
         result = db[PO_COLLECTION].update_one(
             {"po_number": po_number, "items.asin": asin},
-            {"$set": {"items.$.final_supply_fo_override": override_value, "updated_at": datetime.now()}},
+            {
+                "$set": {
+                    "items.$.final_supply_fo_override": override_value,
+                    "updated_at": datetime.now(),
+                }
+            },
         )
         return result.matched_count
 
     matched = await asyncio.to_thread(_update)
     if not matched:
-        raise HTTPException(status_code=404, detail=f"PO {po_number} / ASIN {asin} not found")
-    return {"po_number": po_number, "asin": asin, "final_supply_fo": None if final_supply_fo < 0 else final_supply_fo}
+        raise HTTPException(
+            status_code=404, detail=f"PO {po_number} / ASIN {asin} not found"
+        )
+    return {
+        "po_number": po_number,
+        "asin": asin,
+        "final_supply_fo": None if final_supply_fo < 0 else final_supply_fo,
+    }
 
 
 @router.patch("/{po_number}/items/{asin}/etrade_unit_cost")
@@ -2356,7 +2627,11 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
 
     # Month labels for last 5 months (from first enriched item if available)
     _month_labels = (enriched[0].get("month_labels") or []) if enriched else []
-    _month_headers = [lbl for (_, _, lbl) in _month_labels] if _month_labels else [f"Month {i+1} Sales" for i in range(5)]
+    _month_headers = (
+        [lbl for (_, _, lbl) in _month_labels]
+        if _month_labels
+        else [f"Month {i+1} Sales" for i in range(5)]
+    )
 
     # Column layout (41 cols + 5 monthly = 46 total):
     # A-H: meta+qty, I=Supply(formula=AM), J=Accepted, K=ShortSupply, L=Received, M=Mismatch
@@ -2368,21 +2643,45 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
     # AL=FinalUnits(For Under-ordering), AM=FinalSupplyQty(For Over-ordering)
     # AN-AR=5 months Amazon sales
     headers = [
-        ("PO Date", False), ("PO", False), ("PO Status", False), ("Ship to location", False),
-        ("ASIN", True), ("Model Number", True), ("Title", True), ("Requested Qty", True),
-        ("Supply Qty", False), ("Accepted Qty", False), ("Short Supply\n(Accepted-Supply)", False),
-        ("Received QTY", False), ("Mismatch QTY", False),
-        ("Zoho MRP", True), ("eTrade ASP", True), ("GST", True), ("MRP w/o GST", True),
-        ("Margin (%)", True), ("Cost Price w/o Tax", True),
-        ("Total Cost\n(Supply Qty)", True), ("Total cost w/o GST\n(Supply Qty)", True),
-        ("Total Cost\n(Accepted Qty)", True), ("Total cost w/o GST\n(Accepted Qty)", True),
-        ("HSN", True), ("Etrade Unit Cost", True), ("Diff", True),
-        ("Zoho Stock", True), ("Status", True), (f"Current Stock\n({inv_date_label})", True),
-        ("Open PO", True), ("Total Qty", True),
+        ("PO Date", False),
+        ("PO", False),
+        ("PO Status", False),
+        ("Ship to location", False),
+        ("ASIN", True),
+        ("Model Number", True),
+        ("Title", True),
+        ("Requested Qty", True),
+        ("Supply Qty", False),
+        ("Accepted Qty", False),
+        ("Short Supply\n(Accepted-Supply)", False),
+        ("Received QTY", False),
+        ("Mismatch QTY", False),
+        ("Zoho MRP", True),
+        ("eTrade ASP", True),
+        ("GST", True),
+        ("MRP w/o GST", True),
+        ("Margin (%)", True),
+        ("Cost Price w/o Tax", True),
+        ("Total Cost\n(Supply Qty)", True),
+        ("Total cost w/o GST\n(Supply Qty)", True),
+        ("Total Cost\n(Accepted Qty)", True),
+        ("Total cost w/o GST\n(Accepted Qty)", True),
+        ("HSN", True),
+        ("Etrade Unit Cost", True),
+        ("Diff", True),
+        ("Zoho Stock", True),
+        ("Status", True),
+        (f"Current Stock\n({inv_date_label})", True),
+        ("Open PO", True),
+        ("Total Qty", True),
         (f"Final DRR\n({_drr_range})", True),
-        ("Net Total Days", True), ("Lead Time", True), ("Coverage Days", True),
-        ("Total Target Days", True), ("Target Stock", True),
-        ("Final Units\n(For Under-ordering)", True), ("Final Supply Qty\n(For Over-ordering)", True),
+        ("Net Total Days", True),
+        ("Lead Time", True),
+        ("Coverage Days", True),
+        ("Total Target Days", True),
+        ("Target Stock", True),
+        ("Final Units\n(For Under-ordering)", True),
+        ("Final Supply Qty\n(For Over-ordering)", True),
     ] + [(lbl, True) for lbl in _month_headers]
 
     for col_idx, (label, highlight) in enumerate(headers, 1):
@@ -2407,28 +2706,34 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
         monthly_sales = item.get("monthly_sales") or []
 
         static = {
-            1: po_date_str,          # A  PO Date
-            2: po_number,            # B  PO
-            3: doc["po_status"],     # C  PO Status
+            1: po_date_str,  # A  PO Date
+            2: po_number,  # B  PO
+            3: doc["po_status"],  # C  PO Status
             4: item["ship_to_location"],  # D
-            5: item["asin"],         # E  ASIN
-            6: item["model_number"], # F  Model Number
-            7: item["title"],        # G  Title
-            8: item["requested_qty"], # H  Requested Qty
+            5: item["asin"],  # E  ASIN
+            6: item["model_number"],  # F  Model Number
+            7: item["title"],  # G  Title
+            8: item["requested_qty"],  # H  Requested Qty
             10: accepted if accepted is not None else "",  # J  Accepted Qty
             12: received if received is not None else "",  # L  Received QTY
-            14: item["zoho_mrp"],    # N  Zoho MRP
-            15: item.get("etrade_asp") if item.get("etrade_asp") is not None else "",  # O  eTrade ASP
-            16: item["gst"] / 100,   # P  GST
+            14: item["zoho_mrp"],  # N  Zoho MRP
+            15: (
+                item.get("etrade_asp") if item.get("etrade_asp") is not None else ""
+            ),  # O  eTrade ASP
+            16: item["gst"] / 100,  # P  GST
             18: item["margin"] if item["margin"] is not None else "",  # R  Margin
-            24: item["hsn"],         # X  HSN
+            24: item["hsn"],  # X  HSN
             25: item["etrade_unit_cost"],  # Y  Etrade Unit Cost
             27: item["zoho_stock"],  # AA Zoho Stock
             28: item["purchase_status"],  # AB Status
             29: item["current_stock"],  # AC Current Stock
-            30: item["open_po"],     # AD Open PO
-            32: (item.get("final_drr") if item.get("final_drr") is not None else (item.get("final_drr_flag") or "")),  # AF Final DRR
-            34: item.get("lead_time", 10),   # AH Lead Time
+            30: item["open_po"],  # AD Open PO
+            32: (
+                item.get("final_drr")
+                if item.get("final_drr") is not None
+                else (item.get("final_drr_flag") or "")
+            ),  # AF Final DRR
+            34: item.get("lead_time", 10),  # AH Lead Time
             35: item.get("coverage_days", COVERAGE_DAYS),  # AI Coverage Days
         }
         # Monthly sales cols 40-44 (AN-AR)
@@ -2439,22 +2744,22 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
         final_units_override = item.get("final_units_override")
         final_supply_fo_override = item.get("final_supply_fo_override")
         formulas = {
-            9:  f"=AM{r}",                                                              # I   Supply Qty = Final Supply Qty (For Over-ordering)
-            11: f'=IF(J{r}="","",J{r}-I{r})',                                          # K   Short Supply
-            13: f'=IF(L{r}="","",J{r}-L{r})',                                          # M   Mismatch
-            17: f'=IF(O{r}="",ROUND(N{r}/(1+P{r}),2),ROUND(O{r}/(1+P{r}),2))',        # Q   MRP w/o GST
-            19: f'=IF(R{r}="","",ROUND(Q{r}*(1-R{r}),2))',                             # S   Cost Price w/o Tax
-            20: f'=IF(OR(Q{r}="",R{r}="",I{r}=""),"",ROUND(Q{r}*(1-R{r})*I{r},2))',    # T   Total Cost (Supply Qty)
-            21: f'=IF(T{r}="","",ROUND(T{r}*(1+P{r}),2))',                             # U   Total cost w/o GST (Supply Qty)
-            22: f'=IF(S{r}="","",ROUND(S{r}*J{r},2))',                                 # V   Total Cost (Accepted Qty)
-            23: f'=IF(V{r}="","",ROUND(V{r}*(1+P{r}),2))',                             # W   Total cost w/o GST (Accepted Qty)
-            26: f'=IF(S{r}="","",Y{r}-S{r})',                                          # Z   Diff
-            31: f"=AC{r}+AD{r}",                                                        # AE  Total Qty
-            33: f'=IF(AF{r}=0,"",ROUND(AE{r}/AF{r},2))',                               # AG  Net Total Days
-            36: f"=AH{r}+AI{r}",                                                        # AJ  Total Target Days
-            37: f"=ROUND(AF{r}*AJ{r},0)",                                               # AK  Target Stock = DRR * Total Target Days
+            9: f"=AM{r}",  # I   Supply Qty = Final Supply Qty (For Over-ordering)
+            11: f'=IF(J{r}="","",J{r}-I{r})',  # K   Short Supply
+            13: f'=IF(L{r}="","",J{r}-L{r})',  # M   Mismatch
+            17: f'=IF(O{r}="",ROUND(N{r}/(1+P{r}),2),ROUND(O{r}/(1+P{r}),2))',  # Q   MRP w/o GST
+            19: f'=IF(R{r}="","",ROUND(Q{r}*(1-R{r}),2))',  # S   Cost Price w/o Tax
+            20: f'=IF(OR(Q{r}="",R{r}="",I{r}=""),"",ROUND(Q{r}*(1-R{r})*I{r},2))',  # T   Total Cost (Supply Qty)
+            21: f'=IF(T{r}="","",ROUND(T{r}*(1+P{r}),2))',  # U   Total cost w/o GST (Supply Qty)
+            22: f'=IF(S{r}="","",ROUND(S{r}*J{r},2))',  # V   Total Cost (Accepted Qty)
+            23: f'=IF(V{r}="","",ROUND(V{r}*(1+P{r}),2))',  # W   Total cost w/o GST (Accepted Qty)
+            26: f'=IF(S{r}="","",Y{r}-S{r})',  # Z   Diff
+            31: f"=AC{r}+AD{r}",  # AE  Total Qty
+            33: f'=IF(AF{r}=0,"",ROUND(AE{r}/AF{r},2))',  # AG  Net Total Days
+            36: f"=AH{r}+AI{r}",  # AJ  Total Target Days
+            37: f"=ROUND(AF{r}*AJ{r},0)",  # AK  Target Stock = DRR * Total Target Days
             38: f'=IF(AF{r}=0,"",IF(AG{r}<AH{r},ROUND(AF{r}*AJ{r},0),IF(AG{r}>AJ{r},0,ROUND((AJ{r}-AG{r})*AF{r},0))))',  # AL  Final Units (For Under-ordering)
-            39: f'=IF(AL{r}="","",MIN(AL{r},H{r}))',                                   # AM  Final Supply Qty (For Over-ordering)
+            39: f'=IF(AL{r}="","",MIN(AL{r},H{r}))',  # AM  Final Supply Qty (For Over-ordering)
         }
         if supply_qty_override is not None:
             formulas.pop(9, None)
@@ -2483,7 +2788,10 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
                 cell.number_format = num_format
             elif col_idx in (16, 18):  # GST%, Margin%
                 cell.number_format = pct_format
-            elif col_idx in (8, 10, 12, 27, 29, 30, 31, 34, 35, 36, 37, 38, 39) or col_idx >= 40:
+            elif (
+                col_idx in (8, 10, 12, 27, 29, 30, 31, 34, 35, 36, 37, 38, 39)
+                or col_idx >= 40
+            ):
                 cell.number_format = int_format
             elif col_idx == 32:  # Final DRR
                 cell.number_format = "0.00"
@@ -2558,22 +2866,21 @@ async def bulk_download_po_reports(po_numbers: list[str], db=Depends(get_databas
 
     # Fetch all docs first, then compute DRR async in parallel, then enrich
     def _fetch_docs():
-        return [
-            db[PO_COLLECTION].find_one({"po_number": pn})
-            for pn in po_numbers
-        ]
+        return [db[PO_COLLECTION].find_one({"po_number": pn}) for pn in po_numbers]
 
     raw_docs = await asyncio.to_thread(_fetch_docs)
     docs = [(pn, doc) for pn, doc in zip(po_numbers, raw_docs) if doc]
 
-    drr_maps = await asyncio.gather(*[
-        _compute_drr_for_po_async(
-            db,
-            doc.get("po_date", ""),
-            [it["asin"] for it in doc.get("items", []) if it.get("asin")],
-        )
-        for _, doc in docs
-    ])
+    drr_maps = await asyncio.gather(
+        *[
+            _compute_drr_for_po_async(
+                db,
+                doc.get("po_date", ""),
+                [it["asin"] for it in doc.get("items", []) if it.get("asin")],
+            )
+            for _, doc in docs
+        ]
+    )
 
     def _build_all():
         results = []
@@ -2935,7 +3242,9 @@ async def upsert_margin(
     etrade_df: Optional[bool] = None,
     db=Depends(get_database),
 ):
-    if all(v is None for v in [margin, cost_price_wo_tax, etrade_asp, etrade_po, etrade_df]):
+    if all(
+        v is None for v in [margin, cost_price_wo_tax, etrade_asp, etrade_po, etrade_df]
+    ):
         raise HTTPException(
             status_code=400,
             detail="At least one field must be provided",
@@ -2965,7 +3274,10 @@ async def upsert_margin(
         db[MARGINS_COLLECTION].update_one({"asin": asin}, {"$set": fields}, upsert=True)
 
     await asyncio.to_thread(_upsert)
-    return {"asin": asin, **{k: v for k, v in fields.items() if k not in ("asin", "updated_at")}}
+    return {
+        "asin": asin,
+        **{k: v for k, v in fields.items() if k not in ("asin", "updated_at")},
+    }
 
 
 @router.post("/bulk_update")
@@ -3093,6 +3405,51 @@ async def get_margins_for_asins(asins: str, db=Depends(get_database)):
     return {m["asin"]: m["margin"] for m in margins}
 
 
+# ─── warehouses ───────────────────────────────────────────────────────────────
+
+
+@router.get("/warehouses")
+async def list_warehouses():
+    """Return Zoho Inventory warehouses for warehouse selectors."""
+
+    def _fetch():
+        token = _get_inventory_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+        all_warehouses = []
+        page = 1
+        while True:
+            r = requests.get(
+                f"{ZOHO_INVENTORY_BASE}/warehouses",
+                headers=headers,
+                params={
+                    "organization_id": ORGANIZATION_ID,
+                    "page": page,
+                    "per_page": 200,
+                },
+                timeout=15,
+            )
+            data = r.json()
+            if not r.ok or data.get("code") != 0:
+                raise ValueError(
+                    f"Zoho error {data.get('code')}: {data.get('message', 'Unknown')}"
+                )
+            batch = data.get("warehouses", [])
+            all_warehouses.extend(
+                {
+                    "warehouse_id": w["warehouse_id"],
+                    "warehouse_name": w["warehouse_name"],
+                }
+                for w in batch
+            )
+            if not data.get("page_context", {}).get("has_more_page"):
+                break
+            page += 1
+        return all_warehouses
+
+    warehouses = await asyncio.to_thread(_fetch)
+    return {"warehouses": warehouses}
+
+
 # ─── estimate ─────────────────────────────────────────────────────────────────
 
 
@@ -3100,7 +3457,9 @@ class EstimateCreateRequest(BaseModel):
     billing_address_id: str
     shipping_address_id: str
     date: Optional[str] = None  # YYYY-MM-DD; defaults to today
-    skip_inactive: bool = False  # If True, skip truly-inactive items instead of blocking
+    skip_inactive: bool = (
+        False  # If True, skip truly-inactive items instead of blocking
+    )
 
 
 class EstimateLinkRequest(BaseModel):
@@ -3188,10 +3547,7 @@ async def create_zoho_estimate(
         }
 
         # For each item, lookup_key = sku_code resolved from ASIN, or model_number used directly
-        all_lookup_keys = list({
-            asin_to_sku_code.get(mn, mn)
-            for mn in model_numbers
-        })
+        all_lookup_keys = list({asin_to_sku_code.get(mn, mn) for mn in model_numbers})
 
         # --- Step 2: composite_products first (always active in Zoho Books) ---
         sku_to_composite_id: dict[str, str] = {}
@@ -3206,7 +3562,9 @@ async def create_zoho_estimate(
 
         # --- Step 3: products fallback for items not found in composite_products ---
         # Prefer active products (dual 5%/12% GST variants — 12% are inactive)
-        non_composite_keys = [k for k in all_lookup_keys if k not in sku_to_composite_id]
+        non_composite_keys = [
+            k for k in all_lookup_keys if k not in sku_to_composite_id
+        ]
         sku_to_product_id: dict[str, str] = {}
         sku_to_product_status: dict[str, str] = {}
         sku_to_product_name: dict[str, str] = {}
@@ -3230,7 +3588,9 @@ async def create_zoho_estimate(
         line_items: list[dict] = []
         for it in items:
             mn = it.get("model_number", "")
-            lookup_key = asin_to_sku_code.get(mn, mn)  # sku_code if ASIN, else model_number direct
+            lookup_key = asin_to_sku_code.get(
+                mn, mn
+            )  # sku_code if ASIN, else model_number direct
 
             # Composite wins — always active in Zoho Books
             zoho_item_id = sku_to_composite_id.get(lookup_key)
@@ -3244,7 +3604,9 @@ async def create_zoho_estimate(
                 item_status = sku_to_product_status.get(lookup_key, "active")
                 if item_status and item_status != "active":
                     product_name = sku_to_product_name.get(lookup_key, lookup_key)
-                    inactive_items.append(f"{mn} — {product_name} (status: {item_status})")
+                    inactive_items.append(
+                        f"{mn} — {product_name} (status: {item_status})"
+                    )
                     continue  # blocked below unless skip_inactive=True
             margin = it.get("margin")
             discount = round(margin * 100, 2) if margin is not None else 0
@@ -3266,9 +3628,7 @@ async def create_zoho_estimate(
             )
 
         if inactive_items and not body.skip_inactive:
-            raise ValueError(
-                "INACTIVE_ITEMS:" + "\n".join(inactive_items)
-            )
+            raise ValueError("INACTIVE_ITEMS:" + "\n".join(inactive_items))
 
         if not line_items:
             raise ValueError(
@@ -3345,10 +3705,10 @@ async def create_zoho_estimate(
             "shipping_address_id": body.shipping_address_id,
             "is_inclusive_tax": False,
             "line_items": line_items,
-            "branch_id":"3220178000156681877",
-            "branch_name":"Amazon (Mumbai Branch)",
+            "branch_id": "3220178000156681877",
+            "branch_name": "Amazon (Mumbai Branch)",
             "salesperson_id": "3220178000000692003",
-            "dispatch_from_address_id":"3220178000541133001",
+            "dispatch_from_address_id": "3220178000541133001",
             # "dispatch_from_address": {
             #     "zip": "401208",
             #     "country": "India",
@@ -3399,7 +3759,9 @@ async def create_zoho_estimate(
     except ValueError as e:
         msg = str(e)
         if msg.startswith("INACTIVE_ITEMS:"):
-            items_list = [line for line in msg[len("INACTIVE_ITEMS:"):].splitlines() if line]
+            items_list = [
+                line for line in msg[len("INACTIVE_ITEMS:") :].splitlines() if line
+            ]
             raise HTTPException(
                 status_code=400,
                 detail={"type": "inactive_items", "items": items_list},
@@ -3468,7 +3830,9 @@ async def update_zoho_estimate(
                 sku_to_composite_id[c["sku_code"]] = c["composite_item_id"]
 
         # products fallback
-        non_composite_keys = [k for k in all_lookup_keys if k not in sku_to_composite_id]
+        non_composite_keys = [
+            k for k in all_lookup_keys if k not in sku_to_composite_id
+        ]
         sku_to_product_id: dict[str, str] = {}
         sku_to_product_status: dict[str, str] = {}
         sku_to_product_name: dict[str, str] = {}
@@ -3502,7 +3866,9 @@ async def update_zoho_estimate(
                 item_status = sku_to_product_status.get(lookup_key, "active")
                 if item_status and item_status != "active":
                     product_name = sku_to_product_name.get(lookup_key, lookup_key)
-                    inactive_items.append(f"{mn} — {product_name} (status: {item_status})")
+                    inactive_items.append(
+                        f"{mn} — {product_name} (status: {item_status})"
+                    )
                     continue
 
             margin = it.get("margin")
@@ -3555,7 +3921,7 @@ async def update_zoho_estimate(
             "branch_id": "3220178000156681877",
             "branch_name": "Amazon (Mumbai Branch)",
             "salesperson_id": "3220178000000692003",
-            "dispatch_from_address_id":"3220178000541133001",
+            "dispatch_from_address_id": "3220178000541133001",
             # "dispatch_from_address": {
             #     "zip": "401208",
             #     "country": "India",
@@ -3596,7 +3962,9 @@ async def update_zoho_estimate(
     except ValueError as e:
         msg = str(e)
         if msg.startswith("INACTIVE_ITEMS:"):
-            items_list = [line for line in msg[len("INACTIVE_ITEMS:"):].splitlines() if line]
+            items_list = [
+                line for line in msg[len("INACTIVE_ITEMS:") :].splitlines() if line
+            ]
             raise HTTPException(
                 status_code=400,
                 detail={"type": "inactive_items", "items": items_list},
@@ -3604,7 +3972,9 @@ async def update_zoho_estimate(
         raise HTTPException(status_code=400, detail=msg)
     except requests.HTTPError as e:
         body_text = e.response.text if e.response is not None else ""
-        raise HTTPException(status_code=502, detail=f"Zoho API error: {e} — {body_text}")
+        raise HTTPException(
+            status_code=502, detail=f"Zoho API error: {e} — {body_text}"
+        )
 
     result = {
         "estimate_id": estimate["estimate_id"],
@@ -3697,17 +4067,28 @@ async def link_package(
         if not doc:
             raise ValueError(f"PO {po_number} not found")
         # Validate package exists
-        if not db[PACKAGES_COLLECTION].find_one({"package_number": body.package_number}):
-            raise ValueError(f"Package {body.package_number!r} not found in packages collection")
+        if not db[PACKAGES_COLLECTION].find_one(
+            {"package_number": body.package_number}
+        ):
+            raise ValueError(
+                f"Package {body.package_number!r} not found in packages collection"
+            )
         # Add to array (addToSet avoids duplicates)
         db[PO_COLLECTION].update_one(
             {"po_number": po_number},
-            {"$addToSet": {"packages": body.package_number}, "$set": {"updated_at": datetime.now()}},
+            {
+                "$addToSet": {"packages": body.package_number},
+                "$set": {"updated_at": datetime.now()},
+            },
         )
         # Recompute accepted costs across all packages
-        updated_doc = db[PO_COLLECTION].find_one({"po_number": po_number}, {"packages": 1})
+        updated_doc = db[PO_COLLECTION].find_one(
+            {"po_number": po_number}, {"packages": 1}
+        )
         all_packages = updated_doc.get("packages") or []
-        accepted_total_cost, accepted_total_cost_gst = _compute_packages_accepted_costs(all_packages, db)
+        accepted_total_cost, accepted_total_cost_gst = _compute_packages_accepted_costs(
+            all_packages, db
+        )
         cost_update: dict = {"updated_at": datetime.now()}
         if accepted_total_cost is not None:
             cost_update["accepted_total_cost"] = accepted_total_cost
@@ -3717,7 +4098,9 @@ async def link_package(
         return all_packages, accepted_total_cost, accepted_total_cost_gst
 
     try:
-        packages, accepted_total_cost, accepted_total_cost_gst = await asyncio.to_thread(_link)
+        packages, accepted_total_cost, accepted_total_cost_gst = (
+            await asyncio.to_thread(_link)
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -3730,7 +4113,9 @@ async def link_package(
 
 
 @router.delete("/{po_number}/package/{pkg_number}")
-async def unlink_specific_package(po_number: str, pkg_number: str, db=Depends(get_database)):
+async def unlink_specific_package(
+    po_number: str, pkg_number: str, db=Depends(get_database)
+):
     """Remove a specific package from the PO's packages array and recompute accepted costs."""
 
     def _unlink():
@@ -3740,13 +4125,22 @@ async def unlink_specific_package(po_number: str, pkg_number: str, db=Depends(ge
         )
         if not result.matched_count:
             return None, None, None
-        updated_doc = db[PO_COLLECTION].find_one({"po_number": po_number}, {"packages": 1})
+        updated_doc = db[PO_COLLECTION].find_one(
+            {"po_number": po_number}, {"packages": 1}
+        )
         remaining = updated_doc.get("packages") or []
         if remaining:
-            accepted_total_cost, accepted_total_cost_gst = _compute_packages_accepted_costs(remaining, db)
+            accepted_total_cost, accepted_total_cost_gst = (
+                _compute_packages_accepted_costs(remaining, db)
+            )
             db[PO_COLLECTION].update_one(
                 {"po_number": po_number},
-                {"$set": {"accepted_total_cost": accepted_total_cost, "accepted_total_cost_gst": accepted_total_cost_gst}},
+                {
+                    "$set": {
+                        "accepted_total_cost": accepted_total_cost,
+                        "accepted_total_cost_gst": accepted_total_cost_gst,
+                    }
+                },
             )
         else:
             accepted_total_cost = accepted_total_cost_gst = None
@@ -3756,10 +4150,17 @@ async def unlink_specific_package(po_number: str, pkg_number: str, db=Depends(ge
             )
         return remaining, accepted_total_cost, accepted_total_cost_gst
 
-    packages, accepted_total_cost, accepted_total_cost_gst = await asyncio.to_thread(_unlink)
+    packages, accepted_total_cost, accepted_total_cost_gst = await asyncio.to_thread(
+        _unlink
+    )
     if packages is None:
         raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
-    return {"po_number": po_number, "packages": packages, "accepted_total_cost": accepted_total_cost, "accepted_total_cost_gst": accepted_total_cost_gst}
+    return {
+        "po_number": po_number,
+        "packages": packages,
+        "accepted_total_cost": accepted_total_cost,
+        "accepted_total_cost_gst": accepted_total_cost_gst,
+    }
 
 
 @router.delete("/{po_number}/package")
@@ -3771,7 +4172,11 @@ async def unlink_all_packages(po_number: str, db=Depends(get_database)):
             {"po_number": po_number},
             {
                 "$set": {"packages": [], "updated_at": datetime.now()},
-                "$unset": {"package_number": "", "accepted_total_cost": "", "accepted_total_cost_gst": ""},
+                "$unset": {
+                    "package_number": "",
+                    "accepted_total_cost": "",
+                    "accepted_total_cost_gst": "",
+                },
             },
         )
         return result.matched_count
@@ -3796,10 +4201,19 @@ async def search_sales_orders(q: str = "", db=Depends(get_database)):
     def _search():
         if not q.strip():
             return []
-        results = db[SALES_ORDERS_COLLECTION].find(
-            {"salesorder_number": {"$regex": q.strip(), "$options": "i"}},
-            {"salesorder_number": 1, "salesorder_id": 1, "customer_name": 1, "_id": 0},
-        ).limit(10)
+        results = (
+            db[SALES_ORDERS_COLLECTION]
+            .find(
+                {"salesorder_number": {"$regex": q.strip(), "$options": "i"}},
+                {
+                    "salesorder_number": 1,
+                    "salesorder_id": 1,
+                    "customer_name": 1,
+                    "_id": 0,
+                },
+            )
+            .limit(10)
+        )
         return list(results)
 
     return await asyncio.to_thread(_search)
@@ -3817,19 +4231,30 @@ async def update_sales_order_no(
             {"salesorder_number": so_number},
             {"salesorder_id": 1, "_id": 0},
         )
-        update_fields: dict = {"sales_order_no": so_number, "updated_at": datetime.now()}
+        update_fields: dict = {
+            "sales_order_no": so_number,
+            "updated_at": datetime.now(),
+        }
         if so_doc:
             update_fields["sales_order_id"] = so_doc["salesorder_id"]
         result = db[PO_COLLECTION].update_one(
             {"po_number": po_number},
             {"$set": update_fields},
         )
-        return result.matched_count, so_number, so_doc.get("salesorder_id") if so_doc else None
+        return (
+            result.matched_count,
+            so_number,
+            so_doc.get("salesorder_id") if so_doc else None,
+        )
 
     count, so_number, so_id = await asyncio.to_thread(_update)
     if not count:
         raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
-    return {"po_number": po_number, "sales_order_no": so_number, "sales_order_id": so_id}
+    return {
+        "po_number": po_number,
+        "sales_order_no": so_number,
+        "sales_order_id": so_id,
+    }
 
 
 # ─── transfer order ────────────────────────────────────────────────────────────
@@ -3837,6 +4262,8 @@ async def update_sales_order_no(
 
 class TransferOrderCreateRequest(BaseModel):
     date: Optional[str] = None  # YYYY-MM-DD; defaults to today
+    from_warehouse_id: Optional[str] = None
+    to_warehouse_id: Optional[str] = None
 
 
 class TransferOrderLinkRequest(BaseModel):
@@ -3860,6 +4287,21 @@ async def create_transfer_order(
 
         pkg_number = doc.get("package_number")
         if not pkg_number:
+            # Fall back to SO-linked package (auto-derived from estimate → sales order)
+            est_id = doc.get("zoho_estimate_id")
+            if est_id:
+                so = db[SALES_ORDERS_COLLECTION].find_one(
+                    {"estimate_id": est_id}, {"packages": 1}
+                )
+                if so:
+                    pkg_nums = [
+                        p["package_number"]
+                        for p in (so.get("packages") or [])
+                        if p.get("package_number")
+                    ]
+                    if pkg_nums:
+                        pkg_number = pkg_nums[0]
+        if not pkg_number:
             raise ValueError("No package linked to this PO — link a package first")
 
         pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_number})
@@ -3878,24 +4320,41 @@ async def create_transfer_order(
             qty = float(li.get("quantity") or 0)
             if qty <= 0:
                 continue
-            line_items.append({
-                "item_id": item_id,
-                "name": li.get("name") or "",
-                "quantity_transfer": qty,
-                "unit": li.get("unit", "pcs"),
-            })
+            line_items.append(
+                {
+                    "item_id": item_id,
+                    "name": li.get("name") or "",
+                    "quantity_transfer": qty,
+                    "unit": li.get("unit", "pcs"),
+                }
+            )
 
         if not line_items:
             raise ValueError("No valid line items found in package")
 
         # Compute next transfer order number (numeric sort, not lexicographic)
-        agg = list(db[TRANSFER_ORDERS_COLLECTION].aggregate([
-            {"$match": {"transfer_order_number": {"$regex": r"^TO-\d+"}}},
-            {"$addFields": {"_to_num": {"$toInt": {"$arrayElemAt": [{"$split": ["$transfer_order_number", "-"]}, 1]}}}},
-            {"$sort": {"_to_num": -1}},
-            {"$limit": 1},
-            {"$project": {"_to_num": 1}},
-        ]))
+        agg = list(
+            db[TRANSFER_ORDERS_COLLECTION].aggregate(
+                [
+                    {"$match": {"transfer_order_number": {"$regex": r"^TO-\d+"}}},
+                    {
+                        "$addFields": {
+                            "_to_num": {
+                                "$toInt": {
+                                    "$arrayElemAt": [
+                                        {"$split": ["$transfer_order_number", "-"]},
+                                        1,
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    {"$sort": {"_to_num": -1}},
+                    {"$limit": 1},
+                    {"$project": {"_to_num": 1}},
+                ]
+            )
+        )
         last_num = agg[0]["_to_num"] if agg else 0
         new_to_number = f"TO-{last_num + 1}"
 
@@ -3906,10 +4365,22 @@ async def create_transfer_order(
         payload: dict = {
             "transfer_order_number": new_to_number,
             "date": to_date,
-            "from_warehouse_id": TO_FROM_WAREHOUSE_ID,
-            "to_warehouse_id": TO_TO_WAREHOUSE_ID,
+            "from_warehouse_id": body.from_warehouse_id or TO_FROM_WAREHOUSE_ID,
+            "from_location_id": body.from_warehouse_id or TO_FROM_WAREHOUSE_ID,
+            "to_warehouse_id": body.to_warehouse_id or TO_TO_WAREHOUSE_ID,
+            "to_location_id": body.to_warehouse_id or TO_TO_WAREHOUSE_ID,
             "line_items": line_items,
         }
+
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "TO payload → from=%s to=%s items=%d",
+            payload["from_warehouse_id"],
+            payload["to_warehouse_id"],
+            len(line_items),
+        )
 
         r = requests.post(
             f"{ZOHO_INVENTORY_BASE}/transferorders",
@@ -3922,13 +4393,16 @@ async def create_transfer_order(
             timeout=30,
         )
         data = r.json()
+        logger.info("Zoho TO response: %s", data)
 
         if not r.ok or data.get("code") != 0:
             msg = data.get("message", "Unknown error")
             bad_ids = data.get("error_info") or []
             if bad_ids:
                 # Map error item_ids back to names from the line items we built
-                id_to_name = {li["item_id"]: li.get("name") or li["item_id"] for li in line_items}
+                id_to_name = {
+                    li["item_id"]: li.get("name") or li["item_id"] for li in line_items
+                }
                 bad_names = [id_to_name.get(iid, iid) for iid in bad_ids]
                 msg = f"{msg} — items: {', '.join(bad_names)}"
             raise ValueError(f"Zoho error {data.get('code')}: {msg}")
@@ -3952,7 +4426,9 @@ async def create_transfer_order(
         raise HTTPException(status_code=400, detail=str(e))
     except requests.HTTPError as e:
         body_text = e.response.text if e.response is not None else ""
-        raise HTTPException(status_code=502, detail=f"Zoho API error: {e} — {body_text}")
+        raise HTTPException(
+            status_code=502, detail=f"Zoho API error: {e} — {body_text}"
+        )
 
     return JSONResponse(
         status_code=201,
@@ -4048,6 +4524,20 @@ async def create_assemblies(po_number: str, db=Depends(get_database)):
             raise ValueError("Assemblies already created — unlink them first")
         pkg_number = doc.get("package_number")
         if not pkg_number:
+            est_id = doc.get("zoho_estimate_id")
+            if est_id:
+                so = db[SALES_ORDERS_COLLECTION].find_one(
+                    {"estimate_id": est_id}, {"packages": 1}
+                )
+                if so:
+                    pkg_nums = [
+                        p["package_number"]
+                        for p in (so.get("packages") or [])
+                        if p.get("package_number")
+                    ]
+                    if pkg_nums:
+                        pkg_number = pkg_nums[0]
+        if not pkg_number:
             raise ValueError("No package linked — link a package first")
 
         pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_number})
@@ -4090,7 +4580,9 @@ async def create_assemblies(po_number: str, db=Depends(get_database)):
             raw_components = comp.get("components") or []
             if isinstance(raw_components, str):
                 try:
-                    raw_components = _parse_addresses(raw_components)  # reuse ast.literal_eval helper
+                    raw_components = _parse_addresses(
+                        raw_components
+                    )  # reuse ast.literal_eval helper
                 except Exception:
                     raw_components = []
             bundle_line_items = []
@@ -4098,12 +4590,14 @@ async def create_assemblies(po_number: str, db=Depends(get_database)):
                 comp_qty = float(c.get("quantity") or 0)
                 if not c.get("item_id") or comp_qty <= 0:
                     continue
-                bundle_line_items.append({
-                    "item_id": c["item_id"],
-                    "name": c.get("name", ""),
-                    "quantity_consumed": comp_qty * qty,
-                    "warehouse_id": TO_FROM_WAREHOUSE_ID,
-                })
+                bundle_line_items.append(
+                    {
+                        "item_id": c["item_id"],
+                        "name": c.get("name", ""),
+                        "quantity_consumed": comp_qty * qty,
+                        "warehouse_id": TO_FROM_WAREHOUSE_ID,
+                    }
+                )
 
             payload = {
                 "composite_item_id": iid,
@@ -4123,7 +4617,9 @@ async def create_assemblies(po_number: str, db=Depends(get_database)):
             data = r.json()
             if not r.ok or data.get("code") != 0:
                 msg = data.get("message", "Unknown error")
-                raise ValueError(f"Zoho bundle error for {comp.get('name', iid)}: {msg}")
+                raise ValueError(
+                    f"Zoho bundle error for {comp.get('name', iid)}: {msg}"
+                )
             bundle = data.get("bundle", {})
             created_bundle_ids.append(bundle.get("bundle_id", ""))
             created_assembly_numbers.append(bundle.get("reference_number", ""))
@@ -4149,7 +4645,9 @@ async def create_assemblies(po_number: str, db=Depends(get_database)):
         raise HTTPException(status_code=400, detail=str(e))
     except requests.HTTPError as e:
         body_text = e.response.text if e.response is not None else ""
-        raise HTTPException(status_code=502, detail=f"Zoho API error: {e} — {body_text}")
+        raise HTTPException(
+            status_code=502, detail=f"Zoho API error: {e} — {body_text}"
+        )
 
     return JSONResponse(
         status_code=201,
