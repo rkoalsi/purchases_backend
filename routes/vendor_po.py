@@ -1292,7 +1292,32 @@ async def list_vendor_pos(db=Depends(get_database)):
             },
             {
                 "$addFields": {
-                    "_so": {"$arrayElemAt": ["$_so", 0]},
+                    # Prefer the SO that has packages; fall back to first SO if none have packages
+                    "_so": {
+                        "$let": {
+                            "vars": {
+                                "with_pkgs": {
+                                    "$filter": {
+                                        "input": "$_so",
+                                        "as": "s",
+                                        "cond": {
+                                            "$gt": [
+                                                {"$size": {"$ifNull": ["$$s.packages", []]}},
+                                                0,
+                                            ]
+                                        },
+                                    }
+                                }
+                            },
+                            "in": {
+                                "$cond": {
+                                    "if": {"$gt": [{"$size": "$$with_pkgs"}, 0]},
+                                    "then": {"$arrayElemAt": ["$$with_pkgs", 0]},
+                                    "else": {"$arrayElemAt": ["$_so", 0]},
+                                }
+                            },
+                        }
+                    }
                 }
             },
             {
