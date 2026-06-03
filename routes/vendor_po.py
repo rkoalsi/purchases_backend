@@ -288,6 +288,21 @@ def _get_dispatched_costs_by_asin(package_number: str, db) -> dict:
     return result
 
 
+def _so_package_numbers_for_estimate(est_id: str, db) -> list[str]:
+    """Return package numbers from the sales order(s) linked to an estimate.
+    When multiple SOs share the same estimate_id, prefer the one(s) with packages."""
+    sos = list(
+        db[SALES_ORDERS_COLLECTION].find({"estimate_id": est_id}, {"packages": 1})
+    )
+    sos_sorted = sorted(sos, key=lambda s: len(s.get("packages") or []), reverse=True)
+    return [
+        p["package_number"]
+        for s in sos_sorted
+        for p in (s.get("packages") or [])
+        if p.get("package_number")
+    ]
+
+
 def _compute_packages_accepted_costs(
     package_numbers: list[str], db
 ) -> tuple[float | None, float | None]:
@@ -2039,15 +2054,7 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
         est_id = doc.get("zoho_estimate_id")
         pkg_numbers: list[str] = []
         if est_id:
-            so = db[SALES_ORDERS_COLLECTION].find_one(
-                {"estimate_id": est_id}, {"packages": 1}
-            )
-            if so:
-                pkg_numbers = [
-                    p["package_number"]
-                    for p in (so.get("packages") or [])
-                    if p.get("package_number")
-                ]
+            pkg_numbers = _so_package_numbers_for_estimate(est_id, db)
         # Fall back to manually linked packages for backward compatibility
         if not pkg_numbers:
             pkg_numbers = doc.get("packages") or (
@@ -4315,17 +4322,9 @@ async def create_transfer_order(
             # Fall back to SO-linked package (auto-derived from estimate → sales order)
             est_id = doc.get("zoho_estimate_id")
             if est_id:
-                so = db[SALES_ORDERS_COLLECTION].find_one(
-                    {"estimate_id": est_id}, {"packages": 1}
-                )
-                if so:
-                    pkg_nums = [
-                        p["package_number"]
-                        for p in (so.get("packages") or [])
-                        if p.get("package_number")
-                    ]
-                    if pkg_nums:
-                        pkg_number = pkg_nums[0]
+                pkg_nums = _so_package_numbers_for_estimate(est_id, db)
+                if pkg_nums:
+                    pkg_number = pkg_nums[0]
         if not pkg_number:
             raise ValueError("No package linked to this PO — link a package first")
 
@@ -4525,17 +4524,9 @@ async def create_assemblies(po_number: str, db=Depends(get_database)):
         if not pkg_number:
             est_id = doc.get("zoho_estimate_id")
             if est_id:
-                so = db[SALES_ORDERS_COLLECTION].find_one(
-                    {"estimate_id": est_id}, {"packages": 1}
-                )
-                if so:
-                    pkg_nums = [
-                        p["package_number"]
-                        for p in (so.get("packages") or [])
-                        if p.get("package_number")
-                    ]
-                    if pkg_nums:
-                        pkg_number = pkg_nums[0]
+                pkg_nums = _so_package_numbers_for_estimate(est_id, db)
+                if pkg_nums:
+                    pkg_number = pkg_nums[0]
         if not pkg_number:
             raise ValueError("No package linked — link a package first")
 
