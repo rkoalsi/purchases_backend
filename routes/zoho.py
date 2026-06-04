@@ -3,9 +3,12 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import io, logging, math, json, re
+import openpyxl
 from fastapi import (
     APIRouter,
     File,
+    Form,
+    Header,
     UploadFile,
     HTTPException,
     status,
@@ -4806,3 +4809,120 @@ async def create_composite_items(payload: CompositeCreateRequest):
         "created_count": created_count,
         "failed_count": len(results) - created_count,
     })
+
+
+# ─── PIS (Product Information Sheet) ──────────────────────────────────────────
+
+from .design import (  # noqa: E402
+    _parse_pis_workbook,
+    _PIS_SHEETS,
+    _style_header_row,
+    _auto_col_width,
+    _upload_to_s3 as _pis_upload_to_s3,
+    _slugify as _pis_slugify,
+    _extract_email_from_token,
+)
+
+_PIS_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_PIS_BRAND_ORDERS_COLLECTION = "brand_orders"
+
+
+@router.get("/pis-template")
+def zoho_download_pis_template():
+    """Return empty PIS XLSX template."""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for sheet_name, headers in _PIS_SHEETS:
+        ws = wb.create_sheet(title=sheet_name)
+        ws.append(headers)
+        _style_header_row(ws, 1, len(headers))
+        ws.freeze_panes = "A2"
+        _auto_col_width(ws)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type=_PIS_CONTENT_TYPE,
+        headers={"Content-Disposition": 'attachment; filename="PIS_Template.xlsx"'},
+    )
+
+
+@router.post("/upload-pis")
+async def zoho_preview_pis(file: UploadFile = File(...)):
+    """Dry-run PIS parse — returns what would be updated without writing."""
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="File must be an Excel (.xlsx) file")
+    data = await file.read()
+    db = get_database()
+    result = await asyncio.to_thread(_parse_pis_workbook, data, db, True)
+    return JSONResponse(content=result)
+
+
+@router.post("/confirm-pis")
+async def zoho_confirm_pis(
+    file: UploadFile = File(...),
+    order_id: str = Form(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Apply PIS XLSX to design_catalogue and attach the file to the given brand order
+    so it appears in both the brand_orders page and the design orders page."""
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="File must be an Excel (.xlsx) file")
+
+    email = _extract_email_from_token(authorization)
+    data = await file.read()
+    db = get_database()
+
+    result = await asyncio.to_thread(_parse_pis_workbook, data, db, False)
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_filename = re.sub(r"[^\w.\-]", "_", file.filename)
+
+    def _attach_to_order():
+        order = db[_PIS_BRAND_ORDERS_COLLECTION].find_one(
+            {"_id": ObjectId(order_id)}, {"brand": 1, "name": 1}
+        )
+        if not order:
+            raise ValueError(f"Order {order_id} not found")
+
+        brand_slug = _pis_slugify(order["brand"])
+        name_slug = _pis_slugify(order["name"])
+        s3_key = f"brand_orders/{brand_slug}/{name_slug}/pis/{ts}_{safe_filename}"
+
+        _pis_upload_to_s3(data, s3_key, _PIS_CONTENT_TYPE)
+
+        doc_entry = {
+            "doc_id": str(ObjectId()),
+            "filename": file.filename,
+            "s3_key": s3_key,
+            "content_type": _PIS_CONTENT_TYPE,
+            "size": len(data),
+            "uploaded_at": datetime.utcnow(),
+            "category": "Product Information Sheet",
+            "folder": "",
+        }
+        designer_doc_entry = {**doc_entry, "doc_id": str(ObjectId())}
+
+        db[_PIS_BRAND_ORDERS_COLLECTION].update_one(
+            {"_id": ObjectId(order_id)},
+            {
+                "$push": {
+                    "documents": doc_entry,
+                    "designer_documents": designer_doc_entry,
+                },
+                "$set": {"updated_at": datetime.utcnow()},
+            },
+        )
+        return s3_key
+
+    try:
+        s3_key = await asyncio.to_thread(_attach_to_order)
+        result["audit"] = {"uploaded_by": email or "unknown", "uploaded_at": ts, "s3_key": s3_key}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.warning("PIS order attachment failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to attach PIS to order")
+
+    return JSONResponse(content=result)

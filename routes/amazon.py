@@ -3720,14 +3720,171 @@ def _build_active_days_df(vc_daily_by_asin: dict, fba_daily_by_asin: dict, repor
     return pd.DataFrame(rows) if rows else None
 
 
-def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_daily_by_asin, drr_dates, report_type, end_date_label, purchase_status_map=None):
+def _fetch_sf_fba_inventory_latest_sync(db, end):
+    """Returns ({asin: {"sf": qty|None, "fba": qty|None}}, date_str). SF=VKSX, FBA=all others."""
+    latest_doc = db["amazon_ledger"].find_one(
+        {"date": {"$lte": end}}, sort=[("date", -1)], projection={"date": 1}
+    )
+    if not latest_doc:
+        return {}, None
+    latest_date = latest_doc["date"]
+    date_str = latest_date.strftime("%-d %b %Y") if hasattr(latest_date, "strftime") else str(latest_date)
+    inv: dict = {}
+    for doc in db["amazon_ledger"].aggregate([
+        {"$match": {"date": latest_date}},
+        {"$group": {
+            "_id": {"asin": "$asin", "is_sf": {"$eq": ["$location_key", "VKSX"]}},
+            "stock": {"$sum": "$ending_warehouse_balance"},
+        }},
+    ]):
+        asin = doc["_id"]["asin"]
+        is_sf = doc["_id"]["is_sf"]
+        stock = int(doc.get("stock") or 0)
+        if asin not in inv:
+            inv[asin] = {"sf": None, "fba": None}
+        if is_sf:
+            inv[asin]["sf"] = stock
+        else:
+            inv[asin]["fba"] = stock
+    return inv, date_str
+
+
+def _fetch_vc_inventory_latest_sync(db, end):
+    """Returns ({asin: qty}, date_str) from amazon_vendor_inventory."""
+    latest_doc = db["amazon_vendor_inventory"].find_one(
+        {"date": {"$lte": end}}, sort=[("date", -1)], projection={"date": 1}
+    )
+    if not latest_doc:
+        return {}, None
+    latest_date = latest_doc["date"]
+    date_str = latest_date.strftime("%-d %b %Y") if hasattr(latest_date, "strftime") else str(latest_date)
+    inv: dict = {}
+    for doc in db["amazon_vendor_inventory"].aggregate([
+        {"$match": {"date": latest_date}},
+        {"$group": {"_id": "$asin", "stock": {"$sum": "$sellableOnHandInventoryUnits"}}},
+    ]):
+        inv[doc["_id"]] = int(doc.get("stock") or 0)
+    return inv, date_str
+
+
+def _fetch_df_inventory_latest_sync(db, end):
+    """Returns ({asin: qty}, date_str) from amazon_df_inventory (empty until populated)."""
+    latest_doc = db["amazon_df_inventory"].find_one(
+        {"date": {"$lte": end}}, sort=[("date", -1)], projection={"date": 1}
+    )
+    if not latest_doc:
+        return {}, None
+    latest_date = latest_doc["date"]
+    date_str = latest_date.strftime("%-d %b %Y") if hasattr(latest_date, "strftime") else str(latest_date)
+    inv: dict = {}
+    for doc in db["amazon_df_inventory"].aggregate([
+        {"$match": {"date": latest_date}},
+        {"$group": {"_id": "$asin", "stock": {"$sum": "$sellableOnHandInventoryUnits"}}},
+    ]):
+        inv[doc["_id"]] = int(doc.get("stock") or 0)
+    return inv, date_str
+
+
+def _fetch_zoho_stock_for_asins_sync(db, asins):
+    """Returns ({asin: qty}, date_str) from zoho_warehouse_stock, Pupscribe WH only."""
+    sku_by_asin: dict = {}
+    for doc in db["amazon_sku_mapping"].find(
+        {"item_id": {"$in": asins}}, {"item_id": 1, "sku_code": 1, "_id": 0}
+    ):
+        sku_by_asin[doc["item_id"]] = doc.get("sku_code", "")
+    skus = list(set(sku_by_asin.values()))
+    if not skus:
+        return {}, None
+    item_id_by_sku: dict = {}
+    for doc in db["products"].find(
+        {"cf_sku_code": {"$in": skus}}, {"cf_sku_code": 1, "item_id": 1, "_id": 0}
+    ):
+        item_id_by_sku[doc["cf_sku_code"]] = doc.get("item_id", "")
+    item_id_by_asin = {
+        asin: item_id_by_sku[sku]
+        for asin, sku in sku_by_asin.items()
+        if sku in item_id_by_sku and item_id_by_sku[sku]
+    }
+    zoho_item_ids = list(set(item_id_by_asin.values()))
+    if not zoho_item_ids:
+        return {}, None
+    latest_doc = db["zoho_warehouse_stock"].find_one(
+        {"zoho_item_id": {"$in": zoho_item_ids}},
+        sort=[("date", -1)],
+        projection={"date": 1},
+    )
+    if not latest_doc:
+        return {}, None
+    latest_date = latest_doc["date"]
+    date_str = latest_date.strftime("%-d %b %Y") if hasattr(latest_date, "strftime") else str(latest_date)
+    stock_by_item_id: dict = {}
+    for doc in db["zoho_warehouse_stock"].aggregate([
+        {"$match": {"zoho_item_id": {"$in": zoho_item_ids}, "date": latest_date}},
+        {"$group": {
+            "_id": "$zoho_item_id",
+            "stock": {"$first": {"$ifNull": ["$warehouses.Pupscribe Enterprises Private Limited", 0]}},
+        }},
+    ]):
+        stock_by_item_id[doc["_id"]] = int(doc.get("stock") or 0)
+    stock_by_asin: dict = {}
+    for asin, item_id in item_id_by_asin.items():
+        stock_by_asin[asin] = stock_by_item_id.get(item_id, 0)
+    return stock_by_asin, date_str
+
+
+def _fetch_vc_open_po_qty_sync(db, asins):
+    """Returns {asin: total_open_qty} from vendor_purchase_orders."""
+    result: dict = {}
+    for doc in db["vendor_purchase_orders"].aggregate([
+        {"$match": {"po_status": {"$in": ["processing", "packed", "closed", "intransit"]}}},
+        {"$unwind": "$items"},
+        {"$match": {"items.asin": {"$in": asins}}},
+        {"$project": {
+            "asin": "$items.asin",
+            "qty": {"$switch": {
+                "branches": [{"case": {"$eq": ["$po_status", "processing"]}, "then": {
+                    "$cond": [
+                        {"$ifNull": ["$items.supply_qty_override", False]},
+                        "$items.supply_qty_override",
+                        {"$cond": [
+                            {"$ifNull": ["$items.final_supply_fo", False]},
+                            "$items.final_supply_fo",
+                            {"$cond": [
+                                {"$gt": [{"$ifNull": ["$items.supply_qty", 0]}, 0]},
+                                "$items.supply_qty",
+                                {"$ifNull": ["$items.requested_qty", 0]},
+                            ]},
+                        ]},
+                    ],
+                }}],
+                "default": {"$ifNull": ["$items.accepted_qty", 0]},
+            }},
+        }},
+        {"$group": {"_id": "$asin", "total": {"$sum": "$qty"}}},
+    ]):
+        result[doc["_id"]] = int(doc.get("total") or 0)
+    return result
+
+
+def _fetch_fba_sit_qty_sync(db, asins):
+    """Returns {asin: open_shipment_qty} from amazon_fba_shipment_processing."""
+    result: dict = {}
+    for doc in db["amazon_fba_shipment_processing"].aggregate([
+        {"$match": {"asin": {"$in": asins}}},
+        {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$requested_qty", 0]}}}},
+    ]):
+        result[doc["_id"]] = int(doc.get("total") or 0)
+    return result
+
+
+def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_daily_by_asin, drr_dates, report_type, end_date_label, purchase_status_map=None, extra_inventory=None):
     """
     Build Active Days sheet matching reference layout.
 
     Layout:
       Row 1  – title with end date
       Row 2  – section group headers
-      Row 3  – column labels (D1-D90, H1-H90, calc columns)
+      Row 3  – column labels (D1-D90, H1-H90, calc columns, new inventory cols)
       Row 4  – actual dates for D1-D90 and H1-H90
       Row 5  – blank separator
       Row 6+ – one data row per ASIN with values + Excel formulas
@@ -3738,33 +3895,73 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
 
     if purchase_status_map is None:
         purchase_status_map = {}
+    if extra_inventory is None:
+        extra_inventory = {}
+
+    sf_fba_inv  = extra_inventory.get("sf_fba", {})
+    vc_inv      = extra_inventory.get("vc", {})
+    df_inv      = extra_inventory.get("df", {})
+    zoho_stock  = extra_inventory.get("zoho", {})
+    open_po_qty = extra_inventory.get("open_po", {})
+    fba_sit_qty = extra_inventory.get("fba_sit", {})
+    sf_date_str   = extra_inventory.get("sf_date")
+    fba_date_str  = extra_inventory.get("fba_date")
+    vc_date_str   = extra_inventory.get("vc_date")
+    df_date_str   = extra_inventory.get("df_date")
+    zoho_date_str = extra_inventory.get("zoho_date")
+
+    def _live_status(inv_val):
+        if inv_val is None:
+            return "Not Listed"
+        return "Live" if inv_val > 0 else "Not Live"
+
+    def _dated_hdr(label, date_str):
+        return f"{label}\n({date_str})" if date_str else label
 
     # ── Column index constants (1-based) ────────────────────────────────
-    COL_STATUS = 1    # Item Status (purchase_status from products)
-    COL_ASIN = 2    # ASIN
-    COL_SKU  = 3    # SKU Code
-    COL_NAME = 4    # Item Name
-    COL_B   = 5    # FBA Sales (incl. SF)
-    COL_C   = 6    # VC Sales
-    COL_D   = 7    # FBA Returns
-    COL_E   = 8    # SF Returns
-    COL_F   = 9    # VC Returns
-    COL_G   = 10   # Total Returns (=D+E+F)
-    COL_H   = 11   # blank spacer
-    COL_D1  = 12   # D1 – most recent day
-    COL_D90 = 101  # D90 – oldest day  (12 + 89)
-    COL_H1  = 102  # H1 – first helper
-    COL_H90 = 191  # H90 – last helper (102 + 89)
-    COL_GF  = 192  # Total Active Days (max 30)
-    COL_GG  = 193  # Selected Sum (30 days)
-    COL_GH  = 194  # Raw Mean (÷30)
-    COL_GI  = 195  # Spike Threshold (2× Mean)
-    COL_GJ  = 196  # Cleaned Units (spikes→threshold)
-    COL_GK  = 197  # Spike Days Found
-    COL_GL  = 198  # Net Units (after returns)
-    COL_GM  = 199  # blank spacer
-    COL_GN  = 200  # Final DRR (units/day)
-    COL_GO  = 201  # DRR Flag
+    COL_STATUS   = 1    # Item Status
+    COL_ASIN     = 2    # ASIN
+    COL_SKU      = 3    # SKU Code
+    COL_SF_LIVE  = 4    # SF Live (Date)           [Section 1 – new]
+    COL_FBA_LIVE = 5    # FBA Live (Date)          [Section 1 – new]
+    COL_VC_LIVE  = 6    # VC Live (Date)           [Section 1 – new]
+    COL_DF_LIVE  = 7    # DF Live (Date)           [Section 1 – new]
+    COL_NAME     = 8    # Item Name
+    COL_B        = 9    # FBA Sales (incl. SF)
+    COL_C        = 10   # VC Sales
+    COL_D        = 11   # FBA Returns
+    COL_E        = 12   # SF Returns
+    COL_F        = 13   # VC Returns
+    COL_G        = 14   # Total Returns (=D+E+F)
+    COL_H        = 15   # blank spacer
+    COL_D1       = 16   # D1 – most recent day
+    COL_D90      = 105  # D90 – oldest day  (16 + 89)
+    COL_H1       = 106  # H1 – first helper
+    COL_H90      = 195  # H90 – last helper (106 + 89)
+    COL_GF       = 196  # Total Active Days (max 30)
+    COL_GG       = 197  # Selected Sum (30 days)
+    COL_GH       = 198  # Raw Mean (÷30)
+    COL_GI       = 199  # Spike Threshold (2× Mean)
+    COL_GJ       = 200  # Cleaned Units (spikes→threshold)
+    COL_GK       = 201  # Spike Days Found
+    COL_GL       = 202  # Net Units (after returns)
+    COL_GM       = 203  # blank spacer
+    COL_GN       = 204  # Final DRR (units/day)
+    COL_GO       = 205  # DRR Flag
+    # Sections 2–4 (new)
+    COL_ZOHO     = 206  # Zoho Stock (Date)
+    COL_FBA_INV  = 207  # FBA inventory (Date)
+    COL_SF_INV   = 208  # SF inventory (Date)
+    COL_VC_INV   = 209  # VC inventory (Date)
+    COL_DF_INV   = 210  # DF inventory (Date)
+    COL_DAYS_FBA = 211  # Days Until Stock Lasts – FBA
+    COL_DAYS_SF  = 212  # Days Until Stock Lasts – SF
+    COL_DAYS_VC  = 213  # Days Until Stock Lasts – VC
+    COL_DAYS_DF  = 214  # Days Until Stock Lasts – DF
+    COL_OPEN_PO  = 215  # Open PO Qty
+    COL_DAYS_PO  = 216  # Days Until Stock Lasts – Open PO + VC
+    COL_FBA_SIT  = 217  # FBA Stock in Transit
+    COL_DAYS_SIT = 218  # Days Until Stock Lasts – FBA + SIT
 
     R_TITLE      = 1
     R_SECTION    = 2
@@ -3772,45 +3969,63 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
     R_DATES      = 4
     R_DATA_START = 6  # row 5 left blank
 
-    L = get_column_letter  # shorthand
+    L = get_column_letter
 
-    # ── Row 1: title ────────────────────────────────────────────────────
     # ── Row 2: section group headers ────────────────────────────────────
-    ws.cell(row=R_SECTION, column=COL_ASIN).value = "RAW INPUTS"
+    ws.cell(row=R_SECTION, column=COL_ASIN).value    = "RAW INPUTS"
+    ws.cell(row=R_SECTION, column=COL_SF_LIVE).value = "Item Status"
     ws.cell(row=R_SECTION, column=COL_D1).value = (
         f"90 DAILY COLUMNS [D1 = {end_date_label}]  —  Blank=OOS  |  0=In Stock No Sale  |"
         "  Number=Units Sold  |  Day 1 = Most Recent"
     )
-    ws.cell(row=R_SECTION, column=COL_H1).value = (
-        "HELPER ROW — Cumulative count of non-blank days. Selected if count ≤ 30."
-    )
-    ws.cell(row=R_SECTION, column=COL_GF).value = "CALCULATIONS"
-    ws.cell(row=R_SECTION, column=COL_GL).value = "NET UNITS"
-    ws.cell(row=R_SECTION, column=COL_GN).value = "FINAL DRR"
-    ws.cell(row=R_SECTION, column=COL_GO).value = "DRR FLAG"
+    ws.cell(row=R_SECTION, column=COL_H1).value  = "HELPER ROW — Cumulative count of non-blank days. Selected if count ≤ 30."
+    ws.cell(row=R_SECTION, column=COL_GF).value  = "CALCULATIONS"
+    ws.cell(row=R_SECTION, column=COL_GL).value  = "NET UNITS"
+    ws.cell(row=R_SECTION, column=COL_GN).value  = "FINAL DRR"
+    ws.cell(row=R_SECTION, column=COL_GO).value  = "DRR FLAG"
+    ws.cell(row=R_SECTION, column=COL_ZOHO).value    = "INVENTORY"
+    ws.cell(row=R_SECTION, column=COL_DAYS_FBA).value = "DAYS UNTIL STOCK LASTS"
+    ws.cell(row=R_SECTION, column=COL_OPEN_PO).value  = "OPEN PO / IN TRANSIT"
     ws.row_dimensions[R_SECTION].height = 30
 
     # ── Row 3: column headers ────────────────────────────────────────────
     fixed_headers = {
-        COL_STATUS: "Item Status",
-        COL_ASIN: "ASIN",
-        COL_SKU:  "SKU Code",
-        COL_NAME: "Item Name",
-        COL_B:  "FBA Sales\n(incl. SF)",
-        COL_C:  "VC Sales",
-        COL_D:  "FBA\nReturns",
-        COL_E:  "SF\nReturns",
-        COL_F:  "VC\nReturns",
-        COL_G:  "Total\nReturns",
-        COL_GF: "Total Active\nDays (max 30)",
-        COL_GG: "Selected Sum\n(30 days)",
-        COL_GH: "Raw Mean\n(÷30)",
-        COL_GI: "Spike Threshold\n(2× Mean)",
-        COL_GJ: "Cleaned Units\n(spikes→2× Mean)",
-        COL_GK: "Spike Days\nFound",
-        COL_GL: "Net Units\n(after returns)",
-        COL_GN: "Final DRR\n(units/day)",
-        COL_GO: "DRR Flag",
+        COL_STATUS:   "Item Status",
+        COL_ASIN:     "ASIN",
+        COL_SKU:      "SKU Code",
+        COL_SF_LIVE:  _dated_hdr("SF Live", sf_date_str),
+        COL_FBA_LIVE: _dated_hdr("FBA Live", fba_date_str),
+        COL_VC_LIVE:  _dated_hdr("VC Live", vc_date_str),
+        COL_DF_LIVE:  _dated_hdr("DF Live", df_date_str),
+        COL_NAME:     "Item Name",
+        COL_B:        "FBA Sales\n(incl. SF)",
+        COL_C:        "VC Sales",
+        COL_D:        "FBA\nReturns",
+        COL_E:        "SF\nReturns",
+        COL_F:        "VC\nReturns",
+        COL_G:        "Total\nReturns",
+        COL_GF:       "Total Active\nDays (max 30)",
+        COL_GG:       "Selected Sum\n(30 days)",
+        COL_GH:       "Raw Mean\n(÷30)",
+        COL_GI:       "Spike Threshold\n(2× Mean)",
+        COL_GJ:       "Cleaned Units\n(spikes→2× Mean)",
+        COL_GK:       "Spike Days\nFound",
+        COL_GL:       "Net Units\n(after returns)",
+        COL_GN:       "Final DRR\n(units/day)",
+        COL_GO:       "DRR Flag",
+        COL_ZOHO:     _dated_hdr("Zoho Stock", zoho_date_str),
+        COL_FBA_INV:  _dated_hdr("FBA", fba_date_str),
+        COL_SF_INV:   _dated_hdr("SF", sf_date_str),
+        COL_VC_INV:   _dated_hdr("VC", vc_date_str),
+        COL_DF_INV:   _dated_hdr("DF", df_date_str),
+        COL_DAYS_FBA: "FBA",
+        COL_DAYS_SF:  "SF",
+        COL_DAYS_VC:  "VC",
+        COL_DAYS_DF:  "DF",
+        COL_OPEN_PO:  "Open PO Qty",
+        COL_DAYS_PO:  "Days Until Stock\nLasts (Open PO + VC)",
+        COL_FBA_SIT:  "FBA Stock\nin Transit",
+        COL_DAYS_SIT: "Days Until Stock\nLasts (FBA + SIT)",
     }
     for k in range(90):
         fixed_headers[COL_D1 + k] = f"D{k + 1}"
@@ -3821,7 +4036,6 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
         c.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
 
     # ── Row 4: actual dates for D1-D90 and H1-H90 ──────────────────────
-    # drr_dates[89] = D1/H1 (most recent), drr_dates[0] = D90/H90 (oldest)
     for k in range(90):
         date_str = drr_dates[89 - k].strftime("%d %b %Y")
         ws.cell(row=R_DATES, column=COL_D1 + k).value = date_str
@@ -3831,7 +4045,6 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
 
     # ── Data rows ────────────────────────────────────────────────────────
     asin_to_item = {item["asin"]: item for item in report_data if item.get("asin")}
-    # Include all products from report_data, not just those with DRR daily data
     report_asins = {item["asin"] for item in report_data if item.get("asin")}
     all_asins = sorted(report_asins | set(drr_vc_daily_by_asin.keys()) | set(drr_fba_daily_by_asin.keys()))
 
@@ -3839,14 +4052,26 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
         r = R_DATA_START + row_offset
         item = asin_to_item.get(asin, {})
 
-        # Item Status – from products collection
+        # Item Status
         sku  = item.get("sku_code", "")
         ws.cell(row=r, column=COL_STATUS).value = purchase_status_map.get(sku, "")
 
-        # ASIN / SKU / Item Name – separate columns
+        # Section 1 – Live status per platform
+        asin_ledger = sf_fba_inv.get(asin, {})
+        sf_qty  = asin_ledger.get("sf")
+        fba_qty = asin_ledger.get("fba")
+        vc_qty  = vc_inv.get(asin) if asin in vc_inv else None
+        df_qty  = df_inv.get(asin) if asin in df_inv else None
+
+        ws.cell(row=r, column=COL_SF_LIVE).value  = _live_status(sf_qty)
+        ws.cell(row=r, column=COL_FBA_LIVE).value = _live_status(fba_qty)
+        ws.cell(row=r, column=COL_VC_LIVE).value  = _live_status(vc_qty)
+        ws.cell(row=r, column=COL_DF_LIVE).value  = _live_status(df_qty)
+
+        # ASIN / SKU / Item Name
         name = item.get("item_name", "")
         ws.cell(row=r, column=COL_ASIN).value = asin
-        ws.cell(row=r, column=COL_SKU).value = sku
+        ws.cell(row=r, column=COL_SKU).value  = sku
         ws.cell(row=r, column=COL_NAME).value = name
 
         # B – FBA Sales (incl. SF)
@@ -3867,18 +4092,12 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
             vc_sales = 0
         ws.cell(row=r, column=COL_C).value = vc_sales
 
-        # D – FBA Returns (excluding SF)
-        if report_type == "vendor_central":
-            fba_ret = 0
-        else:
-            fba_ret = item.get("fba_returns", 0) or 0
+        # D – FBA Returns
+        fba_ret = 0 if report_type == "vendor_central" else (item.get("fba_returns", 0) or 0)
         ws.cell(row=r, column=COL_D).value = fba_ret
 
         # E – SF Returns
-        if report_type == "vendor_central":
-            sf_ret = 0
-        else:
-            sf_ret = item.get("seller_flex_returns", 0) or 0
+        sf_ret = 0 if report_type == "vendor_central" else (item.get("seller_flex_returns", 0) or 0)
         ws.cell(row=r, column=COL_E).value = sf_ret
 
         # F – VC Returns
@@ -3887,35 +4106,35 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
         # G – Total Returns formula
         ws.cell(row=r, column=COL_G).value = f"={L(COL_D)}{r}+{L(COL_E)}{r}+{L(COL_F)}{r}"
 
-        # Build date-keyed daily lookups for this ASIN
+        # Build date-keyed daily lookups
         vc_by_date  = {_parse_date_str(d.get("date")): d for d in drr_vc_daily_by_asin.get(asin, []) if _parse_date_str(d.get("date"))}
         fba_by_date = {_parse_date_str(d.get("date")): d for d in drr_fba_daily_by_asin.get(asin, []) if _parse_date_str(d.get("date"))}
 
         # D1-D90 – merged daily: blank=OOS, 0=in-stock-no-sale, N=units sold
         for k in range(90):
-            dt = drr_dates[89 - k]  # D1 = most recent
+            dt = drr_dates[89 - k]
             vc_day  = vc_by_date.get(dt)  or {}
             fba_day = fba_by_date.get(dt) or {}
             vc_stock  = vc_day.get("closing_stock",  0) or 0
             fba_stock = fba_day.get("closing_stock", 0) or 0
             vc_sold   = max(0, vc_day.get("units_sold",  0) or 0)
             fba_sold  = max(0, fba_day.get("units_sold", 0) or 0)
-            in_stock  = vc_stock > 0 or fba_stock > 0 or vc_sold > 0 or fba_sold > 0
-            if in_stock:
+            if vc_stock > 0 or fba_stock > 0 or vc_sold > 0 or fba_sold > 0:
                 ws.cell(row=r, column=COL_D1 + k).value = vc_sold + fba_sold
-            # else: leave blank → OOS
 
-        # Highlight spike days (value > GI spike threshold) in yellow
-        gi_ltr = L(COL_GI)
-        d1_ltr = L(COL_D1)
+        # Spike highlighting
+        gi_ltr  = L(COL_GI)
+        d1_ltr  = L(COL_D1)
         d90_ltr = L(COL_D90)
-        spike_formula = f"AND(NOT(ISBLANK({d1_ltr}{r})),{d1_ltr}{r}>${gi_ltr}{r})"
         ws.conditional_formatting.add(
             f"{d1_ltr}{r}:{d90_ltr}{r}",
-            FormulaRule(formula=[spike_formula], fill=SPIKE_FILL),
+            FormulaRule(
+                formula=[f"AND(NOT(ISBLANK({d1_ltr}{r})),{d1_ltr}{r}>${gi_ltr}{r})"],
+                fill=SPIKE_FILL,
+            ),
         )
 
-        # H1-H90 – cumulative count of non-blank day formulas
+        # H1-H90 – cumulative non-blank count
         for k in range(90):
             d_ltr = L(COL_D1 + k)
             if k == 0:
@@ -3925,26 +4144,21 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
                 formula = f"=IF(NOT(ISBLANK({d_ltr}{r})),{ph}{r}+1,{ph}{r})"
             ws.cell(row=r, column=COL_H1 + k).value = formula
 
-        # Calculation column formulas (GF-GO)
-        ge = L(COL_H90);  ct = L(COL_H1)
-        h  = L(COL_D1);   cs = L(COL_D90)
-        gf = L(COL_GF);   gg = L(COL_GG);  gh = L(COL_GH);  gi = L(COL_GI)
-        gj = L(COL_GJ);   gk = L(COL_GK);  gl = L(COL_GL);  f_ = L(COL_G)
+        # Calculation columns (GF–GO)
+        ge = L(COL_H90); ct = L(COL_H1)
+        h  = L(COL_D1);  cs = L(COL_D90)
+        gf = L(COL_GF);  gg = L(COL_GG); gh = L(COL_GH); gi = L(COL_GI)
+        gj = L(COL_GJ);  gk = L(COL_GK); gl = L(COL_GL); f_ = L(COL_G)
+        gn = L(COL_GN)
 
         ws.cell(row=r, column=COL_GF).value = f"=MIN({ge}{r},30)"
-
         ws.cell(row=r, column=COL_GG).value = (
             f"=IFERROR(SUMPRODUCT(({ct}{r}:{ge}{r}<=30)"
             f"*(NOT(ISBLANK({h}{r}:{cs}{r})))"
             f"*IF(ISBLANK({h}{r}:{cs}{r}),0,{h}{r}:{cs}{r})),0)"
         )
-
-        ws.cell(row=r, column=COL_GH).value = (
-            f"=IFERROR(IF({gf}{r}<30,0,ROUND({gg}{r}/30,2)),0)"
-        )
-
+        ws.cell(row=r, column=COL_GH).value = f"=IFERROR(IF({gf}{r}<30,0,ROUND({gg}{r}/30,2)),0)"
         ws.cell(row=r, column=COL_GI).value = f"=MAX({gh}{r}*2,5)"
-
         ws.cell(row=r, column=COL_GJ).value = (
             f"=IFERROR(ROUND({gg}{r}-SUMPRODUCT(({ct}{r}:{ge}{r}<=30)"
             f"*(NOT(ISBLANK({h}{r}:{cs}{r})))"
@@ -3952,23 +4166,17 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
             f"*(IF(ISBLANK({h}{r}:{cs}{r}),0,{h}{r}:{cs}{r})-{gi}{r})),2)"
             f',\"Check Inputs\")'
         )
-
         ws.cell(row=r, column=COL_GK).value = (
             f"=IFERROR(SUMPRODUCT(({ct}{r}:{ge}{r}<=30)"
             f"*(NOT(ISBLANK({h}{r}:{cs}{r})))"
             f"*(IF(ISBLANK({h}{r}:{cs}{r}),0,{h}{r}:{cs}{r})>{gi}{r})*1),0)"
         )
-
-        ws.cell(row=r, column=COL_GL).value = (
-            f'=IFERROR(MAX(0,{gj}{r}-{f_}{r}),"Check Inputs")'
-        )
-
+        ws.cell(row=r, column=COL_GL).value = f'=IFERROR(MAX(0,{gj}{r}-{f_}{r}),"Check Inputs")'
         ws.cell(row=r, column=COL_GN).value = (
             f'=IFERROR(IF({gf}{r}=0,"Manual Input Required - No Sales History",'
             f'IF({gf}{r}<30,"Manual Input Required - Only "&{gf}{r}&" In-Stock Days Found",'
             f'ROUND({gl}{r}/30,2))),"Check Inputs")'
         )
-
         ws.cell(row=r, column=COL_GO).value = (
             f'=IFERROR(IF({gf}{r}=0,"Manual Input Required - No Sales History",'
             f'IF({gf}{r}<30,"Manual Input Required - Only "&{gf}{r}&" In-Stock Days Found",'
@@ -3976,15 +4184,47 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
             f'"OK - Full Confidence"))),"Check Inputs")'
         )
 
+        # Section 2 – Inventory values
+        ws.cell(row=r, column=COL_ZOHO).value    = zoho_stock.get(asin, 0)
+        ws.cell(row=r, column=COL_FBA_INV).value = fba_qty if fba_qty is not None else 0
+        ws.cell(row=r, column=COL_SF_INV).value  = sf_qty  if sf_qty  is not None else 0
+        ws.cell(row=r, column=COL_VC_INV).value  = vc_qty  if vc_qty  is not None else 0
+        ws.cell(row=r, column=COL_DF_INV).value  = df_qty  if df_qty  is not None else 0
+
+        # Section 3 – Days Until Stock Lasts formulas (inv / Final DRR)
+        def _days_formula(inv_col):
+            iv = L(inv_col)
+            return (
+                f'=IFERROR(IF(ISNUMBER({gn}{r}),IF({gn}{r}=0,"",ROUND({iv}{r}/{gn}{r},1)),""),"")'
+            )
+        ws.cell(row=r, column=COL_DAYS_FBA).value = _days_formula(COL_FBA_INV)
+        ws.cell(row=r, column=COL_DAYS_SF).value  = _days_formula(COL_SF_INV)
+        ws.cell(row=r, column=COL_DAYS_VC).value  = _days_formula(COL_VC_INV)
+        ws.cell(row=r, column=COL_DAYS_DF).value  = _days_formula(COL_DF_INV)
+
+        # Section 4 – Open PO / SIT
+        ws.cell(row=r, column=COL_OPEN_PO).value = open_po_qty.get(asin, 0)
+        vc_inv_ltr = L(COL_VC_INV); po_ltr = L(COL_OPEN_PO)
+        ws.cell(row=r, column=COL_DAYS_PO).value = (
+            f'=IFERROR(IF(ISNUMBER({gn}{r}),IF({gn}{r}=0,"",ROUND(({vc_inv_ltr}{r}+{po_ltr}{r})/{gn}{r},1)),""),"")'
+        )
+        ws.cell(row=r, column=COL_FBA_SIT).value = fba_sit_qty.get(asin, 0)
+        fba_inv_ltr = L(COL_FBA_INV); sit_ltr = L(COL_FBA_SIT)
+        ws.cell(row=r, column=COL_DAYS_SIT).value = (
+            f'=IFERROR(IF(ISNUMBER({gn}{r}),IF({gn}{r}=0,"",ROUND(({fba_inv_ltr}{r}+{sit_ltr}{r})/{gn}{r},1)),""),"")'
+        )
+
     # ── Styling ──────────────────────────────────────────────────────────
-    C_BLUE_D   = "366092"  # dark blue  (raw inputs header)
-    C_GOLD_D   = "8B6914"  # dark gold  (daily cols header)
-    C_GRAY_D   = "595959"  # dark gray  (helper header)
-    C_GREEN_D  = "375623"  # dark green (calc header)
-    C_GOLD_S   = "BF9000"  # section gold
-    C_GRAY_S   = "808080"  # section gray
-    C_GREEN_S  = "1E4620"  # section green
-    C_DATE_BG  = "FFF8DC"  # date row background
+    C_BLUE_D   = "366092"
+    C_RED_D    = "C00000"
+    C_GOLD_D   = "8B6914"
+    C_GRAY_D   = "595959"
+    C_GREEN_D  = "375623"
+    C_GOLD_S   = "BF9000"
+    C_GRAY_S   = "808080"
+    C_GREEN_S  = "1E4620"
+    C_RED_S    = "ED0000"
+    C_DATE_BG  = "FFF8DC"
 
     # Row 1 – title
     t = ws.cell(row=R_TITLE, column=COL_ASIN)
@@ -3995,13 +4235,17 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
 
     # Row 2 – section group headers
     sec_map = {
-        COL_ASIN: (C_BLUE_D,  "FFFFFF"),
-        COL_D1:   (C_GOLD_S,  "FFFFFF"),
-        COL_H1:  (C_GRAY_S,  "FFFFFF"),
-        COL_GF:  (C_GREEN_S, "FFFFFF"),
-        COL_GL:  (C_GREEN_S, "FFFFFF"),
-        COL_GN:  (C_GREEN_S, "FFFFFF"),
-        COL_GO:  (C_GREEN_S, "FFFFFF"),
+        COL_ASIN:     (C_BLUE_D,  "FFFFFF"),
+        COL_SF_LIVE:  (C_RED_S,   "FFFFFF"),
+        COL_D1:       (C_GOLD_S,  "FFFFFF"),
+        COL_H1:       (C_GRAY_S,  "FFFFFF"),
+        COL_GF:       (C_GREEN_S, "FFFFFF"),
+        COL_GL:       (C_GREEN_S, "FFFFFF"),
+        COL_GN:       (C_GREEN_S, "FFFFFF"),
+        COL_GO:       (C_GREEN_S, "FFFFFF"),
+        COL_ZOHO:     (C_RED_S,   "FFFFFF"),
+        COL_DAYS_FBA: (C_RED_S,   "FFFFFF"),
+        COL_OPEN_PO:  (C_RED_S,   "FFFFFF"),
     }
     for col_idx, (bg, fg) in sec_map.items():
         c = ws.cell(row=R_SECTION, column=col_idx)
@@ -4009,33 +4253,40 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
         c.fill  = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
         c.alignment = Alignment(wrap_text=True, vertical="center")
 
-    # Row 3 – column labels
-    yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-    for col_idx in range(1, COL_GO + 1):
+    # Row 3 – column label styling
+    yellow_fill  = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+    red_hdr_fill = PatternFill(start_color=C_RED_D,  end_color=C_RED_D,  fill_type="solid")
+    for col_idx in range(1, COL_DAYS_SIT + 1):
         c = ws.cell(row=R_HEADERS, column=col_idx)
         if not c.value:
             continue
         if col_idx == COL_STATUS:
-            c.font  = Font(bold=True, color="000000")
-            c.fill  = yellow_fill
+            c.font = Font(bold=True, color="000000")
+            c.fill = yellow_fill
+        elif col_idx in (COL_SF_LIVE, COL_FBA_LIVE, COL_VC_LIVE, COL_DF_LIVE):
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = red_hdr_fill
         elif col_idx <= COL_G:
-            c.font  = Font(bold=True, color="FFFFFF")
-            c.fill  = PatternFill(start_color=C_BLUE_D, end_color=C_BLUE_D, fill_type="solid")
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = PatternFill(start_color=C_BLUE_D, end_color=C_BLUE_D, fill_type="solid")
         elif col_idx <= COL_D90:
-            c.font  = Font(bold=True, color="FFFFFF")
-            c.fill  = PatternFill(start_color=C_GOLD_D, end_color=C_GOLD_D, fill_type="solid")
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = PatternFill(start_color=C_GOLD_D, end_color=C_GOLD_D, fill_type="solid")
         elif col_idx <= COL_H90:
-            c.font  = Font(bold=True, color="FFFFFF")
-            c.fill  = PatternFill(start_color=C_GRAY_D, end_color=C_GRAY_D, fill_type="solid")
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = PatternFill(start_color=C_GRAY_D, end_color=C_GRAY_D, fill_type="solid")
+        elif col_idx <= COL_GO:
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = PatternFill(start_color=C_GREEN_D, end_color=C_GREEN_D, fill_type="solid")
         else:
-            c.font  = Font(bold=True, color="FFFFFF")
-            c.fill  = PatternFill(start_color=C_GREEN_D, end_color=C_GREEN_D, fill_type="solid")
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = red_hdr_fill
         c.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
     ws.row_dimensions[R_HEADERS].height = 42
 
-    # Row 4 – date labels for D1-D90 and H1-H90 (italic, tinted background)
-    d_date_fill = PatternFill(start_color=C_DATE_BG,  end_color=C_DATE_BG,  fill_type="solid")
-    h_date_fill = PatternFill(start_color="E8E8E8",   end_color="E8E8E8",   fill_type="solid")
+    # Row 4 – date labels
+    d_date_fill = PatternFill(start_color=C_DATE_BG, end_color=C_DATE_BG, fill_type="solid")
+    h_date_fill = PatternFill(start_color="E8E8E8",  end_color="E8E8E8",  fill_type="solid")
     for k in range(90):
         for col_base, fill in ((COL_D1, d_date_fill), (COL_H1, h_date_fill)):
             c = ws.cell(row=R_DATES, column=col_base + k)
@@ -4045,25 +4296,36 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
     ws.row_dimensions[R_DATES].height = 18
 
     # ── Column widths ────────────────────────────────────────────────────
-    ws.column_dimensions[L(COL_STATUS)].width = 18  # Item Status
-    ws.column_dimensions[L(COL_ASIN)].width = 16   # ASIN
-    ws.column_dimensions[L(COL_SKU)].width = 18    # SKU Code
-    ws.column_dimensions[L(COL_NAME)].width = 40   # Item Name
-    for ci in range(COL_B, COL_H):                  # FBA Sales–Total Returns
-        ws.column_dimensions[L(ci)].width = 10
-    ws.column_dimensions[L(COL_H)].width = 2        # spacer
-    for k in range(90):                             # D1-D90
+    ws.column_dimensions[L(COL_STATUS)].width   = 18
+    ws.column_dimensions[L(COL_ASIN)].width     = 16
+    ws.column_dimensions[L(COL_SKU)].width      = 18
+    for ci in (COL_SF_LIVE, COL_FBA_LIVE, COL_VC_LIVE, COL_DF_LIVE):
+        ws.column_dimensions[L(ci)].width       = 14
+    ws.column_dimensions[L(COL_NAME)].width     = 40
+    for ci in range(COL_B, COL_H):
+        ws.column_dimensions[L(ci)].width       = 10
+    ws.column_dimensions[L(COL_H)].width        = 2
+    for k in range(90):
         ws.column_dimensions[L(COL_D1 + k)].width = 11
-    for k in range(90):                             # H1-H90 helpers
+    for k in range(90):
         ws.column_dimensions[L(COL_H1 + k)].width = 4
-    for ci in [COL_GF, COL_GG, COL_GH, COL_GI, COL_GJ, COL_GK, COL_GL]:
-        ws.column_dimensions[L(ci)].width = 12
-    ws.column_dimensions[L(COL_GM)].width = 2       # spacer
-    ws.column_dimensions[L(COL_GN)].width = 15
-    ws.column_dimensions[L(COL_GO)].width = 38
+    for ci in (COL_GF, COL_GG, COL_GH, COL_GI, COL_GJ, COL_GK, COL_GL):
+        ws.column_dimensions[L(ci)].width       = 12
+    ws.column_dimensions[L(COL_GM)].width       = 2
+    ws.column_dimensions[L(COL_GN)].width       = 15
+    ws.column_dimensions[L(COL_GO)].width       = 38
+    ws.column_dimensions[L(COL_ZOHO)].width     = 16
+    for ci in (COL_FBA_INV, COL_SF_INV, COL_VC_INV, COL_DF_INV):
+        ws.column_dimensions[L(ci)].width       = 12
+    for ci in (COL_DAYS_FBA, COL_DAYS_SF, COL_DAYS_VC, COL_DAYS_DF):
+        ws.column_dimensions[L(ci)].width       = 11
+    ws.column_dimensions[L(COL_OPEN_PO)].width  = 13
+    ws.column_dimensions[L(COL_DAYS_PO)].width  = 20
+    ws.column_dimensions[L(COL_FBA_SIT)].width  = 14
+    ws.column_dimensions[L(COL_DAYS_SIT)].width = 20
 
-    # Freeze at L6: columns A-K + rows 1-5 always visible
-    ws.freeze_panes = "L6"
+    # Freeze: cols A–O visible (daily cols start at P/col 16)
+    ws.freeze_panes = f"{L(COL_D1)}6"
 
 
 def _style_sheet(worksheet, df, header_color="366092"):
@@ -4109,10 +4371,11 @@ def _style_calendar_sheet(worksheet, df):
     worksheet.freeze_panes = "E2"
 
 
-def _build_inventory_sheet(ws, daily_by_asin, report_data, all_dates, title, platform, purchase_status_map=None):
+def _build_inventory_sheet(ws, daily_by_asin, report_data, all_dates, title, platform, purchase_status_map=None, mode="sales"):
     """
-    Calendar-style inventory sheet: one row per ASIN, one column per day in the selected range.
-    Cell = units sold (green), 0 if in-stock/no-sale (blue), blank if OOS.
+    Calendar-style sheet: one row per ASIN, one column per day.
+    mode="sales"     : cell = units_sold (green), 0 if in-stock/no-sale (blue), blank if OOS.
+    mode="inventory" : cell = closing_stock (blue if > 0), blank if OOS.
     """
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
@@ -4161,10 +4424,11 @@ def _build_inventory_sheet(ws, daily_by_asin, report_data, all_dates, title, pla
     date_range_str = f"{all_dates[0].strftime('%d %b %Y')} — {all_dates[-1].strftime('%d %b %Y')}"
     ws.merge_cells(start_row=R_INFO, start_column=1, end_row=R_INFO, end_column=last_col)
     ic = ws.cell(row=R_INFO, column=1)
-    ic.value = (
-        f"Date Range: {date_range_str}     "
-        "Green = Units Sold     Blue = In Stock / No Sale     Blank = Out of Stock"
-    )
+    if mode == "inventory":
+        legend_text = "Blue = In Stock (closing stock shown)     Blank = Out of Stock"
+    else:
+        legend_text = "Green = Units Sold     Blue = In Stock / No Sale     Blank = Out of Stock"
+    ic.value = f"Date Range: {date_range_str}     {legend_text}"
     ic.font  = Font(italic=True, size=10, color=C_TITLE_BG)
     ic.fill  = PatternFill(start_color=C_INFO_BG, end_color=C_INFO_BG, fill_type="solid")
     ic.alignment = Alignment(horizontal="left", vertical="center", indent=1)
@@ -4180,10 +4444,11 @@ def _build_inventory_sheet(ws, daily_by_asin, report_data, all_dates, title, pla
         COL_ASIN:  "ASIN",
         COL_SKU:   "SKU Code",
         COL_NAME:  "Item Name",
-        COL_TOTAL: "Total Units\nSold",
+        COL_TOTAL: "Avg Daily\nStock" if mode == "inventory" else "Total Units\nSold",
         COL_DIS:   "Days In\nStock",
-        COL_STOCK: f"Closing Stock\n({all_dates[-1].strftime('%d %b %Y')})",
+        COL_STOCK: f"Closing Stock\n({(all_dates[-1] - timedelta(days=2)).strftime('%d %b %Y')})",
     }
+    stock_date = all_dates[-1] - timedelta(days=2)
     for ci, label in fixed_hdrs.items():
         c = ws.cell(row=R_HDR, column=ci)
         c.value = label
@@ -4227,6 +4492,7 @@ def _build_inventory_sheet(ws, daily_by_asin, report_data, all_dates, title, pla
         }
 
         total_sold    = 0
+        total_stock   = 0
         days_in_stock = 0
         latest_stock  = 0
 
@@ -4235,24 +4501,36 @@ def _build_inventory_sheet(ws, daily_by_asin, report_data, all_dates, title, pla
             sold  = day.get("units_sold",    0) or 0
             stock = day.get("closing_stock", 0) or 0
             in_stock = stock > 0 or sold > 0
-            total_sold    += sold
-            days_in_stock += 1 if in_stock else 0
-            if i == len(all_dates) - 1:
+            if dt == stock_date:
                 latest_stock = stock
 
             c = ws.cell(row=r, column=COL_DATE1 + i)
-            if sold > 0:
-                c.value     = sold
-                c.fill      = sold_fill
-                c.font      = Font(bold=True, size=9)
-                c.alignment = Alignment(horizontal="center", vertical="center")
-            elif in_stock:
-                c.value     = 0
-                c.fill      = stock_fill
-                c.font      = Font(size=9, color="888888")
-                c.alignment = Alignment(horizontal="center", vertical="center")
+
+            if mode == "inventory":
+                if stock > 0:
+                    total_stock   += stock
+                    days_in_stock += 1
+                    c.value     = stock
+                    c.fill      = stock_fill
+                    c.font      = Font(size=9, color="1F497D")
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    c.fill = row_bg
             else:
-                c.fill = row_bg
+                total_sold    += sold
+                days_in_stock += 1 if in_stock else 0
+                if sold > 0:
+                    c.value     = sold
+                    c.fill      = sold_fill
+                    c.font      = Font(bold=True, size=9)
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+                elif in_stock:
+                    c.value     = 0
+                    c.fill      = stock_fill
+                    c.font      = Font(size=9, color="888888")
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    c.fill = row_bg
 
         def _set(col, val, bold=False, align="left", color="000000", size=10):
             c = ws.cell(row=r, column=col)
@@ -4261,12 +4539,18 @@ def _build_inventory_sheet(ws, daily_by_asin, report_data, all_dates, title, pla
             c.alignment = Alignment(horizontal=align, vertical="center")
             c.fill      = row_bg
 
-        _set(COL_ASIN,  asin,          size=9,  color="595959")
-        _set(COL_SKU,   sku,           bold=True)
+        if mode == "inventory":
+            avg_stock = round(total_stock / days_in_stock) if days_in_stock > 0 else 0
+            col_total_val = avg_stock
+        else:
+            col_total_val = total_sold
+
+        _set(COL_ASIN,  asin,           size=9,  color="595959")
+        _set(COL_SKU,   sku,            bold=True)
         _set(COL_NAME,  name)
-        _set(COL_TOTAL, total_sold,    bold=True, align="center")
-        _set(COL_DIS,   days_in_stock, align="center")
-        _set(COL_STOCK, latest_stock,  align="center")
+        _set(COL_TOTAL, col_total_val,  bold=True, align="center")
+        _set(COL_DIS,   days_in_stock,  align="center")
+        _set(COL_STOCK, latest_stock,   align="center")
         ws.row_dimensions[r].height = 18
 
     # ── Column widths ────────────────────────────────────────────────────
@@ -4424,6 +4708,37 @@ async def download_report_by_date_range(
                 detail="No data found for the specified date range and report type",
             )
 
+        # --- Fetch Section 1/2/4 inventory data in parallel ---
+        all_asin_list = [item["asin"] for item in report_data if item.get("asin")]
+        (
+            (sf_fba_inv, sf_fba_date),
+            (vc_inv_data, vc_inv_date),
+            (df_inv_data, df_inv_date),
+            (zoho_data,   zoho_date),
+            vc_open_po,
+            fba_sit,
+        ) = await asyncio.gather(
+            asyncio.to_thread(_fetch_sf_fba_inventory_latest_sync, database, end),
+            asyncio.to_thread(_fetch_vc_inventory_latest_sync,     database, end),
+            asyncio.to_thread(_fetch_df_inventory_latest_sync,     database, end),
+            asyncio.to_thread(_fetch_zoho_stock_for_asins_sync,    database, all_asin_list),
+            asyncio.to_thread(_fetch_vc_open_po_qty_sync,          database, all_asin_list),
+            asyncio.to_thread(_fetch_fba_sit_qty_sync,             database, all_asin_list),
+        )
+        extra_inventory = {
+            "sf_fba":    sf_fba_inv,
+            "vc":        vc_inv_data,
+            "df":        df_inv_data,
+            "zoho":      zoho_data,
+            "open_po":   vc_open_po,
+            "fba_sit":   fba_sit,
+            "sf_date":   sf_fba_date,
+            "fba_date":  sf_fba_date,
+            "vc_date":   vc_inv_date,
+            "df_date":   df_inv_date,
+            "zoho_date": zoho_date,
+        }
+
         # --- Build main DataFrame ---
         df = pd.DataFrame(report_data)
 
@@ -4524,32 +4839,65 @@ async def download_report_by_date_range(
             report_type,
             end_label,
             purchase_status_map,
+            extra_inventory,
         )
 
-        # VC Inventory sheet (selected date range, ASIN-level calendar)
-        if vc_daily_by_asin:
-            ws_vc = wb.create_sheet("VC Inventory")
+        # 90-day date range label for sheet titles
+        drr_start_label = drr_dates[0].strftime("%d %b %Y")
+        drr_end_label   = drr_dates[-1].strftime("%d %b %Y")
+        drr_range_str   = f"{drr_start_label} to {drr_end_label}"
+
+        # Vendor Sales → Vendor Inventory → FBA Sales → FBA Inventory
+        if drr_vc_daily_by_asin:
+            ws_vc_sales = wb.create_sheet("Vendor Sales")
             _build_inventory_sheet(
-                ws_vc,
-                vc_daily_by_asin,
+                ws_vc_sales,
+                drr_vc_daily_by_asin,
                 report_data,
-                all_dates,
-                f"Vendor Central — Inventory Report  ({start_date} to {end_date})",
+                drr_dates,
+                f"Vendor Central — Sales Report  ({drr_range_str})",
                 "VC",
                 purchase_status_map,
+                mode="sales",
             )
 
-        # FBA Inventory sheet (selected date range, ASIN-level calendar)
-        if fba_daily_by_asin:
-            ws_fba = wb.create_sheet("FBA Inventory")
+        if drr_vc_daily_by_asin:
+            ws_vc_inv = wb.create_sheet("Vendor Inventory")
             _build_inventory_sheet(
-                ws_fba,
-                fba_daily_by_asin,
+                ws_vc_inv,
+                drr_vc_daily_by_asin,
                 report_data,
-                all_dates,
-                f"FBA — Inventory Report  ({start_date} to {end_date})",
+                drr_dates,
+                f"Vendor Central — Inventory Report  ({drr_range_str})",
+                "VC",
+                purchase_status_map,
+                mode="inventory",
+            )
+
+        if drr_fba_daily_by_asin:
+            ws_fba_sales = wb.create_sheet("FBA Sales")
+            _build_inventory_sheet(
+                ws_fba_sales,
+                drr_fba_daily_by_asin,
+                report_data,
+                drr_dates,
+                f"FBA — Sales Report  ({drr_range_str})",
                 "FBA",
                 purchase_status_map,
+                mode="sales",
+            )
+
+        if drr_fba_daily_by_asin:
+            ws_fba_inv = wb.create_sheet("FBA Inventory")
+            _build_inventory_sheet(
+                ws_fba_inv,
+                drr_fba_daily_by_asin,
+                report_data,
+                drr_dates,
+                f"FBA — Inventory Report  ({drr_range_str})",
+                "FBA",
+                purchase_status_map,
+                mode="inventory",
             )
 
         wb.save(excel_buffer)

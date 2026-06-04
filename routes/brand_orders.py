@@ -122,6 +122,11 @@ async def create_order(
     eta_port_date: Optional[str] = Form(None),
     duty_payment_date: Optional[str] = Form(None),
     inward_date: Optional[str] = Form(None),
+    po_due_date: Optional[str] = Form(None),
+    custom_duty: Optional[float] = Form(None),
+    custom_duty_due_date: Optional[str] = Form(None),
+    shipping_charges: Optional[float] = Form(None),
+    shipping_charges_due_date: Optional[str] = Form(None),
     db=Depends(get_database),
 ):
     if order_date:
@@ -143,6 +148,9 @@ async def create_order(
         "eta_port_date": eta_port_date,
         "duty_payment_date": duty_payment_date,
         "inward_date": inward_date,
+        "po_due_date": po_due_date,
+        "custom_duty_due_date": custom_duty_due_date,
+        "shipping_charges_due_date": shipping_charges_due_date,
     })
 
     def _insert():
@@ -179,6 +187,8 @@ async def create_order(
             "created_at": now,
             "updated_at": now,
             **extra_dates,
+            "custom_duty": custom_duty,
+            "shipping_charges": shipping_charges,
         }
         result = db[COLLECTION].insert_one(doc)
         return str(result.inserted_id), doc
@@ -324,6 +334,95 @@ async def download_lead_time_report(
 
     buf = await asyncio.to_thread(_build_lead_time_excel, orders)
     filename = f"Lead_Time_Report_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/payment-report")
+async def download_payment_report(
+    request: Request,
+    brand: Optional[str] = None,
+    db=Depends(get_database),
+):
+    """Generate Payment Dates & Details report (admin only)."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = auth_header.split(" ", 1)[1]
+    try:
+        secret = os.getenv("SECRET_KEY") or ""
+        algo = os.getenv("ALGORITHM") or "HS256"
+        payload = jwt.decode(token, secret, algorithms=[algo], options={"verify_aud": False, "verify_exp": False})
+        email = payload.get("sub")
+    except Exception as exc:
+        logger.warning("payment-report token decode failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    def _fetch_payment(email, brand_filter):
+        user = db["purchase_users"].find_one({"email": email}, {"role": 1})
+        if not user or user.get("role") != "admin":
+            return None
+        query = {"brand": brand_filter} if brand_filter else {}
+        pipeline = [
+            {"$match": query},
+            {"$lookup": {
+                "from": PO_COLLECTION,
+                "localField": "purchaseorder_number",
+                "foreignField": "purchaseorder_number",
+                "as": "_po",
+            }},
+            {"$addFields": {
+                "po_sub_total": {"$arrayElemAt": ["$_po.sub_total", 0]},
+                "po_currency_code": {"$arrayElemAt": ["$_po.currency_code", 0]},
+                "po_status": {
+                    "$let": {
+                        "vars": {
+                            "fmt": {"$arrayElemAt": ["$_po.order_status_formatted", 0]},
+                            "raw": {"$arrayElemAt": ["$_po.order_status", 0]},
+                        },
+                        "in": {
+                            "$cond": {
+                                "if": {"$gt": [{"$strLenCP": {"$ifNull": ["$$fmt", ""]}}, 0]},
+                                "then": "$$fmt",
+                                "else": {
+                                    "$cond": {
+                                        "if": {"$gt": [{"$strLenCP": {"$ifNull": ["$$raw", ""]}}, 0]},
+                                        "then": {
+                                            "$concat": [
+                                                {"$toUpper": {"$substrCP": ["$$raw", 0, 1]}},
+                                                {"$substrCP": ["$$raw", 1, {"$subtract": [{"$strLenCP": "$$raw"}, 1]}]},
+                                            ]
+                                        },
+                                        "else": "",
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+            }},
+            {"$project": {
+                "brand": 1, "name": 1, "purchaseorder_number": 1,
+                "po_sub_total": 1, "po_currency_code": 1, "po_status": 1,
+                "po_due_date": 1, "custom_duty": 1, "custom_duty_due_date": 1,
+                "shipping_charges": 1, "shipping_charges_due_date": 1,
+            }},
+            {"$sort": {"brand": 1, "name": 1}},
+        ]
+        return list(db[COLLECTION].aggregate(pipeline))
+
+    orders = await asyncio.to_thread(_fetch_payment, email, brand)
+    if orders is None:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    currencies = {o.get("po_currency_code") for o in orders if o.get("po_currency_code")}
+    fx_rates = await asyncio.to_thread(_fetch_fx_rates, currencies)
+
+    buf = await asyncio.to_thread(_build_payment_report_excel, orders, fx_rates)
+    filename = f"Payment_Report_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -619,6 +718,11 @@ async def update_order(
     eta_port_date: Optional[str] = Form(None),
     duty_payment_date: Optional[str] = Form(None),
     inward_date: Optional[str] = Form(None),
+    po_due_date: Optional[str] = Form(None),
+    custom_duty: Optional[float] = Form(None),
+    custom_duty_due_date: Optional[str] = Form(None),
+    shipping_charges: Optional[float] = Form(None),
+    shipping_charges_due_date: Optional[str] = Form(None),
     db=Depends(get_database),
 ):
     fields: dict = {"updated_at": datetime.now()}
@@ -653,6 +757,9 @@ async def update_order(
         ("eta_port_date", eta_port_date),
         ("duty_payment_date", duty_payment_date),
         ("inward_date", inward_date),
+        ("po_due_date", po_due_date),
+        ("custom_duty_due_date", custom_duty_due_date),
+        ("shipping_charges_due_date", shipping_charges_due_date),
     ]:
         if val is not None:
             if val:
@@ -661,6 +768,11 @@ async def update_order(
                 except ValueError:
                     raise HTTPException(status_code=400, detail=f"{field} must be YYYY-MM-DD")
             fields[field] = val or None
+
+    if custom_duty is not None:
+        fields["custom_duty"] = custom_duty
+    if shipping_charges is not None:
+        fields["shipping_charges"] = shipping_charges
 
     def _update():
         order_doc = db[COLLECTION].find_one(
@@ -1443,6 +1555,174 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
         ws.column_dimensions[get_column_letter(i)].width = w
 
     ws.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def _fetch_fx_rates(currencies: set) -> dict:
+    """Return {currency_code: inr_rate} using Frankfurter (free, no key needed)."""
+    rates: dict = {}
+    for cur in currencies:
+        if not cur or cur == "INR":
+            rates[cur] = 1.0
+            continue
+        try:
+            resp = requests.get(
+                "https://api.frankfurter.app/latest",
+                params={"from": cur, "to": "INR"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                rates[cur] = resp.json().get("rates", {}).get("INR")
+            else:
+                rates[cur] = None
+        except Exception:
+            rates[cur] = None
+    return rates
+
+
+def _build_payment_report_excel(orders: list, fx_rates: dict) -> io.BytesIO:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Payment Report"
+
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF", size=9)
+    data_font = Font(size=9)
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+    num_fmt = '#,##0.00'
+
+    headers = [
+        "Brand — Order Number",
+        "PO Number",
+        "PO Status",
+        "PO Total Value (Foreign Currency)",
+        "Live INR Value",
+        "Exchange Rate Used (INR +₹0.20)",
+        "PO Due Date",
+        "Custom Duty (INR)",
+        "Custom Duty Due Date",
+        "Shipping Charges (INR)",
+        "Shipping Charges Due Date",
+    ]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+        cell.border = border
+    ws.row_dimensions[1].height = 20
+
+    for order in orders:
+        brand_order_label = f"{order.get('brand', '')} — {order.get('name', '')}"
+        po_total = order.get("po_sub_total")
+        po_currency = order.get("po_currency_code") or ""
+
+        po_total_str = f"{po_currency} {po_total:,.2f}" if po_total is not None else ""
+
+        inr_value = None
+        rate_used = None
+        if po_total is not None and po_currency:
+            raw_rate = fx_rates.get(po_currency)
+            if raw_rate is not None:
+                # INR stays at 1.0; all other currencies get +₹0.20 spread
+                rate_used = 1.0 if po_currency == "INR" else round(raw_rate + 0.20, 4)
+                inr_value = round(po_total * rate_used, 2)
+
+        def fmt_date_cell(d):
+            if not d:
+                return None
+            try:
+                return datetime.strptime(d, "%Y-%m-%d")
+            except Exception:
+                return None
+
+        row = [
+            brand_order_label,
+            order.get("purchaseorder_number", ""),
+            order.get("po_status", ""),
+            po_total_str,
+            inr_value,
+            rate_used,
+            fmt_date_cell(order.get("po_due_date")),
+            order.get("custom_duty"),
+            fmt_date_cell(order.get("custom_duty_due_date")),
+            order.get("shipping_charges"),
+            fmt_date_cell(order.get("shipping_charges_due_date")),
+        ]
+        ws.append(row)
+        excel_row = ws.max_row
+        for col_idx, cell in enumerate(ws[excel_row], 1):
+            cell.font = data_font
+            cell.border = border
+            if col_idx in (7, 9, 11):  # date columns
+                if cell.value:
+                    cell.number_format = "DD-MMM-YYYY"
+                cell.alignment = center
+            elif col_idx in (5, 6, 8, 10):  # numeric columns (INR value, rate, custom duty, shipping)
+                cell.number_format = num_fmt
+                cell.alignment = center
+            else:
+                cell.alignment = left
+
+    col_widths = [40, 20, 16, 28, 20, 26, 16, 20, 20, 22, 24]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws.freeze_panes = "A2"
+
+    # ── FX Rates sheet ──────────────────────────────────────────────────────
+    ws2 = wb.create_sheet("FX Rates")
+    fx_headers = ["Currency", "Live Rate (Frankfurter, INR per 1 unit)", "Rate Used (+₹0.20 spread)", "Note"]
+    ws2.append(fx_headers)
+    for cell in ws2[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+        cell.border = border
+    ws2.row_dimensions[1].height = 20
+
+    # Collect unique currencies from orders (preserving encounter order)
+    seen: dict = {}
+    for order in orders:
+        cur = order.get("po_currency_code") or ""
+        if cur and cur not in seen:
+            seen[cur] = fx_rates.get(cur)
+
+    rate4_fmt = '#,##0.0000'
+    for cur, raw_rate in seen.items():
+        if cur == "INR":
+            adj_rate = 1.0
+            note = "Base currency — no spread applied"
+        elif raw_rate is not None:
+            adj_rate = round(raw_rate + 0.20, 4)
+            note = "Frankfurter live rate + ₹0.20 spread"
+        else:
+            adj_rate = None
+            note = "Rate unavailable"
+        row2 = [cur, raw_rate, adj_rate, note]
+        ws2.append(row2)
+        r = ws2.max_row
+        for col_idx, cell in enumerate(ws2[r], 1):
+            cell.font = data_font
+            cell.border = border
+            if col_idx in (2, 3):
+                cell.number_format = rate4_fmt
+                cell.alignment = center
+            elif col_idx == 1:
+                cell.alignment = center
+                cell.font = Font(bold=True, size=9)
+            else:
+                cell.alignment = left
+
+    for i, w in enumerate([14, 38, 30, 38], 1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
 
     buf = io.BytesIO()
     wb.save(buf)
