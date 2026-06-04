@@ -1175,7 +1175,7 @@ _PIS_SHEETS: list[tuple[str, list[str]]] = [
         "Materials", "Cleaning Instructions", "Images",
     ]),
     ("Treats", [
-        "Sr No", "Product Name", "HSN", "EAN/UPC",
+        "Sr No", "Item Code (Manufacturer)", "BB code", "Item Name", "HSN", "EAN/UPC",
         "Category", "Sub-Category", "Series",
         "Product weight w/ packaging (g)", "Product weight w/o packaging(g)",
         "Product dimensions w/ packaging (cm)", "Product dimensions w/o packaging (cm) - Single piece",
