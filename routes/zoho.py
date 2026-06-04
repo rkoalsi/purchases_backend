@@ -1362,21 +1362,47 @@ def generate_brand_sales_report(
             for item in _cu:
                 prod    = get_prod(item["item_name"], item["item_sku"])
                 brand   = prod.get("brand", "Unknown")
-                cat     = prod.get("category") or "Uncategorized"
-                sub_cat = prod.get("sub_category") or "Uncategorized"
                 amt     = item.get("item_total") or 0
-                by_cu[brand]           += amt
-                _bwc[brand][cat]       += amt
-                _bwsc[brand][sub_cat]  += amt
+                by_cu[brand] += amt
             for item in _cn_cu:
+                prod    = get_prod(item["item_name"], item["item_sku"])
+                brand   = prod.get("brand", "Unknown")
+                amt     = item.get("item_total") or 0
+                by_cu[brand] -= amt
+
+            # BWC/BWSC use by_all - by_tr logic so Grand Total matches BWS Pure Sales (=B-C)
+            for item in _all:
                 prod    = get_prod(item["item_name"], item["item_sku"])
                 brand   = prod.get("brand", "Unknown")
                 cat     = prod.get("category") or "Uncategorized"
                 sub_cat = prod.get("sub_category") or "Uncategorized"
                 amt     = item.get("item_total") or 0
-                by_cu[brand]           -= amt
-                _bwc[brand][cat]       -= amt
-                _bwsc[brand][sub_cat]  -= amt
+                _bwc[brand][cat]      += amt
+                _bwsc[brand][sub_cat] += amt
+            for item in _tr:
+                prod    = get_prod(item["item_name"], item["item_sku"])
+                brand   = prod.get("brand", "Unknown")
+                cat     = prod.get("category") or "Uncategorized"
+                sub_cat = prod.get("sub_category") or "Uncategorized"
+                amt     = item.get("item_total") or 0
+                _bwc[brand][cat]      -= amt
+                _bwsc[brand][sub_cat] -= amt
+            for item in _cn_all:
+                prod    = get_prod(item["item_name"], item["item_sku"])
+                brand   = prod.get("brand", "Unknown")
+                cat     = prod.get("category") or "Uncategorized"
+                sub_cat = prod.get("sub_category") or "Uncategorized"
+                amt     = item.get("item_total") or 0
+                _bwc[brand][cat]      -= amt
+                _bwsc[brand][sub_cat] -= amt
+            for item in _cn_tr:
+                prod    = get_prod(item["item_name"], item["item_sku"])
+                brand   = prod.get("brand", "Unknown")
+                cat     = prod.get("category") or "Uncategorized"
+                sub_cat = prod.get("sub_category") or "Uncategorized"
+                amt     = item.get("item_total") or 0
+                _bwc[brand][cat]      += amt
+                _bwsc[brand][sub_cat] += amt
 
             return by_all, by_tr, by_cu, _bwc, _bwsc
 
@@ -1441,8 +1467,9 @@ def generate_brand_sales_report(
                 if transfer_val:
                     ws.cell(row=r, column=3, value=round(transfer_val, 2)).number_format = "#,##0.00"
                 ws.cell(row=r, column=3).border = thin_border
-                ws.cell(row=r, column=4, value=round(pure_val, 2)).number_format = "#,##0.00"
-                ws.cell(row=r, column=4).border = thin_border
+                pure_cell = ws.cell(row=r, column=4, value=f"=B{r}-C{r}")
+                pure_cell.number_format = "#,##0.00"
+                pure_cell.border = thin_border
 
             grand_row = data_start + len(all_brands)
             ws.cell(row=grand_row, column=1, value="Grand Total")
