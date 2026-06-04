@@ -3105,11 +3105,12 @@ _SS = lambda tag: f"{{{_SS_NS}}}{tag}"  # noqa: E731
 
 def _fill_invoice_line_items_xls(
     file_bytes: bytes,
-    sku_qty_map: dict,      # {cf_sku_code: qty (int)}
-    sku_product_map: dict,  # {cf_sku_code: {"hsn": str, "tax_rate": float}}
+    asin_qty_map: dict,      # {asin: qty (int)}
+    asin_product_map: dict,  # {asin: {"hsn": str, "tax_rate": float}}
 ) -> bytes:
     """Parse Amazon InvoiceLineItems SpreadsheetML .xls, fill Quantity/HSN/Tax rate
-    from package data, unprotect the InvoiceItems sheet, and return modified bytes."""
+    from package data (matched by ASIN), unprotect the InvoiceItems sheet, and return
+    modified bytes."""
     from lxml import etree
 
     parser = etree.XMLParser(remove_comments=False)
@@ -3140,30 +3141,30 @@ def _fill_invoice_line_items_xls(
 
     rows = table.findall(_SS("Row"))
 
-    # Locate header row (contains "Model #")
+    # Locate header row (contains "ASIN")
     header_idx = None
-    col_model, col_qty, col_hsn, col_tax = 4, 5, 9, 11  # defaults from known layout
+    col_asin, col_qty, col_hsn, col_tax = 3, 5, 9, 11  # defaults from known layout
     for i, row in enumerate(rows):
         cells = row.findall(_SS("Cell"))
         vals = [
             (c.find(_SS("Data")).text or "") if c.find(_SS("Data")) is not None else ""
             for c in cells
         ]
-        if "Model #" in vals:
+        if "ASIN" in vals:
             header_idx = i
-            col_model = vals.index("Model #")
+            col_asin = vals.index("ASIN")
             col_qty = vals.index("Quantity") if "Quantity" in vals else col_qty
             col_hsn = vals.index("HSN") if "HSN" in vals else col_hsn
             col_tax = vals.index("Tax rate") if "Tax rate" in vals else col_tax
             break
 
     if header_idx is None:
-        raise ValueError("Header row with 'Model #' not found in InvoiceItems")
+        raise ValueError("Header row with 'ASIN' not found in InvoiceItems")
 
     # Fill data rows
     for row in rows[header_idx + 1:]:
         cells = row.findall(_SS("Cell"))
-        if len(cells) <= col_model:
+        if not cells:
             continue
 
         # Resolve physical column index respecting ss:Index (sparse rows)
@@ -3196,15 +3197,14 @@ def _fill_invoice_line_items_xls(
             d.set(_SS("Type"), dtype)
             d.text = str(value) if value is not None else ""
 
-        raw_sku = _get_val(col_model)
-        sku = raw_sku.strip() if raw_sku else ""
-        if not sku:
+        asin = (_get_val(col_asin) or "").strip()
+        if not asin:
             continue
 
-        if sku in sku_qty_map:
-            qty = sku_qty_map[sku]
+        if asin in asin_qty_map:
+            qty = asin_qty_map[asin]
             _set_val(col_qty, int(qty))
-            prod = sku_product_map.get(sku, {})
+            prod = asin_product_map.get(asin, {})
             if prod.get("hsn"):
                 _set_val(col_hsn, str(prod["hsn"]), dtype="String")
             if prod.get("tax_rate") is not None:
@@ -3287,8 +3287,24 @@ async def upload_invoice_line_items(
                     "tax_rate": round(gst_pct / 100, 4) if gst_pct else 0.0,
                 }
 
+        # Build ASIN-keyed maps via amazon_sku_mapping (item_id=ASIN, sku_code=cf_sku_code)
+        asin_qty_map: dict[str, float] = {}
+        asin_product_map: dict[str, dict] = {}
+        for mapping in db[SKU_MAPPING_COLLECTION].find(
+            {"sku_code": {"$in": all_skus}},
+            {"item_id": 1, "sku_code": 1},
+        ):
+            asin = mapping.get("item_id")
+            sku = mapping.get("sku_code")
+            if not asin or not sku:
+                continue
+            if sku in sku_qty_map:
+                asin_qty_map[asin] = sku_qty_map[sku]
+            if sku in sku_product_map:
+                asin_product_map[asin] = sku_product_map[sku]
+
         try:
-            filled_bytes = _fill_invoice_line_items_xls(file_bytes, sku_qty_map, sku_product_map)
+            filled_bytes = _fill_invoice_line_items_xls(file_bytes, asin_qty_map, asin_product_map)
         except ValueError as e:
             raise _BadFile(str(e))
 
@@ -3336,6 +3352,44 @@ async def get_invoice_file_url(po_number: str, db=Depends(get_database)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"url": url}
+
+
+@router.delete("/{po_number}/invoice_file")
+async def delete_invoice_file(po_number: str, db=Depends(get_database)):
+    """Delete the stored VC invoice file from S3 and clear the reference in DB."""
+
+    class _NotFound(Exception):
+        pass
+
+    def _delete():
+        doc = db[PO_COLLECTION].find_one(
+            {"po_number": po_number}, {"invoice_file_s3_key": 1}
+        )
+        if not doc:
+            raise _NotFound(f"PO {po_number} not found")
+        s3_key = doc.get("invoice_file_s3_key")
+        if not s3_key:
+            raise _NotFound("No invoice file uploaded for this PO")
+        boto3.client("s3", region_name=AWS_REGION).delete_object(
+            Bucket=S3_BUCKET, Key=s3_key
+        )
+        db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {
+                "$unset": {"invoice_file_s3_key": ""},
+                "$set": {"updated_at": datetime.now()},
+            },
+        )
+
+    try:
+        await asyncio.to_thread(_delete)
+    except _NotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("delete_invoice_file failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"po_number": po_number, "deleted": True}
 
 
 @router.get("/{po_number}/order_file")
