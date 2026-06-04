@@ -761,6 +761,37 @@ _PIS_COL_MAP: dict[str, str | None] = {
     # treats-specific
     "ingredient list %": "ingredient_list",
     "nutrition analysis": "nutritional_analysis",
+    # grooming-specific — pet_size/age_group variants
+    "dog size / breed / coat": "pet_size",
+    "dog size / breed / coat ": "pet_size",
+    "dog age (puppy/adult / senior)": "age_group",
+    # grooming — composition maps to ingredient_list
+    "composition / ingredients": "ingredient_list",
+    # grooming — text attributes
+    "scented / unscented": "_g_scented",
+    "essential oils": "_g_essential_oils",
+    # grooming — boolean certifications
+    " ifra-certified": "_g_ifra_certified",
+    "ifra-certified": "_g_ifra_certified",
+    "slicone free": "_g_silicone_free",
+    "silicone free": "_g_silicone_free",
+    "sls free": "_g_sls_free",
+    "paraben-free": "_g_paraben_free",
+    "ph balanced": "_g_ph_balanced",
+    "hypoallergenic": "_g_hypoallergenic",
+    "soap-free": "_g_soap_free",
+    "tear-free": "_g_tear_free",
+    "dye-free / colorant-free": "_g_dye_free",
+    "artificial fragrance-free": "_g_fragrance_free",
+    "alcohol-free": "_g_alcohol_free",
+    "dea-free": "_g_dea_free",
+    "peg-free": "_g_peg_free",
+    "phthalate-free": "_g_phthalate_free",
+    "formaldehyde-free": "_g_formaldehyde_free",
+    "vegan": "_g_vegan",
+    "cruelty-free": "_g_cruelty_free",
+    "all natural ingredients": "_g_all_natural",
+    "dermatologically tested": "_g_dermatologically_tested",
     # explicitly skipped
     "item code (manufacturer)": None,
     "sr no": None,
@@ -769,7 +800,6 @@ _PIS_COL_MAP: dict[str, str | None] = {
     "padding (plush toys)": None,
     "absorption capacity": None,
     "composition": None,
-    "scented / unscented": None,
     "shelf life": None,
     "natural ingredients (yes/no)": None,
     "grain free (yes/no)": None,
@@ -789,6 +819,34 @@ _PIS_COL_MAP: dict[str, str | None] = {
     "animal body parts used": None,
     "feeding guide": None,
     "lab test reports (if any)": None,
+}
+
+
+_GROOMING_BOOL_ATTRS: dict[str, str] = {
+    "_g_ifra_certified": "ifra_certified",
+    "_g_silicone_free": "silicone_free",
+    "_g_sls_free": "sls_free",
+    "_g_paraben_free": "paraben_free",
+    "_g_ph_balanced": "ph_balanced",
+    "_g_hypoallergenic": "hypoallergenic",
+    "_g_soap_free": "soap_free",
+    "_g_tear_free": "tear_free",
+    "_g_dye_free": "dye_free",
+    "_g_fragrance_free": "fragrance_free",
+    "_g_alcohol_free": "alcohol_free",
+    "_g_dea_free": "dea_free",
+    "_g_peg_free": "peg_free",
+    "_g_phthalate_free": "phthalate_free",
+    "_g_formaldehyde_free": "formaldehyde_free",
+    "_g_vegan": "vegan",
+    "_g_cruelty_free": "cruelty_free",
+    "_g_all_natural": "all_natural_ingredients",
+    "_g_dermatologically_tested": "dermatologically_tested",
+}
+
+_GROOMING_TEXT_ATTRS: dict[str, str] = {
+    "_g_scented": "scent_type",
+    "_g_essential_oils": "essential_oils",
 }
 
 
@@ -918,6 +976,20 @@ def _process_pis_sheet(ws, sheet_name: str, db, dry_run: bool = False) -> dict:
         if links:
             set_fields["image_links"] = links
             fields_updated.append("image_links")
+
+        # Grooming attributes (boolean certifications + text attrs)
+        grooming_attrs: dict[str, Any] = {}
+        for internal_key, attr_name in _GROOMING_BOOL_ATTRS.items():
+            val = _to_bool(raw.get(internal_key))
+            if val is not None:
+                grooming_attrs[attr_name] = val
+        for internal_key, attr_name in _GROOMING_TEXT_ATTRS.items():
+            v = str(raw[internal_key]).strip() if raw.get(internal_key) is not None else None
+            if v:
+                grooming_attrs[attr_name] = v
+        if grooming_attrs:
+            set_fields["grooming_attributes"] = grooming_attrs
+            fields_updated.append("grooming_attributes")
 
         # Dimensions
         dims_with = _parse_dims_str(raw.get("_dims_with"))
@@ -1114,13 +1186,20 @@ _PIS_SHEETS: list[tuple[str, list[str]]] = [
         "Main Animal Source", "Form Used",
         "Shelf Life", "feeding guide", "Images", "Lab Test Reports (If Any)",
     ]),
-    ("Apparel & Accessories", [
+    ("Grooming", [
         "Item Code (Manufacturer)", "BB code", "Item Name", "HSN", "EAN/UPC",
         "Category", "Sub-Category", "Series",
-        "Product weight w/ packaging (g)", "Product weight w/o packaging(g)",
-        "Product dimensions w/ packaging (cm)", "Product dimensions w/o packaging (cm)",
+        "Product weight w/ packaging (g)", "Product weight w/o packaging(g) ",
+        "Product dimensions w/ packaging (cm)",
+        "Composition / Ingredients", "Scented / Unscented", " IFRA-certified",
+        "Slicone Free", "SLS Free", "Paraben-Free", "pH Balanced", "Hypoallergenic",
+        "Soap-Free", "Tear-Free", "Dye-Free / Colorant-Free", "Artificial Fragrance-Free",
+        "Alcohol-Free", "DEA-Free", "PEG-Free", "Phthalate-Free", "Formaldehyde-Free",
+        "Vegan", "Cruelty-Free", "All Natural Ingredients", "Essential Oils",
+        "Shelf Life",
         "Features 1", "Features 2", "Features 3", "Features 4", "Features 5",
-        "Materials", "Dog Size", "Images",
+        "Materials", "Dog Size / Breed / Coat ", "Dog Age (Puppy/Adult / Senior)",
+        "Dermatologically Tested", "Images",
     ]),
 ]
 
