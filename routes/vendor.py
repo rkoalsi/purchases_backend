@@ -431,7 +431,11 @@ async def validate_draft_order(
 
         products_by_bb: dict[str, dict] = {}
         for p in products_col.find({"cf_sku_code": {"$in": bb_codes}}, PRODUCT_PROJECTION):
-            products_by_bb[p["cf_sku_code"]] = p
+            key = p["cf_sku_code"]
+            existing = products_by_bb.get(key)
+            # Prefer active product over inactive when multiple share the same SKU code
+            if existing is None or (p.get("status") == "active" and existing.get("status") != "active"):
+                products_by_bb[key] = p
 
         remaining_mfr = [
             it["manufacturer_code"]
@@ -442,7 +446,10 @@ async def validate_draft_order(
         products_by_mfr: dict[str, dict] = {}
         if remaining_mfr:
             for p in products_col.find({"cf_item_code": {"$in": remaining_mfr}}, PRODUCT_PROJECTION):
-                products_by_mfr[p.get("cf_item_code", "")] = p
+                key = p.get("cf_item_code", "")
+                existing = products_by_mfr.get(key)
+                if existing is None or (p.get("status") == "active" and existing.get("status") != "active"):
+                    products_by_mfr[key] = p
 
         validated = []
         missing = []
