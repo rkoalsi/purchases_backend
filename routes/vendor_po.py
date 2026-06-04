@@ -181,21 +181,43 @@ def _fetch_monthly_amazon_sales(db, asins: list, num_months: int = 5):
     return result, months
 
 
-def _get_dispatched_costs_by_asin(package_number: str, db) -> dict:
-    """Return {asin: {qty, item_total, item_total_gst}} for a linked package's line items."""
-    pkg = db[PACKAGES_COLLECTION].find_one({"package_number": package_number})
-    if not pkg:
-        return {}
-    line_items = pkg.get("line_items") or []
-    sku_rows = []
+def _extract_sku_rows_from_line_items(line_items: list, db) -> list[dict]:
+    """Return [{sku, qty, name}] for each line item, resolving cf_sku_code via
+    item_custom_fields first, then falling back to products.item_id lookup."""
+    rows = []
+    fallback_ids: list[tuple[int, str]] = []  # (index_into_rows, item_id)
     for li in line_items:
         sku = None
         for cf in li.get("item_custom_fields") or []:
             if cf.get("api_name") == "cf_sku_code":
                 sku = cf.get("value")
                 break
-        if sku:
-            sku_rows.append({"sku": sku, "qty": float(li.get("quantity") or 0)})
+        row = {"sku": sku, "qty": float(li.get("quantity") or 0), "name": li.get("name") or "", "item_id": li.get("item_id")}
+        rows.append(row)
+        if not sku and li.get("item_id"):
+            fallback_ids.append((len(rows) - 1, li["item_id"]))
+    if fallback_ids:
+        item_id_to_sku = {
+            p["item_id"]: p["cf_sku_code"]
+            for p in db[PRODUCTS_COLLECTION].find(
+                {"item_id": {"$in": [iid for _, iid in fallback_ids]}, "cf_sku_code": {"$exists": True}},
+                {"item_id": 1, "cf_sku_code": 1},
+            )
+            if p.get("cf_sku_code")
+        }
+        for idx, item_id in fallback_ids:
+            if item_id in item_id_to_sku:
+                rows[idx]["sku"] = item_id_to_sku[item_id]
+    return [r for r in rows if r["sku"]]
+
+
+def _get_dispatched_costs_by_asin(package_number: str, db) -> dict:
+    """Return {asin: {qty, item_total, item_total_gst}} for a linked package's line items."""
+    pkg = db[PACKAGES_COLLECTION].find_one({"package_number": package_number})
+    if not pkg:
+        return {}
+    line_items = pkg.get("line_items") or []
+    sku_rows = _extract_sku_rows_from_line_items(line_items, db)
     if not sku_rows:
         return {}
     skus = [r["sku"] for r in sku_rows]
@@ -340,16 +362,8 @@ def _compute_package_accepted_costs(
 
     line_items = pkg.get("line_items") or []
 
-    # Extract SKUs from item_custom_fields
-    sku_qty_pairs: list[tuple[str, float]] = []
-    for li in line_items:
-        sku = None
-        for cf in li.get("item_custom_fields") or []:
-            if cf.get("api_name") == "cf_sku_code":
-                sku = cf.get("value")
-                break
-        if sku:
-            sku_qty_pairs.append((sku, float(li.get("quantity") or 0)))
+    sku_rows = _extract_sku_rows_from_line_items(line_items, db)
+    sku_qty_pairs: list[tuple[str, float]] = [(r["sku"], r["qty"]) for r in sku_rows]
 
     if not sku_qty_pairs:
         return None, None
@@ -2074,22 +2088,10 @@ async def get_package_breakdown(po_number: str, db=Depends(get_database)):
     package_number = pkg_numbers[0]
     line_items = pkg.get("line_items") or []
 
-    # Extract SKU, qty, name per line item
-    sku_rows: list[dict] = []
-    for li in line_items:
-        sku = None
-        for cf in li.get("item_custom_fields") or []:
-            if cf.get("api_name") == "cf_sku_code":
-                sku = cf.get("value")
-                break
-        if sku:
-            sku_rows.append(
-                {
-                    "sku": sku,
-                    "name": li.get("name") or "",
-                    "qty": float(li.get("quantity") or 0),
-                }
-            )
+    def _resolve_skus():
+        return _extract_sku_rows_from_line_items(line_items, db)
+
+    sku_rows = await asyncio.to_thread(_resolve_skus)
 
     if not sku_rows:
         return {
