@@ -1207,7 +1207,7 @@ def _query_line_items_for_brand_report(
         "status": {"$nin": ["draft", "void"]},
     }
     if filter_type == "transfer_order":
-        match["customer_name"] = {"$regex": "pupscribe", "$options": "i"}
+        match["customer_name"] = {"$regex": "pupscribe enterprises", "$options": "i"}
     elif filter_type == "customer_only":
         match["$nor"] = [
             {"customer_name": {"$in": EXCLUDED_CUSTOMERS_LIST}},
@@ -1234,9 +1234,10 @@ def _query_credit_notes_for_brand_report(
     credit_notes_col, start_date: datetime, end_date: datetime, filter_type: str
 ) -> list:
     """
-    filter_type: 'all' | 'customer_only'
-    'all'          — all credit notes excluding transfer order customers (matches Zoho P&L behaviour)
-    'customer_only' — credit notes excluding transfer orders AND excluded customers
+    filter_type: 'all' | 'customer_only' | 'transfer_order'
+    'all'            — all credit notes excluding transfer order customers (matches Zoho P&L behaviour)
+    'customer_only'  — credit notes excluding transfer orders AND excluded customers
+    'transfer_order' — credit notes only for pupscribe-regex customers (mirrors invoice transfer_order filter)
     Returns list of {item_name, item_sku, item_total} for credit notes in the period.
     credit_notes stores date as ISODate or string — both are handled.
     """
@@ -1250,7 +1251,9 @@ def _query_credit_notes_for_brand_report(
         ],
         "status": {"$nin": ["draft", "void"]},
     }
-    if filter_type == "customer_only":
+    if filter_type == "transfer_order":
+        match["customer_name"] = {"$regex": "pupscribe enterprises", "$options": "i"}
+    elif filter_type == "customer_only":
         match["$nor"] = [
             {"customer_name": {"$in": EXCLUDED_CUSTOMERS_LIST}},
             {"customer_name": {"$regex": "pupscribe", "$options": "i"}},
@@ -1338,8 +1341,8 @@ def generate_brand_sales_report(
             _cu  = _query_line_items_for_brand_report(invoices_col, s, e, "customer_only")
 
             # Credit notes reduce revenue — subtract them to match Zoho's Total Operating Income.
-            # Transfer order CNs are excluded (Zoho doesn't net internal transfer CNs against revenue).
             _cn_all = _query_credit_notes_for_brand_report(credit_notes_col, s, e, "all")
+            _cn_tr  = _query_credit_notes_for_brand_report(credit_notes_col, s, e, "transfer_order")
             _cn_cu  = _query_credit_notes_for_brand_report(credit_notes_col, s, e, "customer_only")
 
             by_all = defaultdict(float)
@@ -1355,6 +1358,8 @@ def generate_brand_sales_report(
 
             for item in _tr:
                 by_tr[get_prod(item["item_name"], item["item_sku"]).get("brand", "Unknown")] += item.get("item_total") or 0
+            for item in _cn_tr:
+                by_tr[get_prod(item["item_name"], item["item_sku"]).get("brand", "Unknown")] -= item.get("item_total") or 0
 
             for item in _cu:
                 prod    = get_prod(item["item_name"], item["item_sku"])
