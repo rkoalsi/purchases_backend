@@ -29,6 +29,7 @@ ZOHO_BOOKS_BASE = "https://books.zoho.com/api/v3"
 PRODUCTS_COLLECTION = "products"
 PURCHASE_ORDERS_COLLECTION = "purchase_orders"
 DRAFT_PURCHASE_ORDERS_COLLECTION = "draft_purchase_orders"
+NOTIFICATIONS_COLLECTION = "notifications"
 
 
 def _get_zoho_token() -> str:
@@ -948,6 +949,41 @@ async def create_draft_order_po(
     except requests.HTTPError as e:
         body = e.response.text if e.response is not None else ""
         raise HTTPException(status_code=502, detail=f"Zoho API error: {e} — {body}")
+
+    async def _notify_po_created():
+        def _fan_out():
+            recipients = list(db["purchase_users"].find(
+                {"status": "active"},
+                {"_id": 1},
+            ))
+            if not recipients:
+                return
+            now = datetime.utcnow()
+            po_number = po_doc.get("purchaseorder_number", "")
+            vendor_name = po_doc.get("vendor_name", "")
+            snippet = f"Draft order converted to PO {po_number} — {vendor_name}"
+            notif_docs = [
+                {
+                    "user_id": str(r["_id"]),
+                    "source": "purchase_order",
+                    "purchaseorder_id": po_doc.get("purchaseorder_id"),
+                    "purchaseorder_number": po_number,
+                    "vendor_name": vendor_name,
+                    "type": "draft_order_po_created",
+                    "actor_name": "System",
+                    "snippet": snippet,
+                    "read": False,
+                    "created_at": now,
+                }
+                for r in recipients
+            ]
+            db[NOTIFICATIONS_COLLECTION].insert_many(notif_docs)
+        try:
+            await asyncio.to_thread(_fan_out)
+        except Exception as _e:
+            logger.warning(f"Draft order PO notification fan-out failed: {_e}")
+
+    asyncio.create_task(_notify_po_created())
 
     return JSONResponse(
         status_code=201,
