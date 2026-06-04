@@ -1258,9 +1258,7 @@ def _query_credit_notes_for_brand_report(
             {"customer_name": {"$in": EXCLUDED_CUSTOMERS_LIST}},
             {"customer_name": {"$regex": "pupscribe", "$options": "i"}},
         ]
-    else:
-        # 'all': exclude transfer order customers — Zoho doesn't net internal transfer CNs against revenue
-        match["customer_name"] = {"$not": {"$regex": "pupscribe", "$options": "i"}}
+    # 'all': no customer filter — include all CNs to match Zoho P&L Total Operating Income
 
     pipeline = [
         {"$match": match},
