@@ -1388,6 +1388,7 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "item_count": 1,
                     "created_at": 1,
                     "order_file_s3_key": 1,
+                    "invoice_file_s3_key": 1,
                     "total_requested_qty": 1,
                     "total_accepted_qty": 1,
                     "total_received_qty": 1,
