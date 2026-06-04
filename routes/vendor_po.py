@@ -3096,6 +3096,248 @@ async def upload_order_file(
     )
 
 
+# ─── Invoice Line Items upload ────────────────────────────────────────────────
+
+_SS_NS = "urn:schemas-microsoft-com:office:spreadsheet"
+_X_NS = "urn:schemas-microsoft-com:office:excel"
+_SS = lambda tag: f"{{{_SS_NS}}}{tag}"  # noqa: E731
+
+
+def _fill_invoice_line_items_xls(
+    file_bytes: bytes,
+    sku_qty_map: dict,      # {cf_sku_code: qty (int)}
+    sku_product_map: dict,  # {cf_sku_code: {"hsn": str, "tax_rate": float}}
+) -> bytes:
+    """Parse Amazon InvoiceLineItems SpreadsheetML .xls, fill Quantity/HSN/Tax rate
+    from package data, unprotect the InvoiceItems sheet, and return modified bytes."""
+    from lxml import etree
+
+    parser = etree.XMLParser(remove_comments=False)
+    tree = etree.parse(io.BytesIO(file_bytes), parser)
+    root = tree.getroot()
+
+    invoice_ws = None
+    for ws in root.findall(_SS("Worksheet")):
+        if ws.get(_SS("Name")) == "InvoiceItems":
+            invoice_ws = ws
+            break
+    if invoice_ws is None:
+        raise ValueError("InvoiceItems sheet not found in file")
+
+    # Unprotect the worksheet (no password set)
+    invoice_ws.set(_SS("Protected"), "0")
+
+    # Also clear ProtectObjects / ProtectScenarios in WorksheetOptions
+    for ws_opts in invoice_ws.findall(f"{{{_X_NS}}}WorksheetOptions"):
+        for tag in ("ProtectObjects", "ProtectScenarios"):
+            el = ws_opts.find(f"{{{_X_NS}}}{tag}")
+            if el is not None:
+                el.text = "False"
+
+    table = invoice_ws.find(_SS("Table"))
+    if table is None:
+        raise ValueError("No Table element in InvoiceItems sheet")
+
+    rows = table.findall(_SS("Row"))
+
+    # Locate header row (contains "Model #")
+    header_idx = None
+    col_model, col_qty, col_hsn, col_tax = 4, 5, 9, 11  # defaults from known layout
+    for i, row in enumerate(rows):
+        cells = row.findall(_SS("Cell"))
+        vals = [
+            (c.find(_SS("Data")).text or "") if c.find(_SS("Data")) is not None else ""
+            for c in cells
+        ]
+        if "Model #" in vals:
+            header_idx = i
+            col_model = vals.index("Model #")
+            col_qty = vals.index("Quantity") if "Quantity" in vals else col_qty
+            col_hsn = vals.index("HSN") if "HSN" in vals else col_hsn
+            col_tax = vals.index("Tax rate") if "Tax rate" in vals else col_tax
+            break
+
+    if header_idx is None:
+        raise ValueError("Header row with 'Model #' not found in InvoiceItems")
+
+    # Fill data rows
+    for row in rows[header_idx + 1:]:
+        cells = row.findall(_SS("Cell"))
+        if len(cells) <= col_model:
+            continue
+
+        # Resolve physical column index respecting ss:Index (sparse rows)
+        # Build positional list: cell_at_col[col_idx] = cell element (or None)
+        cell_at_col: list = []
+        pos = 0
+        for c in cells:
+            idx_attr = c.get(_SS("Index"))
+            if idx_attr:
+                pos = int(idx_attr) - 1  # ss:Index is 1-based
+            # extend if needed
+            while len(cell_at_col) < pos:
+                cell_at_col.append(None)
+            cell_at_col.append(c)
+            pos += 1
+
+        def _get_val(col_idx: int) -> str:
+            if col_idx >= len(cell_at_col) or cell_at_col[col_idx] is None:
+                return ""
+            d = cell_at_col[col_idx].find(_SS("Data"))
+            return (d.text or "") if d is not None else ""
+
+        def _set_val(col_idx: int, value, dtype: str = "Number"):
+            if col_idx >= len(cell_at_col) or cell_at_col[col_idx] is None:
+                return
+            c = cell_at_col[col_idx]
+            d = c.find(_SS("Data"))
+            if d is None:
+                d = etree.SubElement(c, _SS("Data"))
+            d.set(_SS("Type"), dtype)
+            d.text = str(value) if value is not None else ""
+
+        raw_sku = _get_val(col_model)
+        sku = raw_sku.strip() if raw_sku else ""
+        if not sku:
+            continue
+
+        if sku in sku_qty_map:
+            qty = sku_qty_map[sku]
+            _set_val(col_qty, int(qty))
+            prod = sku_product_map.get(sku, {})
+            if prod.get("hsn"):
+                _set_val(col_hsn, str(prod["hsn"]), dtype="String")
+            if prod.get("tax_rate") is not None:
+                _set_val(col_tax, prod["tax_rate"])
+        else:
+            _set_val(col_qty, 0)
+
+    out = io.BytesIO()
+    tree.write(out, encoding="utf-8", xml_declaration=True)
+    return out.getvalue()
+
+
+@router.post("/{po_number}/upload_invoice")
+async def upload_invoice_line_items(
+    po_number: str,
+    file: UploadFile = File(...),
+    db=Depends(get_database),
+):
+    """Upload Amazon InvoiceLineItems .xls; fill Quantity/HSN/Tax rate from linked
+    packages and product data, then return the completed file for download."""
+    if not file.filename or not file.filename.lower().endswith(".xls"):
+        raise HTTPException(status_code=400, detail="File must be a .xls Amazon Invoice file")
+
+    file_bytes = await file.read()
+
+    class _NotFound(Exception):
+        pass
+
+    class _BadFile(Exception):
+        pass
+
+    def _process():
+        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
+        if not doc:
+            raise _NotFound(f"PO {po_number} not found")
+
+        # Collect package numbers — try via sales order / estimate first, then direct fields
+        pkg_numbers: list[str] = []
+        est_id = doc.get("zoho_estimate_id")
+        if est_id:
+            pkg_numbers = _so_package_numbers_for_estimate(est_id, db)
+        if not pkg_numbers:
+            pkg_numbers = doc.get("packages") or (
+                [doc["package_number"]] if doc.get("package_number") else []
+            )
+        if not pkg_numbers:
+            raise _BadFile(f"No packages linked to PO {po_number}")
+
+        # Load all line items from every linked package → {sku: qty}
+        sku_qty_map: dict[str, float] = {}
+        all_skus: list[str] = []
+        for pkg_num in pkg_numbers:
+            pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_num})
+            if not pkg:
+                continue
+            sku_rows = _extract_sku_rows_from_line_items(pkg.get("line_items") or [], db)
+            for r in sku_rows:
+                sku = r["sku"]
+                sku_qty_map[sku] = sku_qty_map.get(sku, 0) + r["qty"]
+                if sku not in all_skus:
+                    all_skus.append(sku)
+
+        if not all_skus:
+            raise _BadFile("No SKUs found in linked packages")
+
+        # Fetch HSN + GST from products (prefer active)
+        sku_product_map: dict[str, dict] = {}
+        for p in db[PRODUCTS_COLLECTION].find(
+            {"cf_sku_code": {"$in": all_skus}},
+            {"cf_sku_code": 1, "status": 1, "hsn_or_sac": 1, "item_tax_preferences": 1},
+        ):
+            sku = p.get("cf_sku_code")
+            if not sku:
+                continue
+            existing = sku_product_map.get(sku)
+            if existing is None or p.get("status") == "active":
+                gst_pct = _extract_gst(p.get("item_tax_preferences") or [])
+                sku_product_map[sku] = {
+                    "hsn": str(p.get("hsn_or_sac") or ""),
+                    "tax_rate": round(gst_pct / 100, 4) if gst_pct else 0.0,
+                }
+
+        try:
+            filled_bytes = _fill_invoice_line_items_xls(file_bytes, sku_qty_map, sku_product_map)
+        except ValueError as e:
+            raise _BadFile(str(e))
+
+        s3_key = f"vendor_purchase_orders/{po_number}/InvoiceLineItems_filled_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls"
+        _upload_to_s3(filled_bytes, s3_key)
+        db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {"$set": {"invoice_file_s3_key": s3_key, "updated_at": datetime.now()}},
+        )
+        return filled_bytes
+
+    try:
+        filled_bytes = await asyncio.to_thread(_process)
+    except _NotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except _BadFile as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("upload_invoice failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    filename = f"InvoiceLineItems_{po_number}_filled.xls"
+    return StreamingResponse(
+        io.BytesIO(filled_bytes),
+        media_type="application/vnd.ms-excel",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{po_number}/invoice_file")
+async def get_invoice_file_url(po_number: str, db=Depends(get_database)):
+    """Return a short-lived presigned URL for the stored invoice file."""
+
+    def _fetch():
+        return db[PO_COLLECTION].find_one({"po_number": po_number}, {"invoice_file_s3_key": 1})
+
+    doc = await asyncio.to_thread(_fetch)
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    s3_key = doc.get("invoice_file_s3_key")
+    if not s3_key:
+        raise HTTPException(status_code=404, detail="No invoice file uploaded for this PO")
+    try:
+        url = await asyncio.to_thread(_presign_s3, s3_key)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"url": url}
+
+
 @router.get("/{po_number}/order_file")
 async def get_order_file_url(po_number: str, db=Depends(get_database)):
     """Return a short-lived presigned URL for the stored order file."""
