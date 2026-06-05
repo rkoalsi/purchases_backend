@@ -3214,7 +3214,7 @@ def _fill_invoice_line_items_xls(
             _set_val(col_qty, 0)
 
     out = io.BytesIO()
-    tree.write(out, encoding="utf-8", xml_declaration=True)
+    tree.write(out, encoding="ISO-8859-1", xml_declaration=True, standalone=True)
     return out.getvalue()
 
 

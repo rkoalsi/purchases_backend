@@ -322,6 +322,10 @@ class CreateBrandRequest(BaseModel):
     name: str
 
 
+class RenameBrandRequest(BaseModel):
+    name: str
+
+
 @router.post("/brands")
 def create_brand(body: CreateBrandRequest, db=Depends(get_database)):
     name = body.name.strip()
@@ -332,6 +336,46 @@ def create_brand(body: CreateBrandRequest, db=Depends(get_database)):
         raise HTTPException(status_code=409, detail="Brand already exists")
     result = brands_collection.insert_one({"name": name})
     return {"_id": str(result.inserted_id), "name": name}
+
+
+@router.patch("/brands/{brand_id}")
+def rename_brand(brand_id: str, body: RenameBrandRequest, db=Depends(get_database)):
+    from bson import ObjectId
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Brand name is required")
+    try:
+        oid = ObjectId(brand_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid brand_id")
+    brands_collection = db.get_collection("brands")
+    conflict = brands_collection.find_one(
+        {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}, "_id": {"$ne": oid}}
+    )
+    if conflict:
+        raise HTTPException(status_code=409, detail="A brand with that name already exists")
+    result = brands_collection.update_one({"_id": oid}, {"$set": {"name": name}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    return {"_id": brand_id, "name": name}
+
+
+@router.delete("/brands/{brand_id}")
+def delete_brand(brand_id: str, db=Depends(get_database)):
+    from bson import ObjectId
+    try:
+        oid = ObjectId(brand_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid brand_id")
+    brands_collection = db.get_collection("brands")
+    brand = brands_collection.find_one({"_id": oid}, {"vendor_ids": 1, "vendor_id": 1})
+    if not brand:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    ids = brand.get("vendor_ids") or ([brand["vendor_id"]] if brand.get("vendor_id") else [])
+    if ids:
+        raise HTTPException(status_code=400, detail="Remove all vendors before deleting this brand")
+    brands_collection.delete_one({"_id": oid})
+    return {"deleted": True}
 
 
 @router.get("")
