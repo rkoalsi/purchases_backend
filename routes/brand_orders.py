@@ -284,6 +284,7 @@ async def list_orders(brand: Optional[str] = None, db=Depends(get_database)):
                         },
                     }
                 },
+                "po_sub_total": {"$arrayElemAt": ["$_po.total", 0]},
                 "po_currency_code": {"$arrayElemAt": ["$_po.currency_code", 0]},
                 "vendor_name": {"$arrayElemAt": ["$_vendor.contact_name", 0]},
             }},
@@ -375,7 +376,7 @@ async def download_payment_report(
                 "as": "_po",
             }},
             {"$addFields": {
-                "po_sub_total": {"$arrayElemAt": ["$_po.sub_total", 0]},
+                "po_sub_total": {"$arrayElemAt": ["$_po.total", 0]},
                 "po_currency_code": {"$arrayElemAt": ["$_po.currency_code", 0]},
                 "po_status": {
                     "$let": {
@@ -688,6 +689,7 @@ async def get_order(order_id: str, db=Depends(get_database)):
                         },
                     }
                 },
+                "po_sub_total": {"$arrayElemAt": ["$_po.total", 0]},
                 "po_currency_code": {"$arrayElemAt": ["$_po.currency_code", 0]},
                 "vendor_name": {"$arrayElemAt": ["$_vendor.contact_name", 0]},
             }},
