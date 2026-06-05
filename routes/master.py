@@ -1999,12 +1999,13 @@ class OptimizedMasterReportService:
 
         return combined_data
 
-    async def fetch_inventory_valuation_cogs(self) -> Dict:
+    async def fetch_inventory_valuation_cogs(self, as_of_date: str = "") -> Dict:
         """Fetch inventory valuation from Zoho Books for Pupscribe WH only.
         Returns {
             "by_sku": {cf_sku_code: {"unit_cost": float, "asset_value": float, "qty": int}},
             "as_of_date": "YYYY-MM-DD",
         }
+        as_of_date: report end date (YYYY-MM-DD); defaults to today.
         """
         try:
             def _fetch():
@@ -2041,7 +2042,7 @@ class OptimizedMasterReportService:
                 token = r.json()["access_token"]
                 headers = {"Authorization": f"Zoho-oauthtoken {token}"}
 
-                as_of_date = datetime.now().strftime("%Y-%m-%d")
+                as_of_date = as_of_date or datetime.now().strftime("%Y-%m-%d")
                 rule = json.dumps({
                     "columns": [{"index": 1, "field": "location_name", "value": [_PUPSCRIBE_WH_LOCATION_ID], "comparator": "in", "group": "branch"}],
                     "criteria_string": "1",
@@ -2151,7 +2152,7 @@ async def _generate_master_report_data(
         _amazon_sku_task = asyncio.create_task(report_service.fetch_amazon_sku_set())
         _blinkit_sku_task = asyncio.create_task(report_service.fetch_blinkit_sku_set())
         _amazon_drr_task = asyncio.create_task(report_service.fetch_amazon_final_drr_by_sku(start_date, end_date))
-        _cogs_task = asyncio.create_task(report_service.fetch_inventory_valuation_cogs()) if include_cogs else None
+        _cogs_task = asyncio.create_task(report_service.fetch_inventory_valuation_cogs(end_date)) if include_cogs else None
 
         # Step 1: Fetch Zoho report + composite products in parallel
         tasks = []
