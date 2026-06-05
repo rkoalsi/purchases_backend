@@ -3214,7 +3214,7 @@ def _fill_invoice_line_items_xls(
             _set_val(col_qty, 0)
 
     out = io.BytesIO()
-    tree.write(out, encoding="ISO-8859-1", xml_declaration=True, standalone=True)
+    tree.write(out, encoding="utf-8", xml_declaration=True)
     return out.getvalue()
 
 
@@ -3327,10 +3327,10 @@ async def upload_invoice_line_items(
         logger.exception("upload_invoice failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-    filename = f"InvoiceLineItems_{po_number}_filled.xls"
+    filename = f"{po_number}_filled.xml"
     return StreamingResponse(
         io.BytesIO(filled_bytes),
-        media_type="application/vnd.ms-excel",
+        media_type="application/xml",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
