@@ -1408,7 +1408,6 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
         "Port→WH Days\n(V = U-S, Target 7)",
         "Port→WH %\n(W = V/N)",
         "Port→WH Over Target\n(X = V-7)",
-        "Duty Payment Date",
         "Lead Time\n(AA = Z-F)",
         "Brand",
         "Avg. Lead Time",
@@ -1440,7 +1439,6 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
             etd = order.get("etd_date")
             port = order.get("eta_port_date")
             inward = order.get("inward_date")
-            duty = order.get("duty_payment_date")
 
             G = _days_between(init, pf)
             I_ = _days_between(pf, ready)
@@ -1466,7 +1464,7 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
                 "etd": etd, "N": J, "O": O_, "P": P, "Q": Q, "R": R,
                 "port": port, "T": T_,
                 "inward": inward, "V": V, "W": W, "X": X,
-                "duty": duty, "AA": AA,
+                "AA": AA,
             })
             sr += 1
 
@@ -1505,7 +1503,6 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
                 row_data["V"],
                 row_data["W"],
                 row_data["X"],
-                fmt_date(row_data["duty"]),
                 row_data["AA"],
                 brand_name if is_last else None,
                 avg_lt if is_last else None,
@@ -1518,7 +1515,7 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
                 cell.border = border
 
                 # Date columns: format as date
-                if col_idx in (4, 5, 7, 10, 16, 18, 22, 23):
+                if col_idx in (4, 5, 7, 10, 16, 18):
                     if cell.value:
                         cell.number_format = "DD-MMM-YYYY"
                     cell.alignment = center
@@ -1528,10 +1525,10 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
                         cell.number_format = "0.0%"
                     cell.alignment = center
                 # Numeric columns
-                elif col_idx in (6, 8, 9, 11, 12, 14, 15, 17, 19, 21, 24):
+                elif col_idx in (6, 8, 9, 11, 12, 14, 15, 17, 19, 21, 22):
                     cell.alignment = center
                 # Brand / avg
-                elif col_idx in (25, 26):
+                elif col_idx in (23, 24):
                     cell.font = avg_font
                     cell.fill = avg_fill
                     cell.alignment = center
@@ -1552,7 +1549,7 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
         ws.append([None] * len(headers))
 
     # ── Column widths ─────────────────────────────────────────────────────────────
-    col_widths = [6, 22, 16, 14, 14, 12, 14, 12, 14, 14, 12, 12, 10, 12, 10, 14, 10, 14, 12, 10, 12, 14, 14, 12, 20, 12]
+    col_widths = [6, 22, 16, 14, 14, 12, 14, 12, 14, 14, 12, 12, 10, 12, 10, 14, 10, 14, 12, 10, 12, 14, 20, 12]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
