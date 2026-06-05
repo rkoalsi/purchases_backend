@@ -741,7 +741,44 @@ async def create_zoho_items(body: CreateZohoItemsRequest):
 def list_draft_orders(db=Depends(get_database)):
     """List all saved draft purchase orders (excluding items for brevity)."""
     col = db.get_collection(DRAFT_PURCHASE_ORDERS_COLLECTION)
-    docs = list(col.find({}, {"items": 1, "description": 1, "detected_vendor": 1, "date": 1, "item_count": 1, "po_created": 1, "po_number": 1, "po_status": 1, "notes": 1, "reference_number": 1, "purchaseorder_number": 1, "created_at": 1}).sort("created_at", -1).limit(100))
+    pipeline = [
+        {"$sort": {"created_at": -1}},
+        {"$limit": 100},
+        {"$lookup": {
+            "from": PURCHASE_ORDERS_COLLECTION,
+            "localField": "purchaseorder_number",
+            "foreignField": "purchaseorder_number",
+            "as": "_po",
+        }},
+        {"$addFields": {
+            "po_status": {
+                "$let": {
+                    "vars": {
+                        "fmt": {"$arrayElemAt": ["$_po.order_status_formatted", 0]},
+                        "raw": {"$arrayElemAt": ["$_po.order_status", 0]},
+                    },
+                    "in": {
+                        "$cond": {
+                            "if": {"$gt": [{"$strLenCP": {"$ifNull": ["$$fmt", ""]}}, 0]},
+                            "then": "$$fmt",
+                            "else": {
+                                "$cond": {
+                                    "if": {"$gt": [{"$strLenCP": {"$ifNull": ["$$raw", ""]}}, 0]},
+                                    "then": {"$concat": [
+                                        {"$toUpper": {"$substrCP": ["$$raw", 0, 1]}},
+                                        {"$substrCP": ["$$raw", 1, {"$subtract": [{"$strLenCP": "$$raw"}, 1]}]},
+                                    ]},
+                                    "else": None,
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+        }},
+        {"$project": {"_po": 0}},
+    ]
+    docs = list(col.aggregate(pipeline))
     return serialize_mongo_document(docs)
 
 
