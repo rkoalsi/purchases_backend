@@ -11,7 +11,7 @@ from functools import lru_cache
 from openpyxl import Workbook, load_workbook
 import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from pydantic import BaseModel
 from ..database import get_database, serialize_mongo_document
@@ -30,6 +30,8 @@ PRODUCTS_COLLECTION = "products"
 PURCHASE_ORDERS_COLLECTION = "purchase_orders"
 DRAFT_PURCHASE_ORDERS_COLLECTION = "draft_purchase_orders"
 NOTIFICATIONS_COLLECTION = "notifications"
+TASKS_COLLECTION = "tasks"
+PO_TASKS_ASSIGNEE_EMAIL = "pupurchase@barkbutler.in"
 
 
 def _get_zoho_token() -> str:
@@ -1021,6 +1023,78 @@ async def create_draft_order_po(
             logger.warning(f"Draft order PO notification fan-out failed: {_e}")
 
     asyncio.create_task(_notify_po_created())
+
+    async def _create_po_tasks():
+        def _insert_tasks():
+            user = db["purchase_users"].find_one({"email": PO_TASKS_ASSIGNEE_EMAIL})
+            if not user:
+                logger.warning(f"PO task creation: user {PO_TASKS_ASSIGNEE_EMAIL} not found")
+                return
+            user_id = str(user["_id"])
+            user_name = user.get("name", PO_TASKS_ASSIGNEE_EMAIL)
+            user_dept = user.get("department", "")
+            po_number = po_doc.get("purchaseorder_number", "")
+            vendor_name = po_doc.get("vendor_name", "")
+            now = datetime.utcnow()
+            tasks = [
+                {
+                    "title": f"Input order related dates — {po_number} ({vendor_name})",
+                    "description": f"Enter order related dates for brand order {po_number}.",
+                    "priority": "medium",
+                    "status": "todo",
+                    "assigned_to": [user_id],
+                    "assigned_to_names": [user_name],
+                    "assigned_to_departments": [user_dept],
+                    "deadline": (now + timedelta(days=7)).strftime("%Y-%m-%d"),
+                    "tags": ["brand-order", "dates"],
+                    "created_by": "system",
+                    "created_by_name": "System",
+                    "creator_department": "",
+                    "comments": [],
+                    "attachments": [],
+                    "activity": [{
+                        "type": "created",
+                        "actor_id": "system",
+                        "actor_name": "System",
+                        "detail": "Task auto-created on brand order creation.",
+                        "timestamp": now.isoformat(),
+                    }],
+                    "created_at": now,
+                    "updated_at": now,
+                },
+                {
+                    "title": f"Input payment related dates and details — {po_number} ({vendor_name})",
+                    "description": f"Enter payment related dates and details for brand order {po_number}.",
+                    "priority": "medium",
+                    "status": "todo",
+                    "assigned_to": [user_id],
+                    "assigned_to_names": [user_name],
+                    "assigned_to_departments": [user_dept],
+                    "deadline": (now + timedelta(days=20)).strftime("%Y-%m-%d"),
+                    "tags": ["brand-order", "payment"],
+                    "created_by": "system",
+                    "created_by_name": "System",
+                    "creator_department": "",
+                    "comments": [],
+                    "attachments": [],
+                    "activity": [{
+                        "type": "created",
+                        "actor_id": "system",
+                        "actor_name": "System",
+                        "detail": "Task auto-created on brand order creation.",
+                        "timestamp": now.isoformat(),
+                    }],
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            ]
+            db[TASKS_COLLECTION].insert_many(tasks)
+        try:
+            await asyncio.to_thread(_insert_tasks)
+        except Exception as _e:
+            logger.warning(f"PO task creation failed: {_e}")
+
+    asyncio.create_task(_create_po_tasks())
 
     return JSONResponse(
         status_code=201,
