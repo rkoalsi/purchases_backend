@@ -32,6 +32,7 @@ from .routes.tasks import router as tasks_router
 from .routes.notifications import router as notifications_router
 from .routes.vc_under_ordering import router as vc_under_ordering_router
 from .routes.sheets_updater import router as sheets_updater_router
+from .routes.amazon_df_inventory import router as amazon_df_inventory_router
 from .database import connect_db, close_db, get_database
 from contextlib import asynccontextmanager
 from .helpers.scheduler import scheduler, api_scheduler, setup_scheduler
@@ -142,6 +143,7 @@ app.include_router(notifications_router, prefix="/notifications", tags=["notific
 app.include_router(vc_under_ordering_router, prefix="/vc_under_ordering", tags=["vc_under_ordering"])
 app.include_router(blinkit_shipment_router, prefix="/blinkit_shipment", tags=["blinkit_shipment"])
 app.include_router(sheets_updater_router, prefix="/sheets", tags=["sheets"])
+app.include_router(amazon_df_inventory_router, prefix="/amazon_df_inventory", tags=["amazon_df_inventory"])
 
 
 # --- Protected Swagger / ReDoc / OpenAPI schema ---
