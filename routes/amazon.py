@@ -3759,11 +3759,17 @@ def _fetch_vc_inventory_latest_sync(db, end):
     latest_date = latest_doc["date"]
     date_str = latest_date.strftime("%-d %b %Y") if hasattr(latest_date, "strftime") else str(latest_date)
     inv: dict = {}
+    # Use per-ASIN latest value so ASINs whose most recent record predates the
+    # global latest_date (e.g. Amazon omitted them from the newest upload) still
+    # appear in inv with qty=0 ("Not Live") rather than being absent ("Not Listed").
+    # null sellableOnHandInventoryUnits also maps to 0 ("Not Live").
     for doc in db["amazon_vendor_inventory"].aggregate([
-        {"$match": {"date": latest_date}},
-        {"$group": {"_id": "$asin", "stock": {"$sum": "$sellableOnHandInventoryUnits"}}},
+        {"$match": {"date": {"$lte": end}}},
+        {"$sort": {"date": -1}},
+        {"$group": {"_id": "$asin", "stock": {"$first": "$sellableOnHandInventoryUnits"}}},
     ]):
-        inv[doc["_id"]] = int(doc.get("stock") or 0)
+        stock = doc.get("stock")
+        inv[doc["_id"]] = int(stock) if stock is not None else 0
     return inv, date_str
 
 
