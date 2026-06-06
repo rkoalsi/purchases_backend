@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status, Depends, Query, UploadFile, File
+from fastapi import APIRouter, Body, HTTPException, status, Depends, Query, UploadFile, File
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Set, Optional
@@ -33,7 +33,6 @@ class OptimizedMasterReportService:
 
     def __init__(self, database):
         self.database = database
-        self._product_name_cache = {}
 
     async def get_zoho_report(self, start_date: str, end_date: str) -> Dict[str, Any]:
         """Get Zoho report data"""
@@ -68,27 +67,16 @@ class OptimizedMasterReportService:
             logger.error(f"Error fetching Zoho report: {e}")
             return {"source": "zoho", "data": [], "success": False, "error": str(e)}
 
-    TRANSFER_ORDER_CUSTOMERS = [
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (KA)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (MH)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (TL)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (TN)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (WB)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (HY)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (DL)",
-        "Pupscribe Enterprises Private Limited (Blinkit Maharashtra)",
-        "Pupscribe Enterprises Private Limited (Blinkit Karnataka)",
-        "Pupscribe Enterprises Private Limited (Blinkit Telangana)",
-        "Pupscribe Enterprises Private Limited (Blinkit Tamil Nadu)",
-        "Pupscribe Enterprises Private Limited (Blinkit Haryana)",
-        "Pupscribe Enterprises Private Limited (Blinkit West Bengal)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (UP)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (GJ)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (KL)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (AD)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (GA)",
-        "(amzb2b) Pupscribe Enterprises Pvt Ltd (PB)",
-    ]
+    async def fetch_transfer_order_customers(self) -> List[str]:
+        """Load transfer-order customer names from the transfer_order_customers collection."""
+        try:
+            col = self.database.get_collection("transfer_order_customers")
+            def _query():
+                return [doc["name"] for doc in col.find({}, {"name": 1, "_id": 0}) if doc.get("name")]
+            return await asyncio.to_thread(_query)
+        except Exception as e:
+            logger.error(f"Error loading transfer order customers from DB: {e}")
+            return []
 
     async def fetch_transfer_orders(self, start_date: str, end_date: str) -> Dict[str, float]:
         """Fetch transfer order quantities from invoices for specific customer names.
@@ -98,13 +86,15 @@ class OptimizedMasterReportService:
             composite_collection = self.database.get_collection("composite_products")
             products_collection = self.database.get_collection("products")
 
+            transfer_customers = await self.fetch_transfer_order_customers()
+
             def _fetch():
                 # credit_notes stores date as ISODate, invoices as string
                 from datetime import datetime
                 cn_start = datetime.strptime(start_date, "%Y-%m-%d")
                 cn_end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
 
-                _transfer_customers_lower = [n.lower() for n in self.TRANSFER_ORDER_CUSTOMERS]
+                _transfer_customers_lower = [n.lower() for n in transfer_customers]
                 pipeline = [
                     {
                         "$match": {
@@ -754,53 +744,6 @@ class OptimizedMasterReportService:
             logger.error(f"Error fetching Amazon final DRR by SKU: {e}")
             return {}
 
-    async def batch_load_product_names(self, sku_codes: Set[str]) -> Dict[str, str]:
-        """Batch load all product names in a single database query"""
-        if not sku_codes:
-            return {}
-
-        try:
-            # Filter out invalid SKUs
-            valid_skus = {sku for sku in sku_codes if sku and sku != "Unknown SKU"}
-
-            if not valid_skus:
-                return {}
-
-            products_collection = self.database.get_collection("products")
-
-            # Single query to get all products - run in thread to avoid blocking event loop
-            def _fetch_products():
-                return list(products_collection.find(
-                    {"cf_sku_code": {"$in": list(valid_skus)}},
-                    {"cf_sku_code": 1, "name": 1, "_id": 0},
-                ).sort("_id", 1))
-
-            products = await asyncio.to_thread(_fetch_products)
-
-            # Create mapping
-            sku_to_name = {}
-            for product in products:
-                sku_code = product.get("cf_sku_code")
-                name = product.get("name")
-                if sku_code and name:
-                    sku_to_name[sku_code] = name
-
-            # Cache the results
-            self._product_name_cache.update(sku_to_name)
-
-            # Add unknown items to cache to avoid future queries
-            for sku in valid_skus:
-                if sku not in sku_to_name:
-                    sku_to_name[sku] = "Unknown Item"
-                    self._product_name_cache[sku] = "Unknown Item"
-
-            logger.info(f"Batch loaded {len(sku_to_name)} product names")
-            return sku_to_name
-
-        except Exception as e:
-            logger.error(f"Error in batch loading product names: {e}")
-            return {}
-
     async def batch_load_all_product_data(self, sku_codes: Set[str]) -> Dict[str, Dict]:
         """Batch load all product data (name, rate, brand, cbm, case_pack) in a single query.
         Returns a dict keyed by sku_code with all fields."""
@@ -1330,27 +1273,6 @@ class OptimizedMasterReportService:
             logger.error(f"Error fetching brand logistics: {e}")
             return {}
 
-    async def get_product_brands(self, sku_codes: Set[str]) -> Dict[str, str]:
-        """Batch load brand info for products"""
-        if not sku_codes:
-            return {}
-
-        try:
-            products_collection = self.database.get_collection("products")
-
-            def _fetch():
-                return list(products_collection.find(
-                    {"cf_sku_code": {"$in": list(sku_codes)}},
-                    {"cf_sku_code": 1, "brand": 1, "_id": 0}
-                ).sort("_id", 1))
-
-            products = await asyncio.to_thread(_fetch)
-            return {p.get("cf_sku_code"): p.get("brand", "") for p in products if p.get("cf_sku_code")}
-
-        except Exception as e:
-            logger.error(f"Error fetching product brands: {e}")
-            return {}
-
     async def fetch_sku_to_item_id_map(self, sku_codes: Set[str]) -> Dict[str, str]:
         """Build reverse mapping: sku_code → zoho item_id from products collection"""
         if not sku_codes:
@@ -1673,47 +1595,18 @@ class OptimizedMasterReportService:
             logger.error(f"Error fetching stock in transit: {e}")
             return {}
 
-    async def get_product_logistics(self, sku_codes: Set[str]) -> Dict[str, Dict]:
-        """Batch load CBM and case_pack from products collection"""
-        if not sku_codes:
-            return {}
+    async def fetch_latest_po_unit_prices(
+        self,
+        sku_codes: Set[str],
+        sku_to_brand: Dict[str, str] = None,
+    ) -> Dict[str, Dict]:
+        """Fetch unit price (rate) and currency_code from the latest purchase order per SKU,
+        filtered by the brand's vendor_id so prices don't bleed across vendors.
 
-        try:
-            products_collection = self.database.get_collection("products")
+        For each SKU the brand name is resolved to a vendor_id via the brands collection,
+        and only POs from that vendor are considered.  SKUs whose brand has no matching
+        vendor entry fall back to unfiltered (any vendor) so nothing is silently dropped.
 
-            def _fetch_logistics():
-                return list(products_collection.find(
-                    {"cf_sku_code": {"$in": list(sku_codes)}},
-                    {"cf_sku_code": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1,
-                     "stock_in_transit_1": 1, "stock_in_transit_2": 1, "stock_in_transit_3": 1,
-                     "hsn_or_sac": 1, "is_combo_product": 1, "_id": 0}
-                ).sort("_id", 1))
-
-            products = await asyncio.to_thread(_fetch_logistics)
-
-            result = {}
-            for p in products:
-                sku = p.get("cf_sku_code")
-                if sku:
-                    result[sku] = {
-                        "cbm": self.safe_float(p.get("cbm")),
-                        "case_pack": self.safe_float(p.get("case_pack")),
-                        "purchase_status": p.get("purchase_status", ""),
-                        "stock_in_transit_1": self.safe_float(p.get("stock_in_transit_1")),
-                        "stock_in_transit_2": self.safe_float(p.get("stock_in_transit_2")),
-                        "stock_in_transit_3": self.safe_float(p.get("stock_in_transit_3")),
-                        "hsn_or_sac": p.get("hsn_or_sac", ""),
-                        "is_combo_product": p.get("is_combo_product", False),
-                    }
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Error fetching product logistics: {e}")
-            return {}
-
-    async def fetch_latest_po_unit_prices(self, sku_codes: Set[str]) -> Dict[str, Dict]:
-        """Fetch unit price (rate) and currency_code from the latest purchase order per SKU.
         Pass 1: matches via line_items.item_custom_fields where api_name == 'cf_sku_code'.
         Pass 2 (fallback): for SKUs not found in pass 1, matches by line_items.item_id
                            via a products-collection lookup (handles POs without custom fields).
@@ -1723,39 +1616,70 @@ class OptimizedMasterReportService:
         try:
             po_collection = self.database.get_collection("purchase_orders")
             products_collection = self.database.get_collection("products")
+            brands_collection = self.database.get_collection("brands")
             sku_list = [s for s in sku_codes if s]
 
             def _fetch():
-                # Pass 1: match via item_custom_fields.cf_sku_code
-                pipeline = [
-                    {"$unwind": "$line_items"},
-                    {"$match": {"line_items.rate": {"$gt": 0}}},
-                    {"$unwind": "$line_items.item_custom_fields"},
-                    {"$match": {
-                        "line_items.item_custom_fields.api_name": "cf_sku_code",
-                        "line_items.item_custom_fields.value": {"$in": sku_list},
-                    }},
-                    {"$sort": {"date": -1}},
-                    {"$group": {
-                        "_id": "$line_items.item_custom_fields.value",
-                        "rate": {"$first": "$line_items.rate"},
-                        "currency_code": {"$first": "$currency_code"},
-                    }},
-                ]
-                result = {}
-                for doc in po_collection.aggregate(pipeline):
-                    sku = doc.get("_id")
-                    if sku:
-                        result[sku] = {
-                            "rate": float(doc.get("rate") or 0),
-                            "currency_code": doc.get("currency_code", "") or "",
-                        }
+                # Build brand_name_lower → vendor_id from brands collection
+                brand_to_vendor: Dict[str, str] = {}
+                for bdoc in brands_collection.find({}, {"name": 1, "vendor_id": 1, "_id": 0}):
+                    bname = bdoc.get("name", "")
+                    vid = bdoc.get("vendor_id", "")
+                    if bname and vid:
+                        brand_to_vendor[bname.lower()] = vid
 
-                # Pass 2: fallback for SKUs not found (PO line items without cf_sku_code)
+                # Group SKUs by vendor_id; those with no match go to unmatched_skus
+                vendor_to_skus: Dict[str, List[str]] = defaultdict(list)
+                unmatched_skus: List[str] = []
+                if sku_to_brand:
+                    for sku in sku_list:
+                        brand = sku_to_brand.get(sku, "") or ""
+                        vid = brand_to_vendor.get(brand.lower(), "") if brand else ""
+                        if vid:
+                            vendor_to_skus[vid].append(sku)
+                        else:
+                            unmatched_skus.append(sku)
+                else:
+                    unmatched_skus = sku_list
+
+                result: Dict[str, Dict] = {}
+
+                def _run_pass1(skus: List[str], vendor_id: str = None):
+                    pipeline = [
+                        *([ {"$match": {"vendor_id": vendor_id}} ] if vendor_id else []),
+                        {"$unwind": "$line_items"},
+                        {"$match": {"line_items.rate": {"$gt": 0}}},
+                        {"$unwind": "$line_items.item_custom_fields"},
+                        {"$match": {
+                            "line_items.item_custom_fields.api_name": "cf_sku_code",
+                            "line_items.item_custom_fields.value": {"$in": skus},
+                        }},
+                        {"$sort": {"date": -1}},
+                        {"$group": {
+                            "_id": "$line_items.item_custom_fields.value",
+                            "rate": {"$first": "$line_items.rate"},
+                            "currency_code": {"$first": "$currency_code"},
+                        }},
+                    ]
+                    for doc in po_collection.aggregate(pipeline):
+                        sku = doc.get("_id")
+                        if sku:
+                            result[sku] = {
+                                "rate": float(doc.get("rate") or 0),
+                                "currency_code": doc.get("currency_code", "") or "",
+                            }
+
+                # Pass 1: one pipeline per vendor group, then fallback for unmatched
+                for vid, skus in vendor_to_skus.items():
+                    _run_pass1(skus, vendor_id=vid)
+                if unmatched_skus:
+                    _run_pass1(unmatched_skus, vendor_id=None)
+
+                # Pass 2: fallback for SKUs still not found (PO line items without cf_sku_code)
                 missing_skus = [s for s in sku_list if s not in result]
                 if missing_skus:
-                    # Build item_id → sku map for missing SKUs from products collection
                     item_id_to_sku: Dict[str, str] = {}
+                    item_id_to_vendor: Dict[str, str] = {}
                     for doc in products_collection.find(
                         {"cf_sku_code": {"$in": missing_skus}},
                         {"item_id": 1, "cf_sku_code": 1, "_id": 0},
@@ -1763,35 +1687,56 @@ class OptimizedMasterReportService:
                         iid = doc.get("item_id")
                         sku = doc.get("cf_sku_code", "")
                         if iid and sku:
-                            item_id_to_sku[str(iid)] = sku
+                            iid_str = str(iid)
+                            item_id_to_sku[iid_str] = sku
+                            if sku_to_brand:
+                                brand = sku_to_brand.get(sku, "") or ""
+                                vid = brand_to_vendor.get(brand.lower(), "") if brand else ""
+                                if vid:
+                                    item_id_to_vendor[iid_str] = vid
 
                     if item_id_to_sku:
-                        str_ids = list(item_id_to_sku.keys())
-                        int_ids = [int(i) for i in str_ids if i.isdigit()]
-                        pipeline2 = [
-                            {"$unwind": "$line_items"},
-                            {"$match": {"$and": [
-                                {"$or": [
-                                    {"line_items.item_id": {"$in": str_ids}},
-                                    {"line_items.item_id": {"$in": int_ids}},
-                                ]},
-                                {"line_items.rate": {"$gt": 0}},
-                            ]}},
-                            {"$sort": {"date": -1}},
-                            {"$group": {
-                                "_id": "$line_items.item_id",
-                                "rate": {"$first": "$line_items.rate"},
-                                "currency_code": {"$first": "$currency_code"},
-                            }},
-                        ]
-                        for doc in po_collection.aggregate(pipeline2):
-                            iid = str(doc.get("_id", ""))
-                            sku = item_id_to_sku.get(iid)
-                            if sku and sku not in result:
-                                result[sku] = {
-                                    "rate": float(doc.get("rate") or 0),
-                                    "currency_code": doc.get("currency_code", "") or "",
-                                }
+                        vendor_to_item_ids: Dict[str, List[str]] = defaultdict(list)
+                        unmatched_item_ids: List[str] = []
+                        for iid_str in item_id_to_sku:
+                            vid = item_id_to_vendor.get(iid_str, "")
+                            if vid:
+                                vendor_to_item_ids[vid].append(iid_str)
+                            else:
+                                unmatched_item_ids.append(iid_str)
+
+                        def _run_pass2(str_ids: List[str], vendor_id: str = None):
+                            int_ids = [int(i) for i in str_ids if i.isdigit()]
+                            pipeline2 = [
+                                *([ {"$match": {"vendor_id": vendor_id}} ] if vendor_id else []),
+                                {"$unwind": "$line_items"},
+                                {"$match": {"$and": [
+                                    {"$or": [
+                                        {"line_items.item_id": {"$in": str_ids}},
+                                        {"line_items.item_id": {"$in": int_ids}},
+                                    ]},
+                                    {"line_items.rate": {"$gt": 0}},
+                                ]}},
+                                {"$sort": {"date": -1}},
+                                {"$group": {
+                                    "_id": "$line_items.item_id",
+                                    "rate": {"$first": "$line_items.rate"},
+                                    "currency_code": {"$first": "$currency_code"},
+                                }},
+                            ]
+                            for doc in po_collection.aggregate(pipeline2):
+                                iid = str(doc.get("_id", ""))
+                                sku = item_id_to_sku.get(iid)
+                                if sku and sku not in result:
+                                    result[sku] = {
+                                        "rate": float(doc.get("rate") or 0),
+                                        "currency_code": doc.get("currency_code", "") or "",
+                                    }
+
+                        for vid, iids in vendor_to_item_ids.items():
+                            _run_pass2(iids, vendor_id=vid)
+                        if unmatched_item_ids:
+                            _run_pass2(unmatched_item_ids, vendor_id=None)
 
                 return result
 
@@ -1803,6 +1748,54 @@ class OptimizedMasterReportService:
             return {}
 
     @staticmethod
+    def _apply_lookback_to_item(item: Dict, lb: Dict, start_date: str) -> None:
+        """Apply a single DRR lookback result to an item, setting all drr/highlight fields in-place."""
+        metrics = item.get("combined_metrics", {})
+        if lb["found"]:
+            metrics["avg_daily_run_rate"] = lb["drr"]
+            if lb["drr"] > 0:
+                metrics["avg_days_of_coverage"] = round(
+                    metrics.get("total_closing_stock", 0) / lb["drr"], 2
+                )
+            item["drr_source"] = "previous_period"
+            item["drr_lookback_period"] = lb["lookback_period"]
+            item["drr_lookback_days_in_stock"] = lb["days_in_stock"]
+            item["drr_lookback_sales"] = lb["units_sold"]
+            item["drr_lookback_returns"] = lb.get("returns", 0)
+            item["drr_net_lookback_sales"] = lb.get("net_units_sold", 0)
+            lb_period = lb["lookback_period"]
+            gt_180 = False
+            seasonal_mismatch = False
+            if lb_period and " to " in lb_period:
+                lb_start_str = lb_period.split(" to ")[0].strip()
+                try:
+                    lb_start_dt = datetime.strptime(lb_start_str, "%Y-%m-%d")
+                    report_start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                    gt_180 = (report_start_dt - lb_start_dt).days > 180
+                    seasonal_mismatch = (
+                        (lb_start_dt.month - 1) // 3 != (report_start_dt.month - 1) // 3
+                    )
+                except ValueError:
+                    pass
+            item["drr_lookback_gt_180"] = gt_180
+            item["drr_lookback_seasonal_mismatch"] = seasonal_mismatch
+            item["highlight"] = "orange" if gt_180 else "yellow"
+            current_net_sales = metrics.get("total_sales", 0)
+            if lb.get("net_units_sold", lb["units_sold"]) < current_net_sales:
+                item["order_qty_demand_override"] = True
+                item["current_period_sales_for_override"] = current_net_sales
+        else:
+            item["drr_source"] = "insufficient_stock"
+            item["drr_lookback_period"] = ""
+            item["drr_lookback_days_in_stock"] = 0
+            item["drr_lookback_sales"] = 0
+            item["drr_lookback_returns"] = 0
+            item["drr_net_lookback_sales"] = 0
+            item["drr_lookback_gt_180"] = False
+            item["drr_lookback_seasonal_mismatch"] = False
+            item["highlight"] = "red"
+
+    @staticmethod
     def enrich_with_order_calculations(
         combined_data: List[Dict],
         transit_data: Dict[str, Dict],
@@ -1811,7 +1804,9 @@ class OptimizedMasterReportService:
         period_days: int = 30,
         current_period_missed_sales_by_sku: Dict[str, float] = None,
     ) -> List[Dict]:
-        """Add order calculation columns to each item in combined_data"""
+        """Set per-item logistics metadata, missed sales, and confidence labels.
+        Coverage and order quantities are deferred to _compute_order_quantities,
+        which runs once after latest stock is attached to each item."""
         if missed_sales_by_sku is None:
             missed_sales_by_sku = {}
         if current_period_missed_sales_by_sku is None:
@@ -1821,29 +1816,15 @@ class OptimizedMasterReportService:
             sku = item.get("sku_code", "")
             metrics = item.get("combined_metrics", {})
             drr = metrics.get("avg_daily_run_rate", 0)
-            closing_stock = metrics.get("total_closing_stock", 0)
 
             # Transit data: always derived from open purchase orders
             logistics = logistics_data.get(sku, {})
             purchase_status = logistics.get("purchase_status", "")
             transit = transit_data.get(sku, {})
-            sit_1 = transit.get("transit_1", 0)
-            sit_2 = transit.get("transit_2", 0)
-            sit_3 = transit.get("transit_3", 0)
-            item["stock_in_transit_1"] = sit_1
-            item["stock_in_transit_2"] = sit_2
-            item["stock_in_transit_3"] = sit_3
-            total_transit = transit.get("total", 0)  # sum of ALL open PO lines, not just 3
-            item["total_stock_in_transit"] = total_transit
-
-            # Days coverage
-            on_hand_days = metrics.get("avg_days_of_coverage", 0)
-            item["on_hand_days_coverage"] = round(on_hand_days, 2)
-
-            current_days_coverage = 0
-            if drr > 0:
-                current_days_coverage = round((closing_stock + total_transit) / drr, 2)
-            item["current_days_coverage"] = current_days_coverage
+            item["stock_in_transit_1"] = transit.get("transit_1", 0)
+            item["stock_in_transit_2"] = transit.get("transit_2", 0)
+            item["stock_in_transit_3"] = transit.get("transit_3", 0)
+            item["total_stock_in_transit"] = transit.get("total", 0)
 
             # Target days = lead_time + safety_days + order_processing
             safety_days = item.get("safety_days", 15)
@@ -1851,18 +1832,16 @@ class OptimizedMasterReportService:
             order_processing = 10
             item["order_processing"] = order_processing
             target_days = lead_time + safety_days + order_processing
+            item["target_days"] = target_days
 
-            # Missed Sales columns (inserted between Current Days Coverage and Target Days)
-            # For demand-override items use current-period missed sales; otherwise use
-            # whatever is in missed_sales_by_sku (which may be lookback-period for those SKUs)
+            # Missed Sales — sourced from lookback period for yellow/orange rows,
+            # current period for white/red/green rows
             if item.get("order_qty_demand_override"):
                 missed_sales = current_period_missed_sales_by_sku.get(sku, 0)
             else:
                 missed_sales = missed_sales_by_sku.get(sku, 0)
             item["missed_sales"] = missed_sales
             missed_sales_drr_raw = missed_sales / period_days if period_days > 0 else 0.0
-            
-            # Cap at 50% of true DRR to prevent over-ordering from missed sales spikes
             if drr > 0:
                 missed_sales_drr_raw = min(missed_sales_drr_raw, 0.5 * drr)
             missed_sales_drr = round(missed_sales_drr_raw, 4)
@@ -1870,65 +1849,29 @@ class OptimizedMasterReportService:
             extra_qty = round(missed_sales_drr * lead_time, 2)
             item["extra_qty"] = extra_qty
 
-            # Net Target Days
-            if current_days_coverage < lead_time:
-                net_target_days = target_days
-            else:
-                net_target_days = target_days - current_days_coverage
-            item["net_target_days"] = round(net_target_days, 2)
-
-            item["target_days"] = target_days
-
-            # Excess or Order
-            if drr == 0:
-                item["excess_or_order"] = "NO MOVEMENT"
-            elif current_days_coverage < target_days:
-                item["excess_or_order"] = "ORDER"
-            else:
-                item["excess_or_order"] = "EXCESS"
-
-            # Logistics (CBM / Case Pack / Purchase Status / Is New)
-            cbm = logistics.get("cbm", 0)
-            case_pack = logistics.get("case_pack", 0)
-            item["cbm"] = cbm
-            item["case_pack"] = case_pack
+            # Logistics metadata
+            item["cbm"] = logistics.get("cbm", 0)
+            item["case_pack"] = logistics.get("case_pack", 0)
             item["purchase_status"] = purchase_status
             item["is_new"] = logistics.get("is_new", False)
             item["hsn_or_sac"] = logistics.get("hsn_or_sac", "")
             item["is_combo_product"] = logistics.get("is_combo_product", False)
 
-            # Skip order quantity calculations for inactive / discontinued items
+            # Inactive items: zero out order fields; _compute_order_quantities
+            # will set days_total_inventory_lasts using latest stock.
             if purchase_status in ("inactive", "discontinued until stock lasts"):
                 item["order_qty"] = 0
                 item["order_qty_plus_extra_qty"] = round(extra_qty, 2)
                 item["order_qty_plus_extra_qty_rounded"] = 0
                 item["total_cbm"] = 0
                 item["days_current_order_lasts"] = 0
-                item["days_total_inventory_lasts"] = round(current_days_coverage, 2)
                 item["order_qty_basis"] = ""
+                item["confidence_multiplier"] = 1.0
                 continue
 
-            # Order quantity
-            order_qty = max(0, net_target_days * drr)
-
-            # Demand-based override: when current-period net sales exceed lookback net sales,
-            # use current-period sales as the order qty instead of DRR × target days.
-            # If coverage is already EXCESS, order nothing (matches Excel: IF(EXCESS, 0, ...)).
-            if item.get("order_qty_demand_override"):
-                if item.get("excess_or_order") == "EXCESS":
-                    order_qty = 0.0
-                else:
-                    order_qty = round(item.get("current_period_sales_for_override", 0), 2)
-                item["order_qty_basis"] = "Current Period Sales"
-            else:
-                item["order_qty_basis"] = ""
-
-            # DRR Flag: confidence tier dampening for items with insufficient stock data.
-            # Applies to insufficient_stock items based on days in stock in the current period.
-            # Tiers: 0–29d → manual (order=0), 30–44d → 0.5×, 45–59d → 0.75×, 60+d → 1.0×
+            # Confidence multiplier and DRR flag label (stock-independent)
             if item.get("drr_source") == "insufficient_stock":
-                days_in_stock = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
-
+                days_in_stock = metrics.get("total_days_in_stock", 0)
                 if days_in_stock < 30:
                     confidence_multiplier = 0.0
                     drr_flag_label = "Manual buyer input required (0%)"
@@ -1941,63 +1884,81 @@ class OptimizedMasterReportService:
                 else:
                     confidence_multiplier = 1.0
                     drr_flag_label = ""
-
-                order_qty = order_qty * confidence_multiplier
-                item["confidence_multiplier"] = confidence_multiplier
-
                 if item.get("order_qty_demand_override"):
                     item["order_qty_basis"] = f"Current Period Sales · {drr_flag_label}" if drr_flag_label else "Current Period Sales"
                 else:
                     item["order_qty_basis"] = drr_flag_label
             else:
-                item["confidence_multiplier"] = 1.0
+                confidence_multiplier = 1.0
+                item["order_qty_basis"] = "Current Period Sales" if item.get("order_qty_demand_override") else ""
+            item["confidence_multiplier"] = confidence_multiplier
 
-            # Append seasonal mismatch warning to DRR Flag when the lookback DRR
-            # comes from a different calendar quarter than the report period.
-            # Purely advisory — does not change order_qty.
             if item.get("drr_lookback_seasonal_mismatch"):
                 existing = item.get("order_qty_basis", "")
                 item["order_qty_basis"] = f"{existing} · Seasonal mismatch" if existing else "Seasonal mismatch"
 
-            item["order_qty"] = round(order_qty, 2)
+        return combined_data
 
-            # Order Qty + Extra Qty
+    @staticmethod
+    def _compute_order_quantities(combined_data: List[Dict]) -> None:
+        """Compute coverage and order quantities using item.latest_total_stock.
+        Modifies items in-place. Must be called after latest stock is attached."""
+        for item in combined_data:
+            metrics = item.get("combined_metrics", {})
+            drr = metrics.get("avg_daily_run_rate", 0)
+            latest_stock = item.get("latest_total_stock", 0)
+            total_transit = item.get("total_stock_in_transit", 0)
+            purchase_status = item.get("purchase_status", "")
+
+            avg_doc = round(latest_stock / drr, 2) if drr > 0 else 0.0
+            metrics["avg_days_of_coverage"] = avg_doc
+            item["on_hand_days_coverage"] = avg_doc
+
+            current_days_coverage = round((latest_stock + total_transit) / drr, 2) if drr > 0 else 0.0
+            item["current_days_coverage"] = current_days_coverage
+
+            target_days = item.get("target_days", 0)
+            if drr == 0:
+                item["excess_or_order"] = "NO MOVEMENT"
+            elif current_days_coverage < target_days:
+                item["excess_or_order"] = "ORDER"
+            else:
+                item["excess_or_order"] = "EXCESS"
+
+            if purchase_status in ("inactive", "discontinued until stock lasts"):
+                item["days_total_inventory_lasts"] = round(current_days_coverage, 2)
+                continue
+
+            extra_qty = item.get("extra_qty", 0)
+            lead_time_val = item.get("lead_time", 60)
+            net_target_days = target_days if current_days_coverage < lead_time_val else target_days - current_days_coverage
+            item["net_target_days"] = round(net_target_days, 2)
+
+            confidence_multiplier = item.get("confidence_multiplier", 1.0)
+            if item.get("order_qty_demand_override"):
+                order_qty = 0.0 if item.get("excess_or_order") == "EXCESS" else item.get("current_period_sales_for_override", 0) * confidence_multiplier
+            else:
+                order_qty = max(0, net_target_days * drr) * confidence_multiplier
+            item["order_qty"] = round(order_qty, 2)
             item["order_qty_plus_extra_qty"] = round(order_qty + extra_qty, 2)
 
-            # Order Qty + Extra Qty rounded down to case pack.
-            # EXCESS → always 0 (no ordering even for extra/missed-sales qty).
-            # ORDER + rounded = 0 → bump to 1 case pack (minimum meaningful order).
+            case_pack = item.get("case_pack", 0)
             order_qty_plus_extra_qty = item["order_qty_plus_extra_qty"]
             if item.get("excess_or_order") == "EXCESS":
                 item["order_qty_plus_extra_qty_rounded"] = 0
             elif case_pack > 0:
                 rounded = math.floor(order_qty_plus_extra_qty / case_pack) * case_pack
                 if rounded == 0 and item.get("excess_or_order") == "ORDER":
-                    rounded = case_pack  # minimum 1 case pack
+                    rounded = case_pack
                 item["order_qty_plus_extra_qty_rounded"] = rounded
             else:
                 item["order_qty_plus_extra_qty_rounded"] = round(order_qty_plus_extra_qty, 0)
 
             order_qty_rounded = item["order_qty_plus_extra_qty_rounded"]
-
-            # Total CBM
-            if case_pack > 0 and cbm > 0:
-                item["total_cbm"] = round((order_qty_rounded / case_pack) * cbm, 4)
-            else:
-                item["total_cbm"] = 0
-
-            # Days current order will last
-            if drr > 0:
-                item["days_current_order_lasts"] = round(order_qty_rounded / drr, 2)
-            else:
-                item["days_current_order_lasts"] = 0
-
-            # Days total inventory will last = current coverage + days order lasts
-            item["days_total_inventory_lasts"] = round(
-                current_days_coverage + item["days_current_order_lasts"], 2
-            )
-
-        return combined_data
+            cbm = item.get("cbm", 0)
+            item["total_cbm"] = round((order_qty_rounded / case_pack) * cbm, 4) if case_pack > 0 and cbm > 0 else 0
+            item["days_current_order_lasts"] = round(order_qty_rounded / drr, 2) if drr > 0 else 0
+            item["days_total_inventory_lasts"] = round(current_days_coverage + item["days_current_order_lasts"], 2)
 
     async def fetch_inventory_valuation_cogs(self, as_of_date: str) -> Dict:
         """Fetch inventory valuation from Zoho Books for Pupscribe WH only.
@@ -2423,68 +2384,13 @@ async def _generate_master_report_data(
                         for item in combined_data:
                             sku = item.get("sku_code", "")
                             days = item.get("combined_metrics", {}).get("total_days_in_stock", 0)
-                            metrics = item.get("combined_metrics", {})
-
-                            if days >= 60:
-                                item["drr_source"] = "current_period"
-                                item["drr_lookback_period"] = ""
-                                item["highlight"] = None
-                            elif sku in lookback_results:
-                                lb = lookback_results[sku]
-                                if lb["found"]:
-                                    metrics["avg_daily_run_rate"] = lb["drr"]
-                                    if lb["drr"] > 0:
-                                        metrics["avg_days_of_coverage"] = round(
-                                            metrics.get("total_closing_stock", 0) / lb["drr"], 2
-                                        )
-                                    item["drr_source"] = "previous_period"
-                                    item["drr_lookback_period"] = lb["lookback_period"]
-                                    item["drr_lookback_days_in_stock"] = lb["days_in_stock"]
-                                    item["drr_lookback_sales"] = lb["units_sold"]
-                                    item["drr_lookback_returns"] = lb.get("returns", 0)
-                                    item["drr_net_lookback_sales"] = lb.get("net_units_sold", 0)
-                                    # Flag if lookback period is > 180 days before report start,
-                                    # and if it falls in a different calendar quarter (seasonal mismatch).
-                                    lb_period = lb["lookback_period"]
-                                    gt_180 = False
-                                    seasonal_mismatch = False
-                                    if lb_period and " to " in lb_period:
-                                        lb_start_str = lb_period.split(" to ")[0].strip()
-                                        try:
-                                            lb_start_dt = datetime.strptime(lb_start_str, "%Y-%m-%d")
-                                            report_start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-                                            gt_180 = (report_start_dt - lb_start_dt).days > 180
-                                            # Different calendar quarter → potential seasonal demand mismatch
-                                            seasonal_mismatch = (
-                                                (lb_start_dt.month - 1) // 3
-                                                != (report_start_dt.month - 1) // 3
-                                            )
-                                        except ValueError:
-                                            pass
-                                    item["drr_lookback_gt_180"] = gt_180
-                                    item["drr_lookback_seasonal_mismatch"] = seasonal_mismatch
-                                    item["highlight"] = "orange" if gt_180 else "yellow"
-                                    # If current-period sales exceed lookback net sales, flag for
-                                    # demand-based order qty override (order qty = current sales)
-                                    current_net_sales = metrics.get("total_sales", 0)
-                                    if lb.get("net_units_sold", lb["units_sold"]) < current_net_sales:
-                                        item["order_qty_demand_override"] = True
-                                        item["current_period_sales_for_override"] = current_net_sales
-                                else:
-                                    item["drr_source"] = "insufficient_stock"
-                                    item["drr_lookback_period"] = ""
-                                    item["drr_lookback_days_in_stock"] = 0
-                                    item["drr_lookback_sales"] = 0
-                                    item["drr_lookback_returns"] = 0
-                                    item["drr_net_lookback_sales"] = 0
-                                    item["drr_lookback_gt_180"] = False
-                                    item["drr_lookback_seasonal_mismatch"] = False
-                                    item["highlight"] = "red"
-                            else:
+                            if days >= 60 or sku not in lookback_results:
                                 item["drr_source"] = "current_period"
                                 item["drr_lookback_period"] = ""
                                 item["drr_lookback_seasonal_mismatch"] = False
                                 item["highlight"] = None
+                            else:
+                                report_service._apply_lookback_to_item(item, lookback_results[sku], start_date)
 
                         logger.info(
                             f"DRR lookback complete: "
@@ -2572,6 +2478,7 @@ async def _generate_master_report_data(
             product_rates = {}
             product_brands = {}
             logistics_data = {}
+            _po_prices_task = None
             try:
                 for sku, pdata in all_product_data.items():
                     rate = pdata.get("rate")
@@ -2592,6 +2499,11 @@ async def _generate_master_report_data(
                         "hsn_or_sac": pdata.get("hsn_or_sac", ""),
                         "is_combo_product": pdata.get("is_combo_product", False),
                     }
+
+                # Kick off vendor-filtered PO price fetch now that product_brands is ready
+                _po_prices_task = asyncio.create_task(
+                    report_service.fetch_latest_po_unit_prices(set(product_brands.keys()), product_brands)
+                )
 
                 if brand:
                     if brand.lower() == "petfest":
@@ -2865,50 +2777,8 @@ async def _generate_master_report_data(
                             )
                             for item in combined_data:
                                 sku = item.get("sku_code", "")
-                                if sku not in stub_lookback_results:
-                                    continue
-                                lb = stub_lookback_results[sku]
-                                metrics = item.get("combined_metrics", {})
-                                if lb["found"]:
-                                    metrics["avg_daily_run_rate"] = lb["drr"]
-                                    if lb["drr"] > 0:
-                                        metrics["avg_days_of_coverage"] = round(
-                                            metrics.get("total_closing_stock", 0) / lb["drr"], 2
-                                        )
-                                    item["drr_source"] = "previous_period"
-                                    item["drr_lookback_period"] = lb["lookback_period"]
-                                    item["drr_lookback_days_in_stock"] = lb["days_in_stock"]
-                                    item["drr_lookback_sales"] = lb["units_sold"]
-                                    item["drr_lookback_returns"] = lb.get("returns", 0)
-                                    item["drr_net_lookback_sales"] = lb.get("net_units_sold", 0)
-                                    lb_period = lb["lookback_period"]
-                                    gt_180 = False
-                                    seasonal_mismatch = False
-                                    if lb_period and " to " in lb_period:
-                                        lb_start_str = lb_period.split(" to ")[0].strip()
-                                        try:
-                                            lb_start_dt = datetime.strptime(lb_start_str, "%Y-%m-%d")
-                                            report_start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-                                            gt_180 = (report_start_dt - lb_start_dt).days > 180
-                                            seasonal_mismatch = (
-                                                (lb_start_dt.month - 1) // 3
-                                                != (report_start_dt.month - 1) // 3
-                                            )
-                                        except ValueError:
-                                            pass
-                                    item["drr_lookback_gt_180"] = gt_180
-                                    item["drr_lookback_seasonal_mismatch"] = seasonal_mismatch
-                                    item["highlight"] = "orange" if gt_180 else "yellow"
-                                else:
-                                    item["drr_source"] = "insufficient_stock"
-                                    item["drr_lookback_period"] = ""
-                                    item["drr_lookback_days_in_stock"] = 0
-                                    item["drr_lookback_sales"] = 0
-                                    item["drr_lookback_returns"] = 0
-                                    item["drr_net_lookback_sales"] = 0
-                                    item["drr_lookback_gt_180"] = False
-                                    item["drr_lookback_seasonal_mismatch"] = False
-                                    item["highlight"] = "red"
+                                if sku in stub_lookback_results:
+                                    report_service._apply_lookback_to_item(item, stub_lookback_results[sku], start_date)
                             logger.info(
                                 f"Stub second-pass lookback complete: "
                                 f"{sum(1 for r in stub_lookback_results.values() if r['found'])} found, "
@@ -2931,6 +2801,17 @@ async def _generate_master_report_data(
                 logger.error(f"Error in movement classification and order calculations: {e}")
                 errors.append(f"Movement/order enrichment error: {str(e)}")
 
+            # Await vendor-filtered PO unit prices (started after product_brands was built)
+            po_prices_by_sku: Dict[str, Dict] = {}
+            if _po_prices_task is not None:
+                try:
+                    po_prices_by_sku = await asyncio.wait_for(_po_prices_task, timeout=30.0)
+                    logger.info(f"PO unit prices resolved for {len(po_prices_by_sku)} SKUs")
+                except Exception as _e:
+                    logger.error(f"PO unit prices fetch failed: {_e}")
+                    if not _po_prices_task.done():
+                        _po_prices_task.cancel()
+
             # Attach latest current stock, PO unit prices, manufacturer code, and Etrade VC data
             for item in combined_data:
                 sku = item.get("sku_code", "")
@@ -2942,8 +2823,9 @@ async def _generate_master_report_data(
                 item["prev_zoho_stock"] = max(0, round(prev_zoho_by_sku.get(sku, 0), 2))
                 item["prev_fba_stock"] = round(prev_fba_by_sku.get(sku, 0), 2)
                 _pdata = all_product_data.get(sku, {})
-                item["unit_price"] = _pdata.get("purchase_price", 0) or 0
-                item["unit_price_currency"] = _pdata.get("currency", "") or ""
+                _po_price = po_prices_by_sku.get(sku, {})
+                item["unit_price"] = _po_price.get("rate") or _pdata.get("purchase_price", 0) or 0
+                item["unit_price_currency"] = _po_price.get("currency_code") or _pdata.get("currency", "") or ""
                 item["manufacturer_code"] = all_product_data.get(sku, {}).get("manufacturer_code", "")
                 item["mrp"] = product_rates.get(sku)
                 item["brand"] = product_brands.get(sku, "")
@@ -2971,92 +2853,9 @@ async def _generate_master_report_data(
                 metrics_ref["etrade_drr"] = round(vc_drr, 4)
                 metrics_ref["etrade_days_inventory_lasts"] = round(vc_stock / vc_drr, 2) if vc_drr > 0 else 0.0
 
-            # Recalculate days-coverage columns and all downstream order calculations
-            # using latest DB stock instead of end-of-period closing stock.
-            for item in combined_data:
-                metrics = item.get("combined_metrics", {})
-                drr = metrics.get("avg_daily_run_rate", 0)
-                latest_stock = item.get("latest_total_stock", 0)
-                total_transit = item.get("total_stock_in_transit", 0)
-                purchase_status = item.get("purchase_status", "")
-
-                # Avg Days of Coverage and On-Hand Days Coverage
-                if drr > 0:
-                    avg_doc = round(latest_stock / drr, 2)
-                else:
-                    avg_doc = 0.0
-                metrics["avg_days_of_coverage"] = avg_doc
-                item["on_hand_days_coverage"] = avg_doc
-
-                # Current Days Coverage
-                if drr > 0:
-                    current_days_coverage = round((latest_stock + total_transit) / drr, 2)
-                else:
-                    current_days_coverage = 0.0
-                item["current_days_coverage"] = current_days_coverage
-
-                # Refresh Excess / Order flag
-                target_days = item.get("target_days", 0)
-                if drr == 0:
-                    item["excess_or_order"] = "NO MOVEMENT"
-                elif current_days_coverage < target_days:
-                    item["excess_or_order"] = "ORDER"
-                else:
-                    item["excess_or_order"] = "EXCESS"
-
-                # Inactive / discontinued: only days_total_inventory_lasts needs updating
-                if purchase_status in ("inactive", "discontinued until stock lasts"):
-                    item["days_total_inventory_lasts"] = round(current_days_coverage, 2)
-                    continue
-
-                # Order quantity
-                extra_qty = item.get("extra_qty", 0)
-                lead_time_val = item.get("lead_time", 60)
-                if current_days_coverage < lead_time_val:
-                    net_target_days = target_days
-                else:
-                    net_target_days = target_days - current_days_coverage
-                item["net_target_days"] = round(net_target_days, 2)
-                confidence_multiplier = item.get("confidence_multiplier", 1.0)
-                if item.get("order_qty_demand_override"):
-                    # Excess coverage → order nothing (matches Excel IF(EXCESS, 0, ...))
-                    if item.get("excess_or_order") == "EXCESS":
-                        order_qty = 0.0
-                    else:
-                        order_qty = item.get("current_period_sales_for_override", 0) * confidence_multiplier
-                else:
-                    order_qty = max(0, net_target_days * drr) * confidence_multiplier
-                item["order_qty"] = round(order_qty, 2)
-                item["order_qty_plus_extra_qty"] = round(order_qty + extra_qty, 2)
-
-                case_pack = item.get("case_pack", 0)
-                order_qty_plus_extra_qty = item["order_qty_plus_extra_qty"]
-                if item.get("excess_or_order") == "EXCESS":
-                    item["order_qty_plus_extra_qty_rounded"] = 0
-                elif case_pack > 0:
-                    rounded = math.floor(order_qty_plus_extra_qty / case_pack) * case_pack
-                    if rounded == 0 and item.get("excess_or_order") == "ORDER":
-                        rounded = case_pack  # minimum 1 case pack
-                    item["order_qty_plus_extra_qty_rounded"] = rounded
-                else:
-                    item["order_qty_plus_extra_qty_rounded"] = round(order_qty_plus_extra_qty, 0)
-
-                order_qty_rounded = item["order_qty_plus_extra_qty_rounded"]
-
-                cbm = item.get("cbm", 0)
-                if case_pack > 0 and cbm > 0:
-                    item["total_cbm"] = round((order_qty_rounded / case_pack) * cbm, 4)
-                else:
-                    item["total_cbm"] = 0
-
-                if drr > 0:
-                    item["days_current_order_lasts"] = round(order_qty_rounded / drr, 2)
-                else:
-                    item["days_current_order_lasts"] = 0
-
-                item["days_total_inventory_lasts"] = round(
-                    current_days_coverage + item["days_current_order_lasts"], 2
-                )
+            # Compute coverage and order quantities once, using latest DB stock
+            # (latest_total_stock was attached in the loop above).
+            report_service._compute_order_quantities(combined_data)
 
             # Await past 90d DRR and compute return_pct + growth_rate for every item
             past_drr_by_sku: Dict[str, float] = {}
@@ -4898,11 +4697,12 @@ async def download_dashboard_kpi(
         combined_data = content.get("combined_data", [])
         latest_stock_dates = content.get("latest_stock_dates", {})
 
-        # Batch-load rates for inventory / missed-sales value columns
-        all_skus = {i.get("sku_code") for i in combined_data if i.get("sku_code")}
-        product_data_map = await service.batch_load_all_product_data(all_skus) if all_skus else {}
+        # Build rate_map from mrp already attached to each combined_data item by
+        # _generate_master_report_data — avoids a redundant products collection query.
         rate_map: Dict[str, float] = {
-            sku: float(pdata.get("rate") or 0) for sku, pdata in product_data_map.items()
+            item.get("sku_code"): float(item.get("mrp") or 0)
+            for item in combined_data
+            if item.get("sku_code")
         }
 
         def _fmt_date(d: str) -> str:
@@ -5075,6 +4875,37 @@ async def download_dashboard_kpi(
         logger.error(f"Error generating dashboard KPI download: {e}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to generate KPI download: {str(e)}")
+
+
+@router.get("/transfer-customers")
+def get_transfer_customers(db=Depends(get_database)):
+    """Return transfer-order customer names from the transfer_order_customers collection."""
+    col = db.get_collection("transfer_order_customers")
+    names = [doc["name"] for doc in col.find({}, {"name": 1, "_id": 0}) if doc.get("name")]
+    return {"customers": names}
+
+
+@router.post("/transfer-customers")
+def add_transfer_customer(payload: dict = Body(...), db=Depends(get_database)):
+    """Add a customer name to the transfer-order customers list."""
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    col = db.get_collection("transfer_order_customers")
+    if col.find_one({"name": name}):
+        raise HTTPException(status_code=409, detail="Customer already exists")
+    col.insert_one({"name": name})
+    return {"message": "Added", "name": name}
+
+
+@router.delete("/transfer-customers/{name:path}")
+def delete_transfer_customer(name: str, db=Depends(get_database)):
+    """Remove a customer name from the transfer-order customers list."""
+    col = db.get_collection("transfer_order_customers")
+    result = col.delete_one({"name": name})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return {"message": "Deleted", "name": name}
 
 
 @router.get("/brands")
