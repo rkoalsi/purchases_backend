@@ -123,6 +123,8 @@ async def create_order(
     duty_payment_date: Optional[str] = Form(None),
     inward_date: Optional[str] = Form(None),
     po_due_date: Optional[str] = Form(None),
+    advance_payment_date: Optional[str] = Form(None),
+    advance_payment_amount: Optional[float] = Form(None),
     custom_duty: Optional[float] = Form(None),
     custom_duty_due_date: Optional[str] = Form(None),
     shipping_charges: Optional[float] = Form(None),
@@ -149,6 +151,7 @@ async def create_order(
         "duty_payment_date": duty_payment_date,
         "inward_date": inward_date,
         "po_due_date": po_due_date,
+        "advance_payment_date": advance_payment_date,
         "custom_duty_due_date": custom_duty_due_date,
         "shipping_charges_due_date": shipping_charges_due_date,
     })
@@ -187,6 +190,7 @@ async def create_order(
             "created_at": now,
             "updated_at": now,
             **extra_dates,
+            "advance_payment_amount": advance_payment_amount,
             "custom_duty": custom_duty,
             "shipping_charges": shipping_charges,
         }
@@ -408,7 +412,8 @@ async def download_payment_report(
             {"$project": {
                 "brand": 1, "name": 1, "purchaseorder_number": 1,
                 "po_sub_total": 1, "po_currency_code": 1, "po_status": 1,
-                "po_due_date": 1, "custom_duty": 1, "custom_duty_due_date": 1,
+                "po_due_date": 1, "advance_payment_date": 1, "advance_payment_amount": 1,
+                "custom_duty": 1, "custom_duty_due_date": 1,
                 "shipping_charges": 1, "shipping_charges_due_date": 1,
             }},
             {"$sort": {"brand": 1, "name": 1}},
@@ -721,6 +726,8 @@ async def update_order(
     duty_payment_date: Optional[str] = Form(None),
     inward_date: Optional[str] = Form(None),
     po_due_date: Optional[str] = Form(None),
+    advance_payment_date: Optional[str] = Form(None),
+    advance_payment_amount: Optional[float] = Form(None),
     custom_duty: Optional[float] = Form(None),
     custom_duty_due_date: Optional[str] = Form(None),
     shipping_charges: Optional[float] = Form(None),
@@ -760,6 +767,7 @@ async def update_order(
         ("duty_payment_date", duty_payment_date),
         ("inward_date", inward_date),
         ("po_due_date", po_due_date),
+        ("advance_payment_date", advance_payment_date),
         ("custom_duty_due_date", custom_duty_due_date),
         ("shipping_charges_due_date", shipping_charges_due_date),
     ]:
@@ -771,6 +779,8 @@ async def update_order(
                     raise HTTPException(status_code=400, detail=f"{field} must be YYYY-MM-DD")
             fields[field] = val or None
 
+    if advance_payment_amount is not None:
+        fields["advance_payment_amount"] = advance_payment_amount
     if custom_duty is not None:
         fields["custom_duty"] = custom_duty
     if shipping_charges is not None:
@@ -1605,6 +1615,8 @@ def _build_payment_report_excel(orders: list, fx_rates: dict) -> io.BytesIO:
         "Live INR Value",
         "Exchange Rate Used (INR +₹0.20)",
         "PO Due Date",
+        "Advance Payment Date",
+        "Advance Payment (INR)",
         "Custom Duty (INR)",
         "Custom Duty Due Date",
         "Shipping Charges (INR)",
@@ -1650,6 +1662,8 @@ def _build_payment_report_excel(orders: list, fx_rates: dict) -> io.BytesIO:
             inr_value,
             rate_used,
             fmt_date_cell(order.get("po_due_date")),
+            fmt_date_cell(order.get("advance_payment_date")),
+            order.get("advance_payment_amount"),
             order.get("custom_duty"),
             fmt_date_cell(order.get("custom_duty_due_date")),
             order.get("shipping_charges"),
@@ -1660,17 +1674,17 @@ def _build_payment_report_excel(orders: list, fx_rates: dict) -> io.BytesIO:
         for col_idx, cell in enumerate(ws[excel_row], 1):
             cell.font = data_font
             cell.border = border
-            if col_idx in (7, 9, 11):  # date columns
+            if col_idx in (7, 8, 11, 13):  # date columns: PO Due, Advance Date, Custom Duty Due, Shipping Due
                 if cell.value:
                     cell.number_format = "DD-MMM-YYYY"
                 cell.alignment = center
-            elif col_idx in (5, 6, 8, 10):  # numeric columns (INR value, rate, custom duty, shipping)
+            elif col_idx in (5, 6, 9, 10, 12):  # numeric: INR value, rate, advance amt, custom duty, shipping
                 cell.number_format = num_fmt
                 cell.alignment = center
             else:
                 cell.alignment = left
 
-    col_widths = [40, 20, 16, 28, 20, 26, 16, 20, 20, 22, 24]
+    col_widths = [40, 20, 16, 28, 20, 26, 16, 22, 22, 20, 20, 22, 24]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 

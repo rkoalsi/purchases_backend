@@ -53,7 +53,15 @@ def _parse_draft_order_excel(file_bytes: bytes) -> list[dict]:
     Item Name, Qty, Unit Price. Reads number_format on the Unit Price cell to detect currency.
     """
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
-    ws = wb.active
+
+    # Prefer the "Draft Order …" sheet; fall back to the active (first) sheet.
+    # Master report files have the main sales sheet first, so wb.active would
+    # land on the wrong sheet without this lookup.
+    draft_sheet = next(
+        (wb[name] for name in wb.sheetnames if name.lower().startswith("draft order")),
+        wb.active,
+    )
+    ws = draft_sheet
 
     header_row = next(ws.iter_rows(min_row=1, max_row=1), None)
     if header_row is None:

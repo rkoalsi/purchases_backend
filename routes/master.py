@@ -3515,10 +3515,13 @@ async def download_master_report(
         combined_data = content.get("combined_data", [])
 
         if not combined_data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No data found to download",
-            )
+            if not brand:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No data found to download",
+                )
+            # Brand filter active but no data yet (e.g. brand-new brand with no products
+            # in DB). Fall through so the Draft Order sheet is generated (blank).
 
         # Build a readable date-range sheet name (Excel max 31 chars) and stock column labels
         try:
@@ -4198,7 +4201,7 @@ async def download_master_report(
                     ws.column_dimensions[col_letter].width = min(max_len + 3, 30)
 
             # Draft Order sheet — only when a brand filter is active
-            if brand and combined_df_data:
+            if brand:
                 _today_label = datetime.now().strftime("%d %b %Y")
                 _draft_sheet_name = f"Draft Order {_today_label}"[:31]
 
@@ -4232,7 +4235,21 @@ async def download_master_report(
                         "_currency": item.get("unit_price_currency", ""),
                     })
 
-                if draft_rows:
+                if not draft_rows:
+                    # Brand-new brand with no products yet — write a blank sheet with headers only.
+                    from openpyxl.utils import get_column_letter as _gcl
+                    _blank_cols = [
+                        "HSN Code", "Manufacturer Code", "BBCode", "Item Name",
+                        "SKU Code", "Category", "Sub Category", "Series", "MRP",
+                        "Qty", "Unit Price", "Total", "Case Pack", "Cartons",
+                        "CBM", "Total CBM", "Final order Qty (rounded up/down)", "Final CBM",
+                    ]
+                    blank_df = pd.DataFrame(columns=_blank_cols)
+                    blank_df.to_excel(writer, sheet_name=_draft_sheet_name, index=False)
+                    ws_blank = writer.sheets[_draft_sheet_name]
+                    for _ci, _cn in enumerate(_blank_cols, 1):
+                        ws_blank.column_dimensions[_gcl(_ci)].width = max(len(_cn) + 4, 14)
+                elif draft_rows:
                     from openpyxl.styles import Border, Side, Font as _Font
 
                     # Group rows by currency so each currency gets its own sheet
@@ -5064,8 +5081,8 @@ async def download_dashboard_kpi(
 def get_available_brands(db=Depends(get_database)):
     """Get list of available brands from products collection"""
     try:
-        products_collection = db.get_collection("products")
-        brands = products_collection.find({"status": "active"}).distinct("brand")
+        brands = db.get_collection("brands")
+        brands = brands.find({}).distinct("name")
         return {
             "brands": [
                 {"value": brand, "label": brand.title()} for brand in brands if brand
