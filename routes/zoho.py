@@ -23,6 +23,7 @@ import concurrent.futures
 from pymongo.errors import PyMongoError
 from bson import ObjectId
 from ..database import get_database, serialize_mongo_document
+from .task_triggers import fire_trigger
 from pydantic import BaseModel, validator
 from typing import List, Optional
 
@@ -4914,15 +4915,21 @@ async def zoho_confirm_pis(
                 "$set": {"updated_at": datetime.utcnow()},
             },
         )
-        return s3_key
+        return s3_key, order["brand"], order["name"]
 
     try:
-        s3_key = await asyncio.to_thread(_attach_to_order)
+        s3_key, order_brand, order_name = await asyncio.to_thread(_attach_to_order)
         result["audit"] = {"uploaded_by": email or "unknown", "uploaded_at": ts, "s3_key": s3_key}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
         logger.warning("PIS order attachment failed: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to attach PIS to order")
+
+    asyncio.create_task(fire_trigger("pil_uploaded", {
+        "brand": order_brand,
+        "order_name": order_name,
+        "filename": file.filename,
+    }, db))
 
     return JSONResponse(content=result)

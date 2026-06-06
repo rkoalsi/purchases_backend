@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from ..database import get_database, serialize_mongo_document
+from .task_triggers import fire_trigger
 import asyncio
 import io
 import os
@@ -239,6 +240,11 @@ async def create_order(
             logger.warning(f"Brand order notification fan-out failed: {_e}")
 
     asyncio.create_task(_notify_brand_order())
+    asyncio.create_task(fire_trigger("brand_order_created", {
+        "brand": doc["brand"],
+        "order_name": doc["name"],
+        "po_number": doc.get("purchaseorder_number") or "",
+    }, db))
 
     return JSONResponse(status_code=201, content={"_id": order_id, **serialize_mongo_document(doc)})
 

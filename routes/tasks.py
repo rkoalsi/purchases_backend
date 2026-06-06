@@ -740,6 +740,62 @@ async def get_task(task_id: str, db=Depends(get_database)):
     return serialize_mongo_document(task)
 
 
+def _spawn_on_complete_tasks_sync(db, templates: list, now: datetime) -> None:
+    """Create follow-up tasks from on_complete_templates when a task is marked done."""
+    USERS_COLLECTION = "purchase_users"
+    for tmpl in templates:
+        emails = tmpl.get("assignee_emails") or []
+        if not emails:
+            continue
+        users_found = list(db[USERS_COLLECTION].find(
+            {"email": {"$in": emails}, "status": "active"}
+        ))
+        if not users_found:
+            logger.warning("on_complete spawn: none of %s found or active, skipping", emails)
+            continue
+        offset = int(tmpl.get("due_date_offset_days", 7))
+        task_doc = {
+            "title": tmpl.get("title", ""),
+            "description": tmpl.get("description", ""),
+            "priority": tmpl.get("priority", "medium"),
+            "status": "todo",
+            "assigned_to": [str(u["_id"]) for u in users_found],
+            "assigned_to_names": [u.get("name", u["email"]) for u in users_found],
+            "assigned_to_departments": [u.get("department", "") for u in users_found],
+            "deadline": (now + timedelta(days=offset)).strftime("%Y-%m-%d"),
+            "tags": list(tmpl.get("tags", [])),
+            "created_by": "system",
+            "created_by_name": "System",
+            "creator_department": "",
+            "comments": [],
+            "attachments": [],
+            "activity": [{
+                "type": "created",
+                "actor_id": "system",
+                "actor_name": "System",
+                "detail": "Task auto-created on completion of a linked task.",
+                "timestamp": now.isoformat(),
+            }],
+            "is_hidden": False,
+            "is_deleted": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+        db[TASKS_COLLECTION].insert_one(task_doc)
+        try:
+            send_task_assignment_notification(
+                task_title=task_doc["title"],
+                created_by_name="System",
+                assigned_by_name="System",
+                new_assignees=[
+                    {"name": n, "department": d}
+                    for n, d in zip(task_doc["assigned_to_names"], task_doc["assigned_to_departments"])
+                ],
+            )
+        except Exception as _e:
+            logger.warning("on_complete Slack notification failed: %s", _e)
+
+
 # ── Update task ───────────────────────────────────────────────────────────────
 
 @router.put("/{task_id}")
@@ -800,6 +856,12 @@ async def update_task(task_id: str, request: UpdateTaskRequest, db=Depends(get_d
             ops["$push"] = {"activity": {"$each": activities}}
 
         db[TASKS_COLLECTION].update_one({"_id": ObjectId(task_id)}, ops)
+
+        # Spawn on-completion follow-up tasks when transitioning to done
+        if (update_fields.get("status") == "done"
+                and existing.get("status") != "done"
+                and existing.get("on_complete_templates")):
+            _spawn_on_complete_tasks_sync(db, existing["on_complete_templates"], now)
 
         # Fan-out notifications for meaningful changes
         title = existing.get("title", "")
