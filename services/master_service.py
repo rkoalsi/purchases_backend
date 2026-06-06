@@ -32,7 +32,7 @@ class OptimizedMasterReportService:
     async def get_zoho_report(self, start_date: str, end_date: str) -> Dict[str, Any]:
         """Get Zoho report data"""
         try:
-            from .zoho import get_sales_report_fast
+            from ..routes.zoho import get_sales_report_fast
 
             response = await get_sales_report_fast(
                 start_date=start_date, end_date=end_date, db=self.database,
@@ -1305,7 +1305,7 @@ class OptimizedMasterReportService:
         Uses TWO batch aggregations (stock + sales) covering all 6 periods at once,
         instead of 12 separate queries.
         """
-        from .zoho import fetch_stock_data_for_items_batch, fetch_zoho_lookback_sales_batch
+        from ..routes.zoho import fetch_stock_data_for_items_batch, fetch_zoho_lookback_sales_batch
 
         if not skus_needing_lookback:
             return {}
@@ -1399,7 +1399,7 @@ class OptimizedMasterReportService:
         Used to compute the growth rate column.
         Returns dict of sku_code -> past_drr (0.0 when no history found).
         """
-        from .zoho import fetch_stock_data_for_items_batch, fetch_zoho_lookback_sales_batch
+        from ..routes.zoho import fetch_stock_data_for_items_batch, fetch_zoho_lookback_sales_batch
 
         if not sku_to_item_id:
             return {}

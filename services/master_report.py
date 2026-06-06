@@ -5,6 +5,7 @@ import math
 from collections import defaultdict
 import logging
 import traceback
+from fastapi import HTTPException, status
 from .master_service import OptimizedMasterReportService
 
 logger = logging.getLogger(__name__)
