@@ -4440,15 +4440,23 @@ def _build_inventory_sheet(ws, daily_by_asin, report_data, all_dates, title, pla
     hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     date_fill = PatternFill(start_color=C_DATE_BG, end_color=C_DATE_BG, fill_type="solid")
 
+    # Find the actual last date with closing stock data across all ASINs
+    _stocked_dates = set()
+    for _asin_data in daily_by_asin.values():
+        for _d in _asin_data:
+            _dt = _parse_date_str(_d.get("date"))
+            if _dt and (_d.get("closing_stock") or 0) > 0:
+                _stocked_dates.add(_dt)
+    stock_date = max(_stocked_dates) if _stocked_dates else (all_dates[-1] - timedelta(days=2))
+
     fixed_hdrs = {
         COL_ASIN:  "ASIN",
         COL_SKU:   "SKU Code",
         COL_NAME:  "Item Name",
         COL_TOTAL: "Avg Daily\nStock" if mode == "inventory" else "Total Units\nSold",
         COL_DIS:   "Days In\nStock",
-        COL_STOCK: f"Closing Stock\n({(all_dates[-1] - timedelta(days=2)).strftime('%d %b %Y')})",
+        COL_STOCK: f"Closing Stock\n({stock_date.strftime('%d %b %Y')})",
     }
-    stock_date = all_dates[-1] - timedelta(days=2)
     for ci, label in fixed_hdrs.items():
         c = ws.cell(row=R_HDR, column=ci)
         c.value = label
