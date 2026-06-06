@@ -1,3 +1,5 @@
+pytest==8.3.5
+pytest-asyncio==0.25.3
 annotated-types==0.7.0
 anyio==4.9.0
 APScheduler==3.11.0

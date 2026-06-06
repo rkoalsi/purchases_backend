@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta
+from ..helpers.datetime_utils import utcnow
 from pymongo.errors import PyMongoError
 from pymongo import ReplaceOne
 from ..database import get_database
@@ -725,7 +726,7 @@ async def fetch_and_insert_report(report_id: str, db=Depends(get_database)):
         return {"reportId": report_id, "inserted": 0, "detail": f"No {data_key} data in report"}
 
     date_str = spec.get("dataStartTime", "")
-    date_obj = datetime.strptime(date_str, "%Y-%m-%d") if date_str else datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    date_obj = datetime.strptime(date_str, "%Y-%m-%d") if date_str else utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     current_time = datetime.now()
 
     collection = db[collection_name]
@@ -1094,7 +1095,7 @@ def collect_pending_vc_reports(db) -> Dict:
                 date_obj = (
                     datetime.strptime(date_str, "%Y-%m-%d")
                     if date_str
-                    else datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+                    else utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
                 )
                 current_time = datetime.now()
 

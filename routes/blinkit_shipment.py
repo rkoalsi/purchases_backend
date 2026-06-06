@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from fastapi.responses import StreamingResponse
 from datetime import datetime, timedelta, date
+from ..helpers.datetime_utils import utcnow
 from ..database import get_database
 import asyncio
 import io
@@ -462,7 +463,7 @@ def _fetch_all_planning(db, today: datetime) -> tuple:
 @router.get("/planning")
 async def get_blinkit_planning(database=Depends(get_database)):
     try:
-        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         drr_start = today - timedelta(days=89)
         drr_period = f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
         rows, inv_date, zoho_stock_date = await asyncio.to_thread(_fetch_all_planning, database, today)
@@ -475,7 +476,7 @@ async def get_blinkit_planning(database=Depends(get_database)):
 @router.get("/planning/download")
 async def download_blinkit_planning(database=Depends(get_database)):
     try:
-        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         drr_start = today - timedelta(days=89)
         drr_period = f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
         rows, inv_date, _zoho_date = await asyncio.to_thread(_fetch_all_planning, database, today)
@@ -510,7 +511,7 @@ async def update_planning_override(
             def _upsert(db):
                 db[PLANNING_OVERRIDES_COLLECTION].update_one(
                     {"sku_code": sku_code},
-                    {"$set": {**update_doc, "sku_code": sku_code, "updated_at": datetime.utcnow()}},
+                    {"$set": {**update_doc, "sku_code": sku_code, "updated_at": utcnow()}},
                     upsert=True,
                 )
             await asyncio.to_thread(_upsert, database)
@@ -530,7 +531,7 @@ async def clear_planning_override(sku_code: str, field: str, database=Depends(ge
     def _clear(db):
         db[PLANNING_OVERRIDES_COLLECTION].update_one(
             {"sku_code": sku_code},
-            {"$unset": {field: ""}, "$set": {"updated_at": datetime.utcnow()}},
+            {"$unset": {field: ""}, "$set": {"updated_at": utcnow()}},
         )
 
     await asyncio.to_thread(_clear, database)
@@ -663,7 +664,7 @@ async def upload_blinkit_processing(
                 "requested_qty": _safe_int(raw[idx_requested_qty] if idx_requested_qty is not None else None),
                 "packed_qty": _safe_int(raw[idx_packed_qty] if idx_packed_qty is not None else None),
                 "status": _safe_str(raw[idx_status] if idx_status is not None else None) or "processing",
-                "uploaded_at": datetime.utcnow(),
+                "uploaded_at": utcnow(),
             }
             records.append(record)
 
@@ -775,7 +776,7 @@ async def update_blinkit_summary(
         update_doc: dict = {
             "ro_number": ro_number,
             "location": location,
-            "updated_at": datetime.utcnow(),
+            "updated_at": utcnow(),
         }
         if payload.reason_for_short_supply is not None:
             update_doc["reason_for_short_supply"] = payload.reason_for_short_supply

@@ -4,6 +4,7 @@ from bson import ObjectId
 from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta, timezone
+from ..helpers.datetime_utils import utcnow
 from pymongo import ASCENDING
 from pymongo.errors import PyMongoError
 from ..database import get_database, serialize_mongo_document
@@ -5584,7 +5585,7 @@ def normalize_seller_flex_recon_row(row: Dict) -> Dict:
         "days_since_return_complete": _str_or_none(row.get("Days Since Return Complete")),
         "return_reason": _str_or_none(row.get("Return Reason")),
         "lpn": _str_or_none(row.get("LPN")),
-        "created_at": datetime.utcnow(),
+        "created_at": utcnow(),
     }
 
 
@@ -6113,7 +6114,7 @@ def normalize_fba_warehouse_return(row: Dict) -> Dict:
         "in_process_quantity": _num_or_none_wh(row.get("in-process-quantity")),
         "removal_fee": _num_or_none_wh(row.get("removal-fee")),
         "currency": _str_or_none(row.get("currency")),
-        "created_at": datetime.utcnow(),
+        "created_at": utcnow(),
     }
 
 
@@ -6536,7 +6537,7 @@ def normalize_vendor_central_return_row(row: Dict) -> Dict:
         "sgst_tax_rate": _num_or_none(_ci_get(row, "SGST Tax Rate")),
         "sgst_tax_amount": _num_or_none(_ci_get(row, "SGST Tax Amount")),
         "total_amount": _num_or_none(_ci_get(row, "Total Amount", "Total amount")),
-        "created_at": datetime.utcnow(),
+        "created_at": utcnow(),
     }
 
 

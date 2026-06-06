@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta
+from ..helpers.datetime_utils import utcnow
 from ..database import get_database
 import asyncio
 import io
@@ -62,7 +63,7 @@ async def _compute_drr_async(db, today: datetime, asins: list[str]) -> dict:
 
 
 def _fetch_data(db, drr_map: dict) -> tuple:
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     drr_start = today - timedelta(days=89)
     drr_period_label = f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
 
@@ -368,7 +369,7 @@ def _fetch_data(db, drr_map: dict) -> tuple:
 @router.get("/data")
 async def get_data(db=Depends(get_database)):
     try:
-        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         # Get ASINs first to compute DRR async (matches PSR/vendor_po)
         margins_docs = await asyncio.to_thread(
             lambda: list(db[MARGINS_COLLECTION].find(
@@ -426,7 +427,7 @@ async def clear_override(asin: str, field: str, db=Depends(get_database)):
 @router.get("/download")
 async def download_xlsx(db=Depends(get_database)):
     try:
-        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         margins_docs = await asyncio.to_thread(
             lambda: list(db[MARGINS_COLLECTION].find(
                 {"etrade_asp": {"$exists": True, "$ne": None}}, {"asin": 1, "_id": 0}

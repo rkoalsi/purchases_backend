@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, R
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
+from ..helpers.datetime_utils import utcnow
 from bson import ObjectId
 from ..database import get_database, serialize_mongo_document
 from .task_triggers import fire_trigger
@@ -211,7 +212,7 @@ async def create_order(
             ))
             if not recipients:
                 return
-            now = datetime.utcnow()
+            now = utcnow()
             brand_name = doc["brand"]
             order_name = doc["name"]
             po_num = doc.get("purchaseorder_number")

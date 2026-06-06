@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta, date
+from ..helpers.datetime_utils import utcnow
 from ..database import get_database
 import asyncio
 import io
@@ -236,7 +237,7 @@ def _get_asins(db) -> list[str]:
 
 def _fetch_planning_data(db, drr_map: dict) -> tuple:
     """Compute full FBA shipment planning rows from MongoDB."""
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     fba_inv_date_str = ""
     zoho_date_str = ""
     etrade_date_str = ""
@@ -924,7 +925,7 @@ def _generate_planning_excel(
 @router.get("/planning")
 async def get_fba_planning(database=Depends(get_database)):
     try:
-        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         drr_start = today - timedelta(days=89)
         drr_period = (
             f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
@@ -949,7 +950,7 @@ async def get_fba_planning(database=Depends(get_database)):
 @router.get("/planning/download")
 async def download_fba_planning(database=Depends(get_database)):
     try:
-        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         drr_start = today - timedelta(days=89)
         drr_period = (
             f"{drr_start.strftime('%-d %b %Y')} – {today.strftime('%-d %b %Y')}"
@@ -1005,7 +1006,7 @@ async def update_planning_override(
             def _upsert(db):
                 db[PLANNING_OVERRIDES_COLLECTION].update_one(
                     {"asin": asin},
-                    {"$set": {**update_doc, "updated_at": datetime.utcnow()}},
+                    {"$set": {**update_doc, "updated_at": utcnow()}},
                     upsert=True,
                 )
 
@@ -1037,7 +1038,7 @@ async def clear_planning_override(
     def _clear(db):
         db[PLANNING_OVERRIDES_COLLECTION].update_one(
             {"asin": asin},
-            {"$unset": {field: ""}, "$set": {"updated_at": datetime.utcnow()}},
+            {"$unset": {field: ""}, "$set": {"updated_at": utcnow()}},
         )
 
     await asyncio.to_thread(_clear, database)
@@ -1148,7 +1149,7 @@ async def upload_planning_overrides(
 
                 # Upsert amazon_sku_mapping
                 if sku_val or fnsku_val:
-                    sku_map_update: dict = {"updated_at": datetime.utcnow()}
+                    sku_map_update: dict = {"updated_at": utcnow()}
                     if sku_val:
                         sku_map_update["sku_code"] = sku_val
                     if fnsku_val:
@@ -1161,7 +1162,7 @@ async def upload_planning_overrides(
                     updated_sku_mapping += 1
 
                 # Build planning overrides doc
-                override_update: dict = {"updated_at": datetime.utcnow()}
+                override_update: dict = {"updated_at": utcnow()}
 
                 if fnsku_val:
                     override_update["fnsku"] = fnsku_val
@@ -1438,7 +1439,7 @@ async def upload_fba_processing(
                     raw[idx_hsn] if idx_hsn is not None else None, idx_hsn
                 ),
                 "gst": _safe_num(raw[idx_gst] if idx_gst is not None else None),
-                "uploaded_at": datetime.utcnow(),
+                "uploaded_at": utcnow(),
             }
             records.append(record)
 
@@ -1506,7 +1507,7 @@ async def update_fba_summary(
         update_doc: dict = {
             "shipment_id": shipment_id,
             "location": location,
-            "updated_at": datetime.utcnow(),
+            "updated_at": utcnow(),
         }
         if payload.reason_for_short_supply is not None:
             update_doc["reason_for_short_supply"] = payload.reason_for_short_supply
@@ -1641,7 +1642,7 @@ def _sync_shipments_to_db(db, days: int = 3650) -> dict:
 
     # ── 4. For each shipment, fetch items and upsert ──────────────────────────
     inserted = updated = errors = skipped = 0
-    now = datetime.utcnow()
+    now = utcnow()
     stale_threshold = now - timedelta(days=7)
 
     for shipment in shipments:

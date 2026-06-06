@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta
+from ..helpers.datetime_utils import utcnow
 from bson import ObjectId
 from typing import List, Optional
 import uuid
@@ -81,7 +82,7 @@ def fire_trigger_sync(event_type: str, context: dict, db) -> int:
     if not rule or not rule.get("task_templates"):
         return 0
 
-    now = datetime.utcnow()
+    now = utcnow()
     task_docs = []
     notify_infos: list[tuple] = []  # (title, user_name, user_dept)
 
@@ -211,7 +212,7 @@ async def create_rule(body: CreateRuleRequest, db=Depends(get_database)):
             d = t.dict()
             d["template_id"] = d.get("template_id") or str(uuid.uuid4())
             templates.append(d)
-        now = datetime.utcnow()
+        now = utcnow()
         doc = {
             "event_type": body.event_type,
             "is_active": True,
@@ -241,7 +242,7 @@ async def update_rule(rule_id: str, body: UpdateRuleRequest, db=Depends(get_data
             d = t.dict()
             d["template_id"] = d.get("template_id") or str(uuid.uuid4())
             templates.append(d)
-        updates: dict = {"task_templates": templates, "updated_at": datetime.utcnow()}
+        updates: dict = {"task_templates": templates, "updated_at": utcnow()}
         if body.is_active is not None:
             updates["is_active"] = body.is_active
         result = db[COLLECTION].update_one(
@@ -264,7 +265,7 @@ async def toggle_rule(rule_id: str, db=Depends(get_database)):
         new_val = not rule.get("is_active", True)
         db[COLLECTION].update_one(
             {"_id": ObjectId(rule_id)},
-            {"$set": {"is_active": new_val, "updated_at": datetime.utcnow()}},
+            {"$set": {"is_active": new_val, "updated_at": utcnow()}},
         )
         return new_val
 

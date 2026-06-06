@@ -709,78 +709,37 @@ def _enrich_items(
                         "_id": "$items.asin",
                         "total": {
                             "$sum": {
-                                "$cond": {
-                                    "if": {"$eq": ["$po_status", "processing"]},
-                                    "then": {
-                                        "$cond": {
-                                            "if": {
-                                                "$ne": [
-                                                    {
-                                                        "$ifNull": [
-                                                            "$items.supply_qty_override",
-                                                            None,
-                                                        ]
-                                                    },
-                                                    None,
-                                                ]
-                                            },
-                                            "then": {
-                                                "$ifNull": [
-                                                    "$items.supply_qty_override",
-                                                    0,
-                                                ]
-                                            },
-                                            "else": {
-                                                "$cond": {
-                                                    "if": {
-                                                        "$ne": [
-                                                            {
-                                                                "$ifNull": [
-                                                                    "$items.final_supply_fo",
-                                                                    None,
-                                                                ]
-                                                            },
-                                                            None,
-                                                        ]
-                                                    },
-                                                    "then": {
-                                                        "$ifNull": [
-                                                            "$items.final_supply_fo",
-                                                            0,
-                                                        ]
-                                                    },
-                                                    "else": {
-                                                        "$cond": {
-                                                            "if": {
-                                                                "$gt": [
-                                                                    {
-                                                                        "$ifNull": [
-                                                                            "$items.supply_qty",
-                                                                            0,
-                                                                        ]
-                                                                    },
-                                                                    0,
-                                                                ]
-                                                            },
-                                                            "then": {
-                                                                "$ifNull": [
-                                                                    "$items.supply_qty",
-                                                                    0,
-                                                                ]
-                                                            },
-                                                            "else": {
-                                                                "$ifNull": [
-                                                                    "$items.requested_qty",
-                                                                    0,
-                                                                ]
-                                                            },
-                                                        }
-                                                    },
-                                                }
-                                            },
-                                        }
-                                    },
-                                    "else": {"$ifNull": ["$items.accepted_qty", 0]},
+                                # processing priority: supply_qty_override → final_supply_fo → supply_qty (>0) → requested_qty
+                                # packed/closed/intransit: accepted_qty
+                                "$switch": {
+                                    "branches": [
+                                        {
+                                            "case": {"$and": [
+                                                {"$eq": ["$po_status", "processing"]},
+                                                {"$ne": ["$items.supply_qty_override", None]},
+                                            ]},
+                                            "then": "$items.supply_qty_override",
+                                        },
+                                        {
+                                            "case": {"$and": [
+                                                {"$eq": ["$po_status", "processing"]},
+                                                {"$ne": ["$items.final_supply_fo", None]},
+                                            ]},
+                                            "then": "$items.final_supply_fo",
+                                        },
+                                        {
+                                            "case": {"$and": [
+                                                {"$eq": ["$po_status", "processing"]},
+                                                {"$gt": [{"$ifNull": ["$items.supply_qty", 0]}, 0]},
+                                            ]},
+                                            "then": "$items.supply_qty",
+                                        },
+                                        {
+                                            "case": {"$eq": ["$po_status", "processing"]},
+                                            "then": {"$ifNull": ["$items.requested_qty", 0]},
+                                        },
+                                    ],
+                                    "default": {"$ifNull": ["$items.accepted_qty", 0]},
                                 }
                             }
                         },
@@ -1209,6 +1168,22 @@ async def list_vendor_pos(db=Depends(get_database)):
     """List all purchase orders with total requested/accepted/received qty sums."""
 
     def _fetch():
+        # supply_qty_override if set, else final_supply_fo — shared by total_final_supply_qty + total_supply_qty
+        _supply_qty_map = {
+            "$sum": {
+                "$map": {
+                    "input": "$items",
+                    "as": "it",
+                    "in": {
+                        "$cond": [
+                            {"$ne": ["$$it.supply_qty_override", None]},
+                            "$$it.supply_qty_override",
+                            {"$ifNull": ["$$it.final_supply_fo", 0]},
+                        ]
+                    },
+                }
+            }
+        }
         pipeline = [
             {
                 "$addFields": {
@@ -1217,37 +1192,9 @@ async def list_vendor_pos(db=Depends(get_database)):
                     "total_received_qty": {
                         "$ifNull": ["$received_qty", {"$sum": "$items.received_qty"}]
                     },
-                    "total_final_supply_qty": {
-                        "$sum": {
-                            "$map": {
-                                "input": "$items",
-                                "as": "it",
-                                "in": {
-                                    "$cond": [
-                                        {"$ne": ["$$it.supply_qty_override", None]},
-                                        "$$it.supply_qty_override",
-                                        {"$ifNull": ["$$it.final_supply_fo", 0]},
-                                    ]
-                                },
-                            }
-                        }
-                    },
                     # Supply Qty mirrors Excel col I: supply_qty_override if set, else final_supply_fo
-                    "total_supply_qty": {
-                        "$sum": {
-                            "$map": {
-                                "input": "$items",
-                                "as": "it",
-                                "in": {
-                                    "$cond": [
-                                        {"$ne": ["$$it.supply_qty_override", None]},
-                                        "$$it.supply_qty_override",
-                                        {"$ifNull": ["$$it.final_supply_fo", 0]},
-                                    ]
-                                },
-                            }
-                        }
-                    },
+                    "total_final_supply_qty": _supply_qty_map,
+                    "total_supply_qty": _supply_qty_map,
                     "_items_cost": {
                         "$sum": {
                             "$map": {

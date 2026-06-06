@@ -2,6 +2,7 @@ import os
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
+from ..helpers.datetime_utils import utcnow
 import io, logging, math, json, re
 import openpyxl
 from fastapi import (
@@ -4442,7 +4443,7 @@ def _check_invoice_recency_sync(db) -> dict:
     except ValueError:
         return {"missing": True, "latest_date": latest_date_str, "days_behind": None}
 
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     days_behind = (today - latest_dt).days
     return {
         "missing": days_behind > 15,
@@ -4777,7 +4778,7 @@ async def create_composite_items(payload: CompositeCreateRequest):
             )
             composite_item_id = zoho_item.get("composite_item_id") or zoho_item.get("item_id", "")
 
-            now = datetime.utcnow()
+            now = utcnow()
             doc = {
                 "composite_item_id": str(composite_item_id),
                 "name": name,
@@ -4877,7 +4878,7 @@ async def zoho_confirm_pis(
 
     result = await asyncio.to_thread(_parse_pis_workbook, data, db, False)
 
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = utcnow().strftime("%Y%m%d_%H%M%S")
     safe_filename = re.sub(r"[^\w.\-]", "_", file.filename)
 
     def _attach_to_order():
@@ -4899,7 +4900,7 @@ async def zoho_confirm_pis(
             "s3_key": s3_key,
             "content_type": _PIS_CONTENT_TYPE,
             "size": len(data),
-            "uploaded_at": datetime.utcnow(),
+            "uploaded_at": utcnow(),
             "category": "Product Information Sheet",
             "folder": "",
         }
@@ -4912,7 +4913,7 @@ async def zoho_confirm_pis(
                     "documents": doc_entry,
                     "designer_documents": designer_doc_entry,
                 },
-                "$set": {"updated_at": datetime.utcnow()},
+                "$set": {"updated_at": utcnow()},
             },
         )
         return s3_key, order["brand"], order["name"]

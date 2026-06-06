@@ -12,6 +12,7 @@ from openpyxl import Workbook, load_workbook
 import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
 from datetime import datetime
+from ..helpers.datetime_utils import utcnow
 from typing import List, Dict, Optional
 from pydantic import BaseModel
 from ..database import get_database, serialize_mongo_document
@@ -643,7 +644,7 @@ async def save_pending_item(body: SavePendingItemRequest, db=Depends(get_databas
             "tax_rate": body.tax_rate,
             "upc_code": body.upc_code,
             "ean_code": body.ean_code,
-            "updated_at": datetime.utcnow(),
+            "updated_at": utcnow(),
         }},
         upsert=True,
     )
@@ -776,7 +777,7 @@ async def create_zoho_items(body: CreateZohoItemsRequest):
                 },
                 {
                     "type": "context",
-                    "elements": [{"type": "mrkdwn", "text": f"Created via Draft Order Upload · {datetime.utcnow().strftime('%d %b %Y, %H:%M UTC')}"}],
+                    "elements": [{"type": "mrkdwn", "text": f"Created via Draft Order Upload · {utcnow().strftime('%d %b %Y, %H:%M UTC')}"}],
                 },
             ]
             payload = {"blocks": blocks}
@@ -1048,7 +1049,7 @@ async def create_draft_order_po(
             ))
             if not recipients:
                 return
-            now = datetime.utcnow()
+            now = utcnow()
             po_number = po_doc.get("purchaseorder_number", "")
             vendor_name = po_doc.get("vendor_name", "")
             snippet = f"Draft order converted to PO {po_number} — {vendor_name}"

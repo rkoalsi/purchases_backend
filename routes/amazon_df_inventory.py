@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from datetime import datetime
+from ..helpers.datetime_utils import utcnow
 from ..database import get_database
 import asyncio
 import csv
@@ -133,7 +134,7 @@ async def upload_inventory(
         raise HTTPException(status_code=400, detail="No data rows found in file")
 
     upload_id = str(uuid.uuid4())
-    uploaded_at = datetime.utcnow()
+    uploaded_at = utcnow()
 
     docs = [
         {

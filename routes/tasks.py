@@ -5,6 +5,7 @@ import os
 import re
 import zipfile
 from datetime import datetime, timedelta
+from ..helpers.datetime_utils import utcnow
 from typing import List, Optional
 
 import boto3
@@ -134,7 +135,7 @@ def _activity_entry(
         "old_value": old_value,
         "new_value": new_value,
         "detail": detail,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": utcnow().isoformat(),
     }
 
 
@@ -150,7 +151,7 @@ def _fan_out_sync(
     snippet: str,
 ) -> None:
     """Insert one notification per unique recipient, excluding the actor."""
-    now = datetime.utcnow()
+    now = utcnow()
     seen = set()
     docs = []
     for uid in recipient_ids:
@@ -230,7 +231,7 @@ async def list_tasks(
                 query["$or"] = search_or
 
         if not show_hidden:
-            two_days_ago = (datetime.utcnow() - timedelta(days=2)).isoformat()
+            two_days_ago = (utcnow() - timedelta(days=2)).isoformat()
             hide_extra = [
                 # Exclude manually hidden tasks
                 {"is_hidden": {"$ne": True}},
@@ -284,7 +285,7 @@ async def get_task_stats(
     vis = {**_visibility_filter(viewer_id, viewer_role), "is_deleted": {"$ne": True}}
 
     def _fetch():
-        now = datetime.utcnow().isoformat()
+        now = utcnow().isoformat()
         pipeline = [
             {"$match": vis},
             {
@@ -396,7 +397,7 @@ async def create_task(request: CreateTaskRequest, db=Depends(get_database)):
         raise HTTPException(status_code=400, detail=f"Invalid status: {request.status}")
 
     def _insert():
-        now = datetime.utcnow()
+        now = utcnow()
         activity = _activity_entry(
             "created",
             request.created_by,
@@ -531,7 +532,7 @@ async def download_task_report(
                 return val
         return val.strftime("%d %b %Y")
 
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = utcnow().isoformat()
 
     # ── Sheet 1: Summary per assignee ─────────────────────────────────────────
     ws_sum = wb.active
@@ -848,7 +849,7 @@ async def update_task(task_id: str, request: UpdateTaskRequest, db=Depends(get_d
                     new_value=fmt(new_raw),
                 ))
 
-        now = datetime.utcnow()
+        now = utcnow()
         update_fields["updated_at"] = now
 
         ops: dict = {"$set": update_fields}
@@ -925,7 +926,7 @@ async def delete_task(task_id: str, db=Depends(get_database)):
             raise HTTPException(status_code=403, detail="Completed tasks cannot be deleted")
         db[TASKS_COLLECTION].update_one(
             {"_id": ObjectId(task_id)},
-            {"$set": {"is_deleted": True, "deleted_at": datetime.utcnow().isoformat()}},
+            {"$set": {"is_deleted": True, "deleted_at": utcnow().isoformat()}},
         )
         return True
 
@@ -944,7 +945,7 @@ async def add_comment(task_id: str, request: AddCommentRequest, db=Depends(get_d
         "text": request.text.strip(),
         "author_id": request.author_id,
         "author_name": request.author_name,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": utcnow().isoformat(),
     }
     activity = _activity_entry(
         "comment_added",
@@ -964,7 +965,7 @@ async def add_comment(task_id: str, request: AddCommentRequest, db=Depends(get_d
             {"_id": ObjectId(task_id)},
             {
                 "$push": {"comments": comment, "activity": activity},
-                "$set": {"updated_at": datetime.utcnow()},
+                "$set": {"updated_at": utcnow()},
             },
         )
         snippet = f'commented: {request.text[:60]}{"…" if len(request.text) > 60 else ""}'
@@ -1004,7 +1005,7 @@ async def delete_comment(task_id: str, comment_id: str, db=Depends(get_database)
             {
                 "$pull": {"comments": {"comment_id": comment_id}},
                 "$push": {"activity": activity},
-                "$set": {"updated_at": datetime.utcnow()},
+                "$set": {"updated_at": utcnow()},
             },
         )
         return result.matched_count > 0
@@ -1038,7 +1039,7 @@ async def upload_attachment(
         if not task:
             raise ValueError("Task not found")
 
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        ts = utcnow().strftime("%Y%m%d_%H%M%S")
         safe_filename = re.sub(r"[^\w.\-]", "_", filename)
         s3_key = f"tasks/{task_id}/{ts}_{safe_filename}"
 
@@ -1050,7 +1051,7 @@ async def upload_attachment(
             "s3_key": s3_key,           # Only the key is stored; URL is presigned on demand
             "content_type": content_type,
             "size": len(file_bytes),
-            "uploaded_at": datetime.utcnow().isoformat(),
+            "uploaded_at": utcnow().isoformat(),
             "uploaded_by": uploaded_by,
             "uploaded_by_name": uploaded_by_name,
         }
@@ -1064,7 +1065,7 @@ async def upload_attachment(
             {"_id": ObjectId(task_id)},
             {
                 "$push": {"attachments": attachment, "activity": activity},
-                "$set": {"updated_at": datetime.utcnow()},
+                "$set": {"updated_at": utcnow()},
             },
         )
         return attachment
@@ -1197,7 +1198,7 @@ async def delete_attachment(task_id: str, file_id: str, db=Depends(get_database)
             {
                 "$pull": {"attachments": {"file_id": file_id}},
                 "$push": {"activity": activity},
-                "$set": {"updated_at": datetime.utcnow()},
+                "$set": {"updated_at": utcnow()},
             },
         )
         return result.matched_count > 0, uploader, uploader_name

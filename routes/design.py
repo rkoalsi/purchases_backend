@@ -6,6 +6,7 @@ import zipfile
 import logging
 import asyncio
 from datetime import datetime, timedelta
+from ..helpers.datetime_utils import utcnow
 from typing import Any, List, Optional
 
 import openpyxl
@@ -304,7 +305,7 @@ def patch_catalogue_item(bb_code: str, body: CatalogueItemPatch):
         update = body.dict(exclude_unset=True)
         if not update:
             raise HTTPException(status_code=400, detail="No fields provided")
-        update["updated_at"] = datetime.utcnow()
+        update["updated_at"] = utcnow()
         res = db[DESIGN_CATALOGUE_COLLECTION].update_one(
             {"bb_code": bb_code}, {"$set": update}
         )
@@ -320,7 +321,7 @@ def patch_product_images(product_id: str, body: dict):
     """Update image_url (single), images array, and/or videos array for a product."""
     try:
         db = get_database()
-        update: dict = {"updated_at": datetime.utcnow()}
+        update: dict = {"updated_at": utcnow()}
         if "image_url" in body:
             update["image_url"] = body["image_url"] or None
         if "images" in body:
@@ -358,7 +359,7 @@ def patch_product_details(product_id: str, body: ProductDetailsPatch):
         update: dict = {k: v for k, v in body.dict().items() if v is not None}
         if not update:
             raise HTTPException(status_code=400, detail="No fields to update")
-        update["updated_at"] = datetime.utcnow()
+        update["updated_at"] = utcnow()
         db[PRODUCTS_COLLECTION].update_one(
             {"_id": ObjectId(product_id)},
             {"$set": update},
@@ -378,7 +379,7 @@ def patch_product_catalogue_details(product_id: str, body: CatalogueItemPatch):
         update: dict = {k: v for k, v in body.dict().items() if v is not None}
         if not update:
             raise HTTPException(status_code=400, detail="No fields to update")
-        update["updated_at"] = datetime.utcnow()
+        update["updated_at"] = utcnow()
         db[DESIGN_CATALOGUE_COLLECTION].update_one(
             {"product_id": ObjectId(product_id)},
             {"$set": update},
@@ -1022,7 +1023,7 @@ def _process_pis_sheet(ws, sheet_name: str, db, dry_run: bool = False) -> dict:
         # Snapshot values before adding timestamp (used in preview tooltips)
         fields_values: dict[str, Any] = dict(set_fields)
 
-        set_fields["updated_at"] = datetime.utcnow()
+        set_fields["updated_at"] = utcnow()
 
         # Match catalogue doc
         if bb_code:
@@ -1130,7 +1131,7 @@ async def confirm_pis(
     result = await asyncio.to_thread(_parse_pis_workbook, data, db, False)
 
     # Upload to S3 for audit trail
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = utcnow().strftime("%Y%m%d_%H%M%S")
     safe_email = re.sub(r"[^\w@.\-]", "_", email or "unknown")
     safe_filename = re.sub(r"[^\w.\-]", "_", file.filename)
     s3_key = f"pis_uploads/{safe_email}/{ts}_{safe_filename}"
