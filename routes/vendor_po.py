@@ -657,7 +657,7 @@ def _enrich_items(
             ):
                 wh = doc.get("warehouses", {})
                 zoho_latest[doc["_id"]] = (
-                    int(sum(v for v in wh.values() if isinstance(v, (int, float))))
+                    int(wh.get("Pupscribe Enterprises Private Limited", 0) or 0)
                     if isinstance(wh, dict)
                     else 0
                 )
@@ -767,6 +767,48 @@ def _enrich_items(
             ]
         ):
             sales_by_asin[doc["_id"]] = int(doc["total_units"])
+
+    # --- SIT (Stock in Transit) from open Zoho purchase_orders, always live ---
+    sit_by_asin: dict[str, dict] = {}
+    if asins:
+        # Build sku_code → asin from sku_map_by_asin (inverted) + direct model_number → asin
+        sku_to_asin_sit: dict[str, str] = {v: k for k, v in sku_map_by_asin.items()}
+        for _it in items:
+            _m = _it.get("model_number", "")
+            _a = _it.get("asin", "")
+            if _m and _a:
+                sku_to_asin_sit[_m] = _a
+
+        open_sit_pos = list(
+            db["purchase_orders"].find(
+                {"order_status_formatted": "Issued"},
+                {"line_items": 1, "date": 1, "_id": 0},
+            ).sort("date", 1)
+        )
+        _asin_sit_qtys: dict[str, list[float]] = {}
+        for _po in open_sit_pos:
+            for _li in _po.get("line_items", []):
+                _sku = ""
+                for _cf in _li.get("item_custom_fields", []):
+                    if _cf.get("api_name") == "cf_sku_code":
+                        _sku = _cf.get("value", "")
+                        break
+                if not _sku:
+                    continue
+                _asin = sku_to_asin_sit.get(_sku)
+                if not _asin or _asin not in asins:
+                    continue
+                _qty = float(_li.get("quantity") or 0)
+                _qty_recv = float(_li.get("quantity_received") or 0)
+                _transit = _qty - _qty_recv
+                if _transit > 0:
+                    _asin_sit_qtys.setdefault(_asin, []).append(_transit)
+        for _asin, _qtys in _asin_sit_qtys.items():
+            sit_by_asin[_asin] = {
+                "sit_1": _qtys[0] if len(_qtys) > 0 else 0,
+                "sit_2": _qtys[1] if len(_qtys) > 1 else 0,
+                "sit_3": _qtys[2] if len(_qtys) > 2 else 0,
+            }
 
     # --- fetch DRR: use pre-computed map from PSR async path if provided, else fall back ---
     if drr_map is None:
@@ -1026,6 +1068,9 @@ def _enrich_items(
                 "hsn": str(product.get("hsn_or_sac") or ""),
                 "diff": diff,
                 "zoho_stock": zoho_stock,
+                "sit_1": sit_by_asin.get(asin, {}).get("sit_1", 0),
+                "sit_2": sit_by_asin.get(asin, {}).get("sit_2", 0),
+                "sit_3": sit_by_asin.get(asin, {}).get("sit_3", 0),
                 "purchase_status": product.get("purchase_status") or "",
                 "current_stock": current_stock,
                 "open_po": open_po,
@@ -2202,6 +2247,90 @@ async def delete_vendor_po(po_number: str, db=Depends(get_database)):
     return {"po_number": po_number, "deleted": True}
 
 
+@router.post("/{po_number}/refresh-zoho-stock")
+async def refresh_zoho_stock(po_number: str, db=Depends(get_database)):
+    """Re-fetch Pupscribe WH zoho_stock for all items in a frozen PO and update stored values."""
+
+    def _refresh():
+        doc = db[PO_COLLECTION].find_one({"po_number": po_number})
+        if doc is None:
+            return None
+
+        items = doc.get("items", [])
+        if not items:
+            return {"po_number": po_number, "updated": 0}
+
+        # Collect zoho_item_ids from stored product data
+        model_numbers = [it.get("model_number", "") for it in items if it.get("model_number")]
+        asins_list = [it.get("asin", "") for it in items if it.get("asin")]
+
+        # Build model → zoho_item_id via products
+        zoho_id_by_model: dict[str, str] = {}
+        for p in db[PRODUCTS_COLLECTION].find(
+            {"cf_sku_code": {"$in": model_numbers}},
+            {"cf_sku_code": 1, "item_id": 1},
+        ):
+            zoho_id_by_model[p["cf_sku_code"]] = p.get("item_id", "")
+
+        # Also try ASIN → sku_code → zoho_item_id for VC-style POs
+        sku_map: dict[str, str] = {}
+        for m in db[SKU_MAPPING_COLLECTION].find(
+            {"item_id": {"$in": asins_list}}, {"item_id": 1, "sku_code": 1}
+        ):
+            sku_map[m["item_id"]] = m.get("sku_code", "")
+        extra_skus = [v for v in sku_map.values() if v and v not in zoho_id_by_model]
+        if extra_skus:
+            for p in db[PRODUCTS_COLLECTION].find(
+                {"cf_sku_code": {"$in": extra_skus}},
+                {"cf_sku_code": 1, "item_id": 1},
+            ):
+                zoho_id_by_model[p["cf_sku_code"]] = p.get("item_id", "")
+
+        zoho_item_ids = list({v for v in zoho_id_by_model.values() if v})
+        if not zoho_item_ids:
+            return {"po_number": po_number, "updated": 0, "zoho_stock_date": None}
+
+        # Fetch latest Pupscribe WH stock
+        pupscribe_stock: dict[str, int] = {}
+        zoho_date_str: str | None = None
+        for doc_z in db[ZOHO_STOCK_COLLECTION].aggregate([
+            {"$match": {"zoho_item_id": {"$in": zoho_item_ids}}},
+            {"$sort": {"date": -1}},
+            {"$group": {"_id": "$zoho_item_id", "warehouses": {"$first": "$warehouses"}, "date": {"$first": "$date"}}},
+        ]):
+            wh = doc_z.get("warehouses", {})
+            pupscribe_stock[doc_z["_id"]] = (
+                int(wh.get("Pupscribe Enterprises Private Limited", 0) or 0)
+                if isinstance(wh, dict) else 0
+            )
+            d = doc_z.get("date")
+            if d:
+                ds = d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)[:10]
+                if zoho_date_str is None or ds > zoho_date_str:
+                    zoho_date_str = ds
+
+        # Update each stored item's zoho_stock
+        updated_items = []
+        for it in items:
+            model = it.get("model_number", "")
+            asin = it.get("asin", "")
+            zoho_id = zoho_id_by_model.get(model) or zoho_id_by_model.get(sku_map.get(asin, ""), "")
+            if zoho_id and zoho_id in pupscribe_stock:
+                it = {**it, "zoho_stock": pupscribe_stock[zoho_id]}
+            updated_items.append(it)
+
+        db[PO_COLLECTION].update_one(
+            {"po_number": po_number},
+            {"$set": {"items": updated_items, "zoho_stock_date": zoho_date_str, "updated_at": datetime.now()}},
+        )
+        return {"po_number": po_number, "updated": len(updated_items), "zoho_stock_date": zoho_date_str}
+
+    result = await asyncio.to_thread(_refresh)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"PO {po_number} not found")
+    return result
+
+
 @router.patch("/{po_number}/status")
 async def update_po_status(po_number: str, po_status: str, db=Depends(get_database)):
     if po_status not in VALID_STATUSES:
@@ -2651,7 +2780,10 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
         ("HSN", True),
         ("Etrade Unit Cost", True),
         ("Diff", True),
-        ("Zoho Stock", True),
+        ("Zoho Stock\n(Pupscribe WH)", True),
+        ("SIT 1", True),
+        ("SIT 2", True),
+        ("SIT 3", True),
         ("Status", True),
         (f"Current Stock\n({inv_date_label})", True),
         ("Open PO", True),
@@ -2706,27 +2838,30 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             18: item["margin"] if item["margin"] is not None else "",  # R  Margin
             24: item["hsn"],  # X  HSN
             25: item["etrade_unit_cost"],  # Y  Etrade Unit Cost
-            27: item["zoho_stock"],  # AA Zoho Stock
-            28: item["purchase_status"],  # AB Status
-            29: item["current_stock"],  # AC Current Stock
-            30: item["open_po"],  # AD Open PO
-            32: (
+            27: item["zoho_stock"],  # AA Zoho Stock (Pupscribe WH)
+            28: item.get("sit_1", 0),  # AB SIT 1
+            29: item.get("sit_2", 0),  # AC SIT 2
+            30: item.get("sit_3", 0),  # AD SIT 3
+            31: item["purchase_status"],  # AE Status
+            32: item["current_stock"],  # AF Current Stock
+            33: item["open_po"],  # AG Open PO
+            35: (
                 item.get("final_drr")
                 if item.get("final_drr") is not None
                 else (item.get("final_drr_flag") or "")
-            ),  # AF Final DRR
-            34: item.get("lead_time", 10),  # AH Lead Time
-            35: item.get("coverage_days", COVERAGE_DAYS),  # AI Coverage Days
+            ),  # AI Final DRR
+            37: item.get("lead_time", 10),  # AK Lead Time
+            38: item.get("coverage_days", COVERAGE_DAYS),  # AL Coverage Days
         }
-        # Monthly sales cols 40-44 (AN-AR)
+        # Monthly sales cols 43-47 (AQ-AU)
         for mi, units in enumerate(monthly_sales[:5]):
-            static[40 + mi] = units
+            static[43 + mi] = units
 
         supply_qty_override = item.get("supply_qty_override")
         final_units_override = item.get("final_units_override")
         final_supply_fo_override = item.get("final_supply_fo_override")
         formulas = {
-            9: f"=AM{r}",  # I   Supply Qty = Final Supply Qty (For Over-ordering)
+            9: f"=AP{r}",  # I   Supply Qty = Final Supply Qty (For Over-ordering)
             11: f'=IF(J{r}="","",J{r}-I{r})',  # K   Short Supply
             13: f'=IF(L{r}="","",J{r}-L{r})',  # M   Mismatch
             17: f'=IF(O{r}="",ROUND(N{r}/(1+P{r}),2),ROUND(O{r}/(1+P{r}),2))',  # Q   MRP w/o GST
@@ -2736,28 +2871,28 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             22: f'=IF(S{r}="","",ROUND(S{r}*J{r},2))',  # V   Total Cost (Accepted Qty)
             23: f'=IF(V{r}="","",ROUND(V{r}*(1+P{r}),2))',  # W   Total cost w/o GST (Accepted Qty)
             26: f'=IF(S{r}="","",Y{r}-S{r})',  # Z   Diff
-            31: f"=AC{r}+AD{r}",  # AE  Total Qty
-            33: f'=IF(AF{r}=0,"",ROUND(AE{r}/AF{r},2))',  # AG  Net Total Days
-            36: f"=AH{r}+AI{r}",  # AJ  Total Target Days
-            37: f"=ROUND(AF{r}*AJ{r},0)",  # AK  Target Stock = DRR * Total Target Days
-            38: f'=IF(AF{r}=0,"",IF(AG{r}<AH{r},ROUND(AF{r}*AJ{r},0),IF(AG{r}>AJ{r},0,ROUND((AJ{r}-AG{r})*AF{r},0))))',  # AL  Final Units (For Under-ordering)
-            39: f'=IF(AL{r}="","",MIN(AL{r},H{r}))',  # AM  Final Supply Qty (For Over-ordering)
+            34: f"=AF{r}+AG{r}",  # AH  Total Qty
+            36: f'=IF(AI{r}=0,"",ROUND(AH{r}/AI{r},2))',  # AJ  Net Total Days
+            39: f"=AK{r}+AL{r}",  # AM  Total Target Days
+            40: f"=ROUND(AI{r}*AM{r},0)",  # AN  Target Stock = DRR * Total Target Days
+            41: f'=IF(AI{r}=0,"",IF(AJ{r}<AK{r},ROUND(AI{r}*AM{r},0),IF(AJ{r}>AM{r},0,ROUND((AM{r}-AJ{r})*AI{r},0))))',  # AO  Final Units (For Under-ordering)
+            42: f'=IF(AO{r}="","",MIN(AO{r},H{r}))',  # AP  Final Supply Qty (For Over-ordering)
         }
         if supply_qty_override is not None:
             formulas.pop(9, None)
-            formulas.pop(39, None)
+            formulas.pop(42, None)
             static[9] = supply_qty_override
-            static[39] = supply_qty_override
+            static[42] = supply_qty_override
         if final_units_override is not None:
-            formulas.pop(38, None)
-            static[38] = final_units_override
+            formulas.pop(41, None)
+            static[41] = final_units_override
         if final_supply_fo_override is not None:
             formulas.pop(9, None)
-            formulas.pop(39, None)
+            formulas.pop(42, None)
             static[9] = final_supply_fo_override
-            static[39] = final_supply_fo_override
+            static[42] = final_supply_fo_override
 
-        total_cols = 39 + len(_month_headers)
+        total_cols = 42 + len(_month_headers)
         for col_idx in range(1, total_cols + 1):
             if col_idx in formulas:
                 cell = ws.cell(row=r, column=col_idx, value=formulas[col_idx])
@@ -2771,19 +2906,19 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             elif col_idx in (16, 18):  # GST%, Margin%
                 cell.number_format = pct_format
             elif (
-                col_idx in (8, 10, 12, 27, 29, 30, 31, 34, 35, 36, 37, 38, 39)
-                or col_idx >= 40
+                col_idx in (8, 10, 12, 27, 28, 29, 30, 32, 33, 34, 37, 38, 39, 40, 41, 42)
+                or col_idx >= 43
             ):
                 cell.number_format = int_format
-            elif col_idx == 32:  # Final DRR
+            elif col_idx == 35:  # Final DRR
                 cell.number_format = "0.00"
-            elif col_idx == 33:  # Net Total Days
+            elif col_idx == 36:  # Net Total Days
                 cell.number_format = days_format
 
     for col_idx in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = 16
     ws.column_dimensions["G"].width = 40
-    ws.column_dimensions["AF"].width = 26  # Final DRR with date range
+    ws.column_dimensions["AI"].width = 26  # Final DRR with date range
     ws.row_dimensions[1].height = 50
 
     buf = io.BytesIO()
