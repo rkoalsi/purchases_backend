@@ -466,7 +466,9 @@ async def download_xlsx(db=Depends(get_database)):
     # I=9 Lead Time  J=10 Coverage Days
     # K=11 Total Target Days (formula)  L=12 Target Stock (formula)
     # M=13 Final Units (formula or override)
-    # N=14 Zoho Stock  O=15 Status  P+ monthly sales
+    # N=14 Days Until Final Units Lasts (formula)
+    # O=15 Total Days Until Stock Lasts (formula)
+    # P=16 Zoho Stock  Q=17 SIT Total  R=18 SIT Brands  S=19 Status  T+ monthly sales
 
     headers = [
         "ASIN", "SKU Code", "Item Name",
@@ -477,6 +479,8 @@ async def download_xlsx(db=Depends(get_database)):
         "Total Target Days\n(=Lead + Coverage)",
         "Target Stock\n(=DRR × Total Target Days)",
         "Final Units\n(under-ordering formula)",
+        "Days Until Final Units Lasts",
+        "Total Days Until Stock Lasts",
         zoho_label,
         "Stock in Transit\n(Open Zoho POs)",
         "SIT Brands",
@@ -528,29 +532,36 @@ async def download_xlsx(db=Depends(get_database)):
         ws.cell(r, 12, f"=IF(G{r}=0,0,ROUND(G{r}*K{r},0))").fill = formula_fill
 
         # M: Final Units — override as hard value, or formula (0 if Zoho stock=0 or DRR=0)
+        # Zoho Stock is now col P (16) after inserting 2 new columns
         if row.get("final_units_overridden") and row.get("final_units") is not None:
             ws.cell(r, 13, row["final_units"])
         else:
             ws.cell(r, 13,
-                f'=IF(N{r}=0,0,'
+                f'=IF(P{r}=0,0,'
                 f'IF(G{r}=0,"",'
                 f'IF(H{r}<I{r},ROUND(G{r}*K{r},0),'
                 f'IF(H{r}>K{r},0,'
                 f'MAX(0,ROUND((K{r}-H{r})*G{r},0))))))'
             ).fill = formula_fill
 
-        # N: Zoho Stock  O: Stock in Transit  P: SIT Brands  Q: Status
-        ws.cell(r, 14, row["zoho_stock"])
-        ws.cell(r, 15, row["sit_total"])
-        ws.cell(r, 16, row["sit_brands"]).alignment = left_wrap
-        ws.cell(r, 17, row["status"])
+        # N: Days Until Final Units Lasts = Final Units / DRR
+        ws.cell(r, 14, f'=IF(G{r}=0,"",ROUND(M{r}/G{r},2))').fill = formula_fill
+
+        # O: Total Days Until Stock Lasts = Days Until Final Units Lasts + Net Total Days
+        ws.cell(r, 15, f'=IF(G{r}=0,"",ROUND(N{r}+H{r},2))').fill = formula_fill
+
+        # P: Zoho Stock  Q: Stock in Transit  R: SIT Brands  S: Status
+        ws.cell(r, 16, row["zoho_stock"])
+        ws.cell(r, 17, row["sit_total"])
+        ws.cell(r, 18, row["sit_brands"]).alignment = left_wrap
+        ws.cell(r, 19, row["status"])
 
         # Monthly sales
         for lbl_idx, lbl in enumerate(month_labels):
-            ws.cell(r, 18 + lbl_idx, ms.get(lbl, 0))
+            ws.cell(r, 20 + lbl_idx, ms.get(lbl, 0))
 
     # Column widths
-    col_widths = [14, 14, 42, 12, 10, 14, 10, 14, 10, 12, 16, 18, 18, 10, 14, 36, 12] + [12] * len(month_labels)
+    col_widths = [14, 14, 42, 12, 10, 14, 10, 14, 10, 12, 16, 18, 18, 20, 20, 10, 14, 36, 12] + [12] * len(month_labels)
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
