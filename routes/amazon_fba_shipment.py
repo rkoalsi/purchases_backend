@@ -372,7 +372,7 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
         ):
             wh = doc.get("warehouses", {})
             zoho_latest[doc["_id"]] = (
-                int(sum(v for v in wh.values() if isinstance(v, (int, float))))
+                int(wh.get("Pupscribe Enterprises Private Limited", 0) or 0)
                 if isinstance(wh, dict)
                 else 0
             )

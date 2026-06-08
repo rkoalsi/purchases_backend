@@ -444,7 +444,7 @@ async def download_inventory_aging(
         for rec in stock_records:
             zoho_id = rec.get("zoho_item_id")
             warehouses = rec.get("warehouses") or {}
-            total_stock = sum(v for v in warehouses.values() if isinstance(v, (int, float)))
+            total_stock = int(warehouses.get("Pupscribe Enterprises Private Limited", 0) or 0)
             if total_stock <= 0:
                 continue
             prod = all_product_map.get(zoho_id, {})

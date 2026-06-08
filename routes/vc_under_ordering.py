@@ -170,7 +170,7 @@ def _fetch_data(db, drr_map: dict) -> tuple:
             {"$group": {"_id": "$zoho_item_id", "warehouses": {"$first": "$warehouses"}, "date": {"$first": "$date"}}},
         ]):
             wh = doc.get("warehouses", {})
-            zoho_latest[doc["_id"]] = int(sum(v for v in wh.values() if isinstance(v, (int, float)))) if isinstance(wh, dict) else 0
+            zoho_latest[doc["_id"]] = int(wh.get("Pupscribe Enterprises Private Limited", 0) or 0) if isinstance(wh, dict) else 0
             d = doc.get("date")
             if d and (latest_zoho_date is None or d > latest_zoho_date):
                 latest_zoho_date = d

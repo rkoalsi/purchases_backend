@@ -4327,7 +4327,8 @@ def get_estimates_vs_invoices(
                 if item_id:
                     warehouses = stock.get("warehouses", {})
                     total_stock = (
-                        sum(warehouses.values()) if isinstance(warehouses, dict) else 0
+                        int(warehouses.get("Pupscribe Enterprises Private Limited", 0) or 0)
+                        if isinstance(warehouses, dict) else 0
                     )
                     closing_stock_map[item_id] = total_stock
 
