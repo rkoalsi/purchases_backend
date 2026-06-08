@@ -1213,7 +1213,8 @@ async def list_vendor_pos(db=Depends(get_database)):
     """List all purchase orders with total requested/accepted/received qty sums."""
 
     def _fetch():
-        # supply_qty_override if set, else final_supply_fo — shared by total_final_supply_qty + total_supply_qty
+        # supply_qty_override → final_supply_fo_override → final_supply_fo → supply_qty → requested_qty
+        # Mirrors Excel Fix 6: items with no DRR have final_supply_fo=None and fall back to supply_qty
         _supply_qty_map = {
             "$sum": {
                 "$map": {
@@ -1223,7 +1224,18 @@ async def list_vendor_pos(db=Depends(get_database)):
                         "$cond": [
                             {"$ne": ["$$it.supply_qty_override", None]},
                             "$$it.supply_qty_override",
-                            {"$ifNull": ["$$it.final_supply_fo", 0]},
+                            {
+                                "$cond": [
+                                    {"$ne": ["$$it.final_supply_fo_override", None]},
+                                    "$$it.final_supply_fo_override",
+                                    {
+                                        "$ifNull": [
+                                            "$$it.final_supply_fo",
+                                            {"$ifNull": ["$$it.supply_qty", "$$it.requested_qty"]},
+                                        ]
+                                    },
+                                ]
+                            },
                         ]
                     },
                 }
@@ -2524,6 +2536,7 @@ async def update_item_supply_qty(
                 "$set": {
                     "items.$.supply_qty_override": override_value,
                     "items.$.final_supply_fo_override": override_value,
+                    "items.$.final_supply_fo": override_value,
                     "updated_at": datetime.now(),
                 }
             },
@@ -2612,14 +2625,24 @@ async def update_item_final_units(
 
     def _update():
         override_value = None if final_units < 0 else final_units
+        # Compute final_supply_fo = min(final_units, requested_qty) to keep list aggregation in sync
+        fo_value = None
+        if override_value is not None:
+            item_doc = db[PO_COLLECTION].find_one(
+                {"po_number": po_number, "items.asin": asin}, {"items.$": 1}
+            )
+            if item_doc and item_doc.get("items"):
+                rq = item_doc["items"][0].get("requested_qty")
+                fo_value = min(override_value, rq) if rq is not None else override_value
+        fields = {
+            "items.$.final_units_override": override_value,
+            "updated_at": datetime.now(),
+        }
+        if fo_value is not None:
+            fields["items.$.final_supply_fo"] = fo_value
         result = db[PO_COLLECTION].update_one(
             {"po_number": po_number, "items.asin": asin},
-            {
-                "$set": {
-                    "items.$.final_units_override": override_value,
-                    "updated_at": datetime.now(),
-                }
-            },
+            {"$set": fields},
         )
         return result.matched_count
 
@@ -2648,6 +2671,7 @@ async def update_item_final_supply_fo(
             {
                 "$set": {
                     "items.$.final_supply_fo_override": override_value,
+                    "items.$.final_supply_fo": override_value,
                     "updated_at": datetime.now(),
                 }
             },
@@ -2872,10 +2896,10 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             23: f'=IF(V{r}="","",ROUND(V{r}*(1+P{r}),2))',  # W   Total cost w/o GST (Accepted Qty)
             26: f'=IF(S{r}="","",Y{r}-S{r})',  # Z   Diff
             34: f"=AF{r}+AG{r}",  # AH  Total Qty
-            36: f'=IF(AI{r}=0,"",ROUND(AH{r}/AI{r},2))',  # AJ  Net Total Days
+            36: f'=IF(ISNUMBER(AI{r}),IF(AI{r}=0,"",ROUND(AH{r}/AI{r},2)),"")',  # AJ  Net Total Days
             39: f"=AK{r}+AL{r}",  # AM  Total Target Days
-            40: f"=ROUND(AI{r}*AM{r},0)",  # AN  Target Stock = DRR * Total Target Days
-            41: f'=IF(AI{r}=0,"",IF(AJ{r}<AK{r},ROUND(AI{r}*AM{r},0),IF(AJ{r}>AM{r},0,ROUND((AM{r}-AJ{r})*AI{r},0))))',  # AO  Final Units (For Under-ordering)
+            40: f'=IF(ISNUMBER(AI{r}),ROUND(AI{r}*AM{r},0),"")',  # AN  Target Stock = DRR * Total Target Days
+            41: f'=IF(NOT(ISNUMBER(AI{r})),"",IF(AI{r}=0,"",IF(AJ{r}<AK{r},ROUND(AI{r}*AM{r},0),IF(AJ{r}>AM{r},0,ROUND((AM{r}-AJ{r})*AI{r},0)))))',  # AO  Final Units (For Under-ordering)
             42: f'=IF(AO{r}="","",MIN(AO{r},H{r}))',  # AP  Final Supply Qty (For Over-ordering)
         }
         if supply_qty_override is not None:
@@ -2891,6 +2915,20 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             formulas.pop(42, None)
             static[9] = final_supply_fo_override
             static[42] = final_supply_fo_override
+
+        # When no override and no computable final_supply_fo (missing/zero DRR),
+        # col I and AP would be blank via formula — fall back to supply_qty so Excel
+        # matches what the frontend shows.
+        if (
+            supply_qty_override is None
+            and final_supply_fo_override is None
+            and item.get("final_supply_fo") is None
+        ):
+            sq_fallback = item.get("supply_qty") or item.get("requested_qty") or ""
+            formulas.pop(9, None)
+            formulas.pop(42, None)
+            static[9] = sq_fallback
+            static[42] = sq_fallback
 
         total_cols = 42 + len(_month_headers)
         for col_idx in range(1, total_cols + 1):
