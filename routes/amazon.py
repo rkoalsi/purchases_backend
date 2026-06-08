@@ -3722,7 +3722,11 @@ def _build_active_days_df(vc_daily_by_asin: dict, fba_daily_by_asin: dict, repor
 
 
 def _fetch_sf_fba_inventory_latest_sync(db, end):
-    """Returns ({asin: {"sf": qty|None, "fba": qty|None}}, date_str). SF=VKSX, FBA=all others."""
+    """Returns ({asin: {"sf": qty|None, "fba": qty|None}}, date_str). SF=VKSX, FBA=all others.
+
+    Uses per-ASIN latest date per channel so ASINs absent from the most recent upload
+    still appear as qty=0 ("Not Live") rather than None ("Not Listed").
+    """
     latest_doc = db["amazon_ledger"].find_one(
         {"date": {"$lte": end}}, sort=[("date", -1)], projection={"date": 1}
     )
@@ -3732,10 +3736,21 @@ def _fetch_sf_fba_inventory_latest_sync(db, end):
     date_str = latest_date.strftime("%-d %b %Y") if hasattr(latest_date, "strftime") else str(latest_date)
     inv: dict = {}
     for doc in db["amazon_ledger"].aggregate([
-        {"$match": {"date": latest_date}},
+        {"$match": {"date": {"$lte": end}}},
+        # Sum per asin+date+channel to handle multiple location entries on the same day
         {"$group": {
-            "_id": {"asin": "$asin", "is_sf": {"$eq": ["$location_key", "VKSX"]}},
+            "_id": {
+                "asin": "$asin",
+                "date": "$date",
+                "is_sf": {"$eq": ["$location_key", "VKSX"]},
+            },
             "stock": {"$sum": "$ending_warehouse_balance"},
+        }},
+        {"$sort": {"_id.date": -1}},
+        # Take most recent stock value per asin+channel
+        {"$group": {
+            "_id": {"asin": "$_id.asin", "is_sf": "$_id.is_sf"},
+            "stock": {"$first": "$stock"},
         }},
     ]):
         asin = doc["_id"]["asin"]
@@ -3775,7 +3790,11 @@ def _fetch_vc_inventory_latest_sync(db, end):
 
 
 def _fetch_df_inventory_latest_sync(db, end):
-    """Returns ({asin: qty}, date_str) from amazon_df_inventory (empty until populated)."""
+    """Returns ({asin: qty}, date_str) from amazon_df_inventory (empty until populated).
+
+    Uses per-ASIN latest date so ASINs absent from the most recent upload still
+    appear as qty=0 ("Not Live") rather than None ("Not Listed").
+    """
     latest_doc = db["amazon_df_inventory"].find_one(
         {"date": {"$lte": end}}, sort=[("date", -1)], projection={"date": 1}
     )
@@ -3785,8 +3804,9 @@ def _fetch_df_inventory_latest_sync(db, end):
     date_str = latest_date.strftime("%-d %b %Y") if hasattr(latest_date, "strftime") else str(latest_date)
     inv: dict = {}
     for doc in db["amazon_df_inventory"].aggregate([
-        {"$match": {"date": latest_date}},
-        {"$group": {"_id": "$asin", "stock": {"$sum": "$sellableOnHandInventoryUnits"}}},
+        {"$match": {"date": {"$lte": end}}},
+        {"$sort": {"date": -1}},
+        {"$group": {"_id": "$asin", "stock": {"$first": "$sellableOnHandInventoryUnits"}}},
     ]):
         inv[doc["_id"]] = int(doc.get("stock") or 0)
     return inv, date_str
