@@ -782,11 +782,28 @@ def _enrich_items(
         open_sit_pos = list(
             db["purchase_orders"].find(
                 {"order_status_formatted": "Issued"},
-                {"line_items": 1, "date": 1, "_id": 0},
+                {"line_items": 1, "date": 1, "vendor_id": 1, "purchaseorder_number": 1, "_id": 0},
             ).sort("date", 1)
         )
-        _asin_sit_qtys: dict[str, list[float]] = {}
+        # Build per-vendor PO ordering (same fix as master_service.get_stock_in_transit):
+        # all SKUs from the same vendor share slot→PO mapping so an ASIN only in the
+        # 2nd PO still gets slot 2, not slot 1.
+        from collections import defaultdict as _defaultdict
+        _vendor_po_order: dict[str, list[str]] = _defaultdict(list)
         for _po in open_sit_pos:
+            _vid = _po.get("vendor_id", "") or "unknown"
+            _pnum = _po.get("purchaseorder_number", "")
+            if _pnum and _pnum not in _vendor_po_order[_vid]:
+                _vendor_po_order[_vid].append(_pnum)
+
+        _asin_sit_slots: dict[str, dict[int, float]] = {}
+        for _po in open_sit_pos:
+            _vid = _po.get("vendor_id", "") or "unknown"
+            _pnum = _po.get("purchaseorder_number", "")
+            _po_slots = _vendor_po_order.get(_vid, [])
+            _slot_idx = _po_slots.index(_pnum) if _pnum in _po_slots else -1
+            if _slot_idx < 0 or _slot_idx >= 3:
+                continue
             for _li in _po.get("line_items", []):
                 _sku = ""
                 for _cf in _li.get("item_custom_fields", []):
@@ -802,12 +819,13 @@ def _enrich_items(
                 _qty_recv = float(_li.get("quantity_received") or 0)
                 _transit = _qty - _qty_recv
                 if _transit > 0:
-                    _asin_sit_qtys.setdefault(_asin, []).append(_transit)
-        for _asin, _qtys in _asin_sit_qtys.items():
+                    _asin_sit_slots.setdefault(_asin, {})
+                    _asin_sit_slots[_asin][_slot_idx] = _asin_sit_slots[_asin].get(_slot_idx, 0) + _transit
+        for _asin, _slots in _asin_sit_slots.items():
             sit_by_asin[_asin] = {
-                "sit_1": _qtys[0] if len(_qtys) > 0 else 0,
-                "sit_2": _qtys[1] if len(_qtys) > 1 else 0,
-                "sit_3": _qtys[2] if len(_qtys) > 2 else 0,
+                "sit_1": _slots.get(0, 0),
+                "sit_2": _slots.get(1, 0),
+                "sit_3": _slots.get(2, 0),
             }
 
     # --- fetch DRR: use pre-computed map from PSR async path if provided, else fall back ---
