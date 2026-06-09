@@ -617,7 +617,9 @@ async def download_master_report(
                 ("Total Stock",          "Pupscribe WH Stock + FBA Stock."),
                 ("Blinkit Inventory",    "Latest Blinkit dark-store inventory (date shown in column header)."),
                 ("Etrade Inventory",     "Vendor Central closing stock at the end of the period."),
-                ("Stock in Transit 1–3", "Open purchase orders / shipments in transit (up to 3 future PO dates). "
+                ("Stock in Transit 1–3 + Transit PO 1–3", "Open purchase orders in transit (up to 3 POs per vendor, sorted by date). "
+                 "Each SIT column shows the pending qty from that vendor's Nth earliest issued PO. "
+                 "The adjacent 'Transit N PO' column shows the corresponding PO number. "
                                          "Sorted by expected delivery date, earliest first."),
                 ("Total Stock in Transit", "Sum of the three transit columns."),
                 ("Net Total Stock",      "Total Stock (latest) + Total Stock in Transit."),
@@ -709,8 +711,11 @@ async def download_master_report(
                         "Target Days": item.get("target_days", 0),
                         "On-Hand Days Coverage": item.get("on_hand_days_coverage", 0),
                         "Stock in Transit 1": item.get("stock_in_transit_1", 0),
+                        "Transit 1 PO": item.get("transit_1_po", ""),
                         "Stock in Transit 2": item.get("stock_in_transit_2", 0),
+                        "Transit 2 PO": item.get("transit_2_po", ""),
                         "Stock in Transit 3": item.get("stock_in_transit_3", 0),
+                        "Transit 3 PO": item.get("transit_3_po", ""),
                         "Total Stock in Transit": item.get("total_stock_in_transit", 0),
                         "Net Total Stock": 0,  # formula: Total Stock (latest) + Total Stock in Transit
                         "Current Days Coverage": item.get("current_days_coverage", 0),

@@ -1538,22 +1538,37 @@ class OptimizedMasterReportService:
             po_collection = self.database.get_collection("purchase_orders")
 
             def _fetch_open_pos():
-                # Sort by date ascending so transit_1 always corresponds to the
-                # earliest-dated open PO for each SKU (deterministic across runs).
+                # Sort by date ascending so slot 1 always corresponds to the
+                # earliest-dated open PO per vendor (deterministic across runs).
                 return list(po_collection.find(
                     {"order_status_formatted": "Issued"},
-                    {"line_items": 1, "purchaseorder_number": 1, "date": 1, "_id": 0}
+                    {"line_items": 1, "purchaseorder_number": 1, "date": 1, "vendor_id": 1, "_id": 0}
                 ).sort("date", 1))
 
             open_pos = await asyncio.to_thread(_fetch_open_pos)
 
-            # Group transit quantities by SKU
-            sku_transit: Dict[str, List[float]] = defaultdict(list)
+            # Build per-vendor PO ordering (already sorted by date ascending).
+            # slot 0 = earliest PO for that vendor, slot 1 = next, etc.
+            vendor_po_order: Dict[str, List[str]] = defaultdict(list)
+            for po in open_pos:
+                vid = po.get("vendor_id", "") or "unknown"
+                po_num = po.get("purchaseorder_number", "")
+                if po_num and po_num not in vendor_po_order[vid]:
+                    vendor_po_order[vid].append(po_num)
+
+            # For each SKU, accumulate qty keyed to the vendor's PO slot index (0-2).
+            sku_transit_slots: Dict[str, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+            sku_po_by_slot: Dict[str, Dict[int, str]] = defaultdict(dict)
 
             for po in open_pos:
-                line_items = po.get("line_items", [])
-                for li in line_items:
-                    # Extract SKU from custom fields
+                vid = po.get("vendor_id", "") or "unknown"
+                po_num = po.get("purchaseorder_number", "")
+                po_slots = vendor_po_order.get(vid, [])
+                slot_idx = po_slots.index(po_num) if po_num in po_slots else -1
+                if slot_idx < 0 or slot_idx >= 3:
+                    continue  # only track first 3 POs per vendor
+
+                for li in po.get("line_items", []):
                     sku_code = ""
                     for cf in li.get("item_custom_fields", []):
                         if cf.get("api_name") == "cf_sku_code":
@@ -1568,19 +1583,22 @@ class OptimizedMasterReportService:
                     transit_qty = qty - qty_received
 
                     if transit_qty > 0:
-                        sku_transit[sku_code].append(transit_qty)
+                        sku_transit_slots[sku_code][slot_idx] += transit_qty
+                        sku_po_by_slot[sku_code][slot_idx] = po_num
 
-            # Build result with up to 3 transit entries per SKU
+            # Build result: slot indices map directly to transit_1/2/3 so that all
+            # SKUs from the same vendor share the same PO→slot assignment.
             result = {}
-            for sku, quantities in sku_transit.items():
-                transit_1 = quantities[0] if len(quantities) > 0 else 0
-                transit_2 = quantities[1] if len(quantities) > 1 else 0
-                transit_3 = quantities[2] if len(quantities) > 2 else 0
+            for sku, slots in sku_transit_slots.items():
+                po_map = sku_po_by_slot.get(sku, {})
                 result[sku] = {
-                    "transit_1": transit_1,
-                    "transit_2": transit_2,
-                    "transit_3": transit_3,
-                    "total": sum(quantities),
+                    "transit_1": slots.get(0, 0),
+                    "transit_2": slots.get(1, 0),
+                    "transit_3": slots.get(2, 0),
+                    "transit_1_po": po_map.get(0, ""),
+                    "transit_2_po": po_map.get(1, ""),
+                    "transit_3_po": po_map.get(2, ""),
+                    "total": sum(slots.values()),
                 }
 
             logger.info(f"Found stock in transit for {len(result)} SKUs from {len(open_pos)} open POs")
@@ -1819,6 +1837,9 @@ class OptimizedMasterReportService:
             item["stock_in_transit_1"] = transit.get("transit_1", 0)
             item["stock_in_transit_2"] = transit.get("transit_2", 0)
             item["stock_in_transit_3"] = transit.get("transit_3", 0)
+            item["transit_1_po"] = transit.get("transit_1_po", "")
+            item["transit_2_po"] = transit.get("transit_2_po", "")
+            item["transit_3_po"] = transit.get("transit_3_po", "")
             item["total_stock_in_transit"] = transit.get("total", 0)
 
             # Target days = lead_time + safety_days + order_processing
