@@ -1444,9 +1444,16 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
     for o in orders:
         grouped.setdefault(o.get("brand", "Unknown"), []).append(o)
 
+    def fmt_date(d):
+        if not d:
+            return None
+        try:
+            return datetime.strptime(d, "%Y-%m-%d")
+        except Exception:
+            return None
+
     sr = 1
     for brand_name, brand_orders in sorted(grouped.items()):
-        lead_times = []
         data_rows = []
 
         for order in brand_orders:
@@ -1457,75 +1464,62 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
             port = order.get("eta_port_date")
             inward = order.get("inward_date")
 
-            G = _days_between(init, pf)
-            I_ = _days_between(pf, ready)
-            J = (G + I_) if G is not None and I_ is not None else None
+            # Python values retained only for conditional fill logic
             O_ = _days_between(ready, etd)
-            P = round(O_ / J, 4) if O_ is not None and J else None
-            Q = (O_ - 7) if O_ is not None else None
-            R = (O_ + J) if O_ is not None and J is not None else None
-            T_ = _days_between(etd, port)
             V = _days_between(port, inward)
-            W = round(V / J, 4) if V is not None and J else None
-            X = (V - 7) if V is not None else None
-            AA = _days_between(pf, inward)
-
-            if AA is not None:
-                lead_times.append(AA)
+            Q_fill = (O_ - 7) if O_ is not None else None
+            X_fill = (V - 7) if V is not None else None
 
             po_num = order.get("purchaseorder_number") or order.get("name", "")
             data_rows.append({
                 "sr": sr, "brand": brand_name, "po_num": po_num,
-                "init": init, "pf": pf, "G": G,
-                "ready": ready, "I": I_, "J": J,
-                "etd": etd, "N": J, "O": O_, "P": P, "Q": Q, "R": R,
-                "port": port, "T": T_,
-                "inward": inward, "V": V, "W": W, "X": X,
-                "AA": AA,
+                "init": init, "pf": pf,
+                "ready": ready, "etd": etd,
+                "port": port, "inward": inward,
+                "Q_fill": Q_fill, "X_fill": X_fill,
             })
             sr += 1
 
-        avg_lt = round(sum(lead_times) / len(lead_times), 1) if lead_times else None
+        brand_start_row = ws.max_row + 1
 
         for i, row_data in enumerate(data_rows):
             is_last = (i == len(data_rows) - 1)
-
-            def fmt_date(d):
-                if not d:
-                    return None
-                try:
-                    return datetime.strptime(d, "%Y-%m-%d")
-                except Exception:
-                    return None
+            r = ws.max_row + 1  # row about to be written
 
             row = [
-                row_data["sr"],
-                row_data["brand"],
-                row_data["po_num"],
-                fmt_date(row_data["init"]),
-                fmt_date(row_data["pf"]),
-                row_data["G"],
-                fmt_date(row_data["ready"]),
-                row_data["I"],
-                row_data["J"],
-                fmt_date(row_data["etd"]),
-                row_data["N"],
-                row_data["O"],
-                row_data["P"],
-                row_data["Q"],
-                row_data["R"],
-                fmt_date(row_data["port"]),
-                row_data["T"],
-                fmt_date(row_data["inward"]),
-                row_data["V"],
-                row_data["W"],
-                row_data["X"],
-                row_data["AA"],
-                brand_name if is_last else None,
-                avg_lt if is_last else None,
+                row_data["sr"],                                                           # A  col 1
+                row_data["brand"],                                                        # B  col 2
+                row_data["po_num"],                                                       # C  col 3
+                fmt_date(row_data["init"]),                                               # D  col 4  Date of Initiation (E)
+                fmt_date(row_data["pf"]),                                                 # E  col 5  Proforma Invoice Date (F)
+                f'=IF(AND(D{r}<>"",E{r}<>""),E{r}-D{r},"")',                             # F  col 6  G = F-E
+                fmt_date(row_data["ready"]),                                              # G  col 7  Order Ready Date (H)
+                f'=IF(AND(E{r}<>"",G{r}<>""),G{r}-E{r},"")',                             # H  col 8  I = H-F
+                f'=IF(AND(F{r}<>"",H{r}<>""),F{r}+H{r},"")',                             # I  col 9  J = G+I
+                fmt_date(row_data["etd"]),                                                # J  col 10 ETD (M)
+                f'=IF(AND(F{r}<>"",H{r}<>""),F{r}+H{r},"")',                             # K  col 11 N = G+I (same as J)
+                f'=IF(AND(G{r}<>"",J{r}<>""),J{r}-G{r},"")',                             # L  col 12 O = M-H
+                f'=IF(AND(L{r}<>"",I{r}<>"",I{r}<>0),L{r}/I{r},"")',                    # M  col 13 P = O/N
+                f'=IF(L{r}<>"",L{r}-7,"")',                                               # N  col 14 Q = O-7
+                f'=IF(AND(L{r}<>"",I{r}<>""),L{r}+I{r},"")',                             # O  col 15 R = O+N
+                fmt_date(row_data["port"]),                                               # P  col 16 Port ETA (S)
+                f'=IF(AND(J{r}<>"",P{r}<>""),P{r}-J{r},"")',                             # Q  col 17 T = S-M
+                fmt_date(row_data["inward"]),                                             # R  col 18 Inward Date (U)
+                f'=IF(AND(P{r}<>"",R{r}<>""),R{r}-P{r},"")',                             # S  col 19 V = U-S
+                f'=IF(AND(S{r}<>"",I{r}<>"",I{r}<>0),S{r}/I{r},"")',                    # T  col 20 W = V/N
+                f'=IF(S{r}<>"",S{r}-7,"")',                                               # U  col 21 X = V-7
+                f'=IF(AND(E{r}<>"",R{r}<>""),R{r}-E{r},"")',                             # V  col 22 AA = Z-F
+                brand_name if is_last else None,                                          # W  col 23 Brand
+                None,                                                                     # X  col 24 Avg Lead Time (set below)
             ]
             ws.append(row)
             excel_row = ws.max_row
+
+            if is_last:
+                ws.cell(row=excel_row, column=24).value = (
+                    f'=IF(COUNT(V{brand_start_row}:V{excel_row})>0,'
+                    f'ROUND(AVERAGE(V{brand_start_row}:V{excel_row}),1),"")'
+                )
 
             for col_idx, cell in enumerate(ws[excel_row], 1):
                 cell.font = brand_font if col_idx <= 2 else data_font
@@ -1536,10 +1530,9 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
                     if cell.value:
                         cell.number_format = "DD-MMM-YYYY"
                     cell.alignment = center
-                # Percentage columns
+                # Percentage columns — always apply format (cell holds a formula)
                 elif col_idx in (13, 20):
-                    if cell.value is not None:
-                        cell.number_format = "0.0%"
+                    cell.number_format = "0.0%"
                     cell.alignment = center
                 # Numeric columns
                 elif col_idx in (6, 8, 9, 11, 12, 14, 15, 17, 19, 21, 22):
@@ -1554,11 +1547,11 @@ def _build_lead_time_excel(orders: list) -> io.BytesIO:
 
                 # Color coding for Q (col 14) and X (col 21)
                 if col_idx == 14:
-                    f = improvement_fill(row_data["Q"])
+                    f = improvement_fill(row_data["Q_fill"])
                     if f:
                         cell.fill = f
                 elif col_idx == 21:
-                    f = improvement_fill(row_data["X"])
+                    f = improvement_fill(row_data["X_fill"])
                     if f:
                         cell.fill = f
 
