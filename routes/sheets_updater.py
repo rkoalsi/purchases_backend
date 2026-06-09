@@ -488,9 +488,9 @@ async def _run_vendor_sheets_core(
 
             data = sku_data.get(sku)
             if data is None:
-                skipped_no_data += 1
-                skipped_no_data_skus.append(sku)
-                continue
+                # SKU had no activity in the report window — write zeros so stale
+                # values from a previous update period are replaced with correct data.
+                data = {"total_sales": 0, "total_days_in_stock": 0}
 
             sheet_row = data_start + 1 + row_idx
 
