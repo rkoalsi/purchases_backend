@@ -3795,21 +3795,74 @@ def _fetch_df_inventory_latest_sync(db, end):
     Uses per-ASIN latest date so ASINs absent from the most recent upload still
     appear as qty=0 ("Not Live") rather than None ("Not Listed").
     """
+    # Support both datetime-stored (new uploads) and string-stored (legacy) dates.
+    end_str = end.strftime("%Y-%m-%d 23:59:59")
+    date_filter = {"$or": [{"date": {"$lte": end}}, {"date": {"$lte": end_str}}]}
+
     latest_doc = db["amazon_df_inventory"].find_one(
-        {"date": {"$lte": end}}, sort=[("date", -1)], projection={"date": 1}
+        date_filter, sort=[("date", -1)], projection={"date": 1}
     )
     if not latest_doc:
         return {}, None
+
     latest_date = latest_doc["date"]
-    date_str = latest_date.strftime("%-d %b %Y") if hasattr(latest_date, "strftime") else str(latest_date)
+    if hasattr(latest_date, "strftime"):
+        date_str = latest_date.strftime("%-d %b %Y")
+    else:
+        try:
+            date_str = datetime.strptime(str(latest_date)[:10], "%Y-%m-%d").strftime("%-d %b %Y")
+        except Exception:
+            date_str = str(latest_date)
+
     inv: dict = {}
     for doc in db["amazon_df_inventory"].aggregate([
-        {"$match": {"date": {"$lte": end}}},
+        {"$match": date_filter},
         {"$sort": {"date": -1}},
-        {"$group": {"_id": "$asin", "stock": {"$first": "$sellableOnHandInventoryUnits"}}},
+        {"$group": {"_id": "$asin", "stock": {"$first": "$available_units"}}},
     ]):
         inv[doc["_id"]] = int(doc.get("stock") or 0)
     return inv, date_str
+
+
+def _fetch_df_inventory_detail_sync(db, end):
+    """Returns (list[dict], date_str) — full per-row records from the latest DF upload <= end."""
+    end_str = end.strftime("%Y-%m-%d 23:59:59")
+    date_filter = {"$or": [{"date": {"$lte": end}}, {"date": {"$lte": end_str}}]}
+
+    latest_doc = db["amazon_df_inventory"].find_one(
+        date_filter, sort=[("date", -1)], projection={"date": 1}
+    )
+    if not latest_doc:
+        return [], None
+
+    latest_date = latest_doc["date"]
+    if hasattr(latest_date, "strftime"):
+        date_str = latest_date.strftime("%-d %b %Y")
+    else:
+        try:
+            date_str = datetime.strptime(str(latest_date)[:10], "%Y-%m-%d").strftime("%-d %b %Y")
+        except Exception:
+            date_str = str(latest_date)
+
+    # Fetch all rows at the per-ASIN latest date (same $or logic)
+    rows = list(db["amazon_df_inventory"].aggregate([
+        {"$match": date_filter},
+        {"$sort": {"date": -1}},
+        {
+            "$group": {
+                "_id": {"asin": "$asin", "warehouse": "$warehouse"},
+                "asin":           {"$first": "$asin"},
+                "sku":            {"$first": "$sku"},
+                "title":          {"$first": "$title"},
+                "warehouse":      {"$first": "$warehouse"},
+                "warehouse_name": {"$first": "$warehouse_name"},
+                "available_units":{"$first": "$available_units"},
+                "status":         {"$first": "$status"},
+            }
+        },
+        {"$sort": {"asin": 1, "warehouse": 1}},
+    ]))
+    return rows, date_str
 
 
 def _fetch_zoho_stock_for_asins_sync(db, asins):
@@ -4398,6 +4451,93 @@ def _style_calendar_sheet(worksheet, df):
     worksheet.freeze_panes = "E2"
 
 
+def _build_df_inventory_sheet(ws, df_records, report_data, date_str):
+    """Flat snapshot table for DF (Seller Flex) inventory — one row per ASIN/warehouse."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    C_TITLE_BG = "7B3F00"   # dark brown
+    C_HDR_BG   = "C0672B"   # amber-brown
+    C_INFO_BG  = "FFF3E0"
+    C_LIVE_BG  = "C6EFCE"   # green
+    C_ZERO_BG  = "FFEB9C"   # yellow
+    C_ALT_ROW  = "FFF8F0"
+
+    HDR_COLS = ["ASIN", "SKU Code", "Item Name", "Warehouse", "Warehouse Name",
+                "Available Units", "Status", "Date"]
+
+    sku_by_asin  = {r["asin"]: r.get("sku_code", "") for r in report_data if r.get("asin")}
+    name_by_asin = {r["asin"]: r.get("item_name", "") for r in report_data if r.get("asin")}
+
+    title_val = f"DF (Seller Flex) Inventory Snapshot  —  {date_str or 'Latest'}"
+    last_col  = len(HDR_COLS)
+
+    # Row 1 – title
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
+    tc = ws.cell(row=1, column=1, value=title_val)
+    tc.font      = Font(bold=True, size=13, color="FFFFFF")
+    tc.fill      = PatternFill(start_color=C_TITLE_BG, end_color=C_TITLE_BG, fill_type="solid")
+    tc.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 26
+
+    # Row 2 – legend
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
+    ic = ws.cell(row=2, column=1, value="Green = Available Units > 0     Yellow = Units = 0     Blank status = Not Listed")
+    ic.font      = Font(italic=True, size=10, color=C_TITLE_BG)
+    ic.fill      = PatternFill(start_color=C_INFO_BG, end_color=C_INFO_BG, fill_type="solid")
+    ic.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[2].height = 20
+
+    # Row 3 – headers
+    hdr_font  = Font(bold=True, color="FFFFFF")
+    hdr_fill  = PatternFill(start_color=C_HDR_BG, end_color=C_HDR_BG, fill_type="solid")
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for col, hdr in enumerate(HDR_COLS, start=1):
+        c = ws.cell(row=3, column=col, value=hdr)
+        c.font      = hdr_font
+        c.fill      = hdr_fill
+        c.alignment = hdr_align
+    ws.row_dimensions[3].height = 22
+
+    # Data rows
+    alt_fill  = PatternFill(start_color=C_ALT_ROW, end_color=C_ALT_ROW, fill_type="solid")
+    live_fill = PatternFill(start_color=C_LIVE_BG, end_color=C_LIVE_BG, fill_type="solid")
+    zero_fill = PatternFill(start_color=C_ZERO_BG, end_color=C_ZERO_BG, fill_type="solid")
+    center    = Alignment(horizontal="center")
+
+    col_widths = [18, 16, 40, 12, 30, 16, 12, 14]
+
+    for row_offset, rec in enumerate(df_records):
+        r     = 4 + row_offset
+        asin  = rec.get("asin", "")
+        units = rec.get("available_units") or 0
+        row_fill = live_fill if units > 0 else (zero_fill if units == 0 else alt_fill)
+        if row_offset % 2 == 1 and units == 0:
+            row_fill = alt_fill   # don't yellow every other zero row
+
+        vals = [
+            asin,
+            sku_by_asin.get(asin) or rec.get("sku", ""),
+            name_by_asin.get(asin) or rec.get("title", ""),
+            rec.get("warehouse", ""),
+            rec.get("warehouse_name", ""),
+            units,
+            rec.get("status", ""),
+            date_str or "",
+        ]
+        for col, val in enumerate(vals, start=1):
+            c = ws.cell(row=r, column=col, value=val)
+            c.fill = row_fill
+            if col in (4, 6, 7, 8):
+                c.alignment = center
+
+    # Column widths
+    for i, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws.freeze_panes = "A4"
+
+
 def _build_inventory_sheet(ws, daily_by_asin, report_data, all_dates, title, platform, purchase_status_map=None, mode="sales"):
     """
     Calendar-style sheet: one row per ASIN, one column per day.
@@ -4752,13 +4892,15 @@ async def download_report_by_date_range(
             (zoho_data,   zoho_date),
             vc_open_po,
             fba_sit,
+            (df_detail_rows, _df_detail_date),
         ) = await asyncio.gather(
-            asyncio.to_thread(_fetch_sf_fba_inventory_latest_sync, database, end),
-            asyncio.to_thread(_fetch_vc_inventory_latest_sync,     database, end),
-            asyncio.to_thread(_fetch_df_inventory_latest_sync,     database, end),
-            asyncio.to_thread(_fetch_zoho_stock_for_asins_sync,    database, all_asin_list),
-            asyncio.to_thread(_fetch_vc_open_po_qty_sync,          database, all_asin_list),
-            asyncio.to_thread(_fetch_fba_sit_qty_sync,             database, all_asin_list),
+            asyncio.to_thread(_fetch_sf_fba_inventory_latest_sync,  database, end),
+            asyncio.to_thread(_fetch_vc_inventory_latest_sync,      database, end),
+            asyncio.to_thread(_fetch_df_inventory_latest_sync,      database, end),
+            asyncio.to_thread(_fetch_zoho_stock_for_asins_sync,     database, all_asin_list),
+            asyncio.to_thread(_fetch_vc_open_po_qty_sync,           database, all_asin_list),
+            asyncio.to_thread(_fetch_fba_sit_qty_sync,              database, all_asin_list),
+            asyncio.to_thread(_fetch_df_inventory_detail_sync,      database, end),
         )
         extra_inventory = {
             "sf_fba":    sf_fba_inv,
@@ -4934,6 +5076,10 @@ async def download_report_by_date_range(
                 purchase_status_map,
                 mode="inventory",
             )
+
+        if df_detail_rows:
+            ws_df_inv = wb.create_sheet("DF Inventory")
+            _build_df_inventory_sheet(ws_df_inv, df_detail_rows, report_data, df_inv_date)
 
         wb.save(excel_buffer)
 

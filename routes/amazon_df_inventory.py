@@ -28,13 +28,33 @@ def _clean_sku(raw: str) -> str:
     return m.group(1) if m else s
 
 
+_DATE_FMTS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d")
+
+
+def _parse_date(val) -> datetime | None:
+    """Normalise date cell to a midnight datetime object."""
+    if val is None:
+        return None
+    if hasattr(val, "strftime"):
+        return val.replace(hour=0, minute=0, second=0, microsecond=0)
+    s = str(val).strip()
+    if not s:
+        return None
+    for fmt in _DATE_FMTS:
+        try:
+            return datetime.strptime(s, fmt).replace(hour=0, minute=0, second=0, microsecond=0)
+        except ValueError:
+            continue
+    return None
+
+
 def _parse_csv(content: bytes) -> list[dict]:
     text = content.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
     rows = []
     for row in reader:
         rows.append({
-            "date": row.get("Date", "").strip(),
+            "date": _parse_date(row.get("Date", "")),
             "sku": _clean_sku(row.get("SKU", "")),
             "asin": row.get("ASIN", "").strip(),
             "title": row.get("Title", "").strip(),
@@ -61,7 +81,7 @@ def _parse_xlsx(content: bytes) -> list[dict]:
         if not any(row):
             continue
         rows.append({
-            "date": _get(row, "Date"),
+            "date": _parse_date(row[col_idx["Date"]] if "Date" in col_idx else None),
             "sku": _clean_sku(_get(row, "SKU")),
             "asin": _get(row, "ASIN"),
             "title": _get(row, "Title"),
