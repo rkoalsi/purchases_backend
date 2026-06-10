@@ -4079,12 +4079,14 @@ async def create_zoho_estimate(
                     continue  # blocked below unless skip_inactive=True
             margin = it.get("margin")
             discount = round(margin * 100, 2) if margin is not None else 0
-            if it.get("supply_qty_override") is not None:
+            if it.get("final_supply_fo_override") is not None:
+                qty = it["final_supply_fo_override"]
+            elif it.get("supply_qty_override") is not None:
                 qty = it["supply_qty_override"]
             elif it.get("final_supply_fo") is not None:
                 qty = it["final_supply_fo"]
             else:
-                qty = 0
+                qty = it.get("supply_qty") or 0
             line_items.append(
                 {
                     "item_id": zoho_item_id,
@@ -4221,6 +4223,13 @@ async def create_zoho_estimate(
             },
         )
 
+        # Sync new estimate to local DB so estimate_diff is immediately usable
+        db[ESTIMATES_COLLECTION].update_one(
+            {"estimate_id": estimate["estimate_id"]},
+            {"$set": estimate},
+            upsert=True,
+        )
+
         return estimate, skipped, inactive_items
 
     try:
@@ -4342,12 +4351,14 @@ async def update_zoho_estimate(
 
             margin = it.get("margin")
             discount = round(margin * 100, 2) if margin is not None else 0
-            if it.get("supply_qty_override") is not None:
+            if it.get("final_supply_fo_override") is not None:
+                qty = it["final_supply_fo_override"]
+            elif it.get("supply_qty_override") is not None:
                 qty = it["supply_qty_override"]
             elif it.get("final_supply_fo") is not None:
                 qty = it["final_supply_fo"]
             else:
-                qty = 0
+                qty = it.get("supply_qty") or 0
             line_items.append(
                 {
                     "item_id": zoho_item_id,
@@ -4419,12 +4430,21 @@ async def update_zoho_estimate(
         if data.get("code") != 0:
             raise ValueError(f"Zoho error: {data.get('message', 'Unknown error')}")
 
+        now = datetime.now()
         db[PO_COLLECTION].update_one(
             {"po_number": po_number},
-            {"$set": {"updated_at": datetime.now()}},
+            {"$set": {"updated_at": now}},
         )
 
-        return data["estimate"], skipped, inactive_items
+        # Sync updated estimate back to local DB so estimate_diff reads fresh data
+        updated_est = data["estimate"]
+        db[ESTIMATES_COLLECTION].update_one(
+            {"estimate_id": updated_est["estimate_id"]},
+            {"$set": updated_est},
+            upsert=True,
+        )
+
+        return updated_est, skipped, inactive_items
 
     try:
         estimate, skipped, inactive_items = await asyncio.to_thread(_update)
