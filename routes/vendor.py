@@ -651,6 +651,81 @@ async def save_pending_item(body: SavePendingItemRequest, db=Depends(get_databas
     return {"ok": True}
 
 
+_MASTER_SHEET_ID   = "1bQEqJxPR_m1Y-K7Bjh74kio2ZTEWENFLoFTl1POabMY"
+_MASTER_SHEET_NAME = "Master"
+_MASTER_HEADER_ROW = 1   # 0-based index
+# Fields from item data → candidate column header substrings (all lowercase)
+_MASTER_FIELD_MAP = [
+    # field name            exact header candidates (lowercase) — first exact match wins
+    ("manufacturer_code", ["manufacturing code", "manufacturer code", "mfr code"]),
+    ("bb_code",           ["sku code (final)", "bb code", "bb_code"]),
+    ("sku_code",          ["upc / ean code", "upc/ean code", "upc", "ean", "barcode"]),
+    ("brand",             ["brand"]),
+    ("item_name",         ["item name", "product name", "name"]),
+    ("mrp",               ["current mrp", "mrp", "rate", "selling price"]),
+    ("hsn_or_sac",        ["hsn code", "hsn/sac", "hsn"]),
+    ("tax_rate",          ["new gst %", "gst %", "tax rate", "gst rate"]),
+    ("category",          ["category"]),
+    ("sub_category",      ["sub-category", "sub category", "subcategory"]),
+    ("series",            ["series"]),
+]
+
+
+def _insert_items_into_master_sheet(items_data: list[dict]) -> dict:
+    """Append newly created items as new rows in the Masters Google Sheet."""
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    creds_path = os.path.join(backend_dir, "creds.json")
+    credentials = Credentials.from_service_account_file(
+        creds_path, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    gc = gspread.authorize(credentials)
+    ws = gc.open_by_key(_MASTER_SHEET_ID).worksheet(_MASTER_SHEET_NAME)
+
+    all_rows = ws.get_all_values()
+    if len(all_rows) <= _MASTER_HEADER_ROW:
+        return {"inserted": 0, "error": "Sheet has no header row"}
+
+    header = [h.strip().lower() for h in all_rows[_MASTER_HEADER_ROW]]
+    num_cols = len(header)
+
+    def _find_col(candidates: list[str]) -> int:
+        for cand in candidates:
+            for i, h in enumerate(header):
+                if h == cand:
+                    return i
+        for cand in candidates:
+            for i, h in enumerate(header):
+                if cand in h:
+                    return i
+        return -1
+
+    col_map = {field: _find_col(cands) for field, cands in _MASTER_FIELD_MAP}
+    mapped = {f: c for f, c in col_map.items() if c >= 0}
+    if not mapped:
+        return {"inserted": 0, "error": "No matching columns found in master sheet header"}
+
+    max_col = max(mapped.values()) + 1
+    row_width = max(num_cols, max_col)
+
+    rows_to_append = []
+    for item in items_data:
+        row: list = [""] * row_width
+        for field, col_idx in mapped.items():
+            val = item.get(field)
+            if val is not None and val != "":
+                row[col_idx] = str(val)
+        rows_to_append.append(row)
+
+    if rows_to_append:
+        ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+
+    logger.info("Inserted %d new item rows into master sheet", len(rows_to_append))
+    return {"inserted": len(rows_to_append), "error": None}
+
+
 @router.post("/draft_orders/create_zoho_items")
 async def create_zoho_items(body: CreateZohoItemsRequest):
     """Create missing items on Zoho Books. Returns per-item created/failed results."""
@@ -788,7 +863,32 @@ async def create_zoho_items(body: CreateZohoItemsRequest):
                     pass
         await asyncio.to_thread(_notify)
 
-    return {"created": created, "failed": failed}
+    masters_result: dict = {"inserted": 0, "error": None}
+    if created:
+        try:
+            items_for_sheet = []
+            created_keys = {(c["bb_code"], c["manufacturer_code"]) for c in created}
+            for item in body.items:
+                if (item.bb_code, item.manufacturer_code) in created_keys:
+                    items_for_sheet.append({
+                        "item_name": item.item_name,
+                        "bb_code": item.bb_code,
+                        "manufacturer_code": item.manufacturer_code,
+                        "hsn_or_sac": item.hsn_or_sac,
+                        "category": item.category,
+                        "sub_category": item.sub_category,
+                        "series": item.series,
+                        "mrp": item.mrp,
+                        "brand": item.brand,
+                        "tax_rate": item.tax_rate,
+                        "sku_code": item.sku_code,
+                    })
+            masters_result = await asyncio.to_thread(_insert_items_into_master_sheet, items_for_sheet)
+        except Exception as e:
+            logger.error("Failed to insert new items into master sheet: %s", e)
+            masters_result = {"inserted": 0, "error": str(e)}
+
+    return {"created": created, "failed": failed, "masters_sheet": masters_result}
 
 
 @router.get("/draft_orders")

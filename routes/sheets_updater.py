@@ -30,10 +30,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ── Google Sheet IDs ──────────────────────────────────────────────────────────
-MASTER_SHEET_ID    = "1bQEqJxPR_m1Y-K7Bjh74kio2ZTEWENFLoFTl1POabMY"
-MASTER_SHEET_NAME  = "Master"
-HEADER_ROW_INDEX   = 1   # 0-based; row 0 is empty, row 1 = header (sheet row 2)
-DATA_START_ROW     = 2   # 0-based index of first data row (sheet row 3)
+MASTER_SHEET_ID         = "1bQEqJxPR_m1Y-K7Bjh74kio2ZTEWENFLoFTl1POabMY"
+MASTER_SHEET_NAME       = "Master"
+AMAZON_COMBO_SHEET_NAME = "AmazonComboProducts"
+HEADER_ROW_INDEX        = 1   # 0-based; row 0 is group headers, row 1 = column headers (sheet row 2)
+DATA_START_ROW          = 2   # 0-based index of first data row (sheet row 3)
 
 # Column CS is column 97 (1-indexed): CA=79 … CS=79+18=97
 STOCK_COL_INDEX = 97
@@ -364,6 +365,108 @@ async def _run_master_stock_core(
     }
 
 
+async def _run_amazon_combo_status_core(db, sheet_id: str) -> dict:
+    """Write purchase_status from products collection into the 'Amazon ComboProducts' sheet Status column."""
+    import gspread
+
+    try:
+        _, sh = _open_sheet(sheet_id)
+        ws = sh.worksheet(AMAZON_COMBO_SHEET_NAME)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not open '{AMAZON_COMBO_SHEET_NAME}' sheet: {exc}")
+
+    try:
+        all_rows = await asyncio.to_thread(ws.get_all_values)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read '{AMAZON_COMBO_SHEET_NAME}' sheet: {exc}")
+
+    if len(all_rows) <= HEADER_ROW_INDEX:
+        raise HTTPException(status_code=400, detail=f"'{AMAZON_COMBO_SHEET_NAME}' sheet has fewer than {HEADER_ROW_INDEX + 1} rows")
+
+    header = [h.strip() for h in all_rows[HEADER_ROW_INDEX]]
+
+    def _col_idx(name: str) -> int:
+        name_lower = name.lower()
+        for i, h in enumerate(header):
+            if h.lower() == name_lower:
+                return i
+        return -1
+
+    sku_col_0    = _col_idx("SKU Code")
+    status_col_0 = _col_idx("Status")
+
+    if sku_col_0 == -1:
+        raise HTTPException(status_code=400, detail=f"'SKU Code' column not found in '{AMAZON_COMBO_SHEET_NAME}'")
+    if status_col_0 == -1:
+        raise HTTPException(status_code=400, detail=f"'Status' column not found in '{AMAZON_COMBO_SHEET_NAME}'")
+
+    data_rows = all_rows[DATA_START_ROW:]
+    unique_skus = list({
+        row[sku_col_0].strip()
+        for row in data_rows
+        if sku_col_0 < len(row) and row[sku_col_0].strip()
+    })
+
+    if not unique_skus:
+        return {
+            "success": True,
+            "message": f"No SKU codes found in '{AMAZON_COMBO_SHEET_NAME}'",
+            "updated": 0,
+            "skipped_no_sku": len(data_rows),
+            "skipped_no_product": 0,
+        }
+
+    def _fetch_products():
+        return list(
+            db.get_collection("products").find(
+                {"cf_sku_code": {"$in": unique_skus}},
+                {"cf_sku_code": 1, "purchase_status": 1, "_id": 0},
+            )
+        )
+
+    product_docs = await asyncio.to_thread(_fetch_products)
+    product_by_sku: dict[str, dict] = {
+        doc["cf_sku_code"]: doc for doc in product_docs if doc.get("cf_sku_code")
+    }
+
+    status_updates: list[dict] = []
+    updated = skipped_no_sku = skipped_no_product = 0
+
+    for idx, row in enumerate(data_rows):
+        sku = row[sku_col_0].strip() if sku_col_0 < len(row) else ""
+        if not sku:
+            skipped_no_sku += 1
+            continue
+        prod = product_by_sku.get(sku)
+        if prod is None:
+            skipped_no_product += 1
+            continue
+        sheet_row = DATA_START_ROW + 1 + idx  # 1-based for gspread
+        status_updates.append({
+            "range": gspread.utils.rowcol_to_a1(sheet_row, status_col_0 + 1),
+            "values": [[prod.get("purchase_status", "")]],
+        })
+        updated += 1
+
+    if status_updates:
+        try:
+            await asyncio.to_thread(
+                ws.batch_update, status_updates, value_input_option="USER_ENTERED"
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"'{AMAZON_COMBO_SHEET_NAME}' write failed: {exc}")
+
+    return {
+        "success": True,
+        "message": f"Updated {updated} rows in '{AMAZON_COMBO_SHEET_NAME}'",
+        "sheet_id": sheet_id,
+        "updated": updated,
+        "skipped_no_sku": skipped_no_sku,
+        "skipped_no_product": skipped_no_product,
+        "products_matched": len(product_by_sku),
+    }
+
+
 async def _run_vendor_sheets_core(
     db,
     vendor_sheet_id: str,
@@ -607,71 +710,44 @@ async def update_all_sheets(
     db=Depends(get_database),
 ):
     """
-    Fetch Zoho stock ONCE and run the master report ONCE (both in parallel),
-    then write the master workbook and all vendor tabs in parallel.
-    Fastest option when both updates are needed.
+    Fetch Zoho stock then write Master stock + Amazon ComboProducts status in parallel.
     """
-    from .master import _generate_master_report_data
-
     master_sheet_id = _parse_sheet_id(body.master_sheet_id, MASTER_SHEET_ID)
-    vendor_sheet_id = _parse_sheet_id(body.vendor_sheet_id, VENDOR_SHEET_ID)
-    start_date, end_date = _last_3_months_range()
 
-    # ── Phase 1: fetch shared data in parallel ────────────────────────────────
-    logger.info("update-all: fetching Zoho stock + master report in parallel")
+    # ── Phase 1: fetch Zoho stock ─────────────────────────────────────────────
+    logger.info("update-all: fetching Zoho stock")
     try:
-        (sku_stock_map, stock_date), report = await asyncio.gather(
-            asyncio.to_thread(_fetch_live_zoho_stock, db),
-            _generate_master_report_data(
-                start_date=start_date, end_date=end_date, include_zoho=True, db=db,
-            ),
-        )
+        sku_stock_map, stock_date = await asyncio.to_thread(_fetch_live_zoho_stock, db)
     except Exception as exc:
         logger.exception("update-all: phase 1 failed")
         raise HTTPException(status_code=500, detail=f"Data fetch failed: {exc}")
 
-    combined_data: list[dict] = report.get("combined_data", [])
-    sku_data: dict[str, dict] = {}
-    for item in combined_data:
-        sku = item.get("sku_code", "")
-        if not sku:
-            continue
-        metrics = item.get("combined_metrics", {})
-        sku_data[sku] = {
-            "total_sales":         round(metrics.get("total_sales", 0) or 0, 2),
-            "total_days_in_stock": int(metrics.get("total_days_in_stock", 0) or 0),
-        }
+    logger.info("update-all: Zoho stock=%d SKUs  stock_date=%s", len(sku_stock_map), stock_date)
 
-    logger.info(
-        "update-all: Zoho stock=%d SKUs  master report=%d SKUs  stock_date=%s",
-        len(sku_stock_map), len(sku_data), stock_date,
-    )
-
-    # ── Phase 2: write both workbooks in parallel ─────────────────────────────
-    logger.info("update-all: writing both workbooks in parallel")
+    # ── Phase 2: write all sheets in parallel ────────────────────────────────
+    logger.info("update-all: writing all sheets in parallel")
     try:
-        master_result, vendor_result = await asyncio.gather(
+        master_result, combo_result = await asyncio.gather(
             _run_master_stock_core(db, master_sheet_id, sku_stock_map, stock_date),
-            _run_vendor_sheets_core(db, vendor_sheet_id, sku_data, sku_stock_map, stock_date, start_date, end_date),
+            _run_amazon_combo_status_core(db, master_sheet_id),
         )
     except Exception as exc:
         logger.exception("update-all: phase 2 failed")
         raise HTTPException(status_code=500, detail=f"Sheet write failed: {exc}")
 
     master_updated = master_result.get("updated", 0)
-    vendor_updated = sum(t.get("updated", 0) for t in vendor_result.get("tabs", []))
-    tabs_ok = sum(1 for t in vendor_result.get("tabs", []) if t.get("success"))
+    combo_updated = combo_result.get("updated", 0)
 
     return JSONResponse({
         "success": True,
         "message": (
-            f"Both workbooks updated — "
+            f"All sheets updated — "
             f"{master_updated} master rows, "
-            f"{vendor_updated} vendor rows ({tabs_ok}/{len(VENDOR_TABS)} tabs)"
+            f"{combo_updated} Amazon combo rows"
         ),
         "stock_date": stock_date,
         "master": master_result,
-        "vendor": vendor_result,
+        "amazon_combo": combo_result,
     })
 
 
@@ -728,4 +804,10 @@ async def update_vendor_sheets(
     result = await _run_vendor_sheets_core(
         db, vendor_sheet_id, sku_data, sku_stock_map, stock_date, start_date, end_date,
     )
+    return JSONResponse(result)
+
+
+@router.post("/update-amazon-combo-status")
+async def update_amazon_combo_status(db=Depends(get_database)):
+    result = await _run_amazon_combo_status_core(db, MASTER_SHEET_ID)
     return JSONResponse(result)
