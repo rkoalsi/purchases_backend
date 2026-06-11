@@ -933,16 +933,16 @@ async def download_master_report(
                     else:
                         ws[f"{_AP}{r}"] = f'=IF({inactive},0,IF({_AO}{r}="EXCESS",0,MAX(0,{_AN}{r}*{_N}{r})*{_AX}{r}))'
 
-                    # Order Qty + Extra Qty (only Extra Qty for inactive/discontinued; 0 for EXCESS)
-                    ws[f"{_AQ}{r}"] = f'=IF({inactive},{_AM}{r},IF({_AO}{r}="EXCESS",0,{_AP}{r}+{_AM}{r}))'
+                    # Order Qty + Extra Qty (only Extra Qty for inactive/discontinued; 0 for EXCESS or NO MOVEMENT)
+                    ws[f"{_AQ}{r}"] = f'=IF({inactive},{_AM}{r},IF(OR({_AO}{r}="EXCESS",{_AO}{r}="NO MOVEMENT"),0,{_AP}{r}+{_AM}{r}))'
 
                     # Order Qty + Extra Qty (Rounded):
-                    # • EXCESS → 0
+                    # • EXCESS or NO MOVEMENT → 0
                     # • ORDER and FLOOR result = 0 → bump to 1 case pack (minimum meaningful order)
                     # • Otherwise → FLOOR to nearest case pack
                     ws[f"{_AT}{r}"] = (
                         f'=IF({inactive},0,'
-                        f'IF({_AO}{r}="EXCESS",0,'
+                        f'IF(OR({_AO}{r}="EXCESS",{_AO}{r}="NO MOVEMENT"),0,'
                         f'IF({_AS}{r}>0,'
                         f'IF(AND(FLOOR({_AQ}{r},{_AS}{r})=0,{_AO}{r}="ORDER"),{_AS}{r},FLOOR({_AQ}{r},{_AS}{r})),'
                         f'ROUND({_AQ}{r},0))))'

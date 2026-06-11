@@ -1936,6 +1936,13 @@ class OptimizedMasterReportService:
             target_days = item.get("target_days", 0)
             if drr == 0:
                 item["excess_or_order"] = "NO MOVEMENT"
+                item["order_qty"] = 0
+                item["order_qty_plus_extra_qty"] = 0
+                item["order_qty_plus_extra_qty_rounded"] = 0
+                item["total_cbm"] = 0
+                item["days_current_order_lasts"] = 0
+                item["days_total_inventory_lasts"] = round(current_days_coverage, 2)
+                continue
             elif current_days_coverage < target_days:
                 item["excess_or_order"] = "ORDER"
             else:
