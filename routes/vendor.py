@@ -91,6 +91,8 @@ def _parse_draft_order_excel(file_bytes: bytes) -> list[dict]:
             col_map.setdefault("series", idx)
         elif "mrp" in h:
             col_map.setdefault("mrp", idx)
+        elif "brand" in h:
+            col_map.setdefault("brand", idx)
         elif "sku" in h:
             col_map.setdefault("sku_barcode", idx)
 
@@ -106,6 +108,7 @@ def _parse_draft_order_excel(file_bytes: bytes) -> list[dict]:
     sub_category_idx = col_map.get("sub_category")
     series_idx = col_map.get("series")
     mrp_idx = col_map.get("mrp")
+    brand_idx = col_map.get("brand")
 
     def _cell_str(row, idx):
         if idx is None or idx >= len(row):
@@ -153,6 +156,7 @@ def _parse_draft_order_excel(file_bytes: bytes) -> list[dict]:
                 "sub_category": _cell_str(row, sub_category_idx),
                 "series": _cell_str(row, series_idx),
                 "mrp": mrp_val,
+                "brand": _cell_str(row, brand_idx),
             }
         )
     return items
@@ -551,6 +555,7 @@ async def validate_draft_order(
                         "category": it.get("category", ""),
                         "sub_category": it.get("sub_category", ""),
                         "series": it.get("series", ""),
+                        "brand": it.get("brand", ""),
                         "mrp": it.get("mrp"),
                         "tax_rate": resolve_gst_rate(it.get("hsn_or_sac", ""), it.get("mrp")),
                         "upc_code": barcode,
@@ -657,6 +662,7 @@ _MASTER_HEADER_ROW = 1   # 0-based index
 # Fields from item data → candidate column header substrings (all lowercase)
 _MASTER_FIELD_MAP = [
     # field name            exact header candidates (lowercase) — first exact match wins
+    ("purchase_status",   ["remark"]),
     ("manufacturer_code", ["manufacturing code", "manufacturer code", "mfr code"]),
     ("bb_code",           ["sku code (final)", "bb code", "bb_code"]),
     ("sku_code",          ["upc / ean code", "upc/ean code", "upc", "ean", "barcode"]),
@@ -672,7 +678,7 @@ _MASTER_FIELD_MAP = [
 
 
 def _insert_items_into_master_sheet(items_data: list[dict]) -> dict:
-    """Append newly created items as new rows in the Masters Google Sheet."""
+    """Insert newly created items into the Masters Google Sheet at the first empty data row."""
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -707,27 +713,50 @@ def _insert_items_into_master_sheet(items_data: list[dict]) -> dict:
     if not mapped:
         return {"inserted": 0, "error": "No matching columns found in master sheet header"}
 
+    # Find the SKU Code Final column to locate the first empty data row
+    sku_col_idx = col_map.get("bb_code", -1)
+    mfr_col_idx = col_map.get("manufacturer_code", -1)
+    key_col = sku_col_idx if sku_col_idx >= 0 else mfr_col_idx
+
+    # Find first empty row in the data section (0-indexed in all_rows)
+    # _MASTER_HEADER_ROW + 1 is the first data row (0-indexed)
+    data_start = _MASTER_HEADER_ROW + 1
+    insert_row_0idx = len(all_rows)  # fallback: after last row
+    if key_col >= 0:
+        for i in range(data_start, len(all_rows)):
+            row_vals = all_rows[i]
+            cell_val = row_vals[key_col].strip() if key_col < len(row_vals) else ""
+            if not cell_val:
+                insert_row_0idx = i
+                break
+
+    # Convert to 1-indexed sheet row for gspread
+    insert_sheet_row = insert_row_0idx + 1
+
     max_col = max(mapped.values()) + 1
     row_width = max(num_cols, max_col)
 
-    rows_to_append = []
+    rows_to_insert = []
     for item in items_data:
         row: list = [""] * row_width
         for field, col_idx in mapped.items():
             val = item.get(field)
             if val is not None and val != "":
                 row[col_idx] = str(val)
-        rows_to_append.append(row)
+        rows_to_insert.append(row)
 
-    if rows_to_append:
-        ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+    if rows_to_insert:
+        ws.insert_rows(rows_to_insert, row=insert_sheet_row, value_input_option="USER_ENTERED")
 
-    logger.info("Inserted %d new item rows into master sheet", len(rows_to_append))
-    return {"inserted": len(rows_to_append), "error": None}
+    logger.info(
+        "Inserted %d new item rows into master sheet at row %d",
+        len(rows_to_insert), insert_sheet_row,
+    )
+    return {"inserted": len(rows_to_insert), "error": None}
 
 
 @router.post("/draft_orders/create_zoho_items")
-async def create_zoho_items(body: CreateZohoItemsRequest):
+async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_database)):
     """Create missing items on Zoho Books. Returns per-item created/failed results."""
 
     FIXED_ACCOUNT_ID         = "3220178000000000388"
@@ -791,7 +820,7 @@ async def create_zoho_items(body: CreateZohoItemsRequest):
                     {"customfield_id": CUSTOM_FIELD_MFR_CODE, "value": item.manufacturer_code or ""},
                     {"customfield_id": CUSTOM_FIELD_SKU_CODE, "value": item.bb_code or ""},
                     {"customfield_id": CUSTOM_FIELD_CATEGORY, "value": item.category or ""},
-                    {"customfield_id": CUSTOM_FIELD_SUB_CAT,  "value": item.sub_category or ""},
+                    {"customfield_id": CUSTOM_FIELD_SUB_CAT,  "value": (item.sub_category or "").capitalize()},
                     {"customfield_id": CUSTOM_FIELD_SERIES,   "value": item.series or ""},
                     {"customfield_id": CUSTOM_FIELD_EXTRA,    "value": ""},
                 ],
@@ -830,6 +859,17 @@ async def create_zoho_items(body: CreateZohoItemsRequest):
         created, failed = await asyncio.to_thread(_do_create)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    if created:
+        def _set_purchase_status():
+            products_col = db.get_collection(PRODUCTS_COLLECTION)
+            for c in created:
+                products_col.update_one(
+                    {"item_id": c["item_id"]},
+                    {"$set": {"purchase_status": "active"}},
+                    upsert=True,
+                )
+        await asyncio.to_thread(_set_purchase_status)
 
     if created:
         def _notify():
@@ -876,12 +916,13 @@ async def create_zoho_items(body: CreateZohoItemsRequest):
                         "manufacturer_code": item.manufacturer_code,
                         "hsn_or_sac": item.hsn_or_sac,
                         "category": item.category,
-                        "sub_category": item.sub_category,
+                        "sub_category": (item.sub_category or "").capitalize(),
                         "series": item.series,
                         "mrp": item.mrp,
                         "brand": item.brand,
-                        "tax_rate": item.tax_rate,
+                        "tax_rate": f"{item.tax_rate}%",
                         "sku_code": item.sku_code,
+                        "purchase_status": "active",
                     })
             masters_result = await asyncio.to_thread(_insert_items_into_master_sheet, items_for_sheet)
         except Exception as e:

@@ -1048,6 +1048,7 @@ async def download_master_report(
                         "Manufacturer Code": item.get("manufacturer_code", ""),
                         "BBCode": item.get("sku_code", ""),
                         "Item Name": item.get("item_name", ""),
+                        "Brand": item.get("brand", ""),
                         "SKU Code": item.get("sku", ""),
                         "Category": item.get("category", ""),
                         "Sub Category": item.get("sub_category", ""),
@@ -1070,7 +1071,7 @@ async def download_master_report(
                     from openpyxl.utils import get_column_letter as _gcl
                     _blank_cols = [
                         "HSN Code", "Manufacturer Code", "BBCode", "Item Name",
-                        "SKU Code", "Category", "Sub Category", "Series", "MRP",
+                        "Brand", "SKU Code", "Category", "Sub Category", "Series", "MRP",
                         "Qty", "Unit Price", "Total", "Case Pack", "Cartons",
                         "CBM", "Total CBM", "Final order Qty (rounded up/down)", "Final CBM",
                     ]
