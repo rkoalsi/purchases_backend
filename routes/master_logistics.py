@@ -1,13 +1,18 @@
-from fastapi import APIRouter, Body, HTTPException, status, Depends, Query, UploadFile, File
-from fastapi.responses import StreamingResponse, Response
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from fastapi import (
+    APIRouter,
+    Body,
+    HTTPException,
+    status,
+    Depends,
+    Query,
+    UploadFile,
+    File,
+)
+from fastapi.responses import StreamingResponse, JSONResponse
+from typing import Dict, Any
 import io
-import json
-import os
-import requests
+import math
 import logging
-import traceback
 import pandas as pd
 from ..database import get_database
 
@@ -20,7 +25,9 @@ router = APIRouter()
 def get_transfer_customers(db=Depends(get_database)):
     """Return transfer-order customer names from the transfer_order_customers collection."""
     col = db.get_collection("transfer_order_customers")
-    names = [doc["name"] for doc in col.find({}, {"name": 1, "_id": 0}) if doc.get("name")]
+    names = [
+        doc["name"] for doc in col.find({}, {"name": 1, "_id": 0}) if doc.get("name")
+    ]
     return {"customers": names}
 
 
@@ -135,7 +142,9 @@ def import_product_logistics(
 
             sku_idx = _col("SKU Code (Final)")
             if sku_idx == -1:
-                logger.warning(f"'SKU Code (Final)' column not found in sheet '{sheet_name}'")
+                logger.warning(
+                    f"'SKU Code (Final)' column not found in sheet '{sheet_name}'"
+                )
                 continue
 
             for row in all_rows[2:]:  # skip row 0 (filler) and row 1 (header)
@@ -225,7 +234,10 @@ def create_brand_logistics(
             {"$set": doc},
             upsert=True,
         )
-        return JSONResponse(status_code=200, content={"message": f"Brand logistics saved for {brand}", "data": doc})
+        return JSONResponse(
+            status_code=200,
+            content={"message": f"Brand logistics saved for {brand}", "data": doc},
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -241,7 +253,9 @@ def delete_brand_logistics(
         result = collection.delete_one({"brand": brand.strip()})
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail=f"Brand '{brand}' not found")
-        return JSONResponse(status_code=200, content={"message": f"Deleted logistics for {brand}"})
+        return JSONResponse(
+            status_code=200, content={"message": f"Deleted logistics for {brand}"}
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -292,9 +306,21 @@ def get_product_logistics_list(
         raw_products = list(
             products_collection.find(
                 query,
-                {"item_id": 1, "cf_sku_code": 1, "name": 1, "brand": 1, "cbm": 1, "case_pack": 1, "purchase_status": 1,
-                 "stock_in_transit_1": 1, "stock_in_transit_2": 1, "stock_in_transit_3": 1,
-                 "purchase_price": 1, "currency": 1, "_id": 0},
+                {
+                    "item_id": 1,
+                    "cf_sku_code": 1,
+                    "name": 1,
+                    "brand": 1,
+                    "cbm": 1,
+                    "case_pack": 1,
+                    "purchase_status": 1,
+                    "stock_in_transit_1": 1,
+                    "stock_in_transit_2": 1,
+                    "stock_in_transit_3": 1,
+                    "purchase_price": 1,
+                    "currency": 1,
+                    "_id": 0,
+                },
             )
             .skip(skip)
             .limit(page_size)
@@ -304,20 +330,22 @@ def get_product_logistics_list(
         # Ensure numeric fields default to 0 when missing from DB
         products = []
         for p in raw_products:
-            products.append({
-                "item_id": str(p.get("item_id", "")),
-                "cf_sku_code": p.get("cf_sku_code", ""),
-                "name": p.get("name", ""),
-                "brand": p.get("brand", ""),
-                "cbm": p.get("cbm", 0) or 0,
-                "case_pack": p.get("case_pack", 0) or 0,
-                "purchase_status": p.get("purchase_status", ""),
-                "stock_in_transit_1": p.get("stock_in_transit_1", 0) or 0,
-                "stock_in_transit_2": p.get("stock_in_transit_2", 0) or 0,
-                "stock_in_transit_3": p.get("stock_in_transit_3", 0) or 0,
-                "purchase_price": p.get("purchase_price", 0) or 0,
-                "currency": p.get("currency", "") or "",
-            })
+            products.append(
+                {
+                    "item_id": str(p.get("item_id", "")),
+                    "cf_sku_code": p.get("cf_sku_code", ""),
+                    "name": p.get("name", ""),
+                    "brand": p.get("brand", ""),
+                    "cbm": p.get("cbm", 0) or 0,
+                    "case_pack": p.get("case_pack", 0) or 0,
+                    "purchase_status": p.get("purchase_status", ""),
+                    "stock_in_transit_1": p.get("stock_in_transit_1", 0) or 0,
+                    "stock_in_transit_2": p.get("stock_in_transit_2", 0) or 0,
+                    "stock_in_transit_3": p.get("stock_in_transit_3", 0) or 0,
+                    "purchase_price": p.get("purchase_price", 0) or 0,
+                    "currency": p.get("currency", "") or "",
+                }
+            )
 
         return JSONResponse(
             status_code=200,
@@ -368,27 +396,41 @@ def download_product_logistics(
         raw_products = list(
             products_collection.find(
                 query,
-                {"item_id": 1, "cf_sku_code": 1, "name": 1, "brand": 1, "cbm": 1, "case_pack": 1,
-                 "purchase_status": 1, "stock_in_transit_1": 1, "stock_in_transit_2": 1,
-                 "stock_in_transit_3": 1, "purchase_price": 1, "currency": 1, "_id": 0},
+                {
+                    "item_id": 1,
+                    "cf_sku_code": 1,
+                    "name": 1,
+                    "brand": 1,
+                    "cbm": 1,
+                    "case_pack": 1,
+                    "purchase_status": 1,
+                    "stock_in_transit_1": 1,
+                    "stock_in_transit_2": 1,
+                    "stock_in_transit_3": 1,
+                    "purchase_price": 1,
+                    "currency": 1,
+                    "_id": 0,
+                },
             ).sort("cf_sku_code", 1)
         )
 
         rows = []
         for p in raw_products:
-            rows.append({
-                "SKU Code": p.get("cf_sku_code", ""),
-                "Product Name": p.get("name", ""),
-                "Brand": p.get("brand", ""),
-                "Status": p.get("purchase_status", ""),
-                "CBM": p.get("cbm", 0) or 0,
-                "Case Pack": p.get("case_pack", 0) or 0,
-                "Currency": p.get("currency", "") or "",
-                "Purchase Price": p.get("purchase_price", 0) or 0,
-                "Stock in Transit 1": p.get("stock_in_transit_1", 0) or 0,
-                "Stock in Transit 2": p.get("stock_in_transit_2", 0) or 0,
-                "Stock in Transit 3": p.get("stock_in_transit_3", 0) or 0,
-            })
+            rows.append(
+                {
+                    "SKU Code": p.get("cf_sku_code", ""),
+                    "Product Name": p.get("name", ""),
+                    "Brand": p.get("brand", ""),
+                    "Status": p.get("purchase_status", ""),
+                    "CBM": p.get("cbm", 0) or 0,
+                    "Case Pack": p.get("case_pack", 0) or 0,
+                    "Currency": p.get("currency", "") or "",
+                    "Purchase Price": p.get("purchase_price", 0) or 0,
+                    "Stock in Transit 1": p.get("stock_in_transit_1", 0) or 0,
+                    "Stock in Transit 2": p.get("stock_in_transit_2", 0) or 0,
+                    "Stock in Transit 3": p.get("stock_in_transit_3", 0) or 0,
+                }
+            )
 
         df = pd.DataFrame(rows)
         # Keep SKU Code as string so Excel doesn't convert to scientific notation
@@ -404,7 +446,9 @@ def download_product_logistics(
         return StreamingResponse(
             buffer,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=product_logistics.xlsx"},
+            headers={
+                "Content-Disposition": "attachment; filename=product_logistics.xlsx"
+            },
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -445,19 +489,31 @@ def update_product_logistics(
         # Update item-specific fields by item_id
         if item_fields:
             iid: Any = int(item_id) if item_id.isdigit() else item_id
-            result = products_collection.update_one({"item_id": iid}, {"$set": item_fields})
+            result = products_collection.update_one(
+                {"item_id": iid}, {"$set": item_fields}
+            )
             if result.matched_count == 0:
-                result = products_collection.update_one({"item_id": item_id}, {"$set": item_fields})
+                result = products_collection.update_one(
+                    {"item_id": item_id}, {"$set": item_fields}
+                )
             matched = max(matched, result.matched_count)
 
         # Update purchase_status across ALL products with the same sku_code
         if purchase_status is not None:
-            sku_filter = {"cf_sku_code": sku_code.strip()} if sku_code else {"item_id": (int(item_id) if item_id.isdigit() else item_id)}
-            result = products_collection.update_many(sku_filter, {"$set": {"purchase_status": purchase_status}})
+            sku_filter = (
+                {"cf_sku_code": sku_code.strip()}
+                if sku_code
+                else {"item_id": (int(item_id) if item_id.isdigit() else item_id)}
+            )
+            result = products_collection.update_many(
+                sku_filter, {"$set": {"purchase_status": purchase_status}}
+            )
             matched = max(matched, result.matched_count)
 
         if matched == 0:
-            raise HTTPException(status_code=404, detail=f"Product with item_id '{item_id}' not found")
+            raise HTTPException(
+                status_code=404, detail=f"Product with item_id '{item_id}' not found"
+            )
 
         return JSONResponse(
             status_code=200,
@@ -491,7 +547,7 @@ async def bulk_upload_product_logistics(
             raise HTTPException(
                 status_code=400,
                 detail=f"Missing required columns: {', '.join(sorted(missing))}. "
-                       "The file must contain 'SKU Code', 'Currency', and 'Purchase Price' columns.",
+                "The file must contain 'SKU Code', 'Currency', and 'Purchase Price' columns.",
             )
 
         products_collection = db.get_collection("products")
@@ -546,4 +602,3 @@ async def bulk_upload_product_logistics(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
