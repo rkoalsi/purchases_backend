@@ -771,6 +771,36 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
     CUSTOM_FIELD_SERIES      = "3220178000505344028"
     CUSTOM_FIELD_EXTRA       = "3220178000517626009"
 
+    def _fetch_brand_manufacturers() -> dict[str, str]:
+        """Return {brand_name_lower: vendor_contact_name} for brands in this batch."""
+        brands = {(item.brand or "").strip() for item in body.items if item.brand}
+        if not brands:
+            return {}
+        brand_docs = list(db.get_collection("brands").find(
+            {"name": {"$in": list(brands)}},
+            {"name": 1, "vendor_ids": 1, "vendor_id": 1},
+        ))
+        vendor_ids = []
+        for bd in brand_docs:
+            ids = bd.get("vendor_ids") or ([bd["vendor_id"]] if bd.get("vendor_id") else [])
+            if ids:
+                vendor_ids.append(ids[0])
+        vendor_map = {
+            v["contact_id"]: v["contact_name"]
+            for v in db.get_collection("vendors").find(
+                {"contact_id": {"$in": vendor_ids}},
+                {"contact_id": 1, "contact_name": 1},
+            )
+        }
+        result = {}
+        for bd in brand_docs:
+            ids = bd.get("vendor_ids") or ([bd["vendor_id"]] if bd.get("vendor_id") else [])
+            if ids and ids[0] in vendor_map:
+                result[(bd["name"] or "").strip().lower()] = vendor_map[ids[0]]
+        return result
+
+    brand_manufacturer_map = await asyncio.to_thread(_fetch_brand_manufacturers)
+
     def _do_create():
         token = _get_zoho_token()
         headers = {"Authorization": f"Zoho-oauthtoken {token}"}
@@ -783,6 +813,7 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
             ean = item.ean_code or barcode
             tax_prefs = TAX_RATE_MAP.get(item.tax_rate, TAX_RATE_MAP[18])
             item_tax_preferences = [tax_prefs["intra"], tax_prefs["inter"]]
+            manufacturer = brand_manufacturer_map.get((item.brand or "").strip().lower(), "")
             payload = {
                 "name": item.item_name,
                 "rate": item.mrp or 0,
@@ -796,6 +827,7 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
                 "inventory_account_id": FIXED_INVENTORY_ACCOUNT,
                 "hsn_or_sac": item.hsn_or_sac or "",
                 "brand": item.brand or "",
+                "manufacturer": manufacturer,
                 "product_type": "goods",
                 "is_taxable": True,
                 "taxability_type": "none",
