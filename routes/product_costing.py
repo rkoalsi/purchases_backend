@@ -19,7 +19,7 @@ from datetime import datetime
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -153,6 +153,9 @@ def _set(ws, row: int, col: int, value, bold: bool = False, pct: bool = False):
 
 def _gst_decimal(product: dict) -> float | None:
     """Return intra-state GST as a decimal (e.g. 0.18 for 18%), or None."""
+    # Direct gst_pct field (used for uploaded templates where GST % is a plain number)
+    if product.get("gst_pct") is not None:
+        return float(product["gst_pct"]) / 100
     for pref in product.get("item_tax_preferences") or []:
         if pref.get("tax_specification") == "intra":
             pct = pref.get("tax_percentage")
@@ -395,6 +398,211 @@ async def generate_product_costing(
     )
 
     filename = f"product_costing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ── Template download ──────────────────────────────────────────────────────────
+
+_TEMPLATE_COLUMNS = [
+    ("Product Name",             True),
+    ("Unit Price (USD)",         True),
+    ("Units per Carton",         True),
+    ("CBM per Carton",           True),
+    ("Custom Duty %",            True),
+    ("HSN Code",                 True),
+    ("GST %",                    True),
+    ("Vendor SKU / Article No.", False),
+    ("Unit Price (RMB)",         False),
+    ("Carton Weight (kg)",       False),
+    ("Notes",                    False),
+]
+
+_TEMPLATE_WIDTHS = [40, 18, 18, 16, 15, 14, 10, 24, 16, 18, 20]
+
+_REQ_FILL = PatternFill("solid", fgColor="1F3864")
+_OPT_FILL = PatternFill("solid", fgColor="4472C4")
+_HDR_FONT = Font(bold=True, color="FFFFFF", size=10)
+
+
+def _build_template_workbook() -> bytes:
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Price List"
+
+    for col, ((name, required), width) in enumerate(zip(_TEMPLATE_COLUMNS, _TEMPLATE_WIDTHS), 1):
+        cell = ws.cell(1, col, name)
+        cell.font      = _HDR_FONT
+        cell.fill      = _REQ_FILL if required else _OPT_FILL
+        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    ws.row_dimensions[1].height = 30
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+@router.get("/template")
+async def download_template():
+    excel_bytes = await asyncio.to_thread(_build_template_workbook)
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="product_costing_template.xlsx"'},
+    )
+
+
+# ── Template upload → costing sheet ───────────────────────────────────────────
+
+# Map header text → product dict key
+_COL_MAP = {
+    "Product Name":             "item_name",
+    "Unit Price (USD)":         "purchase_price",
+    "Units per Carton":         "case_pack",
+    "CBM per Carton":           "cbm",
+    "Custom Duty %":            "custom_duty",
+    "HSN Code":                 "hsn_or_sac",
+    "GST %":                    "gst_pct",
+    "Vendor SKU / Article No.": "cf_item_code",
+    "Unit Price (RMB)":         "rmb_price",
+    "Carton Weight (kg)":       "ctn_weight",
+    "Notes":                    "notes",
+}
+
+
+def _parse_template(file_bytes: bytes) -> list[dict]:
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    ws = wb.active
+
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    # Detect header row — first row where at least one cell matches a known column name
+    header_row_idx = None
+    col_indices: dict[str, int] = {}
+    for ri, row in enumerate(rows):
+        mapping = {}
+        for ci, cell in enumerate(row):
+            if cell and str(cell).strip() in _COL_MAP:
+                mapping[str(cell).strip()] = ci
+        if mapping:
+            header_row_idx = ri
+            col_indices = mapping
+            break
+
+    if header_row_idx is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not find header row. Make sure the file uses the standard template."
+        )
+
+    if "Product Name" not in col_indices or "Unit Price (USD)" not in col_indices:
+        raise HTTPException(
+            status_code=400,
+            detail="Template must have at least 'Product Name' and 'Unit Price (USD)' columns."
+        )
+
+    products = []
+    for row in rows[header_row_idx + 1:]:
+        if not any(row):
+            continue
+
+        def _get(col_name: str):
+            idx = col_indices.get(col_name)
+            if idx is None or idx >= len(row):
+                return None
+            v = row[idx]
+            return v if v not in ("", None) else None
+
+        name = _get("Product Name")
+        price_usd = _get("Unit Price (USD)")
+
+        if not name or not isinstance(price_usd, (int, float)) or float(price_usd) <= 0:
+            continue
+
+        case_pack  = _get("Units per Carton")
+        cbm        = _get("CBM per Carton")
+        duty       = _get("Custom Duty %")
+        hsn        = _get("HSN Code")
+        gst        = _get("GST %")
+        vendor_sku = _get("Vendor SKU / Article No.")
+
+        product: dict = {
+            "item_name":     str(name).strip(),
+            "purchase_price": float(price_usd),
+            "cf_sku_code":   "",
+            "cf_item_code":  str(vendor_sku) if vendor_sku is not None else "",
+            "purchase_status": "",
+        }
+        if case_pack is not None:
+            try:
+                product["case_pack"] = int(float(case_pack))
+            except (ValueError, TypeError):
+                pass
+        if cbm is not None:
+            try:
+                product["cbm"] = float(cbm)
+            except (ValueError, TypeError):
+                pass
+        if duty is not None:
+            try:
+                product["custom_duty"] = float(duty)
+            except (ValueError, TypeError):
+                pass
+        if hsn is not None:
+            product["hsn_or_sac"] = str(hsn)
+        if gst is not None:
+            try:
+                product["gst_pct"] = float(gst)
+            except (ValueError, TypeError):
+                pass
+
+        products.append(product)
+
+    if not products:
+        raise HTTPException(status_code=400, detail="No valid product rows found in the uploaded file.")
+
+    return products
+
+
+@router.post("/upload")
+async def upload_price_list(
+    file:          UploadFile = File(...),
+    tab_label:     str        = Form("Uploaded"),
+    currency_label: str       = Form("USD"),
+    bank_rate:     float      = Form(96.0),
+    customs_rate:  float      = Form(92.0),
+    freight_rate:  float      = Form(92.0),
+):
+    content = await file.read()
+
+    products = await asyncio.to_thread(_parse_template, content)
+
+    tab = BrandTabConfig(
+        label=tab_label,
+        brand_names=[],
+        currency_label=currency_label,
+        exchange_rates=ExchangeRates(bank=bank_rate, customs=customs_rate, freight=freight_rate),
+    )
+
+    excel_bytes = await asyncio.to_thread(
+        _build_workbook,
+        [tab], [products],
+        None, None,
+        datetime.now().strftime("%d %b %Y"), "",
+    )
+
+    safe = tab_label.replace(" ", "_").replace("/", "-")
+    filename = f"product_costing_{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     return StreamingResponse(
         io.BytesIO(excel_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
