@@ -47,6 +47,7 @@ class CreateTaskRequest(BaseModel):
     assigned_to_names: Optional[List[str]] = []
     assigned_to_departments: Optional[List[str]] = []
     deadline: Optional[str] = None
+    is_daily: Optional[bool] = False
     tags: Optional[List[str]] = []
     created_by: str
     created_by_name: str
@@ -62,6 +63,7 @@ class UpdateTaskRequest(BaseModel):
     assigned_to_names: Optional[List[str]] = None
     assigned_to_departments: Optional[List[str]] = None
     deadline: Optional[str] = None
+    is_daily: Optional[bool] = None
     tags: Optional[List[str]] = None
     is_hidden: Optional[bool] = None
     actor_id: Optional[str] = None
@@ -174,14 +176,21 @@ def _fan_out_sync(
         db[NOTIFICATIONS_COLLECTION].insert_many(docs)
 
 
-def _visibility_filter(viewer_id: Optional[str], viewer_role: Optional[str]) -> dict:
+def _visibility_filter(viewer_id: Optional[str], viewer_role: Optional[str], viewer_department: Optional[str] = None) -> dict:
     """Return a MongoDB match fragment enforcing per-role visibility rules.
-    Admin/manager see everything; regular users only see tasks they created or are assigned to.
+    Admin/manager see everything; regular users see tasks they created, are assigned to,
+    or that belong to their department.
     If viewer_id is absent (e.g. old Design Tasks callers), no filter is applied.
     """
     if not viewer_id or viewer_role in ("admin", "manager"):
         return {}
-    return {"$or": [{"assigned_to": viewer_id}, {"created_by": viewer_id}]}
+    conditions = [{"assigned_to": viewer_id}, {"created_by": viewer_id}]
+    if viewer_department:
+        conditions += [
+            {"assigned_to_departments": viewer_department},
+            {"creator_department": viewer_department},
+        ]
+    return {"$or": conditions}
 
 
 # ── List tasks ────────────────────────────────────────────────────────────────
@@ -190,6 +199,7 @@ def _visibility_filter(viewer_id: Optional[str], viewer_role: Optional[str]) -> 
 async def list_tasks(
     viewer_id: Optional[str] = Query(None),
     viewer_role: Optional[str] = Query(None),
+    viewer_department: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
     priority: Optional[str] = Query(None),
     assigned_to: Optional[str] = Query(None),
@@ -201,7 +211,7 @@ async def list_tasks(
     db=Depends(get_database),
 ):
     def _fetch():
-        query: dict = {**_visibility_filter(viewer_id, viewer_role), "is_deleted": {"$ne": True}}
+        query: dict = {**_visibility_filter(viewer_id, viewer_role, viewer_department), "is_deleted": {"$ne": True}}
         if status_filter and status_filter in VALID_STATUSES:
             query["status"] = status_filter
         if priority and priority in VALID_PRIORITIES:
@@ -412,7 +422,8 @@ async def create_task(request: CreateTaskRequest, db=Depends(get_database)):
             "assigned_to": request.assigned_to or [],
             "assigned_to_names": request.assigned_to_names or [],
             "assigned_to_departments": request.assigned_to_departments or [],
-            "deadline": request.deadline,
+            "deadline": None if request.is_daily else request.deadline,
+            "is_daily": bool(request.is_daily),
             "tags": request.tags or [],
             "created_by": request.created_by,
             "created_by_name": request.created_by_name,
@@ -812,6 +823,8 @@ async def update_task(task_id: str, request: UpdateTaskRequest, db=Depends(get_d
         raise HTTPException(status_code=400, detail=f"Invalid priority: {update_fields['priority']}")
     if "status" in update_fields and update_fields["status"] not in VALID_STATUSES:
         raise HTTPException(status_code=400, detail=f"Invalid status: {update_fields['status']}")
+    if update_fields.get("is_daily"):
+        update_fields["deadline"] = None
     if not update_fields:
         raise HTTPException(status_code=400, detail="No fields to update")
 
