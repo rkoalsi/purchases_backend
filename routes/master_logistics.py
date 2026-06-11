@@ -217,6 +217,7 @@ def create_brand_logistics(
     safety_days_fast: float = Query(40),
     safety_days_medium: float = Query(25),
     safety_days_slow: float = Query(15),
+    order_processing: float = Query(10),
     db=Depends(get_database),
 ):
     """Create or update brand logistics settings"""
@@ -228,6 +229,7 @@ def create_brand_logistics(
             "safety_days_fast": safety_days_fast,
             "safety_days_medium": safety_days_medium,
             "safety_days_slow": safety_days_slow,
+            "order_processing": order_processing,
         }
         collection.update_one(
             {"brand": brand.strip()},

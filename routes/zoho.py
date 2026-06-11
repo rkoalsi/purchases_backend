@@ -4801,6 +4801,11 @@ async def create_composite_items(payload: CompositeCreateRequest):
             await asyncio.to_thread(
                 db[COMPOSITE_COLLECTION].insert_one, doc
             )
+            # await asyncio.to_thread(
+            #     db["products"].update_many,
+            #     {"cf_sku_code": sku_code},
+            #     {"$set": {"purchase_status": "active combo"}},
+            # )
             results.append({"sku_code": sku_code, "name": name, "success": True, "composite_item_id": str(composite_item_id)})
             created_count += 1
         except Exception as e:

@@ -181,6 +181,35 @@ class TestComputeOrderQuantities:
         assert item["order_qty"] == 0
         assert item["order_qty_plus_extra_qty_rounded"] == 0
 
+    def test_no_movement_when_drr_negative(self):
+        # Returns + transfers exceeding sales must not classify as ORDER and
+        # get bumped to a minimum case pack by the zero-floor rounding rule.
+        item = _make_item(drr=-1.5, latest_stock=0, case_pack=6)
+        OptimizedMasterReportService._compute_order_quantities([item])
+        assert item["excess_or_order"] == "NO MOVEMENT"
+        assert item["order_qty"] == 0
+        assert item["order_qty_plus_extra_qty_rounded"] == 0
+
+    def test_negative_net_demand_floors_drr_at_zero(self, service):
+        # combine_data_by_sku_optimized: more returns than sales → DRR 0, not negative
+        normalized = [[{
+            "source": "zoho",
+            "sku_code": "NEG001",
+            "item_name": "Net Negative Item",
+            "item_id": "123",
+            "units_sold": 2.0,
+            "units_returned": 0.0,
+            "credit_notes": 10.0,
+            "total_amount": 100.0,
+            "closing_stock": 0.0,
+            "days_in_stock": 30,
+            "days_in_stock_any_wh": 30,
+        }]]
+        result = service.combine_data_by_sku_optimized(normalized, period_days=90)
+        metrics = result[0]["combined_metrics"]
+        assert metrics["avg_daily_run_rate"] == 0
+        assert metrics["total_sales"] == -8.0  # true net kept for visibility
+
     def test_excess_when_well_stocked(self):
         # coverage >> target_days → EXCESS
         item = _make_item(drr=1.0, latest_stock=500, transit=0, target_days=95)

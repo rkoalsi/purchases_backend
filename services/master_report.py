@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 async def _generate_master_report_data(
     start_date: str,
     end_date: str,
-    include_zoho: bool,
     db,
     brand: str = None,
     dashboard_mode: bool = False,
@@ -24,15 +23,26 @@ async def _generate_master_report_data(
     Internal function that generates full master report data (with raw individual_reports).
     Used by both the API endpoint and the download endpoint.
     """
+    # Background tasks — pre-declared so the finally block can cancel any that
+    # are still running when the function exits early (validation error, 404,
+    # timeout). Without this they keep scanning millions of records for nothing.
+    _zoho_stock_task = _fba_stock_task = _blinkit_inv_task = None
+    _amazon_sku_task = _blinkit_sku_task = _amazon_drr_task = None
+    _cogs_task = _past_drr_task = _po_prices_task = None
     try:
         # Validate dates
         try:
-            datetime.strptime(start_date, "%Y-%m-%d")
-            datetime.strptime(end_date, "%Y-%m-%d")
+            _val_start = datetime.strptime(start_date, "%Y-%m-%d")
+            _val_end = datetime.strptime(end_date, "%Y-%m-%d")
         except ValueError:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid date format. Use YYYY-MM-DD",
+            )
+        if _val_start > _val_end:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="start_date must be on or before end_date",
             )
 
         logger.info(
@@ -56,17 +66,7 @@ async def _generate_master_report_data(
         _amazon_drr_task = asyncio.create_task(report_service.fetch_amazon_final_drr_by_sku(start_date, end_date))
         _cogs_task = asyncio.create_task(report_service.fetch_inventory_valuation_cogs(end_date)) if include_cogs else None
 
-        # Step 1: Fetch Zoho report + composite products in parallel
-        tasks = []
-        if include_zoho:
-            tasks.append(report_service.get_zoho_report(start_date, end_date))
-
-        if not tasks:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="At least one data source must be selected",
-            )
-
+        # Step 1: Fetch Zoho report (sole sales source) + composite products in parallel
         # Fetch ALL composite products in parallel with reports (collection is small)
         async def _fetch_all_composites():
             try:
@@ -87,7 +87,7 @@ async def _generate_master_report_data(
         try:
             all_results = await asyncio.wait_for(
                 asyncio.gather(
-                    *tasks,
+                    report_service.get_zoho_report(start_date, end_date),
                     _fetch_all_composites(),
                     report_service.fetch_fba_closing_stock(end_date),
                     report_service.fetch_transfer_orders(start_date, end_date),
@@ -827,20 +827,6 @@ async def _generate_master_report_data(
                 else:
                     item["growth_rate"] = None
 
-        # If combined_data was empty the if-block above was skipped and the background
-        # tasks were never awaited — cancel them to avoid dangling tasks.
-        if not combined_data:
-            if not _zoho_stock_task.done():
-                _zoho_stock_task.cancel()
-            if not _fba_stock_task.done():
-                _fba_stock_task.cancel()
-            if not _amazon_sku_task.done():
-                _amazon_sku_task.cancel()
-            if not _blinkit_sku_task.done():
-                _blinkit_sku_task.cancel()
-            if not _amazon_drr_task.done():
-                _amazon_drr_task.cancel()
-
         # Step 5: Calculate summary statistics
         total_skus = len(combined_data)
         summary_stats = {
@@ -945,4 +931,15 @@ async def _generate_master_report_data(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate optimized master report: {str(e)}",
         )
+    finally:
+        # Cancel any background task still running — covers every early exit
+        # (validation errors, 404s, timeouts, unexpected exceptions). On the
+        # success path all tasks are already done, so cancel() is a no-op.
+        for _t in (
+            _zoho_stock_task, _fba_stock_task, _blinkit_inv_task,
+            _amazon_sku_task, _blinkit_sku_task, _amazon_drr_task,
+            _cogs_task, _past_drr_task, _po_prices_task,
+        ):
+            if _t is not None and not _t.done():
+                _t.cancel()
 

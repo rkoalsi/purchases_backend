@@ -372,8 +372,7 @@ async def generate_product_costing(
             (sku_stock_map, stock_date), report = await asyncio.gather(
                 asyncio.to_thread(_fetch_live_zoho_stock, db),
                 _generate_master_report_data(
-                    start_date=start_date, end_date=end_date,
-                    include_zoho=True, db=db,
+                    start_date=start_date, end_date=end_date, db=db,
                 ),
             )
             sku_sales_data = {}

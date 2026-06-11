@@ -581,7 +581,6 @@ async def generate_and_send_draft_order_slack_report():
         report_data = await _generate_master_report_data(
             start_date=start_date.strftime("%Y-%m-%d"),
             end_date=end_date.strftime("%Y-%m-%d"),
-            include_zoho=True,
             db=db,
         )
 

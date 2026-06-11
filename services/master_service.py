@@ -1210,11 +1210,16 @@ class OptimizedMasterReportService:
             transfer_qty = transfer_orders_by_sku.get(sku, 0)
             net_demand = round(metrics["total_units_sold"] - credit_notes - transfer_qty, 2)
 
+            # Floor the DRR numerator at 0: when returns + transfers exceed sales,
+            # net_demand goes negative and a negative DRR would slip past the
+            # NO MOVEMENT check and trigger a minimum case-pack order downstream.
+            # (total_sales keeps the true negative value for visibility.)
             days_in_stock = metrics.get("total_days_in_stock", 0)
+            drr_demand = max(0.0, net_demand)
             if days_in_stock > 0:
-                metrics["avg_daily_run_rate"] = round(net_demand / days_in_stock, 2)
+                metrics["avg_daily_run_rate"] = round(drr_demand / days_in_stock, 2)
             elif period_days > 0:
-                metrics["avg_daily_run_rate"] = round(net_demand / period_days, 2)
+                metrics["avg_daily_run_rate"] = round(drr_demand / period_days, 2)
 
             # Closing stock = Pupscribe WH (Zoho) + FBA stock
             metrics["total_closing_stock"] = round(zoho_stock + fba_stock, 2)
@@ -1260,6 +1265,7 @@ class OptimizedMasterReportService:
                         "safety_days_fast": self.safe_float(doc.get("safety_days_fast", 40)),
                         "safety_days_medium": self.safe_float(doc.get("safety_days_medium", 25)),
                         "safety_days_slow": self.safe_float(doc.get("safety_days_slow", 15)),
+                        "order_processing": self.safe_float(doc.get("order_processing", 10), 10),
                     }
 
             return result
@@ -1455,6 +1461,7 @@ class OptimizedMasterReportService:
             "safety_days_fast": 40,
             "safety_days_medium": 25,
             "safety_days_slow": 15,
+            "order_processing": 10,
         }
 
         # Group item indices by brand
@@ -1528,6 +1535,7 @@ class OptimizedMasterReportService:
                 item["mover_class"] = mover_class
                 item["safety_days"] = safety_days
                 item["lead_time"] = brand_settings.get("lead_time", 60)
+                item["order_processing"] = brand_settings.get("order_processing", 10)
                 item["brand"] = product_brands.get(item.get("sku_code", ""), "") or ""
 
         return combined_data
@@ -1845,7 +1853,7 @@ class OptimizedMasterReportService:
             # Target days = lead_time + safety_days + order_processing
             safety_days = item.get("safety_days", 15)
             lead_time = item.get("lead_time", 60)
-            order_processing = 10
+            order_processing = item.get("order_processing", 10)
             item["order_processing"] = order_processing
             target_days = lead_time + safety_days + order_processing
             item["target_days"] = target_days
@@ -1934,7 +1942,9 @@ class OptimizedMasterReportService:
             item["current_days_coverage"] = current_days_coverage
 
             target_days = item.get("target_days", 0)
-            if drr == 0:
+            # <= 0 (not == 0): a negative DRR must not classify as ORDER and get
+            # bumped to a minimum case pack by the zero-floor rounding rule below.
+            if drr <= 0:
                 item["excess_or_order"] = "NO MOVEMENT"
                 item["order_qty"] = 0
                 item["order_qty_plus_extra_qty"] = 0

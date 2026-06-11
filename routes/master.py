@@ -34,7 +34,6 @@ router.include_router(_logistics_router)
 async def get_master_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
-    include_zoho: bool = Query(True, description="Include Zoho data"),
     brand: str = Query(None, description="Filter by brand name (e.g. 'Truelove'). Omit for all brands."),
     db=Depends(get_database),
 ):
@@ -77,7 +76,7 @@ async def get_master_report(
     ### 5. DRR Lookback (≥ 90-day reports only)
     For SKUs with fewer than 60 days in stock during the current period
     (insufficient data for a reliable DRR), the system looks back up to 6
-    previous 90-day windows to find a period where the SKU had ≥ 90 days
+    previous 90-day windows to find a period where the SKU had ≥ 60 days
     in stock. If found:
     - DRR is replaced with the historical value (`drr_source = "previous_period"`, `highlight = "yellow"`)
     - Missed sales for that SKU are re-fetched from **the same lookback date window** so that
@@ -116,7 +115,7 @@ async def get_master_report(
 
     ### 8. Order Quantity Calculations
     For each SKU (skipped for inactive / discontinued items):
-    - `target_days` = lead_time + safety_days + order_processing (10 days fixed)
+    - `target_days` = lead_time + safety_days + order_processing (per-brand, default 10 days)
     - `current_days_coverage` = (closing_stock + stock_in_transit) ÷ DRR
     - `net_target_days` = target_days − current_days_coverage (floored at target_days if already under lead time)
     - `order_qty` = max(0, net_target_days × DRR)
@@ -186,7 +185,7 @@ async def get_master_report(
     | `excess_or_order` | `ORDER` / `EXCESS` / `NO MOVEMENT` |
     """
     content = await _generate_master_report_data(
-        start_date, end_date, include_zoho, db, brand=brand,
+        start_date, end_date, db, brand=brand,
     )
 
     # Strip raw data from individual_reports for the API response (keep metadata only)
@@ -207,7 +206,6 @@ async def get_master_report(
 async def download_master_report(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD format"),
-    include_zoho: bool = Query(True, description="Include Zoho data"),
     brand: str = Query(None, description="Filter by brand name (e.g. 'Truelove'). Omit for all brands."),
     include_cogs: bool = Query(False, description="Include COGS columns (Unit Cost, Pupscribe Stock Value, Pupscribe Stock on Hand) from Zoho Books inventory valuation"),
     db=Depends(get_database),
@@ -264,7 +262,7 @@ async def download_master_report(
     - `Movement` – Fast / Medium / Slow Mover (classified within brand group)
 
     **Order Parameters**
-    - `Safety Days`, `Lead Time`, `Order Processing` (fixed 10 days), `Target Days`
+    - `Safety Days`, `Lead Time`, `Order Processing` (per-brand from brand_logistics, default 10 days), `Target Days`
     - `On-Hand Days Coverage` – days of stock based on period-end stock
     - `Stock in Transit 1 / 2 / 3`, `Total Stock in Transit`
     - `Current Days Coverage` – (latest stock + transit) ÷ DRR
@@ -331,7 +329,6 @@ async def download_master_report(
         content = await _generate_master_report_data(
             start_date=start_date,
             end_date=end_date,
-            include_zoho=include_zoho,
             db=db,
             brand=brand,
             include_cogs=include_cogs,
@@ -861,10 +858,12 @@ async def download_master_report(
                     _net_ts = f"{_I}{r}"  # Net Total Sales cell (formula already injected above)
                     _data_row_drr_src = combined_df_data[row_idx - 2].get("DRR Source", "current_period")
                     if (row_idx - 2) in demand_override_row_indices or _data_row_drr_src != "previous_period":
-                        # Green / White / Red: Net Total Sales / Days in Stock
+                        # Green / White / Red: Net Total Sales / Days in Stock.
+                        # MAX(0, …) floors negative DRR (returns > sales) so the
+                        # Excess/Order formula resolves to NO MOVEMENT, not ORDER.
                         ws[f"{_N}{r}"] = (
-                            f'=IF({_days_in_stock_col}{r}>0,{_net_ts}/{_days_in_stock_col}{r},'
-                            f'IF({_net_ts}=0,0,{_net_ts}/{_period_days}))'
+                            f'=MAX(0,IF({_days_in_stock_col}{r}>0,{_net_ts}/{_days_in_stock_col}{r},'
+                            f'IF({_net_ts}=0,0,{_net_ts}/{_period_days})))'
                         )
                     else:
                         # Yellow / Orange: Net Lookback Sales / Lookback Days in Stock
@@ -929,7 +928,7 @@ async def download_master_report(
                     # For demand-override rows (green), use Net Total Sales × confidence multiplier
                     # For all other rows: MAX(0, Net Target Days × DRR) × confidence multiplier
                     if (row_idx - 2) in demand_override_row_indices:
-                        ws[f"{_AP}{r}"] = f'=IF({_AO}{r}="EXCESS",0,{_I}{r}*{_AX}{r})'
+                        ws[f"{_AP}{r}"] = f'=IF({inactive},0,IF({_AO}{r}="EXCESS",0,{_I}{r}*{_AX}{r}))'
                     else:
                         ws[f"{_AP}{r}"] = f'=IF({inactive},0,IF({_AO}{r}="EXCESS",0,MAX(0,{_AN}{r}*{_N}{r})*{_AX}{r}))'
 
@@ -1254,7 +1253,8 @@ def _aggregate_brand_kpi(
     bl = brand_logistics_map.get(brand.lower(), {})
     lead_time = bl.get("lead_time", 60)
     safety_days_medium = bl.get("safety_days_medium", 25)
-    target_days = lead_time + safety_days_medium + 10
+    order_processing = bl.get("order_processing", 10)
+    target_days = lead_time + safety_days_medium + order_processing
 
     units_sold = sum(i.get("combined_metrics", {}).get("total_units_sold", 0) for i in items)
     units_returned = sum(i.get("combined_metrics", {}).get("total_units_returned", 0) for i in items)
@@ -1318,12 +1318,14 @@ def _aggregate_brand_kpi(
             stock_w_total += item_stock
     weighted_avg_days_cover = round(weighted_doc_sum / stock_w_total, 2) if stock_w_total > 0 else 0.0
 
-    # Alert level based on aggregate days cover
+    # Alert level based on current days coverage (on-hand + in-transit).
+    # Stock already on the water counts towards covering the lead time, so a
+    # brand with a full container in transit is not flagged critical.
     if drr == 0:
         alert_level = 3  # no movement
-    elif days_cover < lead_time:
+    elif current_days_coverage < lead_time:
         alert_level = 2  # red – critical
-    elif days_cover < target_days:
+    elif current_days_coverage < target_days:
         alert_level = 1  # yellow – caution
     else:
         alert_level = 0  # green – healthy
@@ -1469,7 +1471,7 @@ async def get_dashboard_kpi(
     | `total_cbm` | Total cubic metres for suggested orders |
     | `lead_time` | Brand lead time (days) from brand_logistics |
     | `safety_days` | Medium-mover safety days from brand_logistics |
-    | `target_days` | lead_time + safety_days + 10 (order processing) |
+    | `target_days` | lead_time + safety_days + order_processing (per-brand, default 10) |
     | `alert_level` | Colour-coded health indicator (see below) |
     | `order_count` | SKUs flagged as ORDER |
     | `excess_count` | SKUs flagged as EXCESS |
@@ -1484,11 +1486,13 @@ async def get_dashboard_kpi(
     | `sku_highest_10` | 10 SKUs with the highest days cover (excluding those already in lowest 10) |
 
     ### `alert_level` – Brand Health Colour
+    Based on `current_days_coverage` (on-hand + in-transit stock), so containers
+    already on the water count towards covering the lead time.
     | Value | Colour | Condition |
     |---|---|---|
-    | `0` | **Green** – Healthy | `days_cover ≥ target_days` (brand has sufficient stock for the full replenishment cycle) |
-    | `1` | **Yellow** – Caution | `lead_time ≤ days_cover < target_days` (stock covers lead time but is below target buffer) |
-    | `2` | **Red** – Critical | `0 < days_cover < lead_time` (stock will run out before a replenishment order can arrive) |
+    | `0` | **Green** – Healthy | `current_days_coverage ≥ target_days` (brand has sufficient stock for the full replenishment cycle) |
+    | `1` | **Yellow** – Caution | `lead_time ≤ current_days_coverage < target_days` (coverage spans lead time but is below target buffer) |
+    | `2` | **Red** – Critical | `current_days_coverage < lead_time` (stock incl. transit will run out before a new order can arrive) |
     | `3` | **Grey** – No Movement | `drr = 0` (no sales recorded in the period) |
 
     ### SKU Stock Classification (per `stock_classification`)
@@ -1522,7 +1526,7 @@ async def get_dashboard_kpi(
         service = OptimizedMasterReportService(db)
 
         content, brand_logistics_map = await asyncio.gather(
-            _generate_master_report_data(start_date, end_date, True, db),
+            _generate_master_report_data(start_date, end_date, db, dashboard_mode=True),
             service.get_brand_logistics(),
         )
 
@@ -1677,11 +1681,12 @@ async def download_dashboard_kpi(
     - `Missed Sales Value (₹, 90d)`, `Missed Sales Value (₹/day)`
 
     ### Conditional Row Formatting (Brand KPI sheet)
+    Based on Current Days Coverage (on-hand + in-transit stock), matching `alert_level`.
     | Colour | Condition | Meaning |
     |---|---|---|
-    | Red | `0 < Days Cover < Lead Time` | Critical – stock will run out before a new order can arrive |
-    | Yellow | `Lead Time ≤ Days Cover < Target Days` | Caution – below the target safety buffer |
-    | (no fill) | `Days Cover ≥ Target Days` or no movement | Healthy / no movement – no action required |
+    | Red | `0 < Current Days Coverage < Lead Time` | Critical – stock incl. transit will run out before a new order can arrive |
+    | Yellow | `Lead Time ≤ Current Days Coverage < Target Days` | Caution – below the target safety buffer |
+    | (no fill) | `Current Days Coverage ≥ Target Days` or no movement | Healthy / no movement – no action required |
 
     ## Excel Sheet: `Product KPI` (breakdown=product)
     One row per active SKU. Columns:
@@ -1722,7 +1727,7 @@ async def download_dashboard_kpi(
 
         service = OptimizedMasterReportService(db)
         content, brand_logistics_map = await asyncio.gather(
-            _generate_master_report_data(start_date, end_date, True, db),
+            _generate_master_report_data(start_date, end_date, db, dashboard_mode=True),
             service.get_brand_logistics(),
         )
 
@@ -1874,7 +1879,8 @@ async def download_dashboard_kpi(
                     red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
                     yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
                     ws = writer.sheets["Brand KPI"]
-                    dc_col = list(df.columns).index("Days Cover (Stock / DRR)") + 1
+                    # Highlight on coverage incl. transit so it matches alert_level
+                    dc_col = list(df.columns).index("Current Days Coverage (Stock+Transit/DRR)") + 1
                     lt_col = list(df.columns).index("Lead Time (days)") + 1
                     tg_col = list(df.columns).index("Target Days") + 1
 
