@@ -249,7 +249,7 @@ def get_products(
         )
 
 
-PURCHASE_STATUS_OPTIONS = {"active", "inactive", "discontinued until stock lasts"}
+PURCHASE_STATUS_OPTIONS = {"active", "inactive", "discontinued until stock lasts", "active - combo"}
 
 
 class PurchaseStatusUpdate(BaseModel):
