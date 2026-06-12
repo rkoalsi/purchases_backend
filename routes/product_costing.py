@@ -49,8 +49,9 @@ COL_FX_TOTAL    = 16  # P  — USD TOTAL = L*O
 COL_CP_ACTUAL   = 17  # Q  — CP (Actual) = IFERROR(R/L,0)
 COL_COST_ACT    = 18  # R  — Total Cost (Actual) = (O*bank_rate)*L
 COL_CP_ASS      = 19  # S  — CP (Ass. Val.) = IFERROR(T/L,0)
-COL_ASS_VAL     = 20  # T  — Ass. Val. = L*bank_rate*O
-# U=21, V=22: intentionally blank (match original layout)
+COL_ASS_VAL     = 20  # T  — Ass. Val. = R+U+V
+COL_ITEM_FREIGHT   = 21  # U  — Item Freight    [blue / optional]
+COL_ITEM_INSURANCE = 22  # V  — Item Insurance  [blue / optional]
 COL_CUS_DUTY    = 23  # W  — Cus duty = T*I
 COL_SURCHARGE   = 24  # X  — Surcharge = W*10%
 COL_DUTY_PC     = 25  # Y  — Cus Duty / PC = IFERROR(W/L,0)
@@ -70,8 +71,8 @@ COL_COST_RETAIL = 38  # AL — Total cost to retailer = (AJ+AH+AG+AE+AF+AD+AC)
 COL_GST_TOTAL   = 39  # AM — Total gst paid = AK*L
 COL_INVESTMENT  = 40  # AN — Total investment = (AL*L)+AM
 COL_OLD_MRP     = 41  # AO — OLD MRP (manual / from product rate)
-COL_NEW_MRP     = 42  # AP — NEW MRP = AJ*3.5
-COL_DISCOUNT    = 43  # AQ — Discount % = IFERROR((AO-AP)/AO,0)
+COL_NEW_MRP     = 42  # AP — NEW MRP = AO (copies OLD MRP; user overrides manually)
+COL_DISCOUNT    = 43  # AQ — Discount % = MAX(0, IFERROR((AO-AP)/AO,0))
 COL_MARGIN      = 44  # AR — Margin (default 0.55)
 COL_PRICE_RTL   = 45  # AS — price to retailer = AP-(AP*AR)
 COL_GST_RATE_R  = 46  # AT — Gst % = 1+(AI/1)
@@ -91,11 +92,12 @@ COL_PROFIT_PC   = 59  # BG — Profit Per Pcs = BB/L
 
 # Columns appended after BG (always present, then optional live-data)
 COL_IMAGE       = 60  # BH — Image or image URL (from upload template)
-COL_SALES       = 61  # BI — Total Sales (3 months)           [live data]
-COL_DAYS        = 62  # BJ — Days in Stock                    [live data]
-COL_STOCK       = 63  # BK — Zoho Stock                       [live data]
-COL_AVG_SALES   = 64  # BL — Avg Sales / Day = IFERROR(BI/BJ,0)
-COL_DAYS_COVER  = 65  # BM — Days Cover = IFERROR(BK/BL,0)
+COL_SALES       = 61  # BI — Total sale of Last 3 months      [live data]
+COL_DAYS        = 62  # BJ — Total No. of days in stock       [live data]
+COL_ZOHO_WH     = 63  # BK — Zoho Stock (Pupscribe WH)        [live data]
+COL_TRANSIT     = 64  # BL — Total Stock in Transit (1+2+3)   [live data]
+COL_AVG_SALES   = 65  # BM — Average Sales per Day (DRR)      [live data]
+COL_DAYS_COVER  = 66  # BN — Days Until Stock Lasts = IFERROR((BK+BL)/BM,0)
 
 # Exchange rate metadata — placed in META_ROW (row 1), cols A–F.
 # Using cols 1–6 avoids overlap with the data columns N/O/P that hold prices.
@@ -118,7 +120,7 @@ _META_FONT   = Font(bold=True, size=9)
 _DATA_FONT   = Font(size=9)
 
 # Blue (optional) data columns that get blue header fill
-_BLUE_COLS = {COL_PACKAGING, COL_ZIPTIES, COL_LABELS, COL_PLASTIC, COL_COURIER, COL_LOGISTICS_PC}
+_BLUE_COLS = {COL_ITEM_FREIGHT, COL_ITEM_INSURANCE, COL_PACKAGING, COL_ZIPTIES, COL_LABELS, COL_PLASTIC, COL_COURIER, COL_LOGISTICS_PC}
 
 
 # ── Request models ─────────────────────────────────────────────────────────────
@@ -216,8 +218,8 @@ def _build_headers(cur: str, include_live: bool, stock_date: str, sales_label: s
         "Total Cost (Actual)",   # 18 R
         "CP (Ass. Val.)",        # 19 S
         "Ass. Val.",             # 20 T
-        "",                      # 21 U
-        "",                      # 22 V
+        "Item Freight",           # 21 U  [blue / optional]
+        "Item Insurance",         # 22 V  [blue / optional]
         "Cus duty",              # 23 W
         "Surcharge",             # 24 X
         "Cus Duty / PC",         # 25 Y
@@ -259,11 +261,12 @@ def _build_headers(cur: str, include_live: bool, stock_date: str, sales_label: s
     ]
     if include_live:
         headers += [
-            f"Total Sales ({sales_label})",   # 61 BI
-            "Days in Stock",                   # 62 BJ
-            f"Zoho Stock ({stock_date})",      # 63 BK
-            "Avg Sales / Day",                 # 64 BL
-            "Days Cover",                      # 65 BM
+            f"Total sale of Last 3 months ({sales_label})",  # 61 BI
+            "Total No. of days in stock last 3 months",       # 62 BJ
+            f"Zoho Stock - Pupscribe WH ({stock_date})",      # 63 BK
+            "Total Stock in Transit (1+2+3)",                  # 64 BL
+            "Average Sales per Day",                           # 65 BM
+            "Days Until Stock Lasts",                          # 66 BN
         ]
     return headers
 
@@ -274,7 +277,6 @@ def _write_row(
     sr: int,
     product: dict,
     include_live: bool,
-    sku_stock_map: dict | None,
     sku_sales_data: dict | None,
 ):
     sku       = product.get("cf_sku_code", "")
@@ -316,8 +318,10 @@ def _write_row(
     # ── Cost formulas ($B$1 = bank rate in META row 1) ────────────────────────
     ws.cell(r, COL_COST_ACT).value  = f"=(O{r}*$B$1)*L{r}"
     ws.cell(r, COL_CP_ACTUAL).value = f"=IFERROR(R{r}/L{r},0)"
-    ws.cell(r, COL_ASS_VAL).value   = f"=L{r}*$B$1*O{r}"   # same basis as cost actual
+    ws.cell(r, COL_ASS_VAL).value   = f"=R{r}+U{r}+V{r}"
     ws.cell(r, COL_CP_ASS).value    = f"=IFERROR(T{r}/L{r},0)"
+    _set(ws, r, COL_ITEM_FREIGHT,   0)
+    _set(ws, r, COL_ITEM_INSURANCE, 0)
 
     # ── Duty formulas ─────────────────────────────────────────────────────────
     ws.cell(r, COL_CUS_DUTY).value  = f"=T{r}*I{r}"
@@ -342,7 +346,7 @@ def _write_row(
     # AK: GST paid till now = (CP_Ass + Duty/PC + Surch/PC) × GST%
     ws.cell(r, COL_GST_PAID).value   = f"=(S{r}+Y{r}+Z{r})*AI{r}"
     # AL: Total cost to retailer = landed + optional packaging cols
-    ws.cell(r, COL_COST_RETAIL).value= f"=(AJ{r}+AH{r}+AG{r}+AE{r}+AF{r}+AD{r}+AC{r})"
+    ws.cell(r, COL_COST_RETAIL).value= f"=(AJ{r}+AG{r}+AE{r}+AF{r}+AD{r}+AC{r})"
     # AM: Total GST paid = AK × qty
     ws.cell(r, COL_GST_TOTAL).value  = f"=AK{r}*L{r}"
     # AN: Total investment = (cost_retail × qty) + total_gst
@@ -353,15 +357,15 @@ def _write_row(
     if mrp:
         _set(ws, r, COL_OLD_MRP, mrp)
 
-    ws.cell(r, COL_NEW_MRP).value   = f"=AJ{r}*3.5"
+    ws.cell(r, COL_NEW_MRP).value   = f"=AO{r}"
     c_disc = ws.cell(r, COL_DISCOUNT)
-    c_disc.value = f"=IFERROR((AO{r}-AP{r})/AO{r},0)"
+    c_disc.value = f"=MAX(0,IFERROR((AO{r}-AP{r})/AO{r},0))"
     c_disc.number_format = "0%"
 
     _set(ws, r, COL_MARGIN, 0.55, pct=True)
 
     ws.cell(r, COL_PRICE_RTL).value  = f"=AP{r}-(AP{r}*AR{r})"
-    ws.cell(r, COL_GST_RATE_R).value = f"=1+(AI{r}/1)"
+    ws.cell(r, COL_GST_RATE_R).value = f"=1+AI{r}"
     ws.cell(r, COL_GST_AMT_R).value  = f"=AS{r}-(AS{r}/AT{r})"
     ws.cell(r, COL_GST_TO_PAY).value = f"=AU{r}-AK{r}"
     ws.cell(r, COL_CASH_AFTER).value = f"=AS{r}-AV{r}"
@@ -410,27 +414,29 @@ def _write_row(
     if include_live:
         if sku_sales_data and sku:
             sd = sku_sales_data.get(sku, {})
-            total_sales = sd.get("total_sales", "")
+            total_sales = sd.get("total_units_sold", "")
             days_in_stk = sd.get("total_days_in_stock", "")
+            zoho_wh     = sd.get("pupscribe_wh_stock", "")
+            transit     = sd.get("total_transit", "")
+            drr         = sd.get("avg_daily_run_rate", "")
             if total_sales != "":
                 _set(ws, r, COL_SALES, total_sales)
             if days_in_stk != "":
                 _set(ws, r, COL_DAYS, days_in_stk)
+            if zoho_wh != "":
+                _set(ws, r, COL_ZOHO_WH, zoho_wh)
+            if transit != "":
+                _set(ws, r, COL_TRANSIT, transit)
+            if drr != "":
+                _set(ws, r, COL_AVG_SALES, drr)
 
-        if sku_stock_map and sku:
-            stock = sku_stock_map.get(sku)
-            if stock is not None:
-                _set(ws, r, COL_STOCK, stock)
-
-        ws.cell(r, COL_AVG_SALES).value  = f"=IFERROR(BI{r}/BJ{r},0)"
-        ws.cell(r, COL_DAYS_COVER).value = f"=IFERROR(BK{r}/BL{r},0)"
+        ws.cell(r, COL_DAYS_COVER).value = f"=IFERROR((BK{r}+BL{r})/BM{r},0)"
 
 
 def _build_sheet(
     wb,
     tab: BrandTabConfig,
     products: list[dict],
-    sku_stock_map: dict | None,
     sku_sales_data: dict | None,
     stock_date: str,
     sales_label: str,
@@ -456,7 +462,7 @@ def _build_sheet(
     _set(ws, 3, 1, f"{tab.label} Latest Price", bold=True)
 
     # ── Row 6: column headers ─────────────────────────────────────────────────
-    include_live = sku_stock_map is not None
+    include_live = sku_sales_data is not None
     headers = _build_headers(cur, include_live, stock_date, sales_label)
     for c, h in enumerate(headers, 1):
         cell = ws.cell(HEADER_ROW, c)
@@ -470,7 +476,7 @@ def _build_sheet(
     # ── Data rows ─────────────────────────────────────────────────────────────
     for i, product in enumerate(products, 1):
         r = DATA_START + i - 1
-        _write_row(ws, r, i, product, include_live, sku_stock_map, sku_sales_data)
+        _write_row(ws, r, i, product, include_live, sku_sales_data)
 
     # ── Column widths ─────────────────────────────────────────────────────────
     ws.column_dimensions[_col(COL_NAME)].width    = 45
@@ -488,7 +494,6 @@ def _build_sheet(
 def _build_workbook(
     tabs: list[BrandTabConfig],
     products_by_tab: list[list[dict]],
-    sku_stock_map: dict | None,
     sku_sales_data: dict | None,
     stock_date: str,
     sales_label: str,
@@ -496,7 +501,7 @@ def _build_workbook(
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     for tab, products in zip(tabs, products_by_tab):
-        _build_sheet(wb, tab, products, sku_stock_map, sku_sales_data, stock_date, sales_label)
+        _build_sheet(wb, tab, products, sku_sales_data, stock_date, sales_label)
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -517,43 +522,46 @@ async def generate_product_costing(
         lambda: [_fetch_products(db, tab) for tab in body.tabs]
     )
 
-    sku_stock_map: dict | None = None
     sku_sales_data: dict | None = None
     stock_date = datetime.now().strftime("%d %b %Y")
     sales_label = ""
 
     if body.include_live_data:
-        from .sheets_updater import _fetch_live_zoho_stock, _last_3_months_range
+        from .sheets_updater import _last_3_months_range
         from ..services.master_report import _generate_master_report_data
 
         start_date, end_date = _last_3_months_range()
         sales_label = f"{start_date} to {end_date}"
 
         try:
-            (sku_stock_map, stock_date), report = await asyncio.gather(
-                asyncio.to_thread(_fetch_live_zoho_stock, db),
-                _generate_master_report_data(
-                    start_date=start_date, end_date=end_date, db=db,
-                ),
+            report = await _generate_master_report_data(
+                start_date=start_date, end_date=end_date, db=db,
             )
+            stock_date = report.get("dates", {}).get("zoho") or stock_date
             sku_sales_data = {}
             for item in report.get("combined_data", []):
                 sku = item.get("sku_code", "")
                 if sku:
                     m = item.get("combined_metrics", {})
                     sku_sales_data[sku] = {
-                        "total_sales":         round(m.get("total_sales", 0) or 0, 2),
+                        "total_units_sold":    round(m.get("total_units_sold", 0) or 0, 2),
                         "total_days_in_stock": int(m.get("total_days_in_stock", 0) or 0),
+                        "pupscribe_wh_stock":  round(m.get("pupscribe_wh_stock", 0) or 0, 2),
+                        "avg_daily_run_rate":  round(m.get("avg_daily_run_rate", 0) or 0, 4),
+                        "total_transit":       round(
+                            (item.get("stock_in_transit_1") or 0) +
+                            (item.get("stock_in_transit_2") or 0) +
+                            (item.get("stock_in_transit_3") or 0), 2
+                        ),
                     }
         except Exception as exc:
             logger.warning("Live data fetch failed (continuing without): %s", exc)
-            sku_stock_map  = None
             sku_sales_data = None
 
     excel_bytes = await asyncio.to_thread(
         _build_workbook,
         body.tabs, products_by_tab,
-        sku_stock_map, sku_sales_data,
+        sku_sales_data,
         stock_date, sales_label,
     )
 
