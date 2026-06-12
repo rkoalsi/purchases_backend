@@ -137,7 +137,6 @@ class BrandTabConfig(BaseModel):
     currency_label:  str  = "USD"
     currency_filter: str | None = None
     exchange_rates:  ExchangeRates = ExchangeRates()
-    include_inactive: bool = False
 
 
 class ProductCostingRequest(BaseModel):
@@ -149,8 +148,6 @@ class ProductCostingRequest(BaseModel):
 
 def _fetch_products(db, tab: BrandTabConfig) -> list[dict]:
     query: dict = {"brand": {"$in": tab.brand_names}}
-    if not tab.include_inactive:
-        query["status"] = "active"
     if tab.currency_filter:
         query["currency"] = tab.currency_filter
     fields = {
@@ -618,6 +615,15 @@ def _build_template_workbook() -> bytes:
     wb.save(buf)
     buf.seek(0)
     return buf.read()
+
+
+@router.get("/brands")
+async def list_brands(db=Depends(get_database)):
+    """Return all brand names from the brands collection, sorted alphabetically."""
+    brands = await asyncio.to_thread(
+        lambda: sorted(db.get_collection("brands").distinct("name"))
+    )
+    return {"brands": brands}
 
 
 @router.get("/template")
