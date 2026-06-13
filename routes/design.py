@@ -2,6 +2,7 @@ import io
 import math
 import os
 import re
+import uuid
 import zipfile
 import logging
 import asyncio
@@ -1802,3 +1803,94 @@ async def delete_designer_document(order_id: str, doc_id: str, db=Depends(get_da
     if not found:
         raise HTTPException(status_code=404, detail="Document not found")
     return {"order_id": order_id, "doc_id": doc_id, "deleted": True}
+
+
+# ─── Brand Catalogues (shared with order-form `catalogues` collection) ────────
+
+CATALOGUES_COLLECTION = "catalogues"
+
+
+@router.get("/brand-catalogues")
+async def list_brand_catalogues(
+    page: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    db=Depends(get_database),
+):
+    def _fetch():
+        pipeline = [
+            {"$sort": {"created_at": -1, "_id": -1}},
+            {"$skip": page * limit},
+            {"$limit": limit},
+        ]
+        total = db[CATALOGUES_COLLECTION].count_documents({})
+        docs = [serialize_mongo_document(d) for d in db[CATALOGUES_COLLECTION].aggregate(pipeline)]
+        return {"catalogues": docs, "total": total, "page": page, "limit": limit}
+
+    return await asyncio.to_thread(_fetch)
+
+
+@router.post("/brand-catalogues/upload")
+async def upload_brand_catalogue(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+    key = f"catalogues/{uuid.uuid4()}.pdf"
+    data = await file.read()
+    _public_s3_client().put_object(
+        Bucket=PUBLIC_S3_BUCKET,
+        Key=key,
+        Body=data,
+        ContentType="application/pdf",
+    )
+    return {"file_url": f"{PUBLIC_S3_URL}/{key}"}
+
+
+class BrandCatalogueBody(BaseModel):
+    name: str
+    brands: Optional[List[str]] = None
+    image_url: str
+    is_active: bool = True
+
+
+@router.post("/brand-catalogues")
+async def create_brand_catalogue(body: BrandCatalogueBody, db=Depends(get_database)):
+    def _insert():
+        doc = {**body.model_dump(), "created_at": datetime.now()}
+        result = db[CATALOGUES_COLLECTION].insert_one(doc)
+        return serialize_mongo_document(db[CATALOGUES_COLLECTION].find_one({"_id": result.inserted_id}))
+
+    return await asyncio.to_thread(_insert)
+
+
+@router.put("/brand-catalogues/{catalogue_id}")
+async def update_brand_catalogue(catalogue_id: str, body: BrandCatalogueBody, db=Depends(get_database)):
+    def _update():
+        update = {**body.model_dump(), "updated_at": datetime.now()}
+        result = db[CATALOGUES_COLLECTION].update_one(
+            {"_id": ObjectId(catalogue_id)}, {"$set": update}
+        )
+        if result.matched_count == 0:
+            return None
+        return serialize_mongo_document(db[CATALOGUES_COLLECTION].find_one({"_id": ObjectId(catalogue_id)}))
+
+    doc = await asyncio.to_thread(_update)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Catalogue not found")
+    return doc
+
+
+@router.delete("/brand-catalogues/{catalogue_id}")
+async def toggle_brand_catalogue(catalogue_id: str, db=Depends(get_database)):
+    def _toggle():
+        doc = db[CATALOGUES_COLLECTION].find_one({"_id": ObjectId(catalogue_id)})
+        if not doc:
+            return None
+        new_state = not doc.get("is_active", True)
+        db[CATALOGUES_COLLECTION].update_one(
+            {"_id": ObjectId(catalogue_id)}, {"$set": {"is_active": new_state}}
+        )
+        return new_state
+
+    result = await asyncio.to_thread(_toggle)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Catalogue not found")
+    return {"is_active": result}
