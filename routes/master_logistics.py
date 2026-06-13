@@ -264,6 +264,69 @@ def delete_brand_logistics(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─── SIT helper (live data from purchase_orders, mirrors master_service logic) ─
+
+
+def _compute_live_transit_by_sku(db) -> dict:
+    """Return {sku_code: {transit_1, transit_2, transit_3, transit_1_po, transit_2_po, transit_3_po}}
+    using the same per-vendor slot algorithm as OptimizedMasterReportService.get_stock_in_transit."""
+    from collections import defaultdict
+
+    po_col = db.get_collection("purchase_orders")
+    open_pos = list(
+        po_col.find(
+            {"order_status_formatted": "Issued"},
+            {"line_items": 1, "purchaseorder_number": 1, "date": 1, "vendor_id": 1, "_id": 0},
+        ).sort("date", 1)
+    )
+
+    vendor_po_order: dict = defaultdict(list)
+    for po in open_pos:
+        vid = po.get("vendor_id", "") or "unknown"
+        po_num = po.get("purchaseorder_number", "")
+        if po_num and po_num not in vendor_po_order[vid]:
+            vendor_po_order[vid].append(po_num)
+
+    sku_slots: dict = defaultdict(lambda: defaultdict(float))
+    sku_po_map: dict = defaultdict(dict)
+
+    for po in open_pos:
+        vid = po.get("vendor_id", "") or "unknown"
+        po_num = po.get("purchaseorder_number", "")
+        po_slots = vendor_po_order.get(vid, [])
+        slot_idx = po_slots.index(po_num) if po_num in po_slots else -1
+        if slot_idx < 0 or slot_idx >= 3:
+            continue
+
+        for li in po.get("line_items", []):
+            sku_code = ""
+            for cf in li.get("item_custom_fields", []):
+                if cf.get("api_name") == "cf_sku_code":
+                    sku_code = cf.get("value", "")
+                    break
+            if not sku_code:
+                continue
+            qty = float(li.get("quantity", 0) or 0)
+            qty_received = float(li.get("quantity_received", 0) or 0)
+            transit_qty = qty - qty_received
+            if transit_qty > 0:
+                sku_slots[sku_code][slot_idx] += transit_qty
+                sku_po_map[sku_code][slot_idx] = po_num
+
+    result = {}
+    for sku, slots in sku_slots.items():
+        po_map = sku_po_map.get(sku, {})
+        result[sku] = {
+            "transit_1": slots.get(0, 0),
+            "transit_2": slots.get(1, 0),
+            "transit_3": slots.get(2, 0),
+            "transit_1_po": po_map.get(0, ""),
+            "transit_2_po": po_map.get(1, ""),
+            "transit_3_po": po_map.get(2, ""),
+        }
+    return result
+
+
 # ─── Product Logistics (CBM / Case Pack) CRUD ──────────────────────
 
 
@@ -272,6 +335,7 @@ def get_product_logistics_list(
     search: str = Query("", description="Search by SKU or product name"),
     brand: str = Query("", description="Filter by brand"),
     status: str = Query("", description="Filter by purchase status"),
+    sort_by: str = Query("sku", description="Sort order: 'sku' (A-Z) or 'latest' (newest first)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db=Depends(get_database),
@@ -316,9 +380,6 @@ def get_product_logistics_list(
                     "cbm": 1,
                     "case_pack": 1,
                     "purchase_status": 1,
-                    "stock_in_transit_1": 1,
-                    "stock_in_transit_2": 1,
-                    "stock_in_transit_3": 1,
                     "purchase_price": 1,
                     "currency": 1,
                     "_id": 0,
@@ -326,24 +387,31 @@ def get_product_logistics_list(
             )
             .skip(skip)
             .limit(page_size)
-            .sort("cf_sku_code", 1)
+            .sort([("created_at", -1), ("_id", -1)] if sort_by == "latest" else [("cf_sku_code", 1)])
         )
 
-        # Ensure numeric fields default to 0 when missing from DB
+        # Compute live SIT from purchase_orders (same logic as master report)
+        live_transit = _compute_live_transit_by_sku(db)
+
         products = []
         for p in raw_products:
+            sku = p.get("cf_sku_code", "")
+            sit = live_transit.get(sku, {})
             products.append(
                 {
                     "item_id": str(p.get("item_id", "")),
-                    "cf_sku_code": p.get("cf_sku_code", ""),
+                    "cf_sku_code": sku,
                     "name": p.get("name", ""),
                     "brand": p.get("brand", ""),
                     "cbm": p.get("cbm", 0) or 0,
                     "case_pack": p.get("case_pack", 0) or 0,
                     "purchase_status": p.get("purchase_status", ""),
-                    "stock_in_transit_1": p.get("stock_in_transit_1", 0) or 0,
-                    "stock_in_transit_2": p.get("stock_in_transit_2", 0) or 0,
-                    "stock_in_transit_3": p.get("stock_in_transit_3", 0) or 0,
+                    "stock_in_transit_1": sit.get("transit_1", 0),
+                    "stock_in_transit_2": sit.get("transit_2", 0),
+                    "stock_in_transit_3": sit.get("transit_3", 0),
+                    "transit_1_po": sit.get("transit_1_po", ""),
+                    "transit_2_po": sit.get("transit_2_po", ""),
+                    "transit_3_po": sit.get("transit_3_po", ""),
                     "purchase_price": p.get("purchase_price", 0) or 0,
                     "currency": p.get("currency", "") or "",
                 }
@@ -406,9 +474,6 @@ def download_product_logistics(
                     "cbm": 1,
                     "case_pack": 1,
                     "purchase_status": 1,
-                    "stock_in_transit_1": 1,
-                    "stock_in_transit_2": 1,
-                    "stock_in_transit_3": 1,
                     "purchase_price": 1,
                     "currency": 1,
                     "_id": 0,
@@ -416,11 +481,15 @@ def download_product_logistics(
             ).sort("cf_sku_code", 1)
         )
 
+        live_transit = _compute_live_transit_by_sku(db)
+
         rows = []
         for p in raw_products:
+            sku = p.get("cf_sku_code", "")
+            sit = live_transit.get(sku, {})
             rows.append(
                 {
-                    "SKU Code": p.get("cf_sku_code", ""),
+                    "SKU Code": sku,
                     "Product Name": p.get("name", ""),
                     "Brand": p.get("brand", ""),
                     "Status": p.get("purchase_status", ""),
@@ -428,9 +497,12 @@ def download_product_logistics(
                     "Case Pack": p.get("case_pack", 0) or 0,
                     "Currency": p.get("currency", "") or "",
                     "Purchase Price": p.get("purchase_price", 0) or 0,
-                    "Stock in Transit 1": p.get("stock_in_transit_1", 0) or 0,
-                    "Stock in Transit 2": p.get("stock_in_transit_2", 0) or 0,
-                    "Stock in Transit 3": p.get("stock_in_transit_3", 0) or 0,
+                    "Stock in Transit 1": sit.get("transit_1", 0),
+                    "Transit 1 PO": sit.get("transit_1_po", ""),
+                    "Stock in Transit 2": sit.get("transit_2", 0),
+                    "Transit 2 PO": sit.get("transit_2_po", ""),
+                    "Stock in Transit 3": sit.get("transit_3", 0),
+                    "Transit 3 PO": sit.get("transit_3_po", ""),
                 }
             )
 
