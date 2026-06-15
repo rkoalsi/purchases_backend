@@ -25,6 +25,28 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 BOOKS_REFRESH_TOKEN = os.getenv("BOOKS_REFRESH_TOKEN")
 ZOHO_BOOKS_BASE = "https://books.zoho.com/api/v3"
 
+# 60-day interval bucket labels returned by Zoho API
+LABEL_FAST   = "1 - 60 days"
+LABEL_MEDIUM = "61 - 120 days"
+LABEL_SLOW   = "121 - 180 days"
+LABEL_DEAD   = "> 180 days"
+
+# Display labels used in sheet names / Excel headers
+DISPLAY_FAST   = "0–60 days"
+DISPLAY_MEDIUM = "60–120 days"
+DISPLAY_SLOW   = "120–180 days"
+DISPLAY_DEAD   = "180+ days"
+
+# Fill colours (hex) per category
+COLOR_FAST   = "27AE60"   # green
+COLOR_FAST2  = "1E8449"   # darker green (prev-period sheet)
+COLOR_MEDIUM = "2471A3"   # blue
+COLOR_MEDIUM2= "1A5276"   # darker blue
+COLOR_SLOW   = "CA6F1E"   # orange
+COLOR_SLOW2  = "A04000"   # darker orange
+COLOR_DEAD   = "7D3C98"   # purple
+COLOR_DEAD2  = "6C3483"   # darker purple
+
 
 def _get_zoho_token() -> str:
     url = BOOKS_URL.format(
@@ -49,7 +71,7 @@ def _fetch_all_aging_items(token: str, to_date: str) -> list:
         "per_page": 500,
         "interval_type": "days",
         "number_of_columns": 4,
-        "interval_range": 90,
+        "interval_range": 60,
         "select_columns": select_columns,
         "to_date": to_date,
         "sort_column": "item_id",
@@ -203,12 +225,10 @@ def _build_summary_sheet(ws, curr_rows: list, prev_rows: list, curr_label: str, 
         ws.append([name, prev_qty, curr_qty, status, diff, change_pct if isinstance(change_pct, float) else change_pct])
         _apply_row_style(ws, i, len(headers), i % 2 == 0)
 
-        # Format Change % column as percentage if it's a number
         pct_cell = ws.cell(row=i, column=6)
         if isinstance(change_pct, float):
             pct_cell.number_format = pct_fmt
 
-        # Colour-code the Status cell
         status_cell = ws.cell(row=i, column=4)
         if status == "New Added":
             status_cell.fill = PatternFill("solid", fgColor="D5F5E3")
@@ -241,7 +261,6 @@ def _aggregate_by_brand(rows: list) -> dict:
 def _write_brand_section(ws, title: str, fill_hex: str, stock_col_label: str,
                          brand_data: dict, start_row: int) -> int:
     """Write a titled brand table starting at start_row. Returns the next free row."""
-    # Section title
     title_cell = ws.cell(row=start_row, column=1, value=title)
     title_cell.font = Font(bold=True, color="FFFFFF", size=11)
     title_cell.fill = PatternFill("solid", fgColor=fill_hex)
@@ -252,7 +271,6 @@ def _write_brand_section(ws, title: str, fill_hex: str, stock_col_label: str,
         cell.fill = PatternFill("solid", fgColor=fill_hex)
     start_row += 1
 
-    # Headers
     headers = ["Brand", stock_col_label, "Total MRP Value", "Collection Value"]
     for col, h in enumerate(headers, start=1):
         ws.cell(row=start_row, column=col, value=h)
@@ -295,33 +313,32 @@ def _build_brand_sheet(ws, brand_totals: dict, stock_date: str,
 
     next_row = 1
 
-    # Section 1 – Current Stock
     next_row = _write_brand_section(
         ws, "Current Stock", "1F5C99", "Zoho Stock",
         brand_totals, next_row,
     )
-    next_row += 2  # gap
+    next_row += 2
 
-    # Section 2 – Slow Movers
     slow_by_brand = _aggregate_by_brand(slow_rows)
     next_row = _write_brand_section(
-        ws, "Slow Movers (181–270 days)", "C0392B", "Qty (181–270 days)",
+        ws, f"Slow Movers ({DISPLAY_SLOW})", COLOR_SLOW, f"Qty ({DISPLAY_SLOW})",
         slow_by_brand, next_row,
     )
-    next_row += 2  # gap
+    next_row += 2
 
-    # Section 3 – Deadstock
     dead_by_brand = _aggregate_by_brand(dead_rows)
     _write_brand_section(
-        ws, "Deadstock (>270 days)", "7D3C98", "Qty (>270 days)",
+        ws, f"Deadstock ({DISPLAY_DEAD})", COLOR_DEAD, f"Qty ({DISPLAY_DEAD})",
         dead_by_brand, next_row,
     )
 
     _auto_width(ws)
 
 
-def _build_rows_from_items(items: list, product_map: dict) -> tuple[list, list]:
-    """Extract slow_rows and dead_rows from Zoho aging items."""
+def _build_rows_from_items(items: list, product_map: dict) -> tuple[list, list, list, list]:
+    """Extract fast, medium, slow, and dead rows from Zoho aging items."""
+    fast_rows = []
+    medium_rows = []
     slow_rows = []
     dead_rows = []
 
@@ -333,20 +350,26 @@ def _build_rows_from_items(items: list, product_map: dict) -> tuple[list, list]:
         brand = (prod.get("brand") or "Unknown").strip() or "Unknown"
         mrp = prod.get("rate") or 0.0
 
-        slow_qty, slow_val = _extract_interval(intervals, "181 - 270 days")
-        dead_qty, dead_val = _extract_interval(intervals, "> 270 days")
+        fast_qty,   fast_val   = _extract_interval(intervals, LABEL_FAST)
+        medium_qty, medium_val = _extract_interval(intervals, LABEL_MEDIUM)
+        slow_qty,   slow_val   = _extract_interval(intervals, LABEL_SLOW)
+        dead_qty,   dead_val   = _extract_interval(intervals, LABEL_DEAD)
 
         base = {"item_id": item_id, "item_name": item_name, "brand": brand, "mrp": mrp}
 
+        if fast_qty > 0:
+            fast_rows.append({**base, "qty": fast_qty, "asset_value": fast_val})
+        if medium_qty > 0:
+            medium_rows.append({**base, "qty": medium_qty, "asset_value": medium_val})
         if slow_qty > 0:
             slow_rows.append({**base, "qty": slow_qty, "asset_value": slow_val})
-
         if dead_qty > 0:
             dead_rows.append({**base, "qty": dead_qty, "asset_value": dead_val})
 
-    slow_rows.sort(key=lambda r: (r["brand"], r["item_name"]))
-    dead_rows.sort(key=lambda r: (r["brand"], r["item_name"]))
-    return slow_rows, dead_rows
+    for rows in (fast_rows, medium_rows, slow_rows, dead_rows):
+        rows.sort(key=lambda r: (r["brand"], r["item_name"]))
+
+    return fast_rows, medium_rows, slow_rows, dead_rows
 
 
 def _date_label(date_str: str) -> str:
@@ -372,7 +395,6 @@ async def download_inventory_aging(
     if prev_date >= to_date:
         raise HTTPException(status_code=400, detail="prev_date must be earlier than to_date")
 
-    # Fetch Zoho token once, then fetch both periods in parallel
     token = await asyncio.to_thread(_get_zoho_token)
     curr_items, prev_items = await asyncio.gather(
         asyncio.to_thread(_fetch_all_aging_items, token, to_date),
@@ -382,7 +404,6 @@ async def download_inventory_aging(
     if not curr_items:
         raise HTTPException(status_code=404, detail="No inventory aging data returned for current date")
 
-    # Batch-load products and brands in parallel
     all_item_ids = list({item["item_id"] for item in curr_items + prev_items})
     products_col = db["products"]
     brands_col = db["brands"]
@@ -413,7 +434,6 @@ async def download_inventory_aging(
 
     product_map = {p["item_id"]: p for p in product_docs}
 
-    # Build brand_totals from zoho_warehouse_stock
     brand_names = [b["name"] for b in brand_docs if b.get("name")]
     brand_totals: dict[str, dict] = {
         name: {"stock": 0.0, "total_mrp": 0.0, "collection_value": 0.0}
@@ -457,38 +477,56 @@ async def download_inventory_aging(
             brand_totals[brand]["total_mrp"] += total_mrp_val
             brand_totals[brand]["collection_value"] += total_mrp_val / 2
 
-    # Build slow/dead rows for both periods
-    curr_slow, curr_dead = _build_rows_from_items(curr_items, product_map)
-    prev_slow, prev_dead = _build_rows_from_items(prev_items, product_map)
+    curr_fast, curr_medium, curr_slow, curr_dead = _build_rows_from_items(curr_items, product_map)
+    prev_fast, prev_medium, prev_slow, prev_dead = _build_rows_from_items(prev_items, product_map)
 
     curr_label = _date_label(to_date)
     prev_label = _date_label(prev_date)
 
-    # Build XLSX
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
-    # Slow Movers sheets
-    ws_slow_summary = wb.create_sheet("Summary - Slow Movers")
-    _build_summary_sheet(ws_slow_summary, curr_slow, prev_slow, curr_label, prev_label, "C0392B")
+    # Fast Movers
+    ws = wb.create_sheet("Summary - Fast Movers")
+    _build_summary_sheet(ws, curr_fast, prev_fast, curr_label, prev_label, COLOR_FAST)
 
-    ws_slow_curr = wb.create_sheet(f"Slow Movers ({curr_label})")
-    _build_item_sheet(ws_slow_curr, "181 - 270 days", curr_slow, "C0392B")
+    ws = wb.create_sheet(f"Fast Movers ({curr_label})")
+    _build_item_sheet(ws, DISPLAY_FAST, curr_fast, COLOR_FAST)
 
-    ws_slow_prev = wb.create_sheet(f"Slow Movers ({prev_label})")
-    _build_item_sheet(ws_slow_prev, "181 - 270 days", prev_slow, "E74C3C")
+    ws = wb.create_sheet(f"Fast Movers ({prev_label})")
+    _build_item_sheet(ws, DISPLAY_FAST, prev_fast, COLOR_FAST2)
 
-    # Deadstock sheets
-    ws_dead_summary = wb.create_sheet("Summary - Deadstock")
-    _build_summary_sheet(ws_dead_summary, curr_dead, prev_dead, curr_label, prev_label, "7D3C98")
+    # Medium Movers
+    ws = wb.create_sheet("Summary - Medium Movers")
+    _build_summary_sheet(ws, curr_medium, prev_medium, curr_label, prev_label, COLOR_MEDIUM)
 
-    ws_dead_curr = wb.create_sheet(f"Deadstock ({curr_label})")
-    _build_item_sheet(ws_dead_curr, "> 270 days", curr_dead, "7D3C98")
+    ws = wb.create_sheet(f"Medium Movers ({curr_label})")
+    _build_item_sheet(ws, DISPLAY_MEDIUM, curr_medium, COLOR_MEDIUM)
 
-    ws_dead_prev = wb.create_sheet(f"Deadstock ({prev_label})")
-    _build_item_sheet(ws_dead_prev, "> 270 days", prev_dead, "9B59B6")
+    ws = wb.create_sheet(f"Medium Movers ({prev_label})")
+    _build_item_sheet(ws, DISPLAY_MEDIUM, prev_medium, COLOR_MEDIUM2)
 
-    # Brand sheet — three sections: current stock, slow movers, deadstock
+    # Slow Movers
+    ws = wb.create_sheet("Summary - Slow Movers")
+    _build_summary_sheet(ws, curr_slow, prev_slow, curr_label, prev_label, COLOR_SLOW)
+
+    ws = wb.create_sheet(f"Slow Movers ({curr_label})")
+    _build_item_sheet(ws, DISPLAY_SLOW, curr_slow, COLOR_SLOW)
+
+    ws = wb.create_sheet(f"Slow Movers ({prev_label})")
+    _build_item_sheet(ws, DISPLAY_SLOW, prev_slow, COLOR_SLOW2)
+
+    # Deadstock
+    ws = wb.create_sheet("Summary - Deadstock")
+    _build_summary_sheet(ws, curr_dead, prev_dead, curr_label, prev_label, COLOR_DEAD)
+
+    ws = wb.create_sheet(f"Deadstock ({curr_label})")
+    _build_item_sheet(ws, DISPLAY_DEAD, curr_dead, COLOR_DEAD)
+
+    ws = wb.create_sheet(f"Deadstock ({prev_label})")
+    _build_item_sheet(ws, DISPLAY_DEAD, prev_dead, COLOR_DEAD2)
+
+    # Brand sheet — current stock + slow movers + deadstock
     ws_brand = wb.create_sheet("Brand wise collection value")
     _build_brand_sheet(ws_brand, brand_totals, stock_date_str, curr_slow, curr_dead)
 
