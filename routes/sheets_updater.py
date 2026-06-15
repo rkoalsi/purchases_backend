@@ -19,7 +19,7 @@ import os
 import asyncio
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -811,3 +811,184 @@ async def update_vendor_sheets(
 async def update_amazon_combo_status(db=Depends(get_database)):
     result = await _run_amazon_combo_status_core(db, MASTER_SHEET_ID)
     return JSONResponse(result)
+
+
+# ── Product images (Master / Discontinued Items sheet ↔ S3) ──────────────────
+
+_PUBLIC_S3_BUCKET  = os.getenv("PUBLIC_S3_BUCKET", "order-form")
+_PUBLIC_S3_REGION  = os.getenv("PUBLIC_S3_REGION", "ap-south-1")
+_PUBLIC_S3_URL     = os.getenv("PUBLIC_S3_URL", "https://assets.pupscribe.in")
+_IMAGE_SHEET_NAMES = ["Master", "Discontinued Items"]
+_NUM_IMAGE_SLOTS   = 12
+
+
+def _public_s3():
+    import boto3
+    return boto3.client(
+        "s3",
+        region_name=_PUBLIC_S3_REGION,
+        aws_access_key_id=os.getenv("PUBLIC_S3_ACCESS_KEY", ""),
+        aws_secret_access_key=os.getenv("PUBLIC_S3_SECRET_KEY", ""),
+    )
+
+
+class ProductImagesUpdateRequest(BaseModel):
+    sheet: str = "Master"
+    images: dict[str, str]  # "1" → url … "12" → url
+
+
+def _read_product_images_sync(sku_code: str) -> dict | None:
+    _, sh = _open_sheet(MASTER_SHEET_ID, writable=False)
+
+    for sheet_name in _IMAGE_SHEET_NAMES:
+        try:
+            ws = sh.worksheet(sheet_name)
+        except Exception:
+            continue
+
+        all_rows = ws.get_all_values()
+        if len(all_rows) <= HEADER_ROW_INDEX:
+            continue
+
+        header       = [h.strip() for h in all_rows[HEADER_ROW_INDEX]]
+        header_lower = [h.lower() for h in header]
+
+        sku_col = next(
+            (i for i, h in enumerate(header_lower) if h == "sku code (final)"), 3
+        )
+
+        img_col: dict[str, int] = {}
+        for slot in range(1, _NUM_IMAGE_SLOTS + 1):
+            idx = next(
+                (i for i, h in enumerate(header_lower) if h == f"image url {slot}"), -1
+            )
+            if idx != -1:
+                img_col[str(slot)] = idx
+
+        data_rows = all_rows[DATA_START_ROW:]
+        for row_idx, row in enumerate(data_rows):
+            cell_sku = row[sku_col].strip() if sku_col < len(row) else ""
+            if cell_sku != sku_code:
+                continue
+
+            images: dict[str, str] = {}
+            for slot in range(1, _NUM_IMAGE_SLOTS + 1):
+                s = str(slot)
+                col = img_col.get(s, -1)
+                images[s] = row[col].strip() if col != -1 and col < len(row) else ""
+
+            return {
+                "sheet": sheet_name,
+                "sku_code": sku_code,
+                "images": images,
+                "row_number": DATA_START_ROW + 1 + row_idx,
+            }
+
+    return None
+
+
+def _write_product_images_sync(sku_code: str, sheet_name: str, images: dict[str, str]) -> int:
+    import gspread
+
+    _, sh = _open_sheet(MASTER_SHEET_ID, writable=True)
+    ws = sh.worksheet(sheet_name)
+    all_rows = ws.get_all_values()
+
+    if len(all_rows) <= HEADER_ROW_INDEX:
+        raise HTTPException(status_code=400, detail="Sheet header row missing")
+
+    header       = [h.strip() for h in all_rows[HEADER_ROW_INDEX]]
+    header_lower = [h.lower() for h in header]
+    sku_col      = next(
+        (i for i, h in enumerate(header_lower) if h == "sku code (final)"), 3
+    )
+
+    img_col: dict[str, int] = {}
+    for slot in range(1, _NUM_IMAGE_SLOTS + 1):
+        idx = next(
+            (i for i, h in enumerate(header_lower) if h == f"image url {slot}"), -1
+        )
+        if idx != -1:
+            img_col[str(slot)] = idx
+
+    data_rows = all_rows[DATA_START_ROW:]
+    row_number: int | None = None
+    for row_idx, row in enumerate(data_rows):
+        if (row[sku_col].strip() if sku_col < len(row) else "") == sku_code:
+            row_number = DATA_START_ROW + 1 + row_idx
+            break
+
+    if row_number is None:
+        raise HTTPException(
+            status_code=404, detail=f"SKU '{sku_code}' not found in sheet '{sheet_name}'"
+        )
+
+    updates = [
+        {
+            "range": gspread.utils.rowcol_to_a1(row_number, img_col[s] + 1),
+            "values": [[url]],
+        }
+        for s, url in images.items()
+        if s in img_col
+    ]
+
+    if updates:
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+
+    return len(updates)
+
+
+@router.get("/product-images/{sku_code}")
+async def get_product_images(sku_code: str):
+    result = await asyncio.to_thread(_read_product_images_sync, sku_code)
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail=f"SKU '{sku_code}' not found in Master or Discontinued Items sheet"
+        )
+    return result
+
+
+@router.post("/product-images/upload")
+async def upload_product_image(
+    file: UploadFile = File(...),
+    item_id: str = Form(...),
+):
+    import time as _time
+    from botocore.exceptions import BotoCoreError, NoCredentialsError
+
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    file.file.seek(0, 2)
+    size = file.file.tell()
+    file.file.seek(0)
+    if size > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File exceeds 10 MB")
+
+    ext = os.path.splitext(file.filename or "image.jpg")[1] or ".jpg"
+    ts  = int(_time.time() * 1000)
+    key = f"product_images/{item_id}_{ts}{ext}"
+
+    try:
+        _public_s3().upload_fileobj(
+            file.file,
+            _PUBLIC_S3_BUCKET,
+            key,
+            ExtraArgs={"ACL": "public-read", "ContentType": file.content_type},
+        )
+    except NoCredentialsError:
+        raise HTTPException(status_code=500, detail="S3 credentials not configured")
+    except BotoCoreError as exc:
+        raise HTTPException(status_code=500, detail=f"S3 upload failed: {exc}")
+    finally:
+        file.file.close()
+
+    return {"url": f"{_PUBLIC_S3_URL}/{key}"}
+
+
+@router.put("/product-images/{sku_code}")
+async def update_product_images(sku_code: str, body: ProductImagesUpdateRequest):
+    updated = await asyncio.to_thread(
+        _write_product_images_sync, sku_code, body.sheet, body.images
+    )
+    return {"success": True, "sku_code": sku_code, "sheet": body.sheet, "cells_updated": updated}
