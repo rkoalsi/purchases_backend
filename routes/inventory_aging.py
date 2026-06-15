@@ -259,22 +259,29 @@ def _aggregate_by_brand(rows: list) -> dict:
 
 
 def _write_brand_section(ws, title: str, fill_hex: str, stock_col_label: str,
-                         brand_data: dict, start_row: int) -> int:
-    """Write a titled brand table starting at start_row. Returns the next free row."""
+                         brand_data: dict, start_row: int,
+                         pct_denom: str | None = None) -> tuple[int, int]:
+    """Write a titled brand table starting at start_row.
+    pct_denom: absolute cell ref for the denominator (e.g. '$D$19') — adds a % of total inventory column.
+    Returns (next_free_row, total_row).
+    """
+    col_count = 5 if pct_denom else 4
     title_cell = ws.cell(row=start_row, column=1, value=title)
     title_cell.font = Font(bold=True, color="FFFFFF", size=11)
     title_cell.fill = PatternFill("solid", fgColor=fill_hex)
     title_cell.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[start_row].height = 18
-    for col in range(2, 5):
+    for col in range(2, col_count + 1):
         cell = ws.cell(row=start_row, column=col)
         cell.fill = PatternFill("solid", fgColor=fill_hex)
     start_row += 1
 
     headers = ["Brand", stock_col_label, "Total MRP Value", "Collection Value"]
+    if pct_denom:
+        headers.append("% of total inventory")
     for col, h in enumerate(headers, start=1):
         ws.cell(row=start_row, column=col, value=h)
-    _apply_header_style(ws, start_row, len(headers), fill_hex)
+    _apply_header_style(ws, start_row, col_count, fill_hex)
     ws.row_dimensions[start_row].height = 18
     data_start = start_row + 1
     start_row += 1
@@ -286,7 +293,10 @@ def _write_brand_section(ws, title: str, fill_hex: str, stock_col_label: str,
         ws.cell(row=start_row, column=2, value=qty)
         ws.cell(row=start_row, column=3, value=tmrp)
         ws.cell(row=start_row, column=4, value=f"=C{start_row}/2")
-        _apply_row_style(ws, start_row, len(headers), start_row % 2 == 0)
+        if pct_denom:
+            pct_cell = ws.cell(row=start_row, column=5, value=f"=D{start_row}/{pct_denom}")
+            pct_cell.number_format = "0.00%"
+        _apply_row_style(ws, start_row, col_count, start_row % 2 == 0)
         start_row += 1
 
     total_row = start_row
@@ -295,15 +305,19 @@ def _write_brand_section(ws, title: str, fill_hex: str, stock_col_label: str,
     ws.cell(row=total_row, column=2, value=f"=SUM(B{data_start}:B{end_data_row})")
     ws.cell(row=total_row, column=3, value=f"=SUM(C{data_start}:C{end_data_row})")
     ws.cell(row=total_row, column=4, value=f"=SUM(D{data_start}:D{end_data_row})")
+    if pct_denom:
+        pct_total = ws.cell(row=total_row, column=5, value=f"=SUM(E{data_start}:E{end_data_row})")
+        pct_total.number_format = "0.00%"
     bold = Font(bold=True)
-    for col in range(1, 5):
+    for col in range(1, col_count + 1):
         ws.cell(row=total_row, column=col).font = bold
     start_row += 1
 
-    return start_row
+    return start_row, total_row
 
 
 def _build_brand_sheet(ws, brand_totals: dict, stock_date: str,
+                       fast_rows: list, medium_rows: list,
                        slow_rows: list, dead_rows: list):
     # Stock date label in col F
     ws.cell(row=1, column=6, value="Zoho Stock Date")
@@ -313,23 +327,39 @@ def _build_brand_sheet(ws, brand_totals: dict, stock_date: str,
 
     next_row = 1
 
-    next_row = _write_brand_section(
+    next_row, curr_stock_total_row = _write_brand_section(
         ws, "Current Stock", "1F5C99", "Zoho Stock",
         brand_totals, next_row,
+    )
+    # Column D of the current stock TOTAL row is the denominator for all % columns
+    pct_denom = f"$D${curr_stock_total_row}"
+    next_row += 2
+
+    fast_by_brand = _aggregate_by_brand(fast_rows)
+    next_row, _ = _write_brand_section(
+        ws, f"Fast Movers ({DISPLAY_FAST})", COLOR_FAST, f"Qty ({DISPLAY_FAST})",
+        fast_by_brand, next_row, pct_denom=pct_denom,
+    )
+    next_row += 2
+
+    medium_by_brand = _aggregate_by_brand(medium_rows)
+    next_row, _ = _write_brand_section(
+        ws, f"Medium Movers ({DISPLAY_MEDIUM})", COLOR_MEDIUM, f"Qty ({DISPLAY_MEDIUM})",
+        medium_by_brand, next_row, pct_denom=pct_denom,
     )
     next_row += 2
 
     slow_by_brand = _aggregate_by_brand(slow_rows)
-    next_row = _write_brand_section(
+    next_row, _ = _write_brand_section(
         ws, f"Slow Movers ({DISPLAY_SLOW})", COLOR_SLOW, f"Qty ({DISPLAY_SLOW})",
-        slow_by_brand, next_row,
+        slow_by_brand, next_row, pct_denom=pct_denom,
     )
     next_row += 2
 
     dead_by_brand = _aggregate_by_brand(dead_rows)
     _write_brand_section(
         ws, f"Deadstock ({DISPLAY_DEAD})", COLOR_DEAD, f"Qty ({DISPLAY_DEAD})",
-        dead_by_brand, next_row,
+        dead_by_brand, next_row, pct_denom=pct_denom,
     )
 
     _auto_width(ws)
@@ -528,7 +558,7 @@ async def download_inventory_aging(
 
     # Brand sheet — current stock + slow movers + deadstock
     ws_brand = wb.create_sheet("Brand wise collection value")
-    _build_brand_sheet(ws_brand, brand_totals, stock_date_str, curr_slow, curr_dead)
+    _build_brand_sheet(ws_brand, brand_totals, stock_date_str, curr_fast, curr_medium, curr_slow, curr_dead)
 
     buf = io.BytesIO()
     wb.save(buf)
