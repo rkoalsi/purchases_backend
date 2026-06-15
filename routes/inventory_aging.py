@@ -325,38 +325,57 @@ def _build_brand_sheet(ws, brand_totals: dict, stock_date: str,
     ws.cell(row=2, column=6, value=stock_date)
     ws.column_dimensions["F"].width = 20
 
-    next_row = 1
+    fast_by_brand   = _aggregate_by_brand(fast_rows)
+    medium_by_brand = _aggregate_by_brand(medium_rows)
+    slow_by_brand   = _aggregate_by_brand(slow_rows)
+    dead_by_brand   = _aggregate_by_brand(dead_rows)
 
-    next_row, curr_stock_total_row = _write_brand_section(
+    # Pre-compute total row numbers for each section so we can build the
+    # denominator formula before writing any data.
+    # Each section layout: title(1) + header(1) + N data rows + total(1) = N+3 rows
+    curr_stock_start   = 1
+    curr_stock_total_r = curr_stock_start + 2 + len(brand_totals)
+    fast_start         = curr_stock_total_r + 3          # +1 next free +2 gap
+    fast_total_r       = fast_start + 2 + len(fast_by_brand)
+    medium_start       = fast_total_r + 3
+    medium_total_r     = medium_start + 2 + len(medium_by_brand)
+    slow_start         = medium_total_r + 3
+    slow_total_r       = slow_start + 2 + len(slow_by_brand)
+    dead_start         = slow_total_r + 3
+    dead_total_r       = dead_start + 2 + len(dead_by_brand)
+
+    # Denominator = sum of collection-value totals across all 4 aging sections
+    # so that Fast+Medium+Slow+Dead % always add up to 100%
+    pct_denom = (
+        f"($D${fast_total_r}+$D${medium_total_r}"
+        f"+$D${slow_total_r}+$D${dead_total_r})"
+    )
+
+    next_row = curr_stock_start
+    next_row, _ = _write_brand_section(
         ws, "Current Stock", "1F5C99", "Zoho Stock",
         brand_totals, next_row,
     )
-    # Column D of the current stock TOTAL row is the denominator for all % columns
-    pct_denom = f"$D${curr_stock_total_row}"
     next_row += 2
 
-    fast_by_brand = _aggregate_by_brand(fast_rows)
     next_row, _ = _write_brand_section(
         ws, f"Fast Movers ({DISPLAY_FAST})", COLOR_FAST, f"Qty ({DISPLAY_FAST})",
         fast_by_brand, next_row, pct_denom=pct_denom,
     )
     next_row += 2
 
-    medium_by_brand = _aggregate_by_brand(medium_rows)
     next_row, _ = _write_brand_section(
         ws, f"Medium Movers ({DISPLAY_MEDIUM})", COLOR_MEDIUM, f"Qty ({DISPLAY_MEDIUM})",
         medium_by_brand, next_row, pct_denom=pct_denom,
     )
     next_row += 2
 
-    slow_by_brand = _aggregate_by_brand(slow_rows)
     next_row, _ = _write_brand_section(
         ws, f"Slow Movers ({DISPLAY_SLOW})", COLOR_SLOW, f"Qty ({DISPLAY_SLOW})",
         slow_by_brand, next_row, pct_denom=pct_denom,
     )
     next_row += 2
 
-    dead_by_brand = _aggregate_by_brand(dead_rows)
     _write_brand_section(
         ws, f"Deadstock ({DISPLAY_DEAD})", COLOR_DEAD, f"Qty ({DISPLAY_DEAD})",
         dead_by_brand, next_row, pct_denom=pct_denom,
