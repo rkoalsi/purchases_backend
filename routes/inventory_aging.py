@@ -60,12 +60,25 @@ def _get_zoho_token() -> str:
     return r.json()["access_token"]
 
 
+PUPSCRIBE_LOCATION_ID = "3220178000143298047"  # Pupscribe Enterprises Private Limited
+
+
 def _fetch_all_aging_items(token: str, to_date: str) -> list:
     headers = {"Authorization": f"Zoho-oauthtoken {token}"}
     select_columns = json.dumps([
         {"field": "item_name", "group": "item"},
         {"field": "intervals", "group": "report"},
     ])
+    rule = json.dumps({
+        "columns": [{
+            "index": 1,
+            "field": "location_name",
+            "value": [PUPSCRIBE_LOCATION_ID],
+            "comparator": "in",
+            "group": "branch",
+        }],
+        "criteria_string": "( 1 )",
+    })
     base_params = {
         "organization_id": ORGANIZATION_ID,
         "per_page": 500,
@@ -77,6 +90,7 @@ def _fetch_all_aging_items(token: str, to_date: str) -> list:
         "sort_column": "item_id",
         "sort_order": "A",
         "response_option": 1,
+        "rule": rule,
     }
 
     all_items = []
@@ -258,14 +272,19 @@ def _aggregate_by_brand(rows: list) -> dict:
     return totals
 
 
+def _section_total_collection_value(by_brand: dict) -> float:
+    """Sum collection value (total_mrp / 2) across all brands in a section."""
+    return sum(d.get("total_mrp", 0) / 2 for d in by_brand.values())
+
+
 def _write_brand_section(ws, title: str, fill_hex: str, stock_col_label: str,
                          brand_data: dict, start_row: int,
-                         pct_denom: str | None = None) -> tuple[int, int]:
+                         pct_denom: float | None = None) -> tuple[int, int]:
     """Write a titled brand table starting at start_row.
-    pct_denom: absolute cell ref for the denominator (e.g. '$D$19') — adds a % of total inventory column.
+    pct_denom: pre-computed total collection value across all aging buckets — adds a % of total inventory column.
     Returns (next_free_row, total_row).
     """
-    col_count = 5 if pct_denom else 4
+    col_count = 5 if pct_denom is not None else 4
     title_cell = ws.cell(row=start_row, column=1, value=title)
     title_cell.font = Font(bold=True, color="FFFFFF", size=11)
     title_cell.fill = PatternFill("solid", fgColor=fill_hex)
@@ -277,7 +296,7 @@ def _write_brand_section(ws, title: str, fill_hex: str, stock_col_label: str,
     start_row += 1
 
     headers = ["Brand", stock_col_label, "Total MRP Value", "Collection Value"]
-    if pct_denom:
+    if pct_denom is not None:
         headers.append("% of total inventory")
     for col, h in enumerate(headers, start=1):
         ws.cell(row=start_row, column=col, value=h)
@@ -289,24 +308,27 @@ def _write_brand_section(ws, title: str, fill_hex: str, stock_col_label: str,
     for brand, data in sorted(brand_data.items()):
         qty = round(data.get("stock", data.get("qty", 0)), 2)
         tmrp = round(data.get("total_mrp", 0), 2)
+        coll_val = round(tmrp / 2, 2)
         ws.cell(row=start_row, column=1, value=brand)
         ws.cell(row=start_row, column=2, value=qty)
         ws.cell(row=start_row, column=3, value=tmrp)
-        ws.cell(row=start_row, column=4, value=f"=C{start_row}/2")
-        if pct_denom:
-            pct_cell = ws.cell(row=start_row, column=5, value=f"=D{start_row}/{pct_denom}")
+        ws.cell(row=start_row, column=4, value=coll_val)
+        if pct_denom is not None:
+            pct = round(coll_val / pct_denom, 6) if pct_denom else 0.0
+            pct_cell = ws.cell(row=start_row, column=5, value=pct)
             pct_cell.number_format = "0.00%"
         _apply_row_style(ws, start_row, col_count, start_row % 2 == 0)
         start_row += 1
 
     total_row = start_row
     end_data_row = total_row - 1
+    has_data = end_data_row >= data_start
     ws.cell(row=total_row, column=1, value="TOTAL")
-    ws.cell(row=total_row, column=2, value=f"=SUM(B{data_start}:B{end_data_row})")
-    ws.cell(row=total_row, column=3, value=f"=SUM(C{data_start}:C{end_data_row})")
-    ws.cell(row=total_row, column=4, value=f"=SUM(D{data_start}:D{end_data_row})")
-    if pct_denom:
-        pct_total = ws.cell(row=total_row, column=5, value=f"=SUM(E{data_start}:E{end_data_row})")
+    ws.cell(row=total_row, column=2, value=f"=SUM(B{data_start}:B{end_data_row})" if has_data else 0)
+    ws.cell(row=total_row, column=3, value=f"=SUM(C{data_start}:C{end_data_row})" if has_data else 0)
+    ws.cell(row=total_row, column=4, value=f"=SUM(D{data_start}:D{end_data_row})" if has_data else 0)
+    if pct_denom is not None:
+        pct_total = ws.cell(row=total_row, column=5, value=(f"=SUM(E{data_start}:E{end_data_row})" if has_data else 0))
         pct_total.number_format = "0.00%"
     bold = Font(bold=True)
     for col in range(1, col_count + 1):
@@ -330,31 +352,22 @@ def _build_brand_sheet(ws, brand_totals: dict, stock_date: str,
     slow_by_brand   = _aggregate_by_brand(slow_rows)
     dead_by_brand   = _aggregate_by_brand(dead_rows)
 
-    # Pre-compute total row numbers for each section so we can build the
-    # denominator formula before writing any data.
-    # Each section layout: title(1) + header(1) + N data rows + total(1) = N+3 rows
-    curr_stock_start   = 1
-    curr_stock_total_r = curr_stock_start + 2 + len(brand_totals)
-    fast_start         = curr_stock_total_r + 3          # +1 next free +2 gap
-    fast_total_r       = fast_start + 2 + len(fast_by_brand)
-    medium_start       = fast_total_r + 3
-    medium_total_r     = medium_start + 2 + len(medium_by_brand)
-    slow_start         = medium_total_r + 3
-    slow_total_r       = slow_start + 2 + len(slow_by_brand)
-    dead_start         = slow_total_r + 3
-    dead_total_r       = dead_start + 2 + len(dead_by_brand)
+    active_brand_totals = {k: v for k, v in brand_totals.items() if v["stock"] > 0}
+    curr_stock_start = 1
 
-    # Denominator = sum of collection-value totals across all 4 aging sections
-    # so that Fast+Medium+Slow+Dead % always add up to 100%
+    # Denominator = total collection value across all 4 aging buckets (pre-computed
+    # as a plain number to avoid cross-section cell references and circular ref warnings)
     pct_denom = (
-        f"($D${fast_total_r}+$D${medium_total_r}"
-        f"+$D${slow_total_r}+$D${dead_total_r})"
+        _section_total_collection_value(fast_by_brand)
+        + _section_total_collection_value(medium_by_brand)
+        + _section_total_collection_value(slow_by_brand)
+        + _section_total_collection_value(dead_by_brand)
     )
 
     next_row = curr_stock_start
     next_row, _ = _write_brand_section(
         ws, "Current Stock", "1F5C99", "Zoho Stock",
-        brand_totals, next_row,
+        active_brand_totals, next_row,
     )
     next_row += 2
 
