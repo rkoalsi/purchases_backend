@@ -317,6 +317,22 @@ def patch_catalogue_item(bb_code: str, body: CatalogueItemPatch):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/products/{product_id}")
+def get_product(product_id: str):
+    """Return a single product document (joined with catalogue data)."""
+    try:
+        db  = get_database()
+        oid = ObjectId(product_id)
+        doc = db[PRODUCTS_COLLECTION].find_one({"_id": oid})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Product not found")
+        cat = db[DESIGN_CATALOGUE_COLLECTION].find_one({"product_id": oid}) or {}
+        doc["catalogue"] = cat
+        return serialize_mongo_document(doc)
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.patch("/products/{product_id}/images")
 def patch_product_images(product_id: str, body: dict):
     """Update image_url (single), images array, and/or videos array for a product."""

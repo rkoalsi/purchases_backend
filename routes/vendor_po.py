@@ -3765,9 +3765,20 @@ async def bulk_update_vendor_pos(
     file_bytes = await file.read()
 
     def _process():
-        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        # Load with data_only=False so formula cells retain "=..." strings.
+        # This lets us skip unedited formula cells (e.g. Supply Qty col I = "=AP{r}")
+        # and only treat manually-typed numeric values as overrides.
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
         ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
+        rows_raw = list(ws.iter_rows(values_only=False))
+
+        def _cell_val(cell):
+            v = cell.value
+            if isinstance(v, str) and v.startswith("="):
+                return None  # formula — user didn't manually type this cell
+            return v
+
+        rows = [[_cell_val(c) for c in row] for row in rows_raw]
         if len(rows) < 2:
             raise ValueError("File has no data rows")
 
