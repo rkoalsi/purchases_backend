@@ -3765,23 +3765,65 @@ async def bulk_update_vendor_pos(
     file_bytes = await file.read()
 
     def _process():
-        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
         ws = wb.active
         rows = list(ws.iter_rows(values_only=True))
         if len(rows) < 2:
             raise ValueError("File has no data rows")
 
+        # Resolve columns by header name so the PO Report download can be used directly.
+        # Supports both the simple bulk template and the full PO Report download format.
+        header = [str(h).strip() if h is not None else "" for h in rows[0]]
+
+        def _col(*names: str) -> int | None:
+            for name in names:
+                try:
+                    return header.index(name)
+                except ValueError:
+                    pass
+            return None
+
+        po_col = _col("PO", "PO Number")
+        asin_col = _col("ASIN")
+        accepted_col = _col("Accepted Qty")
+        received_col = _col("Received QTY", "Received Qty")
+        status_col = _col("PO Status")
+        supply_col = _col("Supply Qty", "Final Supply Qty\n(For Over-ordering)")
+
+        if po_col is None:
+            raise ValueError("No 'PO' or 'PO Number' column found in uploaded file")
+        if asin_col is None:
+            raise ValueError("No 'ASIN' column found in uploaded file")
+
+        def _int_cell(row: tuple, col: int | None) -> int | None:
+            if col is None or col >= len(row) or row[col] is None:
+                return None
+            raw = str(row[col]).strip()
+            if not raw:
+                return None
+            try:
+                return int(float(raw))
+            except (ValueError, TypeError):
+                return None
+
         # Group rows by PO number
         updates: dict = {}
         for row in rows[1:]:
-            if not row[0]:
+            if po_col >= len(row) or not row[po_col]:
                 continue
-            po_num = str(row[0]).strip()
-            asin = str(row[1]).strip() if row[1] else ""
-            accepted_qty = int(row[2]) if row[2] is not None else None
-            received_qty = int(row[3]) if row[3] is not None else None
+            po_num = str(row[po_col]).strip()
+            asin = (
+                str(row[asin_col]).strip()
+                if asin_col is not None and asin_col < len(row) and row[asin_col]
+                else ""
+            )
+            accepted_qty = _int_cell(row, accepted_col)
+            received_qty = _int_cell(row, received_col)
+            supply_qty = _int_cell(row, supply_col)
             po_status_raw = (
-                str(row[4]).strip().lower() if len(row) > 4 and row[4] else None
+                str(row[status_col]).strip().lower()
+                if status_col is not None and status_col < len(row) and row[status_col]
+                else None
             )
 
             if po_num not in updates:
@@ -3793,6 +3835,7 @@ async def bulk_update_vendor_pos(
                 updates[po_num]["items"][asin] = {
                     "accepted_qty": accepted_qty,
                     "received_qty": received_qty,
+                    "supply_qty": supply_qty,
                 }
 
         updatable_statuses = {"pending", "processing", "packed", "closed"}
@@ -3832,6 +3875,14 @@ async def bulk_update_vendor_pos(
                         item_changes += 1
                     if item_update["received_qty"] is not None:
                         item["received_qty"] = item_update["received_qty"]
+                        item_changes += 1
+                    if item_update.get("supply_qty") is not None:
+                        sq = item_update["supply_qty"]
+                        if sq == -1:
+                            item.pop("final_supply_fo_override", None)
+                            item.pop("supply_qty_override", None)
+                        else:
+                            item["final_supply_fo_override"] = sq
                         item_changes += 1
 
             if item_changes:
