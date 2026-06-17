@@ -1399,11 +1399,15 @@ class OptimizedMasterReportService:
         self,
         sku_to_item_id: Dict[str, str],
         start_date: str,
-    ) -> Dict[str, float]:
+        period_days: int = 90,
+    ) -> Dict[str, Dict]:
         """
-        Fetch Zoho-based DRR for the 90-day window immediately before start_date.
-        Used to compute the growth rate column.
-        Returns dict of sku_code -> past_drr (0.0 when no history found).
+        Fetch Zoho-based DRR for the comparison window immediately before start_date.
+        Window length matches period_days (defaults to 90).
+        Used to compute the growth rate column and to populate lookback sales for
+        current_period/insufficient_stock rows.
+        Returns dict of sku_code -> {drr, units_sold, returns, net_units_sold,
+                                     days_in_stock, period}.
         """
         from ..routes.zoho import fetch_stock_data_for_items_batch, fetch_zoho_lookback_sales_batch
 
@@ -1413,7 +1417,8 @@ class OptimizedMasterReportService:
         try:
             start_dt = datetime.strptime(start_date, "%Y-%m-%d")
             past_end = start_dt - timedelta(days=1)
-            past_start = past_end - timedelta(days=89)  # 90 days inclusive
+            past_start = past_end - timedelta(days=period_days - 1)
+            period_str = f"{past_start.strftime('%Y-%m-%d')} to {past_end.strftime('%Y-%m-%d')}"
             periods = [(past_start, past_end)]
             all_item_ids = list(set(sku_to_item_id.values()))
 
@@ -1425,7 +1430,7 @@ class OptimizedMasterReportService:
             stock_data = stock_by_period.get(0, {})
             sales_data = sales_by_period.get(0, {})
 
-            result: Dict[str, float] = {}
+            result: Dict[str, Dict] = {}
             for sku, item_id in sku_to_item_id.items():
                 stock_info = stock_data.get(item_id, {})
                 days_in_stock = stock_info.get("total_days_in_stock", 0)
@@ -1433,12 +1438,20 @@ class OptimizedMasterReportService:
                 units_sold = item_sales.get("units_sold", 0) if isinstance(item_sales, dict) else int(item_sales)
                 returns = item_sales.get("returns", 0) if isinstance(item_sales, dict) else 0
                 net_units_sold = max(0, units_sold - returns)
-                result[sku] = round(net_units_sold / days_in_stock, 4) if days_in_stock > 0 else 0.0
+                drr = round(net_units_sold / days_in_stock, 4) if days_in_stock > 0 else 0.0
+                result[sku] = {
+                    "drr": drr,
+                    "units_sold": units_sold,
+                    "returns": returns,
+                    "net_units_sold": net_units_sold,
+                    "days_in_stock": days_in_stock,
+                    "period": period_str,
+                }
 
-            logger.info(f"Fetched past 90d DRR for {len(result)} SKUs")
+            logger.info(f"Fetched past {period_days}d DRR for {len(result)} SKUs")
             return result
         except Exception as e:
-            logger.error(f"Error fetching past 90d DRR: {e}")
+            logger.error(f"Error fetching past {period_days}d DRR: {e}")
             return {}
 
     @staticmethod

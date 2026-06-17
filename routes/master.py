@@ -524,7 +524,13 @@ async def download_master_report(
                 ("Net Total Sales",        "Total Units Sold − Total Units Returned − Transfer Orders. "
                                            "This is the demand figure used for White/Red DRR."),
                 ("Net Lookback Sales",     "MAX(0, Lookback Sales − Lookback Returns). "
-                                           "Used as the numerator for DRR on Yellow/Orange rows."),
+                                           "Used as the numerator for DRR on Yellow/Orange rows, "
+                                           "and for the Growth Rate formula on all row colours."),
+                ("Lookback Return %",      "Lookback Returns ÷ Lookback Sales × 100. "
+                                           "Return rate during the comparison period."),
+                ("Growth Rate (%)",        "(Net Total Sales − Net Lookback Sales) ÷ Net Lookback Sales × 100. "
+                                           "Populated for all row colours once comparison-period data is available. "
+                                           "Blank when no lookback sales exist."),
                 ("DRR Source",             "current_period · previous_period · insufficient_stock. "
                                            "Drives both the row colour and the DRR formula used."),
                 ("DRR Lookback Period",    "Date range of the lookback window used for Yellow/Orange rows."),
@@ -649,6 +655,12 @@ async def download_master_report(
             for item in combined_data:
                 if not isinstance(item, dict):
                     continue
+                # Combo products are removed from the report — their sales were
+                # redistributed to component items in master_report.py.  Any combo
+                # that survived to this point (e.g. missing composite_products entry)
+                # is still excluded here to keep the sheet clean.
+                if item.get("is_combo_product"):
+                    continue
                 if item.get("order_qty_demand_override"):
                     demand_override_row_indices.add(len(combined_df_data))
                 if item.get("drr_lookback_gt_180"):
@@ -685,13 +697,13 @@ async def download_master_report(
                         "Net Total Sales": metrics.get("total_sales", 0),
                         "Return %": item.get("return_pct", 0),
                         "Days in Stock (Pupscribe Warehouse)": metrics.get("total_days_in_stock", 0),
-                        "Days in Stock (Any Warehouse)": metrics.get("total_days_in_stock_any_wh", 0),
                         "Lookback Days in Stock": item.get("drr_lookback_days_in_stock", 0),
                         "Lookback Sales": item.get("drr_lookback_sales", 0),
                         "Lookback Returns": item.get("drr_lookback_returns", 0),
                         "Net Lookback Sales": item.get("drr_net_lookback_sales", 0),
+                        "Lookback Return %": None,  # formula injected below
                         "Avg Daily Run Rate": metrics.get("avg_daily_run_rate", 0),
-                        "Growth Rate (%)": item.get("growth_rate"),
+                        "Growth Rate (%)": None,  # Excel formula injected for all row colours
                         "DRR Source": item.get("drr_source", "current_period"),
                         "DRR Lookback Period": item.get("drr_lookback_period", ""),
                         f"Pupscribe WH Stock ({_prev_zoho_label})": item.get("prev_zoho_stock", 0),
@@ -828,6 +840,8 @@ async def download_master_report(
                 _lkbk_sales_col      = _col("Lookback Sales")
                 _lkbk_returns_col    = _col("Lookback Returns")
                 _net_lkbk_col        = _col("Net Lookback Sales")
+                _lkbk_ret_pct_col    = _col("Lookback Return %")
+                _growth_rate_col     = _col("Growth Rate (%)")
                 _is_new_col          = _col("Is New")
 
                 drr_source_col_idx = cols_list.index("DRR Source") + 1  # 1-based
@@ -844,6 +858,19 @@ async def download_master_report(
                     ws[f"{_net_lkbk_col}{r}"] = (
                         f"=MAX(0,{_lkbk_sales_col}{r}-{_lkbk_returns_col}{r})"
                     )
+
+                    # Lookback Return % = Lookback Returns / Lookback Sales × 100
+                    ws[f"{_lkbk_ret_pct_col}{r}"] = (
+                        f"=IF({_lkbk_sales_col}{r}>0,{_lkbk_returns_col}{r}/{_lkbk_sales_col}{r}*100,0)"
+                    )
+
+                    # Growth Rate (%) — injected for ALL row colours once lookback sales
+                    # are populated for white/red rows as well as yellow/orange.
+                    # Blank ("") when no comparison data exists.
+                    ws[f"{_growth_rate_col}{r}"] = (
+                        f'=IF({_net_lkbk_col}{r}>0,({_I}{r}-{_net_lkbk_col}{r})/{_net_lkbk_col}{r}*100,"")'
+                    )
+                    ws[f"{_growth_rate_col}{r}"].number_format = '0.00"%"'
 
                     # Net Total Sales = Total Units Sold − Total Units Returned − Transfer Orders
                     # (Total Units Returned used instead of Total Credit Notes — values are equivalent)
@@ -1011,6 +1038,38 @@ async def download_master_report(
                 ws.column_dimensions[_T].hidden = True   # FBA Stock (prev)
                 ws.column_dimensions[_R].hidden = True   # Total Stock (prev)
 
+                # Hide individual latest WH/FBA stock components — total stock (=V+W) stays visible
+                ws.column_dimensions[_V].hidden = True   # Pupscribe WH Stock (latest)
+                ws.column_dimensions[_W].hidden = True   # FBA Stock (latest)
+
+                # Hide metadata columns not needed in the default view
+                for _hide_col_name in (
+                    "Is New",
+                    "Live on Amazon",
+                    "Live on Blinkit",
+                    "Manufacturer Code",
+                    "Unit Price",
+                    "Total Amount",
+                    "Total Units Sold",
+                    "Total Units Returned",
+                    "Transfer Orders",
+                    "Lookback Days in Stock",
+                    "Lookback Sales",
+                    "Lookback Returns",
+                    "Safety Days",
+                    "Lead Time",
+                    "Order Processing",
+                    "Stock in Transit 1",
+                    "Transit 1 PO",
+                    "Stock in Transit 2",
+                    "Transit 2 PO",
+                    "Stock in Transit 3",
+                    "Transit 3 PO",
+                ):
+                    try:
+                        ws.column_dimensions[_col(_hide_col_name)].hidden = True
+                    except (ValueError, KeyError):
+                        pass  # column may not exist when COGS mode is off
 
                 # Hide Brand column for individual brand reports (redundant when filtered to one brand)
                 if brand:

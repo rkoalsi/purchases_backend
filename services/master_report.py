@@ -293,15 +293,18 @@ async def _generate_master_report_data(
             if new_skus and idx < len(parallel_results) and not isinstance(parallel_results[idx], Exception):
                 all_product_data.update(parallel_results[idx])
 
-            # Start past-90d DRR fetch as a background task so it runs concurrently
+            # Start past-period DRR fetch as a background task so it runs concurrently
             # with the DRR lookback below. all_product_data is now fully populated.
+            # Pass period_days so the comparison window always matches the report period.
             _full_sku_to_item_id = {
                 sku: pdata["item_id"]
                 for sku, pdata in all_product_data.items()
                 if pdata.get("item_id")
             }
             _past_drr_task = (
-                asyncio.create_task(report_service.fetch_past_90d_drr(_full_sku_to_item_id, start_date))
+                asyncio.create_task(
+                    report_service.fetch_past_90d_drr(_full_sku_to_item_id, start_date, period_days)
+                )
                 if _full_sku_to_item_id else None
             )
 
@@ -796,17 +799,82 @@ async def _generate_master_report_data(
                 metrics_ref["etrade_drr"] = round(vc_drr, 4)
                 metrics_ref["etrade_days_inventory_lasts"] = round(vc_stock / vc_drr, 2) if vc_drr > 0 else 0.0
 
+            # Expand combo products: redistribute their sales into component items and
+            # remove the combo rows so they don't appear in the report.  This must run
+            # BEFORE _compute_order_quantities so that component DRR / order quantities
+            # incorporate the extra demand from combo sales.
+            try:
+                composite_col = report_service.database.get_collection("composite_products")
+                combo_items = [i for i in combined_data if i.get("is_combo_product")]
+                if combo_items:
+                    combo_skus = [i["sku_code"] for i in combo_items if i.get("sku_code")]
+
+                    def _load_composite_components():
+                        result = {}
+                        for doc in composite_col.find(
+                            {"sku_code": {"$in": combo_skus}},
+                            {"sku_code": 1, "components": 1, "_id": 0},
+                        ):
+                            sku = doc.get("sku_code")
+                            if sku and doc.get("components"):
+                                result[sku] = doc["components"]
+                        return result
+
+                    combo_component_map = await asyncio.to_thread(_load_composite_components)
+
+                    # Build SKU → item index for fast lookup
+                    sku_to_item = {i["sku_code"]: i for i in combined_data if i.get("sku_code")}
+
+                    for combo in combo_items:
+                        combo_sku = combo.get("sku_code", "")
+                        components = combo_component_map.get(combo_sku, [])
+                        if not components:
+                            logger.warning(f"Combo {combo_sku} has no component mapping — skipping sales redistribution")
+                            continue
+                        combo_metrics = combo.get("combined_metrics", {})
+                        units_sold = combo_metrics.get("total_units_sold", 0)
+                        units_returned = combo_metrics.get("total_units_returned", 0)
+                        credit_notes = combo_metrics.get("total_credit_notes", 0)
+                        transfer_qty = combo_metrics.get("transfer_orders", 0)
+                        for comp in components:
+                            comp_sku = comp.get("sku_code", "")
+                            comp_qty = float(comp.get("quantity", 1))
+                            target = sku_to_item.get(comp_sku)
+                            if not target:
+                                continue
+                            tm = target.get("combined_metrics", {})
+                            tm["total_units_sold"] = round(tm.get("total_units_sold", 0) + units_sold * comp_qty, 2)
+                            tm["total_units_returned"] = round(tm.get("total_units_returned", 0) + units_returned * comp_qty, 2)
+                            tm["total_credit_notes"] = round(tm.get("total_credit_notes", 0) + credit_notes * comp_qty, 2)
+                            tm["transfer_orders"] = round(tm.get("transfer_orders", 0) + transfer_qty * comp_qty, 2)
+                            # Recompute net demand and DRR for the component
+                            net_demand = max(0.0, round(
+                                tm["total_units_sold"] - tm["total_credit_notes"] - tm["transfer_orders"], 2
+                            ))
+                            tm["total_sales"] = net_demand
+                            days_in_stock = tm.get("total_days_in_stock", 0)
+                            if days_in_stock > 0:
+                                tm["avg_daily_run_rate"] = round(net_demand / days_in_stock, 2)
+
+                    combo_sku_set = {i["sku_code"] for i in combo_items}
+                    combined_data = [i for i in combined_data if i.get("sku_code") not in combo_sku_set]
+                    logger.info(f"Removed {len(combo_items)} combo rows; redistributed sales to components")
+            except Exception as _e:
+                logger.error(f"Combo expansion error: {_e}")
+
             # Compute coverage and order quantities once, using latest DB stock
             # (latest_total_stock was attached in the loop above).
             report_service._compute_order_quantities(combined_data)
 
-            # Await past 90d DRR and compute return_pct + growth_rate for every item
-            past_drr_by_sku: Dict[str, float] = {}
+            # Await past-period DRR and compute return_pct + growth_rate for every item.
+            # fetch_past_90d_drr now uses period_days so the comparison window matches
+            # the current report period (not a hardcoded 90 days).
+            past_data_by_sku: Dict[str, Dict] = {}
             if _past_drr_task is not None:
                 try:
-                    past_drr_by_sku = await asyncio.wait_for(_past_drr_task, timeout=30.0)
+                    past_data_by_sku = await asyncio.wait_for(_past_drr_task, timeout=30.0)
                 except Exception as e:
-                    logger.warning(f"Past 90d DRR fetch failed or timed out: {e}")
+                    logger.warning(f"Past-period DRR fetch failed or timed out: {e}")
                     _past_drr_task.cancel()
 
             for item in combined_data:
@@ -816,11 +884,25 @@ async def _generate_master_report_data(
                 item["return_pct"] = round((total_returned / total_sold) * 100, 2) if total_sold > 0 else 0.0
 
                 current_drr = metrics.get("avg_daily_run_rate", 0)
-                past_drr = past_drr_by_sku.get(item.get("sku_code", ""), 0)
-                # Lookback items have avg_daily_run_rate overwritten with a historical DRR,
-                # so comparing it against past_drr (90d before start_date) is directionally
-                # meaningless. Leave growth_rate blank for those items.
-                if item.get("drr_source") == "previous_period":
+                past_data = past_data_by_sku.get(item.get("sku_code", ""), {})
+                past_drr = past_data.get("drr", 0)
+
+                # Lookback items (yellow/orange) already have drr_lookback_* fields set via
+                # fetch_previous_period_drr. For current_period and insufficient_stock items,
+                # populate the lookback fields from the comparison-period data so the Excel
+                # Growth Rate formula (Net Total Sales vs Net Lookback Sales) works for all
+                # row colours, not just yellow/orange.
+                drr_source = item.get("drr_source", "current_period")
+                if drr_source != "previous_period" and past_data:
+                    item["drr_lookback_sales"] = past_data.get("units_sold", 0)
+                    item["drr_lookback_returns"] = past_data.get("returns", 0)
+                    item["drr_lookback_days_in_stock"] = past_data.get("days_in_stock", 0)
+                    item["drr_net_lookback_sales"] = past_data.get("net_units_sold", 0)
+                    item["drr_lookback_period"] = past_data.get("period", "")
+
+                # growth_rate is kept as a Python fallback for the JSON API response;
+                # the Excel download now injects a formula for every row instead.
+                if drr_source == "previous_period":
                     item["growth_rate"] = None
                 elif past_drr and past_drr > 0:
                     item["growth_rate"] = round(((current_drr - past_drr) / past_drr) * 100, 2)
