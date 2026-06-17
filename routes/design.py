@@ -1093,9 +1093,31 @@ def _process_pis_sheet(ws, sheet_name: str, db, dry_run: bool = False) -> dict:
         if dry_run:
             existing = db[DESIGN_CATALOGUE_COLLECTION].find_one(filter_q, {"_id": 1, "product_name": 1})
             matched = existing is not None
+            if not matched and bb_code:
+                # Also match inactive products not yet in design_catalogue
+                matched = db[PRODUCTS_COLLECTION].find_one({"cf_sku_code": bb_code}, {"_id": 1}) is not None
         else:
             res = db[DESIGN_CATALOGUE_COLLECTION].update_one(filter_q, {"$set": set_fields})
             matched = res.matched_count > 0
+            if not matched and bb_code:
+                # Fall back: inactive product exists in products but has no catalogue entry yet — create one
+                product = db[PRODUCTS_COLLECTION].find_one({"cf_sku_code": bb_code}, {"_id": 1, "name": 1})
+                if product:
+                    db[DESIGN_CATALOGUE_COLLECTION].update_one(
+                        {"bb_code": bb_code},
+                        {
+                            "$setOnInsert": {
+                                "bb_code": bb_code,
+                                "product_id": str(product["_id"]),
+                                "product_name": product.get("name", ""),
+                            },
+                            "$set": set_fields,
+                        },
+                        upsert=True,
+                    )
+                    if not product_name:
+                        product_name = product.get("name", "")
+                    matched = True
 
         if not matched:
             not_found.append({
