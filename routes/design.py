@@ -1106,11 +1106,7 @@ def _process_pis_sheet(ws, sheet_name: str, db, dry_run: bool = False) -> dict:
                     db[DESIGN_CATALOGUE_COLLECTION].update_one(
                         {"bb_code": bb_code},
                         {
-                            "$setOnInsert": {
-                                "bb_code": bb_code,
-                                "product_id": str(product["_id"]),
-                                "product_name": product.get("name", ""),
-                            },
+                            "$setOnInsert": {"product_id": str(product["_id"])},
                             "$set": set_fields,
                         },
                         upsert=True,
