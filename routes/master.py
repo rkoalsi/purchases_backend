@@ -1259,6 +1259,303 @@ async def download_master_report(
                                 max_len = max(max_len, len(val))
                             ws_draft.column_dimensions[col_letter].width = min(max_len + 3, 30)
 
+            # ── Validation Sheet ──────────────────────────────────────────────────
+            from openpyxl.styles import (
+                PatternFill as _VPF, Font as _VFont,
+                Alignment as _VAlign, Border as _VBorder, Side as _VSide,
+            )
+
+            _vws = writer.book.create_sheet("Validation")
+
+            # Fills
+            _vf_navy    = _VPF(start_color="1F3864", end_color="1F3864", fill_type="solid")
+            _vf_blue    = _VPF(start_color="2E4D7B", end_color="2E4D7B", fill_type="solid")
+            _vf_pass    = _VPF(start_color="375623", end_color="375623", fill_type="solid")
+            _vf_fail    = _VPF(start_color="7B1F1F", end_color="7B1F1F", fill_type="solid")
+            _vf_col_hdr = _VPF(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+            _vf_alt     = _VPF(start_color="F2F7FC", end_color="F2F7FC", fill_type="solid")
+            _vf_white   = _VPF(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+            _vthin      = _VBorder(
+                left=_VSide(border_style="thin", color="AAAAAA"),
+                right=_VSide(border_style="thin", color="AAAAAA"),
+                top=_VSide(border_style="thin", color="AAAAAA"),
+                bottom=_VSide(border_style="thin", color="AAAAAA"),
+            )
+
+            def _vw(r, c, v, *, bold=False, fill=None, fc="000000", align="left",
+                    wrap=False, sz=10, italic=False, border=False):
+                cell = _vws.cell(row=r, column=c, value=v)
+                cell.font = _VFont(bold=bold, color=fc, size=sz, italic=italic)
+                cell.alignment = _VAlign(horizontal=align, vertical="center", wrap_text=wrap)
+                if fill:
+                    cell.fill = fill
+                if border:
+                    cell.border = _vthin
+                return cell
+
+            # ── Build validation data ────────────────────────────────────────────
+            _non_combo = [i for i in combined_data if not i.get("is_combo_product")]
+
+            # Check 1 — SIT sum mismatch (SIT1+SIT2+SIT3 ≠ total_stock_in_transit)
+            _sit_mismatches = []
+            for _it in _non_combo:
+                _sit_sum = round(
+                    _it.get("stock_in_transit_1", 0) +
+                    _it.get("stock_in_transit_2", 0) +
+                    _it.get("stock_in_transit_3", 0), 2
+                )
+                _sit_stored = round(_it.get("total_stock_in_transit", 0), 2)
+                if abs(_sit_sum - _sit_stored) > 0.01:
+                    _sit_mismatches.append({
+                        "sku": _it.get("sku_code", ""),
+                        "name": _it.get("item_name", ""),
+                        "brand": _it.get("brand", ""),
+                        "sit1": _it.get("stock_in_transit_1", 0),
+                        "po1": _it.get("transit_1_po", ""),
+                        "sit2": _it.get("stock_in_transit_2", 0),
+                        "po2": _it.get("transit_2_po", ""),
+                        "sit3": _it.get("stock_in_transit_3", 0),
+                        "po3": _it.get("transit_3_po", ""),
+                        "computed_sum": _sit_sum,
+                        "stored_total": _sit_stored,
+                        "diff": round(_sit_sum - _sit_stored, 2),
+                    })
+
+            # Check 2 — Active items with negative DRR or negative stock
+            _neg_drr_stock = []
+            for _it in _non_combo:
+                if _it.get("purchase_status", "") != "active":
+                    continue
+                _m = _it.get("combined_metrics", {})
+                _drr_v = _m.get("avg_daily_run_rate", 0)
+                _wh_v  = _it.get("latest_zoho_stock", 0)
+                _fba_v = _it.get("latest_fba_stock", 0)
+                _tot_v = _it.get("latest_total_stock", 0)
+                _issues = []
+                if _drr_v < 0:
+                    _issues.append("Negative DRR")
+                if _tot_v < 0:
+                    _issues.append("Negative total stock")
+                if _issues:
+                    _neg_drr_stock.append({
+                        "sku": _it.get("sku_code", ""),
+                        "name": _it.get("item_name", ""),
+                        "brand": _it.get("brand", ""),
+                        "drr": _drr_v,
+                        "wh_stock": _wh_v,
+                        "fba_stock": _fba_v,
+                        "total_stock": _tot_v,
+                        "issue": " | ".join(_issues),
+                    })
+
+            # Check 3 — EXCESS rows with non-zero Rounded Order Qty
+            _excess_nonzero = []
+            for _it in _non_combo:
+                if _it.get("excess_or_order", "") == "EXCESS":
+                    _rnd = _it.get("order_qty_plus_extra_qty_rounded", 0) or 0
+                    if _rnd > 0:
+                        _m = _it.get("combined_metrics", {})
+                        _excess_nonzero.append({
+                            "sku": _it.get("sku_code", ""),
+                            "name": _it.get("item_name", ""),
+                            "brand": _it.get("brand", ""),
+                            "excess_order": _it.get("excess_or_order", ""),
+                            "rounded_qty": _rnd,
+                            "drr": _m.get("avg_daily_run_rate", 0),
+                            "current_days_coverage": _it.get("current_days_coverage", 0),
+                            "target_days": _it.get("target_days", 0),
+                        })
+
+            # Check 4 — Items with negative Net Total Sales
+            _neg_sales = []
+            for _it in _non_combo:
+                _m = _it.get("combined_metrics", {})
+                _nts = _m.get("total_sales", 0)
+                if _nts < 0:
+                    _neg_sales.append({
+                        "sku": _it.get("sku_code", ""),
+                        "name": _it.get("item_name", ""),
+                        "brand": _it.get("brand", ""),
+                        "status": _it.get("purchase_status", ""),
+                        "units_sold": _m.get("total_units_sold", 0),
+                        "units_returned": _m.get("total_units_returned", 0),
+                        "transfers": _m.get("transfer_orders", 0),
+                        "net_total_sales": _nts,
+                    })
+
+            # Check 5 — Items with negative inventory
+            _neg_inv = []
+            for _it in _non_combo:
+                _wh_v  = _it.get("latest_zoho_stock", 0)
+                _fba_v = _it.get("latest_fba_stock", 0)
+                _issues = []
+                if _wh_v < 0:
+                    _issues.append(f"WH: {_wh_v}")
+                if _fba_v < 0:
+                    _issues.append(f"FBA: {_fba_v}")
+                if _issues:
+                    _neg_inv.append({
+                        "sku": _it.get("sku_code", ""),
+                        "name": _it.get("item_name", ""),
+                        "brand": _it.get("brand", ""),
+                        "status": _it.get("purchase_status", ""),
+                        "wh_stock": _wh_v,
+                        "fba_stock": _fba_v,
+                        "total_stock": _it.get("latest_total_stock", 0),
+                        "issue": " | ".join(_issues),
+                    })
+
+            _val_checks = [
+                ("SIT Sum Mismatch",                          _sit_mismatches),
+                ("Active Items — Negative DRR or Stock",      _neg_drr_stock),
+                ("EXCESS Rows with Non-Zero Rounded Order",   _excess_nonzero),
+                ("Items with Negative Net Sales",             _neg_sales),
+                ("Items with Negative Inventory",             _neg_inv),
+            ]
+
+            # ── Write: title + summary ────────────────────────────────────────────
+            _vws.merge_cells("A1:H1")
+            _vw(1, 1, "MASTER REPORT — DATA VALIDATION", bold=True, sz=13,
+                fill=_vf_navy, fc="FFFFFF", align="center")
+            _vws.row_dimensions[1].height = 24
+
+            _vws.merge_cells("A2:H2")
+            _vw(2, 1,
+                f"Period: {start_date} to {end_date}  |  "
+                f"Generated: {datetime.now().strftime('%d %b %Y %H:%M')}  |  "
+                f"SKUs in report: {len(_non_combo)}",
+                italic=True, sz=9, fill=_vf_alt, align="center")
+
+            _vr = 4  # current write row
+
+            # Summary header
+            _vws.merge_cells(f"A{_vr}:H{_vr}")
+            _vw(_vr, 1, "SUMMARY", bold=True, sz=11, fill=_vf_blue, fc="FFFFFF", align="center")
+            _vws.row_dimensions[_vr].height = 20
+            _vr += 1
+
+            # Summary column headers: A=#, B-F=Check name (merged), G=SKUs Flagged, H=Status
+            _vw(_vr, 1, "#",            bold=True, fill=_vf_col_hdr, border=True, align="center")
+            _vw(_vr, 2, "Check",        bold=True, fill=_vf_col_hdr, border=True, align="left")
+            _vw(_vr, 7, "SKUs Flagged", bold=True, fill=_vf_col_hdr, border=True, align="center")
+            _vw(_vr, 8, "Status",       bold=True, fill=_vf_col_hdr, border=True, align="center")
+            _vws.merge_cells(f"B{_vr}:F{_vr}")
+            _vr += 1
+
+            for _idx, (_chk_name, _chk_rows) in enumerate(_val_checks, 1):
+                _cnt = len(_chk_rows)
+                _pass = _cnt == 0
+                _status_fill = _vf_pass if _pass else _vf_fail
+                _status_text = "✓  PASS" if _pass else f"✗  {_cnt} issue{'s' if _cnt != 1 else ''}"
+                _row_fill = _vf_alt if _idx % 2 == 0 else _vf_white
+                # Write ALL values before any merge to avoid MergedCell read-only errors
+                _vw(_vr, 1, _idx,         align="center", fill=_row_fill, border=True)
+                _vw(_vr, 2, _chk_name,    fill=_row_fill, border=True)
+                _vw(_vr, 7, _cnt,         align="center", fill=_row_fill, border=True)
+                _vw(_vr, 8, _status_text, bold=True, fill=_status_fill, fc="FFFFFF",
+                    align="center", border=True)
+                _vws.merge_cells(f"B{_vr}:F{_vr}")
+                _vr += 1
+
+            # ── Write: detail sections ────────────────────────────────────────────
+            _DETAIL_COLS = {
+                "SIT Sum Mismatch": [
+                    ("SKU Code",       lambda x: x["sku"]),
+                    ("Item Name",      lambda x: x["name"]),
+                    ("Brand",          lambda x: x["brand"]),
+                    ("SIT 1",          lambda x: x["sit1"]),
+                    ("PO 1",           lambda x: x["po1"]),
+                    ("SIT 2",          lambda x: x["sit2"]),
+                    ("PO 2",           lambda x: x["po2"]),
+                    ("SIT 3",          lambda x: x["sit3"]),
+                    ("PO 3",           lambda x: x["po3"]),
+                    ("Computed Sum",   lambda x: x["computed_sum"]),
+                    ("Stored Total",   lambda x: x["stored_total"]),
+                    ("Difference",     lambda x: x["diff"]),
+                ],
+                "Active Items — Negative DRR or Stock": [
+                    ("SKU Code",       lambda x: x["sku"]),
+                    ("Item Name",      lambda x: x["name"]),
+                    ("Brand",          lambda x: x["brand"]),
+                    ("DRR",            lambda x: x["drr"]),
+                    ("WH Stock",       lambda x: x["wh_stock"]),
+                    ("FBA Stock",      lambda x: x["fba_stock"]),
+                    ("Total Stock",    lambda x: x["total_stock"]),
+                    ("Issue",          lambda x: x["issue"]),
+                ],
+                "EXCESS Rows with Non-Zero Rounded Order": [
+                    ("SKU Code",           lambda x: x["sku"]),
+                    ("Item Name",          lambda x: x["name"]),
+                    ("Brand",              lambda x: x["brand"]),
+                    ("Excess / Order",     lambda x: x["excess_order"]),
+                    ("Rounded Order Qty",  lambda x: x["rounded_qty"]),
+                    ("DRR",                lambda x: x["drr"]),
+                    ("Current Days Cover", lambda x: x["current_days_coverage"]),
+                    ("Target Days",        lambda x: x["target_days"]),
+                ],
+                "Items with Negative Net Sales": [
+                    ("SKU Code",           lambda x: x["sku"]),
+                    ("Item Name",          lambda x: x["name"]),
+                    ("Brand",              lambda x: x["brand"]),
+                    ("Status",             lambda x: x["status"]),
+                    ("Units Sold",         lambda x: x["units_sold"]),
+                    ("Units Returned",     lambda x: x["units_returned"]),
+                    ("Transfer Orders",    lambda x: x["transfers"]),
+                    ("Net Total Sales",    lambda x: x["net_total_sales"]),
+                ],
+                "Items with Negative Inventory": [
+                    ("SKU Code",       lambda x: x["sku"]),
+                    ("Item Name",      lambda x: x["name"]),
+                    ("Brand",          lambda x: x["brand"]),
+                    ("Status",         lambda x: x["status"]),
+                    ("WH Stock",       lambda x: x["wh_stock"]),
+                    ("FBA Stock",      lambda x: x["fba_stock"]),
+                    ("Total Stock",    lambda x: x["total_stock"]),
+                    ("Issue",          lambda x: x["issue"]),
+                ],
+            }
+
+            for _idx, (_chk_name, _chk_rows) in enumerate(_val_checks, 1):
+                _vr += 1  # blank spacer
+
+                # Section header
+                _ncols = len(_DETAIL_COLS[_chk_name])
+                _end_col = get_column_letter(_ncols)
+                _vws.merge_cells(f"A{_vr}:{_end_col}{_vr}")
+                _cnt = len(_chk_rows)
+                _sec_fill = _vf_pass if _cnt == 0 else _vf_fail
+                _vw(_vr, 1,
+                    f"{_idx}  ·  {_chk_name.upper()}  —  "
+                    + ("NO ISSUES" if _cnt == 0 else f"{_cnt} ISSUE{'S' if _cnt != 1 else ''}"),
+                    bold=True, sz=10, fill=_sec_fill, fc="FFFFFF", align="center")
+                _vws.row_dimensions[_vr].height = 18
+                _vr += 1
+
+                if _cnt == 0:
+                    continue  # no rows to write for this check
+
+                # Column headers
+                _col_defs = _DETAIL_COLS[_chk_name]
+                for _ci, (_cname, _) in enumerate(_col_defs, 1):
+                    _vw(_vr, _ci, _cname, bold=True, fill=_vf_col_hdr, border=True, align="center")
+                _vr += 1
+
+                # Data rows
+                for _ri, _row in enumerate(_chk_rows):
+                    _rf = _vf_alt if _ri % 2 == 0 else _vf_white
+                    for _ci, (_, _getter) in enumerate(_col_defs, 1):
+                        _vw(_vr, _ci, _getter(_row), fill=_rf, border=True)
+                    _vr += 1
+
+            # ── Column widths ────────────────────────────────────────────────────
+            _vws.column_dimensions["A"].width = 16
+            _vws.column_dimensions["B"].width = 32
+            _vws.column_dimensions["C"].width = 14
+            for _cl in ["D", "E", "F", "G", "H", "I", "J", "K", "L"]:
+                _vws.column_dimensions[_cl].width = 16
+
+            _vws.freeze_panes = "A3"
+
         excel_buffer.seek(0)
         file_bytes = excel_buffer.read()
 
