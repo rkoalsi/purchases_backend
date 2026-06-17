@@ -757,9 +757,11 @@ _PIS_COL_MAP: dict[str, str | None] = {
     "product weight w/o packaging(g) ": "_weight_without",
     "product weight w/o packaging(g) - single piece": "_weight_without",
     "product dimensions w/ packaging (cm)": "_dims_with",
+    "product dimensions w/ packaging (cm) (l*b*h)": "_dims_with",
     "product dimensions w/o packaging (cm)": "_dims_without",
     "product dimensions w/o packaging (cm) - single piece": "_dims_without",
     "product dimensions w/o packaging (cm) - single piece ": "_dims_without",
+    "product dimensions w/o packaging (cm) - single piece (l*b*h)": "_dims_without",
     # features
     "features 1": "_feat_1",
     "features 2": "_feat_2",
@@ -810,32 +812,36 @@ _PIS_COL_MAP: dict[str, str | None] = {
     "cruelty-free": "_g_cruelty_free",
     "all natural ingredients": "_g_all_natural",
     "dermatologically tested": "_g_dermatologically_tested",
+    # treats — booleans
+    "natural ingredients (yes/no)": "_t_natural_ingredients",
+    "grain free (yes/no)": "_t_grain_free",
+    "gluten free (yes/no)": "_t_gluten_free",
+    "human grade ingredients (yes/no)": "_t_human_grade",
+    # treats — text
+    "functional treat (specify the function, ex: dental)": "_t_functional_treat",
+    "main animal source": "_t_main_animal_source",
+    "form used": "_t_form_used",
+    "source of ingredients": "_t_source_of_ingredients",
+    "source of ingredients ": "_t_source_of_ingredients",
+    "starch source": "_t_starch_source",
+    "plant protein source": "_t_plant_protein_source",
+    "glycerin type & source": "_t_glycerin_source",
+    "other animal source": "_t_other_animal_source",
+    "special additives": "_t_special_additives",
+    "animal body parts used": "_t_animal_body_parts",
+    "shelf life": "_t_shelf_life",
+    "feeding guide": "_t_feeding_guide",
     # explicitly skipped
     "item code (manufacturer)": None,
+    "manufacturer code": None,
     "sr no": None,
     "case pack": None,
     "cleaning instructions": None,
     "padding (plush toys)": None,
     "absorption capacity": None,
     "composition": None,
-    "shelf life": None,
-    "natural ingredients (yes/no)": None,
-    "grain free (yes/no)": None,
-    "gluten free (yes/no)": None,
-    "functional treat (specify the function, ex: dental)": None,
-    "human grade ingredients (yes/no)": None,
-    "main animal source": None,
-    "form used": None,
     "answer": None,
     "answer ": None,
-    "source of ingredients ": None,
-    "starch source": None,
-    "plant protein source": None,
-    "glycerin type & source": None,
-    "other animal source": None,
-    "special additives": None,
-    "animal body parts used": None,
-    "feeding guide": None,
     "lab test reports (if any)": None,
 }
 
@@ -865,6 +871,28 @@ _GROOMING_BOOL_ATTRS: dict[str, str] = {
 _GROOMING_TEXT_ATTRS: dict[str, str] = {
     "_g_scented": "scent_type",
     "_g_essential_oils": "essential_oils",
+}
+
+_TREATS_BOOL_ATTRS: dict[str, str] = {
+    "_t_natural_ingredients": "natural_ingredients",
+    "_t_grain_free": "grain_free",
+    "_t_gluten_free": "gluten_free",
+    "_t_human_grade": "human_grade_ingredients",
+}
+
+_TREATS_TEXT_ATTRS: dict[str, str] = {
+    "_t_functional_treat": "functional_treat",
+    "_t_main_animal_source": "main_animal_source",
+    "_t_form_used": "form_used",
+    "_t_source_of_ingredients": "source_of_ingredients",
+    "_t_starch_source": "starch_source",
+    "_t_plant_protein_source": "plant_protein_source",
+    "_t_glycerin_source": "glycerin_type_source",
+    "_t_other_animal_source": "other_animal_source",
+    "_t_special_additives": "special_additives",
+    "_t_animal_body_parts": "animal_body_parts_used",
+    "_t_shelf_life": "shelf_life",
+    "_t_feeding_guide": "feeding_guide",
 }
 
 
@@ -1008,6 +1036,20 @@ def _process_pis_sheet(ws, sheet_name: str, db, dry_run: bool = False) -> dict:
         if grooming_attrs:
             set_fields["grooming_attributes"] = grooming_attrs
             fields_updated.append("grooming_attributes")
+
+        # Treats attributes
+        treats_attrs: dict[str, Any] = {}
+        for internal_key, attr_name in _TREATS_BOOL_ATTRS.items():
+            val = _to_bool(raw.get(internal_key))
+            if val is not None:
+                treats_attrs[attr_name] = val
+        for internal_key, attr_name in _TREATS_TEXT_ATTRS.items():
+            v = str(raw[internal_key]).strip() if raw.get(internal_key) is not None else None
+            if v and v.lower() not in ("no", "n/a", "none", "-"):
+                treats_attrs[attr_name] = v
+        if treats_attrs:
+            set_fields["treats_attributes"] = treats_attrs
+            fields_updated.append("treats_attributes")
 
         # Dimensions
         dims_with = _parse_dims_str(raw.get("_dims_with"))
@@ -1201,7 +1243,11 @@ _PIS_SHEETS: list[tuple[str, list[str]]] = [
         "Ingredient List %", "Nutrition Analysis",
         "Natural Ingredients (Yes/No)", "Grain Free (Yes/No)", "Gluten Free (Yes/No)",
         "Functional Treat (Specify the function, ex: Dental)", "Human Grade Ingredients (Yes/No)",
-        "Main Animal Source", "Form Used",
+        "Main Animal Source", "Form Used", "Answer",
+        "Source of Ingredients", "Answer ", "Starch Source", "Answer ",
+        "Plant Protein Source", "Answer ", "Glycerin Type & Source", "Answer ",
+        "Other Animal Source", "Answer ", "Special Additives", "Answer",
+        "Animal Body Parts Used", "Answer ",
         "Shelf Life", "feeding guide", "Images", "Lab Test Reports (If Any)",
     ]),
     ("Grooming", [
