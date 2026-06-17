@@ -110,7 +110,7 @@ def _validate_optional_dates(fields_map: dict) -> dict:
     return out
 
 
-@router.post("/")
+@router.post("")
 async def create_order(
     brand: str = Form(...),
     vendor_id: Optional[str] = Form(None),
@@ -250,7 +250,7 @@ async def create_order(
     return JSONResponse(status_code=201, content={"_id": order_id, **serialize_mongo_document(doc)})
 
 
-@router.get("/")
+@router.get("")
 async def list_orders(brand: Optional[str] = None, db=Depends(get_database)):
     def _fetch():
         query = {"brand": brand} if brand else {}
