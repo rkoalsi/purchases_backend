@@ -123,12 +123,12 @@ def _delete_from_s3(s3_key: str) -> None:
 _CATALOGUE_LOOKUP_FIELDS = {
     # product_name, product_category, hsn_code intentionally excluded —
     # those always come from the products collection (Zoho source of truth).
-    "bb_code": 1, "sub_category": 1,
+    "bb_code": 1, "sub_category": 1, "series": 1,
     "mrp": 1, "dimensions": 1, "material": 1, "features": 1,
     "image_links": 1, "squeaker": 1, "catnip": 1,
     "age_group": 1, "pet_size": 1, "chewing_style": 1,
     "size_chart": 1, "ingredient_list": 1, "nutritional_analysis": 1,
-    "gst_percentage": 1,
+    "gst_percentage": 1, "treats_attributes": 1, "product_category": 1,
 }
 
 
