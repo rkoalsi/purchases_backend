@@ -1013,49 +1013,35 @@ async def upload_product_image(
 
 
 def _sync_order_form_images_sync(sku_code: str, images: dict[str, str], db) -> int:
-    """Update only the order-form positions that have a freshly-uploaded image.
+    """Sync order-form S3 images from the sheet payload into products.images.
 
-    Only URLs under /product_images/ (uploaded via our UI) are written;
-    Drive URLs and other S3 paths are ignored so existing positions are never evicted.
+    Only URLs under /product_images/ (uploaded via our UI) are written.
+    The frontend sends the complete current sheet state, so we build a compact
+    list directly from it — no positional padding, no empty strings stored.
     """
     our_prefix = f"{_PUBLIC_S3_URL.rstrip('/')}/product_images/"
 
-    new_uploads = {
-        str(slot): images[str(slot)]
+    # Collect S3 URLs from priority slots in priority order (compact — no gaps)
+    synced: list[str] = [
+        images[str(slot)]
         for slot in _ORDER_FORM_SLOT_PRIORITY
         if images.get(str(slot), "").startswith(our_prefix)
-    }
-    if not new_uploads:
+    ]
+    if not synced:
         return 0
 
-    product = db["products"].find_one({"cf_sku_code": sku_code}, {"images": 1, "image_url": 1})
-    existing: list[str] = list((product or {}).get("images") or [])
+    product = db["products"].find_one({"cf_sku_code": sku_code}, {"image_url": 1})
     existing_image_url: str = (product or {}).get("image_url") or ""
 
-    for i, slot in enumerate(_ORDER_FORM_SLOT_PRIORITY):
-        url = new_uploads.get(str(slot))
-        if url:
-            while len(existing) <= i:
-                existing.append("")
-            existing[i] = url
-
-    # Drop trailing empty strings but keep internal gaps intact
-    while existing and not existing[-1]:
-        existing.pop()
-
-    if not existing:
-        return 0
-
-    update_fields: dict = {"images": existing}
-    if existing[0]:
-        # Position 0 has a value (slot 2 was uploaded) — promote it as primary
-        update_fields["image_url"] = existing[0]
+    update_fields: dict = {"images": synced}
+    slot2_url = images.get("2", "")
+    if slot2_url.startswith(our_prefix):
+        # Slot 2 (priority position 0) is the canonical primary image
+        update_fields["image_url"] = slot2_url
     elif not existing_image_url:
-        # No prior image_url at all — use first non-empty we have
-        first_valid = next((u for u in existing if u), None)
-        if first_valid:
-            update_fields["image_url"] = first_valid
-    # If existing[0] is empty but image_url already exists, leave image_url untouched
+        # No prior image_url — promote the first synced image
+        update_fields["image_url"] = synced[0]
+    # If slot 2 is empty but image_url already exists, leave image_url untouched
 
     result = db["products"].update_one(
         {"cf_sku_code": sku_code},

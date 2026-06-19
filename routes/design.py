@@ -344,7 +344,7 @@ def patch_product_images(product_id: str, body: dict):
         if "images" in body:
             if not isinstance(body["images"], list):
                 raise HTTPException(status_code=400, detail="images must be a list")
-            update["images"] = body["images"]
+            update["images"] = [img for img in body["images"] if img]
         if "videos" in body:
             if not isinstance(body["videos"], list):
                 raise HTTPException(status_code=400, detail="videos must be a list")
