@@ -656,7 +656,7 @@ async def save_pending_item(body: SavePendingItemRequest, db=Depends(get_databas
     return {"ok": True}
 
 
-_MASTER_SHEET_ID   = "1bQEqJxPR_m1Y-K7Bjh74kio2ZTEWENFLoFTl1POabMY"
+_MASTER_SHEET_ID   = "1tn_Lj3KR0zXY8B-8ZUkSznZgE4YzyjtAkcpdHzBCgt4"
 _MASTER_SHEET_NAME = "Master"
 _MASTER_HEADER_ROW = 1   # 0-based index
 # Fields from item data → candidate column header substrings (all lowercase)

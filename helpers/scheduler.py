@@ -684,6 +684,37 @@ async def scheduled_fba_shipments_sync():
     await api_scheduler.sync_fba_shipments(days=3650, notify=False)
 
 
+async def scheduled_sheets_update():
+    """Update master + Amazon combo Google Sheets — runs at 9:30 AM, 2:00 PM, 6:30 PM IST."""
+    from ..routes.sheets_updater import (
+        _fetch_live_zoho_stock,
+        _run_master_stock_core,
+        _run_amazon_combo_status_core,
+        _resolve_master_sheet_id_from_db,
+    )
+    try:
+        db = get_database()
+        master_sheet_id = await asyncio.to_thread(_resolve_master_sheet_id_from_db, db, None)
+        sku_stock_map, stock_date = await asyncio.to_thread(_fetch_live_zoho_stock, db)
+        master_result, combo_result = await asyncio.gather(
+            _run_master_stock_core(db, master_sheet_id, sku_stock_map, stock_date),
+            _run_amazon_combo_status_core(db, master_sheet_id),
+        )
+        master_updated = master_result.get("updated", 0)
+        combo_updated = combo_result.get("updated", 0)
+        send_slack_notification(
+            "Sheets Updater — Master + Amazon Combo",
+            success=True,
+            details={"processed": master_updated + combo_updated},
+        )
+        logger.info("Scheduled sheets update complete: %d master + %d combo rows", master_updated, combo_updated)
+    except Exception as e:
+        logger.error(f"Scheduled sheets update failed: {e}")
+        send_slack_notification(
+            "Sheets Updater — Master + Amazon Combo", success=False, error_msg=str(e)
+        )
+
+
 def setup_scheduler():
     """Configure and start the scheduler"""
     # Daily tasks
@@ -736,7 +767,18 @@ def setup_scheduler():
         misfire_grace_time=600,
     )
 
+    # Sheets updater — 9:30 AM IST (04:00 UTC), 2:00 PM IST (08:30 UTC), 6:30 PM IST (13:00 UTC)
+    for job_hour, job_minute, job_suffix in [(4, 0, "0930ist"), (8, 30, "1400ist"), (13, 0, "1830ist")]:
+        scheduler.add_job(
+            scheduled_sheets_update,
+            trigger=CronTrigger(hour=job_hour, minute=job_minute, timezone="UTC"),
+            id=f"sheets_update_{job_suffix}",
+            name=f"Sheets Updater ({job_suffix.upper()})",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+
     logger.info(
-        "Scheduler configured successfully with daily, weekly, composite items, and FBA shipments tasks"
+        "Scheduler configured successfully with daily, weekly, composite items, FBA shipments, and sheets updater tasks"
     )
 

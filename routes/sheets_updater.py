@@ -24,13 +24,14 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ..database import get_database
+from ..helpers.scheduler import send_slack_notification, SLACK_URL
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 # ── Google Sheet IDs ──────────────────────────────────────────────────────────
-MASTER_SHEET_ID         = "1bQEqJxPR_m1Y-K7Bjh74kio2ZTEWENFLoFTl1POabMY"
+MASTER_SHEET_ID         = "1tn_Lj3KR0zXY8B-8ZUkSznZgE4YzyjtAkcpdHzBCgt4"
 MASTER_SHEET_NAME       = "Master"
 AMAZON_COMBO_SHEET_NAME = "AmazonComboProducts"
 HEADER_ROW_INDEX        = 1   # 0-based; row 0 is group headers, row 1 = column headers (sheet row 2)
@@ -107,6 +108,16 @@ def _parse_sheet_id(value: str | None, default: str) -> str:
         return value
     logger.warning("_parse_sheet_id: could not parse '%s', using default", value)
     return default
+
+
+def _resolve_master_sheet_id_from_db(db, body_value: str | None) -> str:
+    """Return master sheet ID: body override → DB config (job_id='master-stock') → constant."""
+    if body_value:
+        return _parse_sheet_id(body_value, MASTER_SHEET_ID)
+    doc = db[CONFIG_COLLECTION].find_one({"job_id": "master-stock"})
+    if doc and doc.get("sheet_url"):
+        return _parse_sheet_id(doc["sheet_url"], MASTER_SHEET_ID)
+    return MASTER_SHEET_ID
 
 
 def _get_inventory_token() -> str:
@@ -330,9 +341,10 @@ async def _run_master_stock_core(
             "values": [[stock_val]],
         })
         if status_col_0 != -1:
+            raw_status = prod.get("purchase_status") or ""
             status_updates.append({
                 "range": gspread.utils.rowcol_to_a1(sheet_row, status_col_0 + 1),
-                "values": [[prod.get("purchase_status", "")]],
+                "values": [[raw_status.replace("_", " ").title()]],
             })
         updated += 1
         if sku not in sku_stock_map:
@@ -442,9 +454,10 @@ async def _run_amazon_combo_status_core(db, sheet_id: str) -> dict:
             skipped_no_product += 1
             continue
         sheet_row = DATA_START_ROW + 1 + idx  # 1-based for gspread
+        raw_status = prod.get("purchase_status") or ""
         status_updates.append({
             "range": gspread.utils.rowcol_to_a1(sheet_row, status_col_0 + 1),
-            "values": [[prod.get("purchase_status", "")]],
+            "values": [[raw_status.replace("_", " ").title()]],
         })
         updated += 1
 
@@ -712,7 +725,9 @@ async def update_all_sheets(
     """
     Fetch Zoho stock then write Master stock + Amazon ComboProducts status in parallel.
     """
-    master_sheet_id = _parse_sheet_id(body.master_sheet_id, MASTER_SHEET_ID)
+    master_sheet_id = await asyncio.to_thread(
+        _resolve_master_sheet_id_from_db, db, body.master_sheet_id
+    )
 
     # ── Phase 1: fetch Zoho stock ─────────────────────────────────────────────
     logger.info("update-all: fetching Zoho stock")
@@ -720,6 +735,7 @@ async def update_all_sheets(
         sku_stock_map, stock_date = await asyncio.to_thread(_fetch_live_zoho_stock, db)
     except Exception as exc:
         logger.exception("update-all: phase 1 failed")
+        send_slack_notification("Sheets Updater — Master + Amazon Combo", success=False, error_msg=f"Zoho stock fetch failed: {exc}")
         raise HTTPException(status_code=500, detail=f"Data fetch failed: {exc}")
 
     logger.info("update-all: Zoho stock=%d SKUs  stock_date=%s", len(sku_stock_map), stock_date)
@@ -733,10 +749,17 @@ async def update_all_sheets(
         )
     except Exception as exc:
         logger.exception("update-all: phase 2 failed")
+        send_slack_notification("Sheets Updater — Master + Amazon Combo", success=False, error_msg=f"Sheet write failed: {exc}")
         raise HTTPException(status_code=500, detail=f"Sheet write failed: {exc}")
 
     master_updated = master_result.get("updated", 0)
     combo_updated = combo_result.get("updated", 0)
+
+    send_slack_notification(
+        "Sheets Updater — Master + Amazon Combo",
+        success=True,
+        details={"processed": master_updated + combo_updated},
+    )
 
     return JSONResponse({
         "success": True,
