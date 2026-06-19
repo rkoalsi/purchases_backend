@@ -5,7 +5,7 @@ import httpx
 import os
 from dotenv import load_dotenv
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from ..database import get_database
 import requests
 from bson import ObjectId
@@ -50,7 +50,7 @@ def send_slack_notification(
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n*Job:* {title}",
+                    "text": f"*Time:* {(datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime('%Y-%m-%d %H:%M:%S IST')}\n*Job:* {title}",
                 },
             },
         ]
@@ -267,7 +267,7 @@ class APIScheduler:
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n" + "\n".join(lines),
+                        "text": f"*Time:* {(datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime('%Y-%m-%d %H:%M:%S IST')}\n\n" + "\n".join(lines),
                     },
                 },
             ]
