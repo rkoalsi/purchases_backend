@@ -1310,6 +1310,24 @@ async def list_vendor_pos(db=Depends(get_database)):
                             }
                         }
                     },
+                    "_items_accepted_cost": {
+                        "$sum": {
+                            "$map": {
+                                "input": "$items",
+                                "as": "it",
+                                "in": {"$ifNull": ["$$it.total_cost_accepted", 0]},
+                            }
+                        }
+                    },
+                    "_items_accepted_cost_gst": {
+                        "$sum": {
+                            "$map": {
+                                "input": "$items",
+                                "as": "it",
+                                "in": {"$ifNull": ["$$it.total_cost_accepted_gst", 0]},
+                            }
+                        }
+                    },
                 }
             },
             # Join estimate to get authoritative sub_total / total when linked
@@ -1399,6 +1417,22 @@ async def list_vendor_pos(db=Depends(get_database)):
                     # (Zoho estimate sub_total can be stale if product GST/pricing changed after estimate creation)
                     "total_cost": {"$round": ["$_items_cost", 2]},
                     "total_cost_gst": {"$round": ["$_items_cost_gst", 2]},
+                    # Prefer per-item sum (written back on report load/download); fall back to
+                    # package-sync stored value for POs that haven't been loaded yet.
+                    "accepted_total_cost": {
+                        "$cond": {
+                            "if": {"$gt": ["$_items_accepted_cost", 0]},
+                            "then": {"$round": ["$_items_accepted_cost", 2]},
+                            "else": {"$ifNull": ["$accepted_total_cost", None]},
+                        }
+                    },
+                    "accepted_total_cost_gst": {
+                        "$cond": {
+                            "if": {"$gt": ["$_items_accepted_cost_gst", 0]},
+                            "then": {"$round": ["$_items_accepted_cost_gst", 2]},
+                            "else": {"$ifNull": ["$accepted_total_cost_gst", None]},
+                        }
+                    },
                 }
             },
             {
@@ -1837,6 +1871,8 @@ async def get_po_report(po_number: str, db=Depends(get_database)):
                         "items.$.total_cost_gst": it.get("total_cost_gst"),
                         "items.$.total_cost_fo": it.get("total_cost_fo"),
                         "items.$.total_cost_fo_gst": it.get("total_cost_fo_gst"),
+                        "items.$.total_cost_accepted": it.get("total_cost_accepted"),
+                        "items.$.total_cost_accepted_gst": it.get("total_cost_accepted_gst"),
                     }
                 },
             )
@@ -3013,6 +3049,8 @@ async def download_po_report(po_number: str, db=Depends(get_database)):
             item_updates[f"items.{i}.final_supply_fo"] = item.get("final_supply_fo")
             item_updates[f"items.{i}.total_cost_fo"] = item.get("total_cost_fo")
             item_updates[f"items.{i}.total_cost_fo_gst"] = item.get("total_cost_fo_gst")
+            item_updates[f"items.{i}.total_cost_accepted"] = item.get("total_cost_accepted")
+            item_updates[f"items.{i}.total_cost_accepted_gst"] = item.get("total_cost_accepted_gst")
         db[PO_COLLECTION].update_one(
             {"po_number": po_number},
             {"$set": item_updates},

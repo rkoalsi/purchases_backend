@@ -5,12 +5,15 @@ from ..helpers.datetime_utils import utcnow
 from ..database import get_database
 import asyncio
 import io
+import os
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 from typing import Optional, Any
 from pydantic import BaseModel
 import logging
+import re
+import requests
 
 from .amazon import compute_drr_for_asins_sync, generate_report_by_date_range, get_amazon_token, make_sp_api_request
 
@@ -25,6 +28,28 @@ FBA_SHIPMENTS_COLLECTION = "amazon_fba_shipments"
 
 DEFAULT_LEAD_TIME = 10
 DEFAULT_COVERAGE_DAYS = 30
+
+# ─── Zoho Books (for estimate creation) ──────────────────────────────────────
+
+_ZOHO_BOOKS_BASE = "https://books.zoho.com/api/v3"
+_ZOHO_ORG_ID = os.getenv("ORGANIZATION_ID", "776755316")
+_ZOHO_BOOKS_URL = os.getenv("BOOKS_URL")
+_ZOHO_CLIENT_ID = os.getenv("CLIENT_ID")
+_ZOHO_CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+_ZOHO_BOOKS_REFRESH_TOKEN = os.getenv("BOOKS_REFRESH_TOKEN")
+
+
+def _get_zoho_books_token() -> str:
+    url = _ZOHO_BOOKS_URL.format(
+        clientId=_ZOHO_CLIENT_ID,
+        clientSecret=_ZOHO_CLIENT_SECRET,
+        grantType="refresh_token",
+        books_refresh_token=_ZOHO_BOOKS_REFRESH_TOKEN,
+    )
+    r = requests.post(url, timeout=30)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
 
 MONTH_NAMES = {
     1: "Jan",
@@ -693,9 +718,124 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
     return rows, fba_inv_date_str, zoho_date_str, etrade_date_str
 
 
+_SHIPMENT_DATE_RE = re.compile(r'\((\d{2}/\d{2}/\d{4})')
+_ACTIVE_STATUSES = ["WORKING", "SHIPPED", "IN_TRANSIT", "DELIVERED", "CHECKED_IN", "RECEIVING"]
+
+
 def _fetch_processing_data(db) -> list[dict]:
-    docs = list(db[PROCESSING_COLLECTION].find({}, {"_id": 0}))
-    return docs
+    # 1. Manually uploaded rows
+    uploaded_rows = list(db[PROCESSING_COLLECTION].find({}, {"_id": 0}))
+    uploaded_ids: set[str] = {r["shipment_id"] for r in uploaded_rows if r.get("shipment_id")}
+
+    # Normalise GST: older rows stored as decimal fraction (0.05) instead of percentage (5)
+    for row in uploaded_rows:
+        g = row.get("gst")
+        if g is not None and 0 < g < 1:
+            row["gst"] = round(g * 100, 2)
+
+    # Enrich uploaded rows with shipment names from the queue collection
+    if uploaded_ids:
+        name_by_id: dict[str, str] = {
+            doc["ShipmentId"]: doc.get("ShipmentName", "")
+            for doc in db[FBA_SHIPMENTS_COLLECTION].find(
+                {"ShipmentId": {"$in": list(uploaded_ids)}},
+                {"ShipmentId": 1, "ShipmentName": 1, "_id": 0},
+            )
+            if doc.get("ShipmentId")
+        }
+        for row in uploaded_rows:
+            row["shipment_name"] = name_by_id.get(row.get("shipment_id", ""), "")
+
+    # 2. Active queue shipments not yet covered by an uploaded sheet
+    queue_shipments = list(db[FBA_SHIPMENTS_COLLECTION].find(
+        {
+            "ShipmentId": {"$nin": list(uploaded_ids)},
+            "items.0": {"$exists": True},
+        },
+        {
+            "ShipmentId": 1,
+            "ShipmentName": 1,
+            "DestinationFulfillmentCenterId": 1,
+            "items": 1,
+            "_id": 0,
+        },
+    ))
+
+    if not queue_shipments:
+        return uploaded_rows
+
+    # 3. Collect all SellerSKUs from queue items for product enrichment
+    all_skus = list({
+        item["SellerSKU"]
+        for s in queue_shipments
+        for item in s.get("items", [])
+        if item.get("SellerSKU")
+    })
+
+    sku_to_asin: dict[str, str] = {
+        doc["sku_code"]: doc.get("item_id", "")
+        for doc in db[SKU_MAPPING_COLLECTION].find(
+            {"sku_code": {"$in": all_skus}},
+            {"sku_code": 1, "item_id": 1, "_id": 0},
+        )
+        if doc.get("sku_code")
+    }
+
+    prod_by_sku: dict[str, dict] = {
+        p["cf_sku_code"]: p
+        for p in db["products"].find(
+            {"cf_sku_code": {"$in": all_skus}},
+            {"cf_sku_code": 1, "name": 1, "rate": 1, "hsn_or_sac": 1, "item_tax_preferences": 1, "_id": 0},
+        )
+        if p.get("cf_sku_code")
+    }
+
+    def _gst(prod: dict):
+        for pref in prod.get("item_tax_preferences") or []:
+            if pref.get("tax_specification") == "intra":
+                return pref.get("tax_percentage")
+        return None
+
+    def _parse_shipment_date(name: str | None):
+        if not name:
+            return None
+        m = _SHIPMENT_DATE_RE.search(name)
+        if not m:
+            return None
+        try:
+            return datetime.strptime(m.group(1), "%d/%m/%Y")
+        except ValueError:
+            return None
+
+    # 4. Build virtual rows for each queue shipment's items
+    virtual_rows: list[dict] = []
+    for shipment in queue_shipments:
+        shipment_id = shipment["ShipmentId"]
+        location = shipment.get("DestinationFulfillmentCenterId", "")
+        date = _parse_shipment_date(shipment.get("ShipmentName"))
+        for item in shipment.get("items", []):
+            seller_sku = item.get("SellerSKU", "")
+            prod = prod_by_sku.get(seller_sku, {})
+            virtual_rows.append({
+                "shipment_id": shipment_id,
+                "shipment_name": shipment.get("ShipmentName", ""),
+                "date": date,
+                "location": location,
+                "sku_code": seller_sku,
+                "asin": sku_to_asin.get(seller_sku, ""),
+                "fnsku": item.get("FulfillmentNetworkSKU", ""),
+                "item_name": prod.get("name", ""),
+                "mrp": prod.get("rate"),
+                "sp": prod.get("rate"),
+                "requested_qty": item.get("QuantityShipped", 0) or 0,
+                "packed_qty": 0,
+                "cost_price": None,
+                "hsn_code": prod.get("hsn_or_sac", ""),
+                "gst": _gst(prod),
+                "_from_queue": True,
+            })
+
+    return uploaded_rows + virtual_rows
 
 
 def _fetch_summary_data(db) -> list[dict]:
@@ -1472,15 +1612,620 @@ async def upload_fba_processing(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ClearProcessingRequest(BaseModel):
+    shipment_ids: Optional[list[str]] = None
+
+
 @router.delete("/processing")
-async def clear_fba_processing(database=Depends(get_database)):
-    """Clear all processing records."""
+async def clear_fba_processing(
+    payload: ClearProcessingRequest = ClearProcessingRequest(),
+    database=Depends(get_database),
+):
+    """Delete processing records. If shipment_ids provided, deletes only those; otherwise deletes all."""
 
     def _clear(db):
-        return db[PROCESSING_COLLECTION].delete_many({}).deleted_count
+        ids = payload.shipment_ids or []
+        query = {"shipment_id": {"$in": ids}} if ids else {}
+        # Collect affected IDs before deletion for flag cleanup
+        affected = ids if ids else list(
+            {doc["shipment_id"] for doc in db[PROCESSING_COLLECTION].find({}, {"shipment_id": 1, "_id": 0})}
+        )
+        deleted = db[PROCESSING_COLLECTION].delete_many(query).deleted_count
+        if affected:
+            # Only clear the flag for shipments that now have no remaining processing rows
+            still_present = {
+                doc["shipment_id"]
+                for doc in db[PROCESSING_COLLECTION].find(
+                    {"shipment_id": {"$in": affected}}, {"shipment_id": 1, "_id": 0}
+                )
+            }
+            to_unlink = [sid for sid in affected if sid not in still_present]
+            if to_unlink:
+                db[FBA_SHIPMENTS_COLLECTION].update_many(
+                    {"ShipmentId": {"$in": to_unlink}},
+                    {"$set": {"has_processing_upload": False}},
+                )
+        return deleted
 
     deleted = await asyncio.to_thread(_clear, database)
     return {"success": True, "deleted": deleted}
+
+
+class SaveProcessingRowsRequest(BaseModel):
+    rows: list[Any]
+
+
+@router.post("/processing/rows")
+async def save_processing_rows(
+    payload: SaveProcessingRowsRequest,
+    database=Depends(get_database),
+):
+    """Save processing rows as JSON (no Excel upload). Used when initialising from queue-sourced data."""
+
+    def _store(db):
+        now = utcnow()
+        saved = 0
+        for rec in payload.rows:
+            shipment_id = rec.get("shipment_id", "")
+            sku_code = rec.get("sku_code", "")
+            if not shipment_id or not sku_code:
+                continue
+            doc = {k: v for k, v in rec.items() if k not in ("_from_queue", "_id")}
+            # Parse date from ISO string if needed
+            raw_date = doc.get("date")
+            if isinstance(raw_date, str) and raw_date:
+                try:
+                    doc["date"] = datetime.fromisoformat(raw_date)
+                except ValueError:
+                    doc["date"] = None
+            doc["uploaded_at"] = now
+            db[PROCESSING_COLLECTION].update_one(
+                {"shipment_id": shipment_id, "sku_code": sku_code, "asin": rec.get("asin", "")},
+                {"$set": doc},
+                upsert=True,
+            )
+            saved += 1
+        return saved
+
+    saved = await asyncio.to_thread(_store, database)
+    linked = await asyncio.to_thread(_relink_processing_uploads, database)
+    return {"success": True, "rows_saved": saved, "db_shipments_linked": linked}
+
+
+# ─── Processing: per-shipment Excel download ──────────────────────────────────
+
+
+@router.get("/processing/{shipment_id}/download")
+async def download_processing_by_shipment(
+    shipment_id: str, database=Depends(get_database)
+):
+    """Download all processing rows for a specific shipment as Excel."""
+    try:
+        def _fetch(db):
+            all_rows = _fetch_processing_data(db)
+            return [r for r in all_rows if r.get("shipment_id") == shipment_id]
+
+        rows = await asyncio.to_thread(_fetch, database)
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No processing data found for shipment {shipment_id}",
+            )
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "FBA Processing"
+
+        headers = [
+            "Shipment ID", "Date", "Location", "SKU Code", "ASIN", "FNSKU",
+            "Item Name", "MRP", "SP", "Requested Qty", "Packed Qty",
+            "Cost Price", "HSN Code", "GST",
+        ]
+        header_fill = PatternFill("solid", fgColor="4472C4")
+        header_font = Font(bold=True, color="FFFFFF")
+        center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center
+
+        for row_idx, row in enumerate(rows, 2):
+            date_val = row.get("date")
+            if isinstance(date_val, datetime):
+                date_str = date_val.strftime("%Y-%m-%d")
+            elif date_val:
+                date_str = str(date_val)
+            else:
+                date_str = None
+            ws.cell(row=row_idx, column=1, value=row.get("shipment_id", ""))
+            ws.cell(row=row_idx, column=2, value=date_str)
+            ws.cell(row=row_idx, column=3, value=row.get("location", ""))
+            ws.cell(row=row_idx, column=4, value=row.get("sku_code", ""))
+            ws.cell(row=row_idx, column=5, value=row.get("asin", ""))
+            ws.cell(row=row_idx, column=6, value=row.get("fnsku", ""))
+            ws.cell(row=row_idx, column=7, value=row.get("item_name", ""))
+            ws.cell(row=row_idx, column=8, value=row.get("mrp"))
+            ws.cell(row=row_idx, column=9, value=row.get("sp"))
+            ws.cell(row=row_idx, column=10, value=row.get("requested_qty", 0))
+            ws.cell(row=row_idx, column=11, value=row.get("packed_qty", 0))
+            ws.cell(row=row_idx, column=12, value=row.get("cost_price"))
+            ws.cell(row=row_idx, column=13, value=row.get("hsn_code", ""))
+            ws.cell(row=row_idx, column=14, value=row.get("gst"))
+
+        col_widths = [18, 12, 16, 14, 14, 14, 35, 8, 8, 13, 11, 11, 12, 6]
+        for col_idx, width in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+        ws.freeze_panes = "A2"
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        safe_id = re.sub(r"[^\w\-]", "_", shipment_id)
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="fba_processing_{safe_id}.xlsx"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading processing data for {shipment_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Processing: Zoho estimate CRUD ──────────────────────────────────────────
+
+
+class FbaEstimateCreateRequest(BaseModel):
+    billing_address_id: str
+    shipping_address_id: str
+    date: Optional[str] = None
+
+
+class FbaEstimateLinkRequest(BaseModel):
+    estimate_number: str
+
+
+@router.get("/processing/{shipment_id}/estimate")
+async def get_fba_shipment_estimate(
+    shipment_id: str, database=Depends(get_database)
+):
+    """Return linked estimate info for an FBA shipment (or empty object if none)."""
+    def _get(db):
+        doc = db[FBA_SHIPMENTS_COLLECTION].find_one(
+            {"ShipmentId": shipment_id},
+            {"zoho_estimate_id": 1, "estimate_number": 1, "_id": 0},
+        )
+        if not doc:
+            return {}
+        est_id = doc.get("zoho_estimate_id")
+        est_num = doc.get("estimate_number")
+        if not est_id and not est_num:
+            return {}
+        est = None
+        if est_id:
+            est = db["estimates"].find_one(
+                {"estimate_id": est_id},
+                {"estimate_id": 1, "estimate_number": 1, "total": 1, "sub_total": 1, "status": 1, "_id": 0},
+            )
+        if not est and est_num:
+            est = db["estimates"].find_one(
+                {"estimate_number": est_num},
+                {"estimate_id": 1, "estimate_number": 1, "total": 1, "sub_total": 1, "status": 1, "_id": 0},
+            )
+        return {
+            "zoho_estimate_id": est_id,
+            "estimate_number": est_num,
+            "sub_total": est.get("sub_total") if est else None,
+            "total": est.get("total") if est else None,
+            "status": est.get("status") if est else None,
+        }
+
+    result = await asyncio.to_thread(_get, database)
+    return result
+
+
+@router.post("/processing/{shipment_id}/estimate")
+async def create_fba_shipment_estimate(
+    shipment_id: str,
+    body: FbaEstimateCreateRequest,
+    database=Depends(get_database),
+):
+    """Create a Zoho Books estimate for all processing rows of an FBA shipment."""
+
+    def _create(db):
+        doc = db[FBA_SHIPMENTS_COLLECTION].find_one({"ShipmentId": shipment_id})
+        if doc and doc.get("zoho_estimate_id"):
+            raise ValueError(
+                f"Shipment already has estimate {doc.get('estimate_number')} — unlink it first"
+            )
+
+        all_rows = _fetch_processing_data(db)
+        rows = [r for r in all_rows if r.get("shipment_id") == shipment_id]
+        if not rows:
+            raise ValueError(f"No processing data found for shipment {shipment_id}")
+
+        skus = [r["sku_code"] for r in rows if r.get("sku_code")]
+
+        sku_to_composite_id: dict[str, str] = {
+            c["sku_code"]: c["composite_item_id"]
+            for c in db["composite_products"].find(
+                {"sku_code": {"$in": skus}},
+                {"sku_code": 1, "composite_item_id": 1},
+            )
+            if c.get("sku_code") and c.get("composite_item_id")
+        }
+
+        sku_to_product_id: dict[str, str] = {}
+        sku_to_product_status: dict[str, str] = {}
+        sku_to_product_name: dict[str, str] = {}
+        non_composite = [s for s in skus if s not in sku_to_composite_id]
+        for p in db["products"].find(
+            {"cf_sku_code": {"$in": non_composite}},
+            {"cf_sku_code": 1, "item_id": 1, "status": 1, "name": 1},
+        ):
+            sku = p.get("cf_sku_code")
+            item_id = p.get("item_id")
+            if not sku or not item_id:
+                continue
+            status = p.get("status", "")
+            if status == "active" or sku not in sku_to_product_id:
+                sku_to_product_id[sku] = item_id
+                sku_to_product_status[sku] = status
+                sku_to_product_name[sku] = p.get("name", sku)
+
+        line_items: list[dict] = []
+        skipped: list[str] = []
+
+        for row in rows:
+            sku = row.get("sku_code", "")
+            zoho_item_id = sku_to_composite_id.get(sku)
+            if not zoho_item_id:
+                zoho_item_id = sku_to_product_id.get(sku)
+                if not zoho_item_id:
+                    skipped.append(sku)
+                    continue
+                item_status = sku_to_product_status.get(sku, "active")
+                if item_status and item_status != "active":
+                    skipped.append(f"{sku} (inactive)")
+                    continue
+
+            mrp = row.get("mrp") or 0
+            gst = row.get("gst")
+            rate = round(mrp / (1 + gst / 100), 2) if gst and gst > 0 else round(float(mrp), 2)
+            qty = row.get("requested_qty", 0)
+            line_items.append({
+                "item_id": zoho_item_id,
+                "quantity": qty,
+                "rate": rate,
+                "unit": "pcs",
+                "hsn_or_sac": row.get("hsn_code", ""),
+            })
+
+        if not line_items:
+            raise ValueError(
+                f"No line items could be built (missing Zoho item_id for: {', '.join(skipped) or 'all items'})"
+            )
+
+        customer = db["customers"].find_one(
+            {"contact_name": {"$regex": "ETRADE", "$options": "i"}},
+            {"contact_id": 1},
+        )
+        if not customer:
+            raise ValueError("ETRADE customer not found in customers collection")
+
+        token = _get_zoho_books_token()
+        zh = {"Authorization": f"Zoho-oauthtoken {token}"}
+
+        now = datetime.now()
+        fy_start = now.year if now.month >= 4 else now.year - 1
+        fy_str = f"{str(fy_start)[-2:]}-{str(fy_start + 1)[-2:]}"
+
+        list_r = requests.get(
+            f"{_ZOHO_BOOKS_BASE}/estimates",
+            headers=zh,
+            params={
+                "organization_id": _ZOHO_ORG_ID,
+                "filter_by": "Status.All",
+                "per_page": 200,
+                "sort_column": "estimate_number",
+                "sort_order": "D",
+            },
+            timeout=30,
+        )
+        list_r.raise_for_status()
+        all_estimates = list_r.json().get("estimates", [])
+        fy_estimates = [e for e in all_estimates if f"/{fy_str}/" in e.get("estimate_number", "")]
+        if fy_estimates:
+            parts = str(fy_estimates[0]["estimate_number"]).split("/")
+            last_num = int(parts[-1])
+            num_width = len(parts[-1])
+            prefix = parts[0]
+        else:
+            parts = str(all_estimates[0]["estimate_number"]).split("/") if all_estimates else ["EST"]
+            last_num = 0
+            num_width = len(parts[-1]) if len(parts) > 1 else 4
+            prefix = parts[0]
+
+        counter_id = f"estimate_counter_{fy_str}"
+        db.counters.update_one({"_id": counter_id}, {"$max": {"seq": last_num}}, upsert=True)
+        counter = db.counters.find_one_and_update(
+            {"_id": counter_id}, {"$inc": {"seq": 1}}, return_document=True
+        )
+        new_num = f"{prefix}/{fy_str}/{str(counter['seq']).zfill(num_width)}"
+
+        payload: dict = {
+            "estimate_number": new_num,
+            "customer_id": customer["contact_id"],
+            "reference_number": shipment_id,
+            "date": body.date or now.strftime("%Y-%m-%d"),
+            "place_of_supply": "MH",
+            "billing_address_id": body.billing_address_id,
+            "shipping_address_id": body.shipping_address_id,
+            "is_inclusive_tax": False,
+            "line_items": line_items,
+            "branch_id": "3220178000156681877",
+            "branch_name": "Amazon (Mumbai Branch)",
+            "salesperson_id": "3220178000000692003",
+            "dispatch_from_address_id": "3220178000541133001",
+        }
+        logger.info("FBA estimate payload for %s: %s", shipment_id, payload)
+        r = requests.post(
+            f"{_ZOHO_BOOKS_BASE}/estimates",
+            headers=zh,
+            json=payload,
+            params={"organization_id": _ZOHO_ORG_ID, "ignore_auto_number_generation": "true"},
+            timeout=30,
+        )
+        logger.info("FBA estimate response %s: %s", r.status_code, r.text)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != 0:
+            raise ValueError(f"Zoho error: {data.get('message', 'Unknown error')}")
+
+        estimate = data["estimate"]
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {"$set": {
+                "zoho_estimate_id": estimate["estimate_id"],
+                "estimate_number": estimate["estimate_number"],
+                "updated_at": utcnow(),
+            }},
+            upsert=True,
+        )
+        db["estimates"].update_one(
+            {"estimate_id": estimate["estimate_id"]},
+            {"$set": estimate},
+            upsert=True,
+        )
+        return estimate, skipped
+
+    try:
+        estimate, skipped = await asyncio.to_thread(_create, database)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except requests.HTTPError as e:
+        body_text = e.response.text if e.response is not None else ""
+        raise HTTPException(status_code=502, detail=f"Zoho API error: {e} — {body_text}")
+    except Exception as e:
+        logger.error(f"Error creating FBA estimate for {shipment_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    result: dict = {
+        "estimate_id": estimate["estimate_id"],
+        "estimate_number": estimate["estimate_number"],
+        "sub_total": estimate.get("sub_total"),
+        "total": estimate.get("total"),
+        "status": estimate.get("status"),
+    }
+    if skipped:
+        result["skipped_items"] = skipped
+    return JSONResponse(status_code=201, content=result)
+
+
+@router.put("/processing/{shipment_id}/estimate")
+async def link_fba_shipment_estimate(
+    shipment_id: str,
+    body: FbaEstimateLinkRequest,
+    database=Depends(get_database),
+):
+    """Link an existing Zoho Books estimate number to an FBA shipment."""
+
+    def _link(db):
+        est = db["estimates"].find_one(
+            {"estimate_number": body.estimate_number},
+            {"estimate_id": 1, "estimate_number": 1, "total": 1, "sub_total": 1, "status": 1, "_id": 0},
+        )
+        if not est:
+            token = _get_zoho_books_token()
+            r = requests.get(
+                f"{_ZOHO_BOOKS_BASE}/estimates",
+                headers={"Authorization": f"Zoho-oauthtoken {token}"},
+                params={"organization_id": _ZOHO_ORG_ID, "estimate_number": body.estimate_number},
+                timeout=30,
+            )
+            r.raise_for_status()
+            estimates = r.json().get("estimates", [])
+            if not estimates:
+                raise ValueError(f"Estimate {body.estimate_number} not found in Zoho")
+            est = estimates[0]
+            db["estimates"].update_one({"estimate_id": est["estimate_id"]}, {"$set": est}, upsert=True)
+
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {"$set": {
+                "zoho_estimate_id": est.get("estimate_id", ""),
+                "estimate_number": est.get("estimate_number", body.estimate_number),
+                "updated_at": utcnow(),
+            }},
+            upsert=True,
+        )
+        return est
+
+    try:
+        est = await asyncio.to_thread(_link, database)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Zoho API error: {e}")
+    except Exception as e:
+        logger.error(f"Error linking estimate for {shipment_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "success": True,
+        "zoho_estimate_id": est.get("estimate_id"),
+        "estimate_number": est.get("estimate_number"),
+        "sub_total": est.get("sub_total"),
+        "total": est.get("total"),
+    }
+
+
+@router.delete("/processing/{shipment_id}/estimate")
+async def unlink_fba_shipment_estimate(
+    shipment_id: str, database=Depends(get_database)
+):
+    """Remove the estimate link from an FBA shipment."""
+    def _unlink(db):
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {"$unset": {"zoho_estimate_id": "", "estimate_number": ""}},
+        )
+
+    await asyncio.to_thread(_unlink, database)
+    return {"success": True}
+
+
+@router.get("/processing/{shipment_id}/estimate_diff")
+async def get_fba_estimate_diff(
+    shipment_id: str, database=Depends(get_database)
+):
+    """Compare FBA processing rows against the linked Zoho estimate line items."""
+
+    def _diff(db):
+        doc = db[FBA_SHIPMENTS_COLLECTION].find_one(
+            {"ShipmentId": shipment_id},
+            {"zoho_estimate_id": 1, "estimate_number": 1},
+        )
+        if not doc:
+            raise ValueError(f"Shipment {shipment_id} not found")
+        est_id = doc.get("zoho_estimate_id")
+        est_num = doc.get("estimate_number")
+        if not est_id and not est_num:
+            raise ValueError("No estimate linked to this shipment")
+
+        est = None
+        if est_id:
+            est = db["estimates"].find_one({"estimate_id": est_id})
+        if not est and est_num:
+            est = db["estimates"].find_one({"estimate_number": est_num})
+        if not est:
+            raise ValueError("Estimate not found in local DB — re-link it to refresh")
+
+        all_rows = _fetch_processing_data(db)
+        proc_rows = [r for r in all_rows if r.get("shipment_id") == shipment_id]
+
+        # Build item_id → sku_code maps
+        est_line_items = est.get("line_items", [])
+        est_item_ids = [li["item_id"] for li in est_line_items if li.get("item_id")]
+
+        item_id_to_sku: dict[str, str] = {}
+        for p in db["products"].find(
+            {"item_id": {"$in": est_item_ids}},
+            {"item_id": 1, "cf_sku_code": 1},
+        ):
+            if p.get("item_id") and p.get("cf_sku_code"):
+                item_id_to_sku[p["item_id"]] = p["cf_sku_code"]
+        for c in db["composite_products"].find(
+            {"composite_item_id": {"$in": est_item_ids}},
+            {"composite_item_id": 1, "sku_code": 1},
+        ):
+            if c.get("composite_item_id") and c.get("sku_code"):
+                item_id_to_sku[c["composite_item_id"]] = c["sku_code"]
+
+        est_by_sku: dict[str, dict] = {}
+        for li in est_line_items:
+            sku = item_id_to_sku.get(li.get("item_id", ""), "")
+            if sku:
+                est_by_sku[sku] = li
+
+        items = []
+        proc_sub_total = 0.0
+        proc_total = 0.0
+        proc_total_qty = 0
+        proc_skus: set[str] = set()
+
+        for row in proc_rows:
+            sku = row.get("sku_code", "")
+            proc_skus.add(sku)
+            req_qty = row.get("requested_qty", 0)
+            mrp = row.get("mrp") or 0
+            gst = row.get("gst")
+            rate_wo_gst = round(mrp / (1 + gst / 100), 2) if gst and gst > 0 else round(float(mrp), 2)
+            proc_item_sub = round(rate_wo_gst * req_qty, 2)
+            proc_item_total = round(float(mrp) * req_qty, 2)
+
+            proc_sub_total += proc_item_sub
+            proc_total += proc_item_total
+            proc_total_qty += req_qty
+
+            eli = est_by_sku.get(sku)
+            est_qty = eli.get("quantity") if eli else None
+            est_rate = eli.get("rate") if eli else None
+            est_item_total = round(float(est_rate) * int(est_qty), 2) if est_rate is not None and est_qty is not None else None
+
+            items.append({
+                "sku_code": sku,
+                "asin": row.get("asin", ""),
+                "item_name": row.get("item_name", ""),
+                "processing_qty": req_qty,
+                "estimate_qty": est_qty,
+                "processing_rate": rate_wo_gst,
+                "estimate_rate": est_rate,
+                "processing_item_total": proc_item_sub,
+                "estimate_item_total": est_item_total,
+                "in_estimate": eli is not None,
+                "qty_match": est_qty == req_qty if est_qty is not None else False,
+                "rate_match": abs(float(est_rate or 0) - rate_wo_gst) < 0.05 if est_rate is not None else False,
+            })
+
+        only_in_estimate = [
+            {
+                "sku_code": item_id_to_sku.get(li.get("item_id", ""), li.get("item_id", "")),
+                "item_name": li.get("name", ""),
+                "estimate_qty": li.get("quantity"),
+                "estimate_rate": li.get("rate"),
+                "estimate_item_total": round(float(li.get("rate") or 0) * int(li.get("quantity") or 0), 2),
+            }
+            for li in est_line_items
+            if item_id_to_sku.get(li.get("item_id", ""), "") not in proc_skus
+        ]
+
+        est_total_qty = sum(int(li.get("quantity") or 0) for li in est_line_items)
+
+        return {
+            "estimate_number": est.get("estimate_number"),
+            "zoho_estimate_id": est_id,
+            "estimate_sub_total": est.get("sub_total"),
+            "estimate_total": est.get("total"),
+            "processing_sub_total": round(proc_sub_total, 2),
+            "processing_total": round(proc_total, 2),
+            "processing_item_count": len(proc_rows),
+            "estimate_item_count": len(est_line_items),
+            "processing_total_qty": proc_total_qty,
+            "estimate_total_qty": est_total_qty,
+            "items": items,
+            "only_in_estimate": only_in_estimate,
+        }
+
+    try:
+        return await asyncio.to_thread(_diff, database)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error computing FBA estimate diff for {shipment_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── Page 3: Summary ──────────────────────────────────────────────────────────
