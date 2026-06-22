@@ -304,6 +304,13 @@ def _write_row(
 
     if case_pack:
         _set(ws, r, COL_CASEPACK, int(case_pack))
+
+    # Quantity (col L): for order-wise costing, use the actual ordered qty from
+    # the PO line item; otherwise fall back to the casepack × carton formula.
+    po_qty = product.get("_po_qty")
+    if po_qty is not None:
+        _set(ws, r, COL_QTY, po_qty)
+    elif case_pack:
         ws.cell(r, COL_QTY).value = f"=M{r}*K{r}"  # casepack × carton
 
     # ── Price columns ─────────────────────────────────────────────────────────
@@ -808,6 +815,230 @@ async def upload_price_list(
 
     safe = tab_label.replace(" ", "_").replace("/", "-")
     filename = f"product_costing_{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ── Order Wise Costing ─────────────────────────────────────────────────────────
+# Costing sheets driven by the actual rates inside a vendor's purchase orders.
+#
+# Brand → vendor: the `brands` collection maps `name → vendor_id`; `vendor_id`
+# matches `purchase_orders.vendor_id`. Merged brands (e.g. Petfest = Dogfest +
+# Catfest) resolve to the union of their constituent vendor_ids (deduped — the
+# constituents often share a single vendor).
+
+
+def _vendor_ids_for_brands(db, brand_names: list[str]) -> list[str]:
+    """Resolve a list of constituent brand names → deduped vendor_ids."""
+    seen: list[str] = []
+    for b in db.brands.find({"name": {"$in": brand_names}}, {"_id": 0, "vendor_id": 1}):
+        vid = b.get("vendor_id")
+        if vid and vid not in seen:
+            seen.append(vid)
+    return seen
+
+
+def _li_has_sku(li: dict) -> bool:
+    return bool(li.get("sku")) and (li.get("quantity") or 0) > 0
+
+
+def _fetch_brand_pos(db, brand_names: list[str]) -> list[dict]:
+    vendor_ids = _vendor_ids_for_brands(db, brand_names)
+    if not vendor_ids:
+        return []
+    cursor = db.purchase_orders.find(
+        {"vendor_id": {"$in": vendor_ids}},
+        {
+            "_id": 0, "purchaseorder_number": 1, "date": 1,
+            "currency_code": 1, "exchange_rate": 1, "vendor_name": 1,
+            "total": 1, "line_items": 1, "status": 1,
+        },
+    )
+    out: list[dict] = []
+    for po in cursor:
+        items = [li for li in (po.get("line_items") or []) if _li_has_sku(li)]
+        if not items:
+            continue
+        out.append({
+            "po_number":     po.get("purchaseorder_number", ""),
+            "date":          str(po.get("date") or "")[:10],
+            "currency_code": po.get("currency_code", "USD"),
+            "exchange_rate": round(po.get("exchange_rate") or 0, 4),
+            "vendor_name":   po.get("vendor_name", ""),
+            "status":        po.get("status", ""),
+            "total":         round(po.get("total") or 0, 2),
+            "num_items":     len(items),
+        })
+    out.sort(key=lambda p: p["date"], reverse=True)
+    return out
+
+
+@router.get("/order-wise/pos")
+async def list_order_wise_pos(brands: str, db=Depends(get_database)):
+    """List purchase orders for the given brand(s).
+
+    `brands` = comma-separated constituent brand names (e.g. "Dogfest,Catfest").
+    """
+    brand_names = [b.strip() for b in brands.split(",") if b.strip()]
+    if not brand_names:
+        raise HTTPException(status_code=400, detail="No brand provided.")
+    pos = await asyncio.to_thread(_fetch_brand_pos, db, brand_names)
+    return {"purchase_orders": pos}
+
+
+def _assemble_po_line_items(db, po: dict) -> list[dict]:
+    """Build costing-row dicts from a PO's line items, joined to products.
+
+    PO line items reference products by Zoho `item_id` and barcode `sku` — NOT by
+    `cf_sku_code`. We look up products on both and use the product's canonical
+    `cf_sku_code` (needed for the BB-code column and the live-data join).
+    """
+    items = [li for li in (po.get("line_items") or []) if _li_has_sku(li)]
+    item_ids = list({li["item_id"] for li in items if li.get("item_id")})
+    barcodes = list({li["sku"] for li in items if li.get("sku")})
+    fields = {
+        "_id": 0, "cf_sku_code": 1, "cf_item_code": 1, "item_name": 1,
+        "purchase_status": 1, "rate": 1, "case_pack": 1, "cbm": 1,
+        "costing_carton": 1, "custom_duty": 1, "hsn_or_sac": 1,
+        "item_tax_preferences": 1, "packing": 1, "image_link": 1,
+        "item_id": 1, "sku": 1,
+    }
+    by_item_id: dict[str, dict] = {}
+    by_sku:     dict[str, dict] = {}
+    for p in db.products.find(
+        {"$or": [{"item_id": {"$in": item_ids}}, {"sku": {"$in": barcodes}}]},
+        fields,
+    ):
+        if p.get("item_id"):
+            by_item_id[p["item_id"]] = p
+        if p.get("sku"):
+            by_sku[p["sku"]] = p
+
+    rows: list[dict] = []
+    for li in items:
+        p = by_item_id.get(li.get("item_id")) or by_sku.get(li.get("sku")) or {}
+        row = {
+            "cf_sku_code":      p.get("cf_sku_code") or li.get("sku", ""),
+            "cf_item_code":     p.get("cf_item_code", ""),
+            "item_name":        li.get("name") or p.get("item_name", ""),
+            "purchase_status":  p.get("purchase_status", ""),
+            "purchase_price":   li.get("rate") or 0,          # ← PO line-item rate
+            "_po_qty":          li.get("quantity") or 0,       # ← actual ordered qty
+            "case_pack":        p.get("case_pack"),
+            "cbm":              p.get("cbm"),
+            "costing_carton":   p.get("costing_carton", 1),
+            "custom_duty":      p.get("custom_duty"),
+            "hsn_or_sac":       li.get("hsn_or_sac") or p.get("hsn_or_sac", ""),
+            "rate":             p.get("rate"),                 # MRP
+            "packing":          p.get("packing"),
+            "image_link":       p.get("image_link", ""),
+        }
+        # GST sourced from products.item_tax_preferences (intra spec) via _gst_decimal
+        if p.get("item_tax_preferences"):
+            row["item_tax_preferences"] = p["item_tax_preferences"]
+        rows.append(row)
+    return rows
+
+
+class OrderWisePO(BaseModel):
+    po_number:      str
+    currency_label: str = "USD"
+    exchange_rates: ExchangeRates = ExchangeRates()
+
+
+class OrderWiseRequest(BaseModel):
+    brand_names:       list[str]
+    pos:               list[OrderWisePO]
+    include_live_data: bool = False
+
+
+@router.post("/order-wise/generate")
+async def generate_order_wise_costing(body: OrderWiseRequest, db=Depends(get_database)):
+    if not body.brand_names:
+        raise HTTPException(status_code=400, detail="No brand provided.")
+    if not body.pos:
+        raise HTTPException(status_code=400, detail="Select at least one purchase order.")
+
+    vendor_ids = await asyncio.to_thread(_vendor_ids_for_brands, db, body.brand_names)
+    if not vendor_ids:
+        raise HTTPException(status_code=404, detail="Brand has no mapped vendor.")
+
+    po_numbers = [p.po_number for p in body.pos]
+
+    def _load() -> tuple[list[BrandTabConfig], list[list[dict]]]:
+        docs = {
+            po.get("purchaseorder_number"): po
+            for po in db.purchase_orders.find(
+                {"vendor_id": {"$in": vendor_ids},
+                 "purchaseorder_number": {"$in": po_numbers}}
+            )
+        }
+        tabs: list[BrandTabConfig] = []
+        products_by_tab: list[list[dict]] = []
+        for req_po in body.pos:
+            po = docs.get(req_po.po_number)
+            if not po:
+                continue
+            tabs.append(BrandTabConfig(
+                label=req_po.po_number[:31],
+                brand_names=body.brand_names,
+                currency_label=req_po.currency_label,
+                exchange_rates=req_po.exchange_rates,
+            ))
+            products_by_tab.append(_assemble_po_line_items(db, po))
+        return tabs, products_by_tab
+
+    tabs, products_by_tab = await asyncio.to_thread(_load)
+    if not tabs:
+        raise HTTPException(status_code=404, detail="None of the selected POs were found.")
+
+    sku_sales_data: dict | None = None
+    stock_date  = datetime.now().strftime("%d %b %Y")
+    sales_label = ""
+
+    if body.include_live_data:
+        from .sheets_updater import _last_3_months_range
+        from ..services.master_report import _generate_master_report_data
+
+        start_date, end_date = _last_3_months_range()
+        sales_label = f"{start_date} to {end_date}"
+        try:
+            report = await _generate_master_report_data(
+                start_date=start_date, end_date=end_date, db=db,
+            )
+            stock_date = report.get("dates", {}).get("zoho") or stock_date
+            sku_sales_data = {}
+            for item in report.get("combined_data", []):
+                sku = item.get("sku_code", "")
+                if sku:
+                    m = item.get("combined_metrics", {})
+                    sku_sales_data[sku] = {
+                        "total_units_sold":    round(m.get("total_units_sold", 0) or 0, 2),
+                        "total_days_in_stock": int(m.get("total_days_in_stock", 0) or 0),
+                        "pupscribe_wh_stock":  round(m.get("pupscribe_wh_stock", 0) or 0, 2),
+                        "avg_daily_run_rate":  round(m.get("avg_daily_run_rate", 0) or 0, 4),
+                        "total_transit":       round(
+                            (item.get("stock_in_transit_1") or 0) +
+                            (item.get("stock_in_transit_2") or 0) +
+                            (item.get("stock_in_transit_3") or 0), 2
+                        ),
+                    }
+        except Exception as exc:
+            logger.warning("Live data fetch failed (continuing without): %s", exc)
+            sku_sales_data = None
+
+    excel_bytes = await asyncio.to_thread(
+        _build_workbook,
+        tabs, products_by_tab,
+        sku_sales_data,
+        stock_date, sales_label,
+    )
+
+    brand_slug = "_".join(body.brand_names).replace(" ", "-").replace("/", "-")
+    filename = f"order_costing_{brand_slug}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     return StreamingResponse(
         io.BytesIO(excel_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
