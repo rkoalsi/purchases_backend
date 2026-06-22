@@ -832,12 +832,22 @@ async def upload_price_list(
 
 
 def _vendor_ids_for_brands(db, brand_names: list[str]) -> list[str]:
-    """Resolve a list of constituent brand names → deduped vendor_ids."""
+    """Resolve a list of constituent brand names → deduped vendor_ids.
+
+    A brand may map to multiple vendors (e.g. Truelove has a USD vendor and a
+    CNY vendor) via the `vendor_ids` array; older docs only have the scalar
+    `vendor_id`. Read both so every vendor's POs are reachable.
+    """
     seen: list[str] = []
-    for b in db.brands.find({"name": {"$in": brand_names}}, {"_id": 0, "vendor_id": 1}):
-        vid = b.get("vendor_id")
-        if vid and vid not in seen:
-            seen.append(vid)
+    for b in db.brands.find(
+        {"name": {"$in": brand_names}}, {"_id": 0, "vendor_id": 1, "vendor_ids": 1}
+    ):
+        vids = list(b.get("vendor_ids") or [])
+        if b.get("vendor_id"):
+            vids.append(b["vendor_id"])
+        for vid in vids:
+            if vid and vid not in seen:
+                seen.append(vid)
     return seen
 
 
@@ -872,6 +882,20 @@ def _fetch_brand_pos(db, brand_names: list[str]) -> list[dict]:
             "total":         round(po.get("total") or 0, 2),
             "num_items":     len(items),
         })
+
+    # Attach the brand-order name (e.g. "Order #2") for each PO, matched on
+    # purchaseorder_number — same field shown on the brand_orders page.
+    po_nums = [p["po_number"] for p in out if p["po_number"]]
+    name_by_po = {
+        bo["purchaseorder_number"]: bo.get("name", "")
+        for bo in db.brand_orders.find(
+            {"purchaseorder_number": {"$in": po_nums}},
+            {"_id": 0, "name": 1, "purchaseorder_number": 1},
+        )
+    }
+    for p in out:
+        p["order_name"] = name_by_po.get(p["po_number"], "")
+
     out.sort(key=lambda p: p["date"], reverse=True)
     return out
 
