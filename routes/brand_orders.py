@@ -8,6 +8,7 @@ from ..database import get_database, serialize_mongo_document
 from .task_triggers import fire_trigger
 import asyncio
 import io
+import json
 import os
 import re
 import zipfile
@@ -96,6 +97,28 @@ def _delete_from_s3(s3_key: str) -> None:
 
 # ─── orders CRUD ──────────────────────────────────────────────────────────────
 
+def _parse_vendor_payments(raw: Optional[str]) -> list:
+    """Parse vendor_payments JSON string into a clean list of {name, amount, date}."""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        result = []
+        for entry in data:
+            name = (entry.get("name") or "").strip()
+            amount = entry.get("amount")
+            date = (entry.get("date") or "").strip()
+            if name or amount not in (None, "") or date:
+                result.append({
+                    "name": name or None,
+                    "amount": float(amount) if amount not in (None, "") else None,
+                    "date": date or None,
+                })
+        return result
+    except Exception:
+        return []
+
+
 def _validate_optional_dates(fields_map: dict) -> dict:
     out = {}
     for field, val in fields_map.items():
@@ -131,6 +154,11 @@ async def create_order(
     custom_duty_due_date: Optional[str] = Form(None),
     shipping_charges: Optional[float] = Form(None),
     shipping_charges_due_date: Optional[str] = Form(None),
+    balance_payment_date: Optional[str] = Form(None),
+    balance_payment_amount: Optional[float] = Form(None),
+    total_payment_made_to_supplier: Optional[float] = Form(None),
+    total_payment_made_to_supplier_date: Optional[str] = Form(None),
+    vendor_payments: Optional[str] = Form(None),
     db=Depends(get_database),
 ):
     if order_date:
@@ -156,6 +184,8 @@ async def create_order(
         "advance_payment_date": advance_payment_date,
         "custom_duty_due_date": custom_duty_due_date,
         "shipping_charges_due_date": shipping_charges_due_date,
+        "balance_payment_date": balance_payment_date,
+        "total_payment_made_to_supplier_date": total_payment_made_to_supplier_date,
     })
 
     def _insert():
@@ -195,6 +225,9 @@ async def create_order(
             "advance_payment_amount": advance_payment_amount,
             "custom_duty": custom_duty,
             "shipping_charges": shipping_charges,
+            "balance_payment_amount": balance_payment_amount,
+            "total_payment_made_to_supplier": total_payment_made_to_supplier,
+            "vendor_payments": _parse_vendor_payments(vendor_payments),
         }
         result = db[COLLECTION].insert_one(doc)
         return str(result.inserted_id), doc
@@ -422,6 +455,9 @@ async def download_payment_report(
                 "po_due_date": 1, "advance_payment_date": 1, "advance_payment_amount": 1,
                 "custom_duty": 1, "custom_duty_due_date": 1,
                 "shipping_charges": 1, "shipping_charges_due_date": 1,
+                "balance_payment_date": 1, "balance_payment_amount": 1,
+                "total_payment_made_to_supplier": 1, "total_payment_made_to_supplier_date": 1,
+                "vendor_payments": 1,
             }},
             {"$sort": {"brand": 1, "name": 1}},
         ]
@@ -739,6 +775,11 @@ async def update_order(
     custom_duty_due_date: Optional[str] = Form(None),
     shipping_charges: Optional[float] = Form(None),
     shipping_charges_due_date: Optional[str] = Form(None),
+    balance_payment_date: Optional[str] = Form(None),
+    balance_payment_amount: Optional[float] = Form(None),
+    total_payment_made_to_supplier: Optional[float] = Form(None),
+    total_payment_made_to_supplier_date: Optional[str] = Form(None),
+    vendor_payments: Optional[str] = Form(None),
     db=Depends(get_database),
 ):
     fields: dict = {"updated_at": datetime.now()}
@@ -777,6 +818,8 @@ async def update_order(
         ("advance_payment_date", advance_payment_date),
         ("custom_duty_due_date", custom_duty_due_date),
         ("shipping_charges_due_date", shipping_charges_due_date),
+        ("balance_payment_date", balance_payment_date),
+        ("total_payment_made_to_supplier_date", total_payment_made_to_supplier_date),
     ]:
         if val is not None:
             if val:
@@ -792,6 +835,12 @@ async def update_order(
         fields["custom_duty"] = custom_duty
     if shipping_charges is not None:
         fields["shipping_charges"] = shipping_charges
+    if balance_payment_amount is not None:
+        fields["balance_payment_amount"] = balance_payment_amount
+    if total_payment_made_to_supplier is not None:
+        fields["total_payment_made_to_supplier"] = total_payment_made_to_supplier
+    if vendor_payments is not None:
+        fields["vendor_payments"] = _parse_vendor_payments(vendor_payments)
 
     def _update():
         order_doc = db[COLLECTION].find_one(
@@ -1607,6 +1656,15 @@ def _build_payment_report_excel(orders: list, fx_rates: dict) -> io.BytesIO:
     left = Alignment(horizontal="left", vertical="center")
     num_fmt = '#,##0.00'
 
+    # Find max number of vendor payment entries across all orders
+    max_vendors = max((len(o.get("vendor_payments") or []) for o in orders), default=0)
+
+    FIXED_COLS = 17  # cols 1–17 (Brand through Supplier Date)
+    # date col indices among fixed cols: 7=PO Due, 8=Advance Date, 11=Custom Duty Due, 13=Shipping Due, 14=Balance Date, 17=Supplier Date
+    FIXED_DATE_COLS = {7, 8, 11, 13, 14, 17}
+    # numeric col indices among fixed cols: 5=INR value, 6=rate, 9=advance amt, 10=custom duty, 12=shipping, 15=balance amt, 16=supplier total
+    FIXED_NUM_COLS = {5, 6, 9, 10, 12, 15, 16}
+
     headers = [
         "Brand — Order Number",
         "PO Number",
@@ -1616,12 +1674,23 @@ def _build_payment_report_excel(orders: list, fx_rates: dict) -> io.BytesIO:
         "Exchange Rate Used (INR +₹0.20)",
         "PO Due Date",
         "Advance Payment Date",
-        "Advance Payment (INR)",
+        "Advance Payment (PO Currency)",
         "Custom Duty (INR)",
         "Custom Duty Due Date",
         "Shipping Charges (INR)",
         "Shipping Charges Due Date",
+        "Balance Payment Date",
+        "Balance Payment (INR)",
+        "Total Payment to Supplier (USD)",
+        "Total Payment to Supplier Date",
     ]
+    for n in range(1, max_vendors + 1):
+        headers += [
+            f"Vendor {n} (Service Provider) Name",
+            f"Vendor {n} (Service Provider) Amount (INR)",
+            f"Vendor {n} (Service Provider) Date",
+        ]
+
     ws.append(headers)
     for cell in ws[1]:
         cell.fill = header_fill
@@ -1629,6 +1698,14 @@ def _build_payment_report_excel(orders: list, fx_rates: dict) -> io.BytesIO:
         cell.alignment = center
         cell.border = border
     ws.row_dimensions[1].height = 20
+
+    def fmt_date_cell(d):
+        if not d:
+            return None
+        try:
+            return datetime.strptime(d, "%Y-%m-%d")
+        except Exception:
+            return None
 
     for order in orders:
         brand_order_label = f"{order.get('brand', '')} — {order.get('name', '')}"
@@ -1642,17 +1719,8 @@ def _build_payment_report_excel(orders: list, fx_rates: dict) -> io.BytesIO:
         if po_total is not None and po_currency:
             raw_rate = fx_rates.get(po_currency)
             if raw_rate is not None:
-                # INR stays at 1.0; all other currencies get +₹0.20 spread
                 rate_used = 1.0 if po_currency == "INR" else round(raw_rate + 0.20, 4)
                 inr_value = round(po_total * rate_used, 2)
-
-        def fmt_date_cell(d):
-            if not d:
-                return None
-            try:
-                return datetime.strptime(d, "%Y-%m-%d")
-            except Exception:
-                return None
 
         row = [
             brand_order_label,
@@ -1668,23 +1736,50 @@ def _build_payment_report_excel(orders: list, fx_rates: dict) -> io.BytesIO:
             fmt_date_cell(order.get("custom_duty_due_date")),
             order.get("shipping_charges"),
             fmt_date_cell(order.get("shipping_charges_due_date")),
+            fmt_date_cell(order.get("balance_payment_date")),
+            order.get("balance_payment_amount"),
+            order.get("total_payment_made_to_supplier"),
+            fmt_date_cell(order.get("total_payment_made_to_supplier_date")),
         ]
+        vps = order.get("vendor_payments") or []
+        for n in range(max_vendors):
+            vp = vps[n] if n < len(vps) else {}
+            row += [
+                vp.get("name") or "",
+                vp.get("amount"),
+                fmt_date_cell(vp.get("date")),
+            ]
+
         ws.append(row)
         excel_row = ws.max_row
         for col_idx, cell in enumerate(ws[excel_row], 1):
             cell.font = data_font
             cell.border = border
-            if col_idx in (7, 8, 11, 13):  # date columns: PO Due, Advance Date, Custom Duty Due, Shipping Due
+            if col_idx in FIXED_DATE_COLS:
                 if cell.value:
                     cell.number_format = "DD-MMM-YYYY"
                 cell.alignment = center
-            elif col_idx in (5, 6, 9, 10, 12):  # numeric: INR value, rate, advance amt, custom duty, shipping
+            elif col_idx in FIXED_NUM_COLS:
                 cell.number_format = num_fmt
                 cell.alignment = center
+            elif col_idx > FIXED_COLS:
+                # vendor block: Name(+0), Amount(+1), Date(+2) per vendor
+                offset = (col_idx - FIXED_COLS - 1) % 3  # 0=name, 1=amount, 2=date
+                if offset == 2:
+                    if cell.value:
+                        cell.number_format = "DD-MMM-YYYY"
+                    cell.alignment = center
+                elif offset == 1:
+                    cell.number_format = num_fmt
+                    cell.alignment = center
+                else:
+                    cell.alignment = left
             else:
                 cell.alignment = left
 
-    col_widths = [40, 20, 16, 28, 20, 26, 16, 22, 22, 20, 20, 22, 24]
+    fixed_widths = [40, 20, 16, 28, 20, 26, 16, 22, 22, 20, 20, 22, 24, 22, 22, 26, 26]
+    vendor_widths = [28, 24, 22] * max_vendors
+    col_widths = fixed_widths + vendor_widths
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
