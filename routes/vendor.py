@@ -270,6 +270,15 @@ class SaveDraftOrderRequest(BaseModel):
     purchaseorder_number: Optional[str] = ""
 
 
+class UpdateDraftPORequest(BaseModel):
+    contact_id: str
+    date: str
+    items: List[dict]
+    notes: Optional[str] = ""
+    reference_number: Optional[str] = ""
+    purchaseorder_number: Optional[str] = ""
+
+
 @router.get("/brands")
 def get_available_brands(db=Depends(get_database)):
     """Get list of available brands with their assigned vendors (supports multi-vendor)."""
@@ -1076,6 +1085,182 @@ async def delete_draft_order(draft_id: str, db=Depends(get_database)):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Draft order not found")
     return {"deleted": True}
+
+
+@router.post("/draft_orders/{draft_id}/update_po")
+async def update_draft_order_po(
+    draft_id: str,
+    body: UpdateDraftPORequest,
+    db=Depends(get_database),
+):
+    """Update an existing Zoho Books PO from a re-uploaded draft and sync the purchase_orders collection."""
+    from bson import ObjectId
+    try:
+        oid = ObjectId(draft_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid draft_id")
+
+    try:
+        datetime.strptime(body.date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+
+    if not body.contact_id:
+        raise HTTPException(status_code=400, detail="contact_id must not be empty")
+    if not body.items:
+        raise HTTPException(status_code=400, detail="items must not be empty")
+
+    def _update():
+        draft_col = db.get_collection(DRAFT_PURCHASE_ORDERS_COLLECTION)
+        draft = draft_col.find_one({"_id": oid})
+        if not draft:
+            raise ValueError("Draft order not found")
+
+        po_number = draft.get("purchaseorder_number") or draft.get("po_number")
+        if not po_number:
+            raise ValueError("Draft has no associated PO number — cannot update")
+
+        existing_po = db[PURCHASE_ORDERS_COLLECTION].find_one(
+            {"purchaseorder_number": po_number},
+            {"purchaseorder_id": 1},
+        )
+        if not existing_po:
+            raise ValueError(f"Purchase order {po_number} not found in database")
+
+        purchaseorder_id = existing_po["purchaseorder_id"]
+
+        token = _get_zoho_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+
+        vendor_doc = db.get_collection("vendors").find_one(
+            {"contact_id": body.contact_id},
+            {
+                "currency_id": 1, "gst_treatment": 1,
+                "billing_address": 1, "shipping_address": 1,
+                "destination_of_supply": 1,
+            },
+        )
+        vd = vendor_doc or {}
+
+        DEFAULT_ACCOUNT_ID = "3220178000000034001"
+        DEFAULT_WAREHOUSE_ID = "3220178000000403010"
+
+        line_items = [
+            {
+                "item_id": it["item_id"],
+                "name": it.get("product_name", ""),
+                "quantity": it["qty"],
+                "rate": it["unit_price"],
+                "account_id": it.get("purchase_account_id") or DEFAULT_ACCOUNT_ID,
+                "hsn_or_sac": it.get("hsn_or_sac", ""),
+                "unit": "pcs",
+                "tags": [],
+                "item_custom_fields": [],
+            }
+            for it in body.items
+            if it.get("item_id")
+        ]
+
+        billing_addr = vd.get("billing_address") or {}
+        shipping_addr = vd.get("shipping_address") or {}
+
+        payload: dict = {
+            "vendor_id": body.contact_id,
+            "date": body.date,
+            "location_id": "3220178000143298047",
+            "delivery_org_address_id": DEFAULT_WAREHOUSE_ID,
+            "template_id": "3220178000000017007",
+            "destination_of_supply": vd.get("destination_of_supply") or "MH",
+            "gst_treatment": vd.get("gst_treatment", "overseas"),
+            "gst_no": "",
+            "is_inclusive_tax": False,
+            "discount": 0,
+            "discount_type": "entity_level",
+            "is_discount_before_tax": True,
+            "payment_terms": 0,
+            "payment_terms_label": "Due on Receipt",
+            "contact_persons": [],
+            "custom_fields": [],
+            "documents": [],
+            "line_items": line_items,
+        }
+        if vd.get("currency_id"):
+            payload["currency_id"] = vd["currency_id"]
+        if billing_addr.get("address_id"):
+            payload["billing_address_id"] = billing_addr["address_id"]
+        if shipping_addr.get("address_id"):
+            payload["shipping_address_id"] = shipping_addr["address_id"]
+        if body.notes:
+            payload["notes"] = body.notes
+        if body.reference_number:
+            payload["reference_number"] = body.reference_number
+        if body.purchaseorder_number:
+            payload["purchaseorder_number"] = body.purchaseorder_number
+
+        logger.info("Zoho PO update payload for %s: %s", purchaseorder_id, payload)
+        r = requests.put(
+            f"{ZOHO_BOOKS_BASE}/purchaseorders/{purchaseorder_id}",
+            headers=headers,
+            json=payload,
+            params={"organization_id": ORGANIZATION_ID},
+            timeout=30,
+        )
+        logger.info("Zoho PO update response %s: %s", r.status_code, r.text)
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("code") != 0:
+            raise ValueError(f"Zoho error: {data.get('message', 'Unknown error')}")
+
+        po_doc = data["purchaseorder"]
+        now = datetime.now()
+
+        db[PURCHASE_ORDERS_COLLECTION].update_one(
+            {"purchaseorder_id": po_doc.get("purchaseorder_id")},
+            {
+                "$set": {**po_doc, "updated_at": now},
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+
+        draft_col.update_one(
+            {"_id": oid},
+            {"$set": {
+                "items": body.items,
+                "item_count": len(body.items),
+                "date": body.date,
+                "notes": body.notes or "",
+                "reference_number": body.reference_number or "",
+                "po_status": po_doc.get("status"),
+                "updated_at": now,
+            }},
+        )
+
+        return po_doc
+
+    try:
+        po_doc = await asyncio.to_thread(_update)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except requests.HTTPError as e:
+        body_text = e.response.text if e.response is not None else ""
+        raise HTTPException(status_code=502, detail=f"Zoho API error: {e} — {body_text}")
+
+    return JSONResponse(
+        status_code=200,
+        content=serialize_mongo_document(
+            {
+                "purchaseorder_id": po_doc.get("purchaseorder_id"),
+                "purchaseorder_number": po_doc.get("purchaseorder_number"),
+                "vendor_name": po_doc.get("vendor_name"),
+                "date": po_doc.get("date"),
+                "status": po_doc.get("status"),
+                "total": po_doc.get("total"),
+                "currency_code": po_doc.get("currency_code"),
+            }
+        ),
+    )
 
 
 @router.post("/draft_orders/create_po")
