@@ -26,6 +26,17 @@ SALES_COLLECTION = "amazon_vendor_sales"
 INVENTORY_COLLECTION = "amazon_vendor_inventory"
 PENDING_REPORTS_COLLECTION = "vc_pending_reports"
 
+# Report options shared by both VC report types (sales + inventory)
+VC_REPORT_OPTIONS = {
+    "reportPeriod": "DAY",
+    "distributorView": "MANUFACTURING",
+    "sellingProgram": "RETAIL",
+}
+# How many times a single collect run will re-request a report that comes back
+# FATAL before giving up (Amazon often FATALs a too-recent date that becomes
+# available a few hours later).
+VC_FATAL_MAX_RETRIES = 2
+
 router = APIRouter()
 
 # VC API Configuration - stored in a dict for easy reloading
@@ -1048,6 +1059,89 @@ def initiate_vc_reports(db) -> Dict:
     return {"initiated": initiated, "failed": failed}
 
 
+def _download_and_insert_vc_report(db, report_type: str, date_str: str, report_document_id: str) -> int:
+    """
+    Download a DONE VC report document and insert new (not-yet-seen) ASIN records
+    for its date. Returns the number of inserted records. Raises on download/parse errors.
+    """
+    if not report_document_id:
+        raise ValueError("Report DONE but no document ID returned")
+
+    report_data = download_report_data(report_document_id, is_gzipped=True)
+    if not report_data:
+        raise ValueError("Downloaded report data is empty")
+
+    parsed = json.loads(report_data)
+
+    if report_type == "GET_VENDOR_INVENTORY_REPORT":
+        data_key = "inventoryByAsin"
+        coll_name = INVENTORY_COLLECTION
+    else:
+        data_key = "salesByAsin"
+        coll_name = SALES_COLLECTION
+
+    records = parsed.get(data_key, [])
+    date_obj = (
+        datetime.strptime(date_str, "%Y-%m-%d")
+        if date_str
+        else utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    )
+    current_time = datetime.now()
+
+    inserted = 0
+    if records:
+        db_coll = db[coll_name]
+        existing_asins = set(db_coll.distinct("asin", {"date": date_obj}))
+        new_records = [
+            {**r, "date": date_obj, "created_at": current_time}
+            for r in records
+            if r.get("asin") not in existing_asins
+        ]
+        if new_records:
+            result = db_coll.insert_many(new_records, ordered=False)
+            inserted = len(result.inserted_ids)
+    return inserted
+
+
+def _retry_fatal_vc_report(db, doc) -> str:
+    """
+    Re-request a report that came back FATAL (Amazon often FATALs a too-recent date
+    whose data finalises a few hours later), then wait for the fresh report to finish.
+    Updates the pending doc with the new report_id and retry count.
+    Returns the new DONE report's document ID. Raises on repeated FATAL / timeout.
+    """
+    report_type = doc["report_type"]
+    date_str = doc.get("date", "")
+    start_date = doc.get("start_date") or f"{date_str}T00:00:00Z"
+    # Inventory uses a single-instant window; sales uses a full-day window.
+    if doc.get("end_date"):
+        end_date = doc["end_date"]
+    elif report_type == "GET_VENDOR_INVENTORY_REPORT":
+        end_date = f"{date_str}T00:00:00Z"
+    else:
+        end_date = f"{date_str}T23:59:59Z"
+
+    pending_coll = db[PENDING_REPORTS_COLLECTION]
+
+    logger.info(f"♻️ Re-requesting FATAL {report_type} for {date_str} and waiting for completion...")
+    new_report_id = create_report(
+        report_type=report_type,
+        start_date=start_date,
+        end_date=end_date,
+        marketplace_ids=[MARKETPLACE_ID],
+        report_options=VC_REPORT_OPTIONS,
+    )
+    pending_coll.update_one(
+        {"_id": doc["_id"]},
+        {
+            "$set": {"report_id": new_report_id, "last_retry_at": datetime.now()},
+            "$inc": {"fatal_retries": 1},
+        },
+    )
+    # Block until the fresh report is DONE (raises HTTPException on FATAL/timeout).
+    return wait_for_report_completion(new_report_id, report_type)
+
+
 def collect_pending_vc_reports(db) -> Dict:
     """
     Check every pending VC report. Download and insert data for completed ones.
@@ -1072,45 +1166,10 @@ def collect_pending_vc_reports(db) -> Dict:
 
             logger.info(f"📊 Report {report_id} ({report_type}, {date_str}): {processing_status}")
 
+            label = "inventory" if report_type == "GET_VENDOR_INVENTORY_REPORT" else "sales"
+
             if processing_status == "DONE":
-                if not report_document_id:
-                    raise ValueError("Report DONE but no document ID returned")
-
-                report_data = download_report_data(report_document_id, is_gzipped=True)
-                if not report_data:
-                    raise ValueError("Downloaded report data is empty")
-
-                parsed = json.loads(report_data)
-
-                if report_type == "GET_VENDOR_INVENTORY_REPORT":
-                    data_key = "inventoryByAsin"
-                    coll_name = INVENTORY_COLLECTION
-                    label = "inventory"
-                else:
-                    data_key = "salesByAsin"
-                    coll_name = SALES_COLLECTION
-                    label = "sales"
-
-                records = parsed.get(data_key, [])
-                date_obj = (
-                    datetime.strptime(date_str, "%Y-%m-%d")
-                    if date_str
-                    else utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-                )
-                current_time = datetime.now()
-
-                inserted = 0
-                if records:
-                    db_coll = db[coll_name]
-                    existing_asins = set(db_coll.distinct("asin", {"date": date_obj}))
-                    new_records = [
-                        {**r, "date": date_obj, "created_at": current_time}
-                        for r in records
-                        if r.get("asin") not in existing_asins
-                    ]
-                    if new_records:
-                        result = db_coll.insert_many(new_records, ordered=False)
-                        inserted = len(result.inserted_ids)
+                inserted = _download_and_insert_vc_report(db, report_type, date_str, report_document_id)
 
                 total_inserted[label] += inserted
                 pending_coll.update_one(
@@ -1123,14 +1182,34 @@ def collect_pending_vc_reports(db) -> Dict:
                 logger.info(f"✅ Report {report_id}: inserted {inserted} {label} records for {date_str}")
 
             elif processing_status == "FATAL":
-                pending_coll.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {"status": "failed", "failed_at": datetime.now(), "error": "FATAL status from Amazon"}},
-                )
-                results["failed"].append({
-                    "report_id": report_id, "type": report_type, "date": date_str, "error": "FATAL",
-                })
-                logger.error(f"❌ Report {report_id} returned FATAL status")
+                # Amazon FATALs a date whose data isn't finalised yet. Re-request the
+                # same date and wait for the fresh report — but cap retries so we don't
+                # loop forever on a genuinely broken report.
+                if doc.get("fatal_retries", 0) >= VC_FATAL_MAX_RETRIES:
+                    pending_coll.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"status": "failed", "failed_at": datetime.now(),
+                                  "error": f"FATAL after {VC_FATAL_MAX_RETRIES} retries"}},
+                    )
+                    results["failed"].append({
+                        "report_id": report_id, "type": report_type, "date": date_str,
+                        "error": f"FATAL after {VC_FATAL_MAX_RETRIES} retries",
+                    })
+                    logger.error(f"❌ Report {report_id} still FATAL after {VC_FATAL_MAX_RETRIES} retries")
+                else:
+                    new_document_id = _retry_fatal_vc_report(db, doc)
+                    inserted = _download_and_insert_vc_report(db, report_type, date_str, new_document_id)
+
+                    total_inserted[label] += inserted
+                    pending_coll.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"status": "completed", "completed_at": datetime.now(), "inserted": inserted}},
+                    )
+                    results["completed"].append({
+                        "report_id": report_id, "type": label, "date": date_str,
+                        "inserted": inserted, "recovered_from_fatal": True,
+                    })
+                    logger.info(f"✅ Recovered FATAL {report_id}: inserted {inserted} {label} records for {date_str}")
 
             else:
                 results["still_pending"].append({
