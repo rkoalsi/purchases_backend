@@ -1084,6 +1084,7 @@ async def search_documents(q: str, db=Depends(get_database)):
 _LINE_ITEM_EXPORT_FIELDS = [
     ("name", "Product Name"),
     ("sku", "SKU"),
+    ("_bb_code", "BB Code"),
     ("quantity", "Quantity"),
     ("quantity_received", "Qty Received"),
     ("quantity_billed", "Qty Billed"),
@@ -1104,7 +1105,8 @@ _LINE_ITEM_EXPORT_FIELDS = [
 ]
 
 
-def _build_line_items_excel(line_items: list, currency_code: str) -> io.BytesIO:
+def _build_line_items_excel(line_items: list, currency_code: str, bb_code_by_item_id: dict = None) -> io.BytesIO:
+    bb_code_by_item_id = bb_code_by_item_id or {}
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Line Items"
@@ -1130,6 +1132,8 @@ def _build_line_items_excel(line_items: list, currency_code: str) -> io.BytesIO:
         for key, _ in _LINE_ITEM_EXPORT_FIELDS:
             if key == "_currency_code":
                 row.append(currency_code or "")
+            elif key == "_bb_code":
+                row.append(bb_code_by_item_id.get(str(item.get("item_id")), ""))
             else:
                 row.append(item.get(key, ""))
         ws.append(row)
@@ -1158,22 +1162,32 @@ async def download_order_line_items(order_id: str, db=Depends(get_database)):
             {"purchaseorder_number": 1, "brand": 1, "name": 1},
         )
         if not order or not order.get("purchaseorder_number"):
-            return None, None, None
+            return None, None, None, None
         po = db[PO_COLLECTION].find_one(
             {"purchaseorder_number": order["purchaseorder_number"]},
             {"line_items": 1, "currency_code": 1},
         )
         if not po:
-            return order, None, None
-        return order, po.get("line_items", []), po.get("currency_code", "")
+            return order, None, None, None
+        line_items = po.get("line_items", [])
+        item_ids = [li.get("item_id") for li in line_items if li.get("item_id")]
+        bb_code_by_item_id = {
+            str(p["item_id"]): p.get("cf_sku_code", "")
+            for p in db["products"].find(
+                {"item_id": {"$in": item_ids}},
+                {"item_id": 1, "cf_sku_code": 1, "_id": 0},
+            )
+            if p.get("item_id")
+        }
+        return order, line_items, po.get("currency_code", ""), bb_code_by_item_id
 
-    order, line_items, currency_code = await asyncio.to_thread(_fetch)
+    order, line_items, currency_code, bb_code_by_item_id = await asyncio.to_thread(_fetch)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found or no PO attached")
     if line_items is None:
         raise HTTPException(status_code=404, detail="Linked PO not found")
 
-    buf = await asyncio.to_thread(_build_line_items_excel, line_items, currency_code or "")
+    buf = await asyncio.to_thread(_build_line_items_excel, line_items, currency_code or "", bb_code_by_item_id)
     po_number = order.get("purchaseorder_number", order_id)
     filename = f"{po_number}_line_items.xlsx"
     return StreamingResponse(
