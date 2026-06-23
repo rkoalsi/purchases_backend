@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import asyncio
 import logging
 import requests
@@ -121,6 +122,75 @@ def _fetch_all_aging_items(token: str, to_date: str) -> list:
     return all_items
 
 
+def _fetch_inventory_valuation(token: str, to_date: str) -> dict:
+    """Fetch Zoho Books inventory valuation (Pupscribe WH only) as of ``to_date``.
+
+    Returns ``{item_id: {"unit_cost": float, "asset_value": float, "qty": float}}``.
+    Aging items and IV rows share the same Zoho Books ``item_id``, so they match
+    directly without a products-collection lookup.
+    """
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    rule = json.dumps({
+        "columns": [{
+            "index": 1,
+            "field": "location_name",
+            "value": [PUPSCRIBE_LOCATION_ID],
+            "comparator": "in",
+            "group": "branch",
+        }],
+        "criteria_string": "1",
+    })
+
+    by_item: dict[str, dict] = {}
+    page = 1
+    while True:
+        params = {
+            "organization_id": ORGANIZATION_ID,
+            "filter_by": "TransactionDate.CustomDate",
+            "to_date": to_date,
+            "rule": rule,
+            "select_columns": '[{"field":"item_name","group":"report"},{"field":"quantity_available","group":"report"},{"field":"asset_value","group":"report"},{"field":"sku","group":"item"}]',
+            "group_by": '[{"field":"none","group":"report"}]',
+            "sort_column": "quantity_available",
+            "sort_order": "D",
+            "response_option": "1",
+            "page": page,
+            "per_page": 200,
+        }
+        resp = requests.get(
+            f"{ZOHO_BOOKS_BASE}/reports/inventoryvaluation",
+            headers=headers,
+            params=params,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code", 0) != 0:
+            raise Exception(f"Zoho IV API error: {data.get('message')}")
+
+        for row in data["inventory_valuation"][0]["item_details"]:
+            row_item_id = str(row.get("item_id") or row.get("item", {}).get("item_id") or "")
+            if not row_item_id:
+                continue
+            qty = row.get("quantity_available", 0) or 0
+            asset_val = row.get("asset_value", 0.0) or 0.0
+            unit_cost = round(asset_val / qty, 2) if qty > 0 else 0.0
+            existing = by_item.get(row_item_id)
+            if existing is None or asset_val > existing.get("asset_value", 0):
+                by_item[row_item_id] = {
+                    "unit_cost": unit_cost,
+                    "asset_value": round(asset_val, 2),
+                    "qty": qty,
+                }
+
+        if not data.get("page_context", {}).get("has_more_page", False):
+            break
+        page += 1
+        time.sleep(0.3)
+
+    return by_item
+
+
 def _extract_interval(intervals: list, label: str) -> tuple[float, float]:
     """Return (stock_on_hand, asset_value) for the given interval label."""
     qty = 0.0
@@ -171,12 +241,19 @@ def _auto_width(ws):
         ws.column_dimensions[col_letter].width = min(max_len + 4, 40)
 
 
-def _build_item_sheet(ws, interval_label: str, rows: list, fill_hex: str):
+def _build_item_sheet(ws, interval_label: str, rows: list, fill_hex: str,
+                      cogs_label: str | None = None):
     headers = [
         "Item ID", "Item Name", "Brand",
         interval_label, f"Asset Value ({interval_label})",
         "MRP", "Total MRP Value", "Collection Value",
     ]
+    if cogs_label is not None:
+        headers += [
+            "Unit Cost",
+            f"Pupscribe Stock Value ({cogs_label})",
+            f"Pupscribe Stock on Hand ({cogs_label})",
+        ]
     ws.append(headers)
     _apply_header_style(ws, 1, len(headers), fill_hex)
     ws.row_dimensions[1].height = 20
@@ -186,7 +263,7 @@ def _build_item_sheet(ws, interval_label: str, rows: list, fill_hex: str):
         asset_val = row["asset_value"]
         mrp = row["mrp"]
 
-        ws.append([
+        values = [
             row["item_id"],
             row["item_name"],
             row["brand"],
@@ -195,20 +272,36 @@ def _build_item_sheet(ws, interval_label: str, rows: list, fill_hex: str):
             mrp if mrp else "",
             f"=D{i}*F{i}" if mrp else "",
             f"=G{i}/2" if mrp else "",
-        ])
+        ]
+        if cogs_label is not None:
+            values += [
+                row.get("cogs_unit_cost", 0) or "",
+                row.get("cogs_asset_value", 0) or "",
+                row.get("cogs_qty", 0) or "",
+            ]
+        ws.append(values)
         _apply_row_style(ws, i, len(headers), i % 2 == 0)
 
     _auto_width(ws)
 
 
-def _build_summary_sheet(ws, curr_rows: list, prev_rows: list, curr_label: str, prev_label: str, fill_hex: str):
+def _build_summary_sheet(ws, curr_rows: list, prev_rows: list, curr_label: str, prev_label: str, fill_hex: str,
+                         cogs_label: str | None = None):
     """Build a comparison summary sheet with all unique items from both periods."""
     curr_map = {r["item_name"]: r["qty"] for r in curr_rows}
     prev_map = {r["item_name"]: r["qty"] for r in prev_rows}
+    # COGS is a per-item total (whole Pupscribe WH stock), sourced from current period.
+    cogs_by_name = {r["item_name"]: r for r in curr_rows} if cogs_label is not None else {}
 
     all_names = sorted(set(curr_map) | set(prev_map))
 
     headers = ["Item Name", prev_label, curr_label, "Status", "Difference Qty", "Change %"]
+    if cogs_label is not None:
+        headers += [
+            "Unit Cost",
+            f"Pupscribe Stock Value ({cogs_label})",
+            f"Pupscribe Stock on Hand ({cogs_label})",
+        ]
     ws.append(headers)
     _apply_header_style(ws, 1, len(headers), fill_hex)
     ws.row_dimensions[1].height = 20
@@ -236,7 +329,15 @@ def _build_summary_sheet(ws, curr_rows: list, prev_rows: list, curr_label: str, 
             status = "No Change"
             change_pct = 0.0
 
-        ws.append([name, prev_qty, curr_qty, status, diff, change_pct if isinstance(change_pct, float) else change_pct])
+        values = [name, prev_qty, curr_qty, status, diff, change_pct if isinstance(change_pct, float) else change_pct]
+        if cogs_label is not None:
+            c = cogs_by_name.get(name, {})
+            values += [
+                c.get("cogs_unit_cost", 0) or "",
+                c.get("cogs_asset_value", 0) or "",
+                c.get("cogs_qty", 0) or "",
+            ]
+        ws.append(values)
         _apply_row_style(ws, i, len(headers), i % 2 == 0)
 
         pct_cell = ws.cell(row=i, column=6)
@@ -397,7 +498,7 @@ def _build_brand_sheet(ws, brand_totals: dict, stock_date: str,
     _auto_width(ws)
 
 
-def _build_rows_from_items(items: list, product_map: dict) -> tuple[list, list, list, list]:
+def _build_rows_from_items(items: list, product_map: dict, cogs_map: dict | None = None) -> tuple[list, list, list, list]:
     """Extract fast, medium, slow, and dead rows from Zoho aging items."""
     fast_rows = []
     medium_rows = []
@@ -418,6 +519,11 @@ def _build_rows_from_items(items: list, product_map: dict) -> tuple[list, list, 
         dead_qty,   dead_val   = _extract_interval(intervals, LABEL_DEAD)
 
         base = {"item_id": item_id, "item_name": item_name, "brand": brand, "mrp": mrp}
+        if cogs_map is not None:
+            cogs = cogs_map.get(item_id, {})
+            base["cogs_unit_cost"] = cogs.get("unit_cost", 0.0)
+            base["cogs_asset_value"] = cogs.get("asset_value", 0.0)
+            base["cogs_qty"] = cogs.get("qty", 0)
 
         if fast_qty > 0:
             fast_rows.append({**base, "qty": fast_qty, "asset_value": fast_val})
@@ -446,6 +552,7 @@ def _date_label(date_str: str) -> str:
 async def download_inventory_aging(
     to_date: str = Query(..., description="Current report date (YYYY-MM-DD)"),
     prev_date: str = Query(..., description="Previous period date (YYYY-MM-DD)"),
+    include_cogs: bool = Query(False, description="Include COGS columns (Unit Cost, Pupscribe Stock Value, Pupscribe Stock on Hand) from Zoho Books inventory valuation"),
     db=Depends(get_database),
 ):
     for label, val in [("to_date", to_date), ("prev_date", prev_date)]:
@@ -458,10 +565,18 @@ async def download_inventory_aging(
         raise HTTPException(status_code=400, detail="prev_date must be earlier than to_date")
 
     token = await asyncio.to_thread(_get_zoho_token)
-    curr_items, prev_items = await asyncio.gather(
-        asyncio.to_thread(_fetch_all_aging_items, token, to_date),
-        asyncio.to_thread(_fetch_all_aging_items, token, prev_date),
-    )
+    if include_cogs:
+        curr_items, prev_items, cogs_map = await asyncio.gather(
+            asyncio.to_thread(_fetch_all_aging_items, token, to_date),
+            asyncio.to_thread(_fetch_all_aging_items, token, prev_date),
+            asyncio.to_thread(_fetch_inventory_valuation, token, to_date),
+        )
+    else:
+        curr_items, prev_items = await asyncio.gather(
+            asyncio.to_thread(_fetch_all_aging_items, token, to_date),
+            asyncio.to_thread(_fetch_all_aging_items, token, prev_date),
+        )
+        cogs_map = None
 
     if not curr_items:
         raise HTTPException(status_code=404, detail="No inventory aging data returned for current date")
@@ -539,54 +654,56 @@ async def download_inventory_aging(
             brand_totals[brand]["total_mrp"] += total_mrp_val
             brand_totals[brand]["collection_value"] += total_mrp_val / 2
 
-    curr_fast, curr_medium, curr_slow, curr_dead = _build_rows_from_items(curr_items, product_map)
-    prev_fast, prev_medium, prev_slow, prev_dead = _build_rows_from_items(prev_items, product_map)
+    curr_fast, curr_medium, curr_slow, curr_dead = _build_rows_from_items(curr_items, product_map, cogs_map)
+    prev_fast, prev_medium, prev_slow, prev_dead = _build_rows_from_items(prev_items, product_map, cogs_map)
 
     curr_label = _date_label(to_date)
     prev_label = _date_label(prev_date)
+    # COGS values are the per-item total Pupscribe WH valuation as of the current date.
+    cogs_label = curr_label if include_cogs else None
 
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
     # Fast Movers
     ws = wb.create_sheet("Summary - Fast Movers")
-    _build_summary_sheet(ws, curr_fast, prev_fast, curr_label, prev_label, COLOR_FAST)
+    _build_summary_sheet(ws, curr_fast, prev_fast, curr_label, prev_label, COLOR_FAST, cogs_label)
 
     ws = wb.create_sheet(f"Fast Movers ({curr_label})")
-    _build_item_sheet(ws, DISPLAY_FAST, curr_fast, COLOR_FAST)
+    _build_item_sheet(ws, DISPLAY_FAST, curr_fast, COLOR_FAST, cogs_label)
 
     ws = wb.create_sheet(f"Fast Movers ({prev_label})")
-    _build_item_sheet(ws, DISPLAY_FAST, prev_fast, COLOR_FAST2)
+    _build_item_sheet(ws, DISPLAY_FAST, prev_fast, COLOR_FAST2, cogs_label)
 
     # Medium Movers
     ws = wb.create_sheet("Summary - Medium Movers")
-    _build_summary_sheet(ws, curr_medium, prev_medium, curr_label, prev_label, COLOR_MEDIUM)
+    _build_summary_sheet(ws, curr_medium, prev_medium, curr_label, prev_label, COLOR_MEDIUM, cogs_label)
 
     ws = wb.create_sheet(f"Medium Movers ({curr_label})")
-    _build_item_sheet(ws, DISPLAY_MEDIUM, curr_medium, COLOR_MEDIUM)
+    _build_item_sheet(ws, DISPLAY_MEDIUM, curr_medium, COLOR_MEDIUM, cogs_label)
 
     ws = wb.create_sheet(f"Medium Movers ({prev_label})")
-    _build_item_sheet(ws, DISPLAY_MEDIUM, prev_medium, COLOR_MEDIUM2)
+    _build_item_sheet(ws, DISPLAY_MEDIUM, prev_medium, COLOR_MEDIUM2, cogs_label)
 
     # Slow Movers
     ws = wb.create_sheet("Summary - Slow Movers")
-    _build_summary_sheet(ws, curr_slow, prev_slow, curr_label, prev_label, COLOR_SLOW)
+    _build_summary_sheet(ws, curr_slow, prev_slow, curr_label, prev_label, COLOR_SLOW, cogs_label)
 
     ws = wb.create_sheet(f"Slow Movers ({curr_label})")
-    _build_item_sheet(ws, DISPLAY_SLOW, curr_slow, COLOR_SLOW)
+    _build_item_sheet(ws, DISPLAY_SLOW, curr_slow, COLOR_SLOW, cogs_label)
 
     ws = wb.create_sheet(f"Slow Movers ({prev_label})")
-    _build_item_sheet(ws, DISPLAY_SLOW, prev_slow, COLOR_SLOW2)
+    _build_item_sheet(ws, DISPLAY_SLOW, prev_slow, COLOR_SLOW2, cogs_label)
 
     # Deadstock
     ws = wb.create_sheet("Summary - Deadstock")
-    _build_summary_sheet(ws, curr_dead, prev_dead, curr_label, prev_label, COLOR_DEAD)
+    _build_summary_sheet(ws, curr_dead, prev_dead, curr_label, prev_label, COLOR_DEAD, cogs_label)
 
     ws = wb.create_sheet(f"Deadstock ({curr_label})")
-    _build_item_sheet(ws, DISPLAY_DEAD, curr_dead, COLOR_DEAD)
+    _build_item_sheet(ws, DISPLAY_DEAD, curr_dead, COLOR_DEAD, cogs_label)
 
     ws = wb.create_sheet(f"Deadstock ({prev_label})")
-    _build_item_sheet(ws, DISPLAY_DEAD, prev_dead, COLOR_DEAD2)
+    _build_item_sheet(ws, DISPLAY_DEAD, prev_dead, COLOR_DEAD2, cogs_label)
 
     # Brand sheet — current stock + slow movers + deadstock
     ws_brand = wb.create_sheet("Brand wise collection value")
