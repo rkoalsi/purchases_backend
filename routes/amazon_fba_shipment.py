@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, date
 from ..helpers.datetime_utils import utcnow
 from ..database import get_database
 import asyncio
+import ast
 import io
 import os
 import openpyxl
@@ -25,6 +26,10 @@ PROCESSING_COLLECTION = "amazon_fba_shipment_processing"
 SUMMARY_COLLECTION = "amazon_fba_shipment_summary"
 SKU_MAPPING_COLLECTION = "amazon_sku_mapping"
 FBA_SHIPMENTS_COLLECTION = "amazon_fba_shipments"
+SALES_ORDERS_COLLECTION = "sales_orders"
+PACKAGES_COLLECTION = "packages"
+TRANSFER_ORDERS_COLLECTION = "transfer_orders"
+ASSEMBLIES_COLLECTION = "assemblies"
 
 DEFAULT_LEAD_TIME = 10
 DEFAULT_COVERAGE_DAYS = 30
@@ -38,6 +43,18 @@ _ZOHO_CLIENT_ID = os.getenv("CLIENT_ID")
 _ZOHO_CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 _ZOHO_BOOKS_REFRESH_TOKEN = os.getenv("BOOKS_REFRESH_TOKEN")
 
+# ─── Zoho Inventory (for transfer orders & assemblies) ───────────────────────
+
+ZOHO_INVENTORY_BASE = os.getenv(
+    "ZOHO_INVENTORY_BASE", "https://www.zohoapis.com/inventory/v1"
+)
+_ZOHO_TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token"
+_INVENTORY_REFRESH_TOKEN = os.getenv("INVENTORY_REFRESH_TOKEN", _ZOHO_BOOKS_REFRESH_TOKEN)
+
+# Default warehouses for FBA transfer orders (overridable per request via dropdown)
+TO_FROM_WAREHOUSE_ID = "3220178000000403010"  # Pupscribe Enterprises Private Limited
+TO_TO_WAREHOUSE_ID = "3220178000156676949"  # Mumbai (Amazon)
+
 
 def _get_zoho_books_token() -> str:
     url = _ZOHO_BOOKS_URL.format(
@@ -49,6 +66,50 @@ def _get_zoho_books_token() -> str:
     r = requests.post(url, timeout=30)
     r.raise_for_status()
     return r.json()["access_token"]
+
+
+def _get_inventory_token() -> str:
+    r = requests.post(
+        _ZOHO_TOKEN_URL,
+        params={
+            "refresh_token": _INVENTORY_REFRESH_TOKEN,
+            "client_id": _ZOHO_CLIENT_ID,
+            "client_secret": _ZOHO_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def _parse_components(raw) -> list[dict]:
+    """Components may be stored as a Python-repr string in MongoDB."""
+    if isinstance(raw, list):
+        return raw
+    if not raw or not isinstance(raw, str):
+        return []
+    try:
+        return ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+        return []
+
+
+def _so_package_numbers_for_estimate(est_id: str, db) -> list[str]:
+    """Return package numbers from the sales order(s) linked to an estimate.
+    When multiple SOs share the same estimate_id, prefer the one(s) with packages."""
+    if not est_id:
+        return []
+    sos = list(
+        db[SALES_ORDERS_COLLECTION].find({"estimate_id": est_id}, {"packages": 1})
+    )
+    sos_sorted = sorted(sos, key=lambda s: len(s.get("packages") or []), reverse=True)
+    return [
+        p["package_number"]
+        for s in sos_sorted
+        for p in (s.get("packages") or [])
+        if p.get("package_number")
+    ]
 
 
 MONTH_NAMES = {
@@ -1795,31 +1856,73 @@ async def get_fba_shipment_estimate(
     def _get(db):
         doc = db[FBA_SHIPMENTS_COLLECTION].find_one(
             {"ShipmentId": shipment_id},
-            {"zoho_estimate_id": 1, "estimate_number": 1, "_id": 0},
+            {
+                "zoho_estimate_id": 1,
+                "estimate_number": 1,
+                "sales_order_no": 1,
+                "sales_order_id": 1,
+                "package_number": 1,
+                "transfer_order_number": 1,
+                "transfer_order_id": 1,
+                "bundle_ids": 1,
+                "assembly_numbers": 1,
+                "_id": 0,
+            },
         )
         if not doc:
             return {}
         est_id = doc.get("zoho_estimate_id")
         est_num = doc.get("estimate_number")
-        if not est_id and not est_num:
-            return {}
-        est = None
-        if est_id:
-            est = db["estimates"].find_one(
-                {"estimate_id": est_id},
-                {"estimate_id": 1, "estimate_number": 1, "total": 1, "sub_total": 1, "status": 1, "_id": 0},
-            )
-        if not est and est_num:
-            est = db["estimates"].find_one(
-                {"estimate_number": est_num},
-                {"estimate_id": 1, "estimate_number": 1, "total": 1, "sub_total": 1, "status": 1, "_id": 0},
-            )
+
+        # ── linkage fields (present even when no estimate yet) ──
+        linkage = {
+            "sales_order_no": doc.get("sales_order_no"),
+            "sales_order_id": doc.get("sales_order_id"),
+            "package_number": doc.get("package_number"),
+            "transfer_order_number": doc.get("transfer_order_number"),
+            "transfer_order_id": doc.get("transfer_order_id"),
+            "bundle_ids": doc.get("bundle_ids") or [],
+            "assembly_numbers": doc.get("assembly_numbers") or [],
+            "estimate_linked_so_number": None,
+            "so_packages": [],
+        }
+
+        if est_id or est_num:
+            est = None
+            if est_id:
+                est = db["estimates"].find_one(
+                    {"estimate_id": est_id},
+                    {"estimate_id": 1, "estimate_number": 1, "total": 1, "sub_total": 1, "status": 1, "salesorders": 1, "_id": 0},
+                )
+            if not est and est_num:
+                est = db["estimates"].find_one(
+                    {"estimate_number": est_num},
+                    {"estimate_id": 1, "estimate_number": 1, "total": 1, "sub_total": 1, "status": 1, "salesorders": 1, "_id": 0},
+                )
+
+            # Derive the SO Zoho auto-created from this estimate (salesorders[] array)
+            if est:
+                salesorders_arr = est.get("salesorders") or []
+                if salesorders_arr:
+                    linkage["estimate_linked_so_number"] = salesorders_arr[-1].get("salesorder_number")
+                linkage["so_packages"] = _so_package_numbers_for_estimate(est_id, db)
+
+            return {
+                "zoho_estimate_id": est_id,
+                "estimate_number": est_num,
+                "sub_total": est.get("sub_total") if est else None,
+                "total": est.get("total") if est else None,
+                "status": est.get("status") if est else None,
+                **linkage,
+            }
+
         return {
-            "zoho_estimate_id": est_id,
-            "estimate_number": est_num,
-            "sub_total": est.get("sub_total") if est else None,
-            "total": est.get("total") if est else None,
-            "status": est.get("status") if est else None,
+            "zoho_estimate_id": None,
+            "estimate_number": None,
+            "sub_total": None,
+            "total": None,
+            "status": None,
+            **linkage,
         }
 
     result = await asyncio.to_thread(_get, database)
@@ -2095,6 +2198,498 @@ async def unlink_fba_shipment_estimate(
 
     await asyncio.to_thread(_unlink, database)
     return {"success": True}
+
+
+# ─── Sales Order / Transfer Order / Assemblies linking ───────────────────────
+
+
+class FbaSalesOrderLinkRequest(BaseModel):
+    sales_order_no: str
+
+
+class FbaPackageLinkRequest(BaseModel):
+    package_number: str
+
+
+class FbaTransferOrderCreateRequest(BaseModel):
+    date: Optional[str] = None  # YYYY-MM-DD; defaults to today
+    from_warehouse_id: Optional[str] = None
+    to_warehouse_id: Optional[str] = None
+
+
+class FbaTransferOrderLinkRequest(BaseModel):
+    transfer_order_number: str
+
+
+class FbaAssemblyLinkRequest(BaseModel):
+    assembly_number: str  # reference_number in assemblies collection
+
+
+@router.patch("/processing/{shipment_id}/sales_order_no")
+async def update_fba_sales_order_no(
+    shipment_id: str, body: FbaSalesOrderLinkRequest, database=Depends(get_database)
+):
+    """Set or update the sales order number on an FBA shipment. Resolves salesorder_id if known."""
+
+    def _update(db):
+        so_number = body.sales_order_no.strip()
+        so_doc = db[SALES_ORDERS_COLLECTION].find_one(
+            {"salesorder_number": so_number},
+            {"salesorder_id": 1, "_id": 0},
+        )
+        update_fields: dict = {
+            "sales_order_no": so_number,
+            "updated_at": utcnow(),
+        }
+        if so_doc:
+            update_fields["sales_order_id"] = so_doc["salesorder_id"]
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {"$set": update_fields},
+            upsert=True,
+        )
+        return so_number, so_doc.get("salesorder_id") if so_doc else None
+
+    so_number, so_id = await asyncio.to_thread(_update, database)
+    return {
+        "shipment_id": shipment_id,
+        "sales_order_no": so_number,
+        "sales_order_id": so_id,
+    }
+
+
+@router.patch("/processing/{shipment_id}/package")
+async def link_fba_package(
+    shipment_id: str, body: FbaPackageLinkRequest, database=Depends(get_database)
+):
+    """Manually link a package to an FBA shipment by package_number (when the SO has none).
+    The package must exist in the packages collection (TO/assemblies build from its line items)."""
+
+    def _link(db):
+        pkg_number = body.package_number.strip()
+        pkg = db[PACKAGES_COLLECTION].find_one(
+            {"package_number": pkg_number}, {"package_number": 1, "_id": 0}
+        )
+        if not pkg:
+            raise ValueError(
+                f"Package {pkg_number!r} not found in packages collection"
+            )
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {"$set": {"package_number": pkg_number, "updated_at": utcnow()}},
+            upsert=True,
+        )
+        return pkg_number
+
+    try:
+        pkg_number = await asyncio.to_thread(_link, database)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"shipment_id": shipment_id, "package_number": pkg_number}
+
+
+@router.delete("/processing/{shipment_id}/package")
+async def unlink_fba_package(shipment_id: str, database=Depends(get_database)):
+    """Remove a manually-linked package from an FBA shipment (SO-derived packages remain)."""
+
+    def _unlink(db):
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {"$unset": {"package_number": ""}, "$set": {"updated_at": utcnow()}},
+        )
+
+    await asyncio.to_thread(_unlink, database)
+    return {"shipment_id": shipment_id, "unlinked": True}
+
+
+def _resolve_fba_package_number(doc: dict, db) -> Optional[str]:
+    """Resolve the package number for a shipment: explicit field, else SO-derived from estimate."""
+    pkg_number = doc.get("package_number")
+    if pkg_number:
+        return pkg_number
+    est_id = doc.get("zoho_estimate_id")
+    if est_id:
+        pkg_nums = _so_package_numbers_for_estimate(est_id, db)
+        if pkg_nums:
+            return pkg_nums[0]
+    return None
+
+
+@router.post("/processing/{shipment_id}/transfer_order")
+async def create_fba_transfer_order(
+    shipment_id: str,
+    body: FbaTransferOrderCreateRequest,
+    database=Depends(get_database),
+):
+    """Create a Zoho Inventory transfer order from the linked package's line items."""
+
+    def _create(db):
+        doc = db[FBA_SHIPMENTS_COLLECTION].find_one({"ShipmentId": shipment_id})
+        if not doc:
+            raise ValueError(f"Shipment {shipment_id} not found")
+        if doc.get("transfer_order_id"):
+            raise ValueError(
+                f"Shipment already has transfer order {doc.get('transfer_order_number')} — unlink it first"
+            )
+
+        pkg_number = _resolve_fba_package_number(doc, db)
+        if not pkg_number:
+            raise ValueError("No package linked to this shipment — link a package first")
+
+        pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_number})
+        if not pkg:
+            raise ValueError(f"Package {pkg_number!r} not found")
+
+        line_items_raw = pkg.get("line_items") or []
+        if not line_items_raw:
+            raise ValueError("Package has no line items")
+
+        line_items: list[dict] = []
+        for li in line_items_raw:
+            item_id = li.get("item_id")
+            if not item_id:
+                continue
+            qty = float(li.get("quantity") or 0)
+            if qty <= 0:
+                continue
+            line_items.append(
+                {
+                    "item_id": item_id,
+                    "name": li.get("name") or "",
+                    "quantity_transfer": qty,
+                    "unit": li.get("unit", "pcs"),
+                }
+            )
+
+        if not line_items:
+            raise ValueError("No valid line items found in package")
+
+        # Compute next transfer order number (numeric sort, not lexicographic)
+        agg = list(db[TRANSFER_ORDERS_COLLECTION].aggregate([
+            {"$match": {"transfer_order_number": {"$regex": r"^TO-\d+"}}},
+            {"$addFields": {"_to_num": {"$toInt": {"$arrayElemAt": [{"$split": ["$transfer_order_number", "-"]}, 1]}}}},
+            {"$sort": {"_to_num": -1}},
+            {"$limit": 1},
+            {"$project": {"_to_num": 1}},
+        ]))
+        last_num = agg[0]["_to_num"] if agg else 0
+        new_to_number = f"TO-{last_num + 1}"
+
+        token = _get_inventory_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+
+        from_wh = body.from_warehouse_id or TO_FROM_WAREHOUSE_ID
+        to_wh = body.to_warehouse_id or TO_TO_WAREHOUSE_ID
+        to_date = body.date or datetime.now().strftime("%Y-%m-%d")
+        payload: dict = {
+            "transfer_order_number": new_to_number,
+            "date": to_date,
+            "from_warehouse_id": from_wh,
+            "from_location_id": from_wh,
+            "to_warehouse_id": to_wh,
+            "to_location_id": to_wh,
+            "line_items": line_items,
+            "status": "draft",
+            "description": shipment_id,
+        }
+
+        r = requests.post(
+            f"{ZOHO_INVENTORY_BASE}/transferorders",
+            headers=headers,
+            json=payload,
+            params={"organization_id": _ZOHO_ORG_ID, "ignore_auto_number_generation": "true"},
+            timeout=30,
+        )
+        data = r.json()
+
+        if not r.ok or data.get("code") != 0:
+            msg = data.get("message", "Unknown error")
+            bad_ids = data.get("error_info") or []
+            if bad_ids:
+                id_to_name = {li["item_id"]: li.get("name") or li["item_id"] for li in line_items}
+                bad_names = [id_to_name.get(iid, iid) for iid in bad_ids]
+                msg = f"{msg} — items: {', '.join(bad_names)}"
+            raise ValueError(f"Zoho error {data.get('code')}: {msg}")
+
+        to = data["transfer_order"]
+        now = datetime.now()
+        db[TRANSFER_ORDERS_COLLECTION].update_one(
+            {"transfer_order_id": to["transfer_order_id"]},
+            {"$set": {**to, "created_at": now, "updated_at": now}},
+            upsert=True,
+        )
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {"$set": {
+                "transfer_order_id": to["transfer_order_id"],
+                "transfer_order_number": to["transfer_order_number"],
+                "updated_at": utcnow(),
+            }},
+        )
+        return to
+
+    try:
+        to = await asyncio.to_thread(_create, database)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except requests.HTTPError as e:
+        body_text = e.response.text if e.response is not None else ""
+        raise HTTPException(status_code=502, detail=f"Zoho API error: {e} — {body_text}")
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "transfer_order_id": to["transfer_order_id"],
+            "transfer_order_number": to["transfer_order_number"],
+            "status": to.get("status"),
+        },
+    )
+
+
+@router.patch("/processing/{shipment_id}/transfer_order")
+async def link_fba_transfer_order(
+    shipment_id: str, body: FbaTransferOrderLinkRequest, database=Depends(get_database)
+):
+    """Link an existing Zoho transfer order to an FBA shipment by transfer_order_number."""
+
+    def _link(db):
+        if not db[FBA_SHIPMENTS_COLLECTION].find_one({"ShipmentId": shipment_id}):
+            raise ValueError(f"Shipment {shipment_id} not found")
+
+        to = db[TRANSFER_ORDERS_COLLECTION].find_one(
+            {"transfer_order_number": body.transfer_order_number},
+            {"transfer_order_id": 1, "transfer_order_number": 1},
+        )
+        if not to:
+            raise ValueError(
+                f"Transfer order {body.transfer_order_number!r} not found in transfer_orders collection"
+            )
+
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {"$set": {
+                "transfer_order_id": to.get("transfer_order_id"),
+                "transfer_order_number": to["transfer_order_number"],
+                "updated_at": utcnow(),
+            }},
+        )
+        return to
+
+    try:
+        to = await asyncio.to_thread(_link, database)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "shipment_id": shipment_id,
+        "transfer_order_number": to["transfer_order_number"],
+        "transfer_order_id": to.get("transfer_order_id"),
+    }
+
+
+@router.delete("/processing/{shipment_id}/transfer_order")
+async def unlink_fba_transfer_order(shipment_id: str, database=Depends(get_database)):
+    """Remove the transfer order link from an FBA shipment."""
+
+    def _unlink(db):
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {
+                "$unset": {"transfer_order_id": "", "transfer_order_number": ""},
+                "$set": {"updated_at": utcnow()},
+            },
+        )
+
+    await asyncio.to_thread(_unlink, database)
+    return {"shipment_id": shipment_id, "unlinked": True}
+
+
+@router.post("/processing/{shipment_id}/assemblies")
+async def create_fba_assemblies(shipment_id: str, database=Depends(get_database)):
+    """Create Zoho Inventory assemblies for all composite items in the linked package."""
+
+    def _create(db):
+        doc = db[FBA_SHIPMENTS_COLLECTION].find_one({"ShipmentId": shipment_id})
+        if not doc:
+            raise ValueError(f"Shipment {shipment_id} not found")
+        if doc.get("bundle_ids"):
+            raise ValueError("Assemblies already created — unlink them first")
+
+        pkg_number = _resolve_fba_package_number(doc, db)
+        if not pkg_number:
+            raise ValueError("No package linked — link a package first")
+
+        pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_number})
+        if not pkg:
+            raise ValueError(f"Package {pkg_number} not found")
+
+        line_items = pkg.get("line_items") or []
+        item_ids = [li.get("item_id") for li in line_items if li.get("item_id")]
+        if not item_ids:
+            raise ValueError("Package has no line items with item_id")
+
+        composite_by_item_id = {
+            c["composite_item_id"]: c
+            for c in db["composite_products"].find(
+                {"composite_item_id": {"$in": item_ids}},
+                {"composite_item_id": 1, "name": 1, "sku_code": 1, "components": 1},
+            )
+            if c.get("composite_item_id")
+        }
+        if not composite_by_item_id:
+            raise ValueError("No composite products found in this package's line items")
+
+        token = _get_inventory_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        created_bundle_ids = []
+        created_assembly_numbers = []
+        for li in line_items:
+            iid = li.get("item_id")
+            if iid not in composite_by_item_id:
+                continue
+            qty = float(li.get("quantity") or 0)
+            if qty <= 0:
+                continue
+            comp = composite_by_item_id[iid]
+
+            raw_components = _parse_components(comp.get("components") or [])
+            bundle_line_items = []
+            for c in raw_components:
+                comp_qty = float(c.get("quantity") or 0)
+                if not c.get("item_id") or comp_qty <= 0:
+                    continue
+                bundle_line_items.append(
+                    {
+                        "item_id": c["item_id"],
+                        "name": c.get("name", ""),
+                        "quantity_consumed": comp_qty * qty,
+                        "warehouse_id": TO_FROM_WAREHOUSE_ID,
+                        "location_id": TO_FROM_WAREHOUSE_ID,
+                    }
+                )
+
+            payload = {
+                "composite_item_id": iid,
+                "composite_item_name": comp.get("name", ""),
+                "date": today,
+                "quantity_to_bundle": qty,
+                "warehouse_id": TO_FROM_WAREHOUSE_ID,
+                "location_id": TO_FROM_WAREHOUSE_ID,
+                "line_items": bundle_line_items,
+            }
+            r = requests.post(
+                f"{ZOHO_INVENTORY_BASE}/bundles",
+                headers=headers,
+                json=payload,
+                params={"organization_id": _ZOHO_ORG_ID},
+                timeout=30,
+            )
+            data = r.json()
+            if not r.ok or data.get("code") != 0:
+                msg = data.get("message", "Unknown error")
+                raise ValueError(f"Zoho bundle error for {comp.get('name', iid)}: {msg}")
+            bundle = data.get("bundle", {})
+            created_bundle_ids.append(bundle.get("bundle_id", ""))
+            created_assembly_numbers.append(bundle.get("reference_number", ""))
+
+        if not created_bundle_ids:
+            raise ValueError("No assemblies were created")
+
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {"$set": {
+                "bundle_ids": created_bundle_ids,
+                "assembly_numbers": created_assembly_numbers,
+                "updated_at": utcnow(),
+            }},
+        )
+        return created_bundle_ids, created_assembly_numbers
+
+    try:
+        bundle_ids, assembly_numbers = await asyncio.to_thread(_create, database)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except requests.HTTPError as e:
+        body_text = e.response.text if e.response is not None else ""
+        raise HTTPException(status_code=502, detail=f"Zoho API error: {e} — {body_text}")
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "shipment_id": shipment_id,
+            "bundle_ids": bundle_ids,
+            "assembly_numbers": assembly_numbers,
+        },
+    )
+
+
+@router.patch("/processing/{shipment_id}/assemblies")
+async def link_fba_assembly(
+    shipment_id: str, body: FbaAssemblyLinkRequest, database=Depends(get_database)
+):
+    """Link an existing assembly to an FBA shipment by its reference_number."""
+
+    def _link(db):
+        doc = db[FBA_SHIPMENTS_COLLECTION].find_one({"ShipmentId": shipment_id})
+        if not doc:
+            raise ValueError(f"Shipment {shipment_id} not found")
+
+        assembly = db[ASSEMBLIES_COLLECTION].find_one(
+            {"reference_number": body.assembly_number},
+            {"bundle_id": 1, "reference_number": 1},
+        )
+        if not assembly:
+            raise ValueError(
+                f"Assembly {body.assembly_number!r} not found in assemblies collection"
+            )
+
+        existing_bundle_ids = doc.get("bundle_ids") or []
+        existing_assembly_numbers = doc.get("assembly_numbers") or []
+        if assembly["bundle_id"] in existing_bundle_ids:
+            raise ValueError(f"Assembly {body.assembly_number!r} is already linked")
+
+        existing_bundle_ids.append(assembly["bundle_id"])
+        existing_assembly_numbers.append(assembly["reference_number"])
+
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {"$set": {
+                "bundle_ids": existing_bundle_ids,
+                "assembly_numbers": existing_assembly_numbers,
+                "updated_at": utcnow(),
+            }},
+        )
+        return existing_bundle_ids, existing_assembly_numbers
+
+    try:
+        bundle_ids, assembly_numbers = await asyncio.to_thread(_link, database)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "shipment_id": shipment_id,
+        "bundle_ids": bundle_ids,
+        "assembly_numbers": assembly_numbers,
+    }
+
+
+@router.delete("/processing/{shipment_id}/assemblies")
+async def unlink_fba_assemblies(shipment_id: str, database=Depends(get_database)):
+    """Remove all assembly links from an FBA shipment."""
+
+    def _unlink(db):
+        db[FBA_SHIPMENTS_COLLECTION].update_one(
+            {"ShipmentId": shipment_id},
+            {
+                "$unset": {"bundle_ids": "", "assembly_numbers": ""},
+                "$set": {"updated_at": utcnow()},
+            },
+        )
+
+    await asyncio.to_thread(_unlink, database)
+    return {"shipment_id": shipment_id, "unlinked": True}
 
 
 @router.get("/processing/{shipment_id}/estimate_diff")
