@@ -691,7 +691,7 @@ def _enrich_items(
                 )
 
         # open PO: processing → supply_qty_override if set, else final_supply_fo if set, else supply_qty if > 0, else requested_qty
-        #          packed/closed/intransit → accepted_qty
+        #          packed/closed/intransit → final_supply_fo if set, else accepted_qty
         for doc in db[PO_COLLECTION].aggregate(
             [
                 {
@@ -710,7 +710,7 @@ def _enrich_items(
                         "total": {
                             "$sum": {
                                 # processing priority: supply_qty_override → final_supply_fo → supply_qty (>0) → requested_qty
-                                # packed/closed/intransit: accepted_qty
+                                # packed/closed/intransit: final_supply_fo if set, else accepted_qty
                                 "$switch": {
                                     "branches": [
                                         {
@@ -737,6 +737,10 @@ def _enrich_items(
                                         {
                                             "case": {"$eq": ["$po_status", "processing"]},
                                             "then": {"$ifNull": ["$items.requested_qty", 0]},
+                                        },
+                                        {
+                                            "case": {"$ne": ["$items.final_supply_fo", None]},
+                                            "then": "$items.final_supply_fo",
                                         },
                                     ],
                                     "default": {"$ifNull": ["$items.accepted_qty", 0]},
