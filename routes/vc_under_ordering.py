@@ -115,13 +115,14 @@ def _fetch_data(db, drr_map: dict) -> tuple:
         ):
             etrade_inv_by_asin[doc["asin"]] = int(doc.get("sellableOnHandInventoryUnits") or 0)
 
-    # 6. Open PO from vendor_purchase_orders — exact same logic as vendor_po.py:
+    # 6. Open PO from vendor_purchase_orders:
     #    processing → supply_qty_override if set, else final_supply_fo if set,
     #                 else supply_qty if > 0, else requested_qty
-    #    packed/closed/intransit → accepted_qty
+    #    pending/packed/closed/intransit → final_supply_fo if set, else accepted_qty
+    #                              (accepted_qty is often 0 while still packed/pending)
     open_po_by_asin: dict[str, int] = {}
     for doc in db["vendor_purchase_orders"].aggregate([
-        {"$match": {"po_status": {"$in": ["processing", "packed", "closed", "intransit"]}}},
+        {"$match": {"po_status": {"$in": ["processing", "pending", "packed", "closed", "intransit"]}}},
         {"$unwind": "$items"},
         {"$match": {"items.asin": {"$in": asins}}},
         {"$group": {
@@ -148,7 +149,13 @@ def _fetch_data(db, drr_map: dict) -> tuple:
                             },
                         }
                     },
-                    "else": {"$ifNull": ["$items.accepted_qty", 0]},
+                    "else": {
+                        "$cond": {
+                            "if": {"$ne": [{"$ifNull": ["$items.final_supply_fo", None]}, None]},
+                            "then": {"$ifNull": ["$items.final_supply_fo", 0]},
+                            "else": {"$ifNull": ["$items.accepted_qty", 0]},
+                        }
+                    },
                 }
             }},
         }},
