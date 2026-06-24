@@ -964,7 +964,10 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
             for c in created:
                 # Store identifying fields too so a re-run in the same flow can dedup by
                 # cf_sku_code before the next full Zoho products sync repopulates them.
-                set_fields = {"purchase_status": "active"}
+                # is_combo_product=False is required for the item to appear on
+                # /design/new-items (which filters on that field); newly-created items
+                # are never combos.
+                set_fields = {"purchase_status": "active", "is_combo_product": False}
                 if c.get("bb_code"):
                     set_fields["cf_sku_code"] = c["bb_code"]
                 if c.get("manufacturer_code"):

@@ -147,7 +147,10 @@ def get_new_items(
         db = get_database()
         col = db[PRODUCTS_COLLECTION]
 
-        query_filter: dict = {"is_combo_product": False}
+        # $ne True (not == False) so products that predate / skip the is_combo_product
+        # field — e.g. items just created via draft-order upload before the next full
+        # Zoho sync — still appear here. A missing field means "not a combo".
+        query_filter: dict = {"is_combo_product": {"$ne": True}}
 
         if search:
             rgx = {"$regex": re.escape(search), "$options": "i"}
