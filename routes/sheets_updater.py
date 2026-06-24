@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import asyncio
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
@@ -847,6 +849,14 @@ _NUM_IMAGE_SLOTS   = 16
 # Priority order for order-form product images (mirrors add_images.py)
 _ORDER_FORM_SLOT_PRIORITY = [2, 12, 4, 5, 6, 7, 8, 3]
 
+# Public backend base URL (used for the stable zip-download links written into the
+# Master sheet). The links are served on-the-fly so they always reflect latest data.
+_BASE_URL = os.getenv("BASE_URL", "https://purchase.pupscribe.in/api").rstrip("/")
+
+# Master-sheet columns for the zip-download links (1-indexed).
+_ECOM_ZIP_COL_INDEX     = 84  # CF — Ecom Images zip
+_SUPPLIER_ZIP_COL_INDEX = 90  # CL — Supplier Images zip
+
 
 def _public_s3():
     import boto3
@@ -856,6 +866,51 @@ def _public_s3():
         aws_access_key_id=os.getenv("PUBLIC_S3_ACCESS_KEY", ""),
         aws_secret_access_key=os.getenv("PUBLIC_S3_SECRET_KEY", ""),
     )
+
+
+def _public_s3_key_from_url(url: str) -> str | None:
+    """Return the S3 key for a URL hosted on our public bucket, else None."""
+    if not url:
+        return None
+    prefix = f"{_PUBLIC_S3_URL.rstrip('/')}/"
+    if url.startswith(prefix):
+        return url[len(prefix):]
+    return None
+
+
+def _build_zip_from_public_s3(image_urls: list[str]):
+    """Stream-build an in-memory zip of the given public-S3 image URLs.
+
+    Only URLs hosted on our public bucket are included (external/Drive links are
+    skipped). Filenames are flattened; collisions get a numeric suffix.
+    """
+    import io
+    import zipfile
+
+    s3 = _public_s3()
+    buf = io.BytesIO()
+    used: dict[str, int] = {}
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for url in image_urls:
+            key = _public_s3_key_from_url(url)
+            if not key:
+                continue
+            try:
+                obj = s3.get_object(Bucket=_PUBLIC_S3_BUCKET, Key=key)
+                data = obj["Body"].read()
+            except Exception:
+                logger.warning("Skipping %s in zip — download failed", key)
+                continue
+            name = key.split("/")[-1]
+            if name in used:
+                used[name] += 1
+                stem, _, ext = name.rpartition(".")
+                name = f"{stem}_{used[name]}.{ext}" if stem else f"{name}_{used[name]}"
+            else:
+                used[name] = 0
+            zf.writestr(name, data)
+    buf.seek(0)
+    return buf
 
 
 class ProductImagesUpdateRequest(BaseModel):
@@ -913,7 +968,17 @@ def _read_product_images_sync(sku_code: str) -> dict | None:
     return None
 
 
-def _write_product_images_sync(sku_code: str, sheet_name: str, images: dict[str, str]) -> int:
+def _write_product_images_sync(
+    sku_code: str,
+    sheet_name: str,
+    images: dict[str, str],
+    extra_cols: dict[int, str] | None = None,
+) -> int:
+    """Write image slots into the sheet row for sku_code.
+
+    extra_cols maps 1-indexed column numbers → string values (e.g. the CF zip
+    link); these are written on the same row alongside the image slots.
+    """
     import gspread
 
     _, sh = _open_sheet(MASTER_SHEET_ID, writable=True)
@@ -957,6 +1022,12 @@ def _write_product_images_sync(sku_code: str, sheet_name: str, images: dict[str,
         for s, url in images.items()
         if s in img_col
     ]
+
+    for col_index, value in (extra_cols or {}).items():
+        updates.append({
+            "range": gspread.utils.rowcol_to_a1(row_number, col_index),
+            "values": [[value]],
+        })
 
     if updates:
         ws.batch_update(updates, value_input_option="USER_ENTERED")
@@ -1056,8 +1127,14 @@ async def update_product_images(
     body: ProductImagesUpdateRequest,
     db=Depends(get_database),
 ):
+    # Stable, always-fresh public download link for this SKU's ecom images.
+    ecom_zip_url = f"{_BASE_URL}/sheets/product-images/{quote(sku_code, safe='')}/zip"
     updated = await asyncio.to_thread(
-        _write_product_images_sync, sku_code, body.sheet, body.images
+        _write_product_images_sync,
+        sku_code,
+        body.sheet,
+        body.images,
+        {_ECOM_ZIP_COL_INDEX: ecom_zip_url},
     )
     synced = await asyncio.to_thread(
         _sync_order_form_images_sync, sku_code, body.images, db
@@ -1068,4 +1145,158 @@ async def update_product_images(
         "sheet": body.sheet,
         "cells_updated": updated,
         "order_form_synced": synced > 0,
+        "ecom_zip_url": ecom_zip_url,
     }
+
+
+# ── Ecom / Supplier image zip downloads (public, on-the-fly) ─────────────────
+
+
+def _zip_filename(sku_code: str, suffix: str) -> str:
+    import re
+    safe = re.sub(r"[^\w.\-]", "_", sku_code) or "images"
+    return f"{safe}_{suffix}.zip"
+
+
+@router.get("/product-images/{sku_code}/zip")
+async def download_product_images_zip(sku_code: str):
+    """Public: stream a fresh zip of this SKU's ecom (sheet) images."""
+    from fastapi.responses import StreamingResponse
+
+    result = await asyncio.to_thread(_read_product_images_sync, sku_code)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"SKU '{sku_code}' not found")
+
+    urls = [u for u in (result.get("images") or {}).values() if u]
+    zip_buf = await asyncio.to_thread(_build_zip_from_public_s3, urls)
+    return StreamingResponse(
+        zip_buf,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{_zip_filename(sku_code, "ecom_images")}"'
+        },
+    )
+
+
+# ── Supplier images (drag-and-drop folder upload, public S3) ─────────────────
+
+
+def _supplier_images_sync(sku_code: str, db) -> list[str]:
+    product = db["products"].find_one(
+        {"cf_sku_code": sku_code}, {"supplier_images": 1}
+    )
+    return list((product or {}).get("supplier_images") or [])
+
+
+@router.get("/supplier-images/{sku_code}")
+async def get_supplier_images(sku_code: str, db=Depends(get_database)):
+    images = await asyncio.to_thread(_supplier_images_sync, sku_code, db)
+    return {
+        "sku_code": sku_code,
+        "images": images,
+        "zip_url": f"{_BASE_URL}/sheets/supplier-images/{quote(sku_code, safe='')}/zip",
+    }
+
+
+@router.post("/supplier-images/upload")
+async def upload_supplier_image(
+    file: UploadFile = File(...),
+    sku_code: str = Form(...),
+    item_id: str = Form(...),
+    db=Depends(get_database),
+):
+    import time as _time
+    from botocore.exceptions import BotoCoreError, NoCredentialsError
+
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    file.file.seek(0, 2)
+    size = file.file.tell()
+    file.file.seek(0)
+    if size > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File exceeds 25 MB")
+
+    base = os.path.basename(file.filename or "image.jpg")
+    safe_name = re.sub(r"[^\w.\-]", "_", base) or "image.jpg"
+    ts  = int(_time.time() * 1000)
+    key = f"supplier_images/{sku_code}/{ts}_{safe_name}"
+
+    try:
+        _public_s3().upload_fileobj(
+            file.file,
+            _PUBLIC_S3_BUCKET,
+            key,
+            ExtraArgs={"ACL": "public-read", "ContentType": file.content_type},
+        )
+    except NoCredentialsError:
+        raise HTTPException(status_code=500, detail="S3 credentials not configured")
+    except BotoCoreError as exc:
+        raise HTTPException(status_code=500, detail=f"S3 upload failed: {exc}")
+    finally:
+        file.file.close()
+
+    url = f"{_PUBLIC_S3_URL}/{key}"
+
+    def _push():
+        db["products"].update_one(
+            {"cf_sku_code": sku_code},
+            {"$addToSet": {"supplier_images": url}},
+        )
+
+    await asyncio.to_thread(_push)
+    return {"url": url}
+
+
+class SupplierImageDeleteRequest(BaseModel):
+    url: str
+
+
+@router.delete("/supplier-images/{sku_code}")
+async def delete_supplier_image(
+    sku_code: str,
+    body: SupplierImageDeleteRequest,
+    db=Depends(get_database),
+):
+    def _remove():
+        db["products"].update_one(
+            {"cf_sku_code": sku_code},
+            {"$pull": {"supplier_images": body.url}},
+        )
+        key = _public_s3_key_from_url(body.url)
+        if key:
+            try:
+                _public_s3().delete_object(Bucket=_PUBLIC_S3_BUCKET, Key=key)
+            except Exception:
+                logger.warning("Failed to delete supplier image %s from S3", key)
+
+    await asyncio.to_thread(_remove)
+    return {"success": True}
+
+
+@router.post("/supplier-images/{sku_code}/save")
+async def save_supplier_images_link(sku_code: str, db=Depends(get_database)):
+    """Write the stable supplier-images zip link into Master col CL."""
+    zip_url = f"{_BASE_URL}/sheets/supplier-images/{quote(sku_code, safe='')}/zip"
+    updated = await asyncio.to_thread(
+        _write_product_images_sync, sku_code, "Master", {}, {_SUPPLIER_ZIP_COL_INDEX: zip_url}
+    )
+    return {"success": True, "sku_code": sku_code, "zip_url": zip_url, "cells_updated": updated}
+
+
+@router.get("/supplier-images/{sku_code}/zip")
+async def download_supplier_images_zip(sku_code: str, db=Depends(get_database)):
+    """Public: stream a fresh zip of this SKU's supplier images."""
+    from fastapi.responses import StreamingResponse
+
+    urls = await asyncio.to_thread(_supplier_images_sync, sku_code, db)
+    if not urls:
+        raise HTTPException(status_code=404, detail="No supplier images for this SKU")
+    zip_buf = await asyncio.to_thread(_build_zip_from_public_s3, urls)
+    return StreamingResponse(
+        zip_buf,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{_zip_filename(sku_code, "supplier_images")}"'
+        },
+    )
