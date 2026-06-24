@@ -578,6 +578,14 @@ async def validate_draft_order(
                     }
                 )
 
+        # Order files usually have no Brand column — backfill missing items with the
+        # order's brand (derived from the matched products) so newly-created Zoho items
+        # get a Brand (and, via the brand→vendor map, a Manufacturer) attached.
+        if first_brand:
+            for m in missing:
+                if not m.get("brand"):
+                    m["brand"] = first_brand
+
         # Detect vendors from the first product's brand (supports multi-vendor)
         detected_vendors = []
         if first_brand:
