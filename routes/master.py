@@ -516,6 +516,9 @@ async def download_master_report(
             _col_guide = [
                 ("Purchase Status",        "active / inactive / discontinued until stock lasts. "
                                            "Inactive/discontinued rows get Order Qty = 0 (except Missed Sales extra qty)."),
+                ("Unit Price",             "Buyer-managed unit price from the Unit Prices page (Tools → Unit Prices), "
+                                           "currency-formatted. Blank when no price has been set for the SKU. "
+                                           "Not derived from purchase orders."),
                 ("Is New",                 "Yes = item launched within this report period. "
                                            "New items with zero sales show 'NO MOVEMENT'."),
                 ("Avg Daily Run Rate",     "Units sold per day. "
