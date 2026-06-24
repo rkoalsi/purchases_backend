@@ -505,11 +505,15 @@ async def validate_draft_order(
             if existing is None or (p.get("status") == "active" and existing.get("status") != "active"):
                 products_by_bb[key] = p
 
+        # Manufacturer-code (cf_item_code) is NOT unique — many SKU variants share the
+        # same style code (e.g. TLC5011 spans 56 Classic-collar variants). Only fall back
+        # to it for rows that lack a BBCode. When a row HAS a BBCode (cf_sku_code, the
+        # authoritative unique SKU) it must match on that alone; otherwise a new SKU would
+        # be silently matched to an unrelated variant via the shared manufacturer code.
         remaining_mfr = [
             it["manufacturer_code"]
             for it in items
-            if it["manufacturer_code"]
-            and (not it["bb_code"] or it["bb_code"] not in products_by_bb)
+            if it["manufacturer_code"] and not it["bb_code"]
         ]
         products_by_mfr: dict[str, dict] = {}
         if remaining_mfr:
@@ -525,10 +529,12 @@ async def validate_draft_order(
         first_brand: str | None = None
         for it in items:
             product = None
-            if it["bb_code"] and it["bb_code"] in products_by_bb:
-                product = products_by_bb[it["bb_code"]]
-            elif it["manufacturer_code"] and it["manufacturer_code"] in products_by_mfr:
-                product = products_by_mfr[it["manufacturer_code"]]
+            if it["bb_code"]:
+                # BBCode present → must match on the unique SKU; no manufacturer-code
+                # fallback (cf_item_code is shared across variants, see above).
+                product = products_by_bb.get(it["bb_code"])
+            elif it["manufacturer_code"]:
+                product = products_by_mfr.get(it["manufacturer_code"])
 
             if product:
                 brand = product.get("brand") or ""
@@ -815,8 +821,50 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
         headers = {"Authorization": f"Zoho-oauthtoken {token}"}
         created = []
         failed = []
+        skipped = []
+
+        # ── Duplicate guard ──────────────────────────────────────────────────
+        # Don't recreate items that already exist. cf_sku_code (bb_code) is the unique
+        # SKU; fall back to barcode (sku) when no bb_code. Catches items created earlier
+        # and synced from Zoho, plus items created moments ago in this same flow (the
+        # post-create upsert below stores these identifying fields immediately, before
+        # the next full Zoho products sync runs).
+        products_col = db.get_collection(PRODUCTS_COLLECTION)
+        bb_codes = [i.bb_code for i in body.items if i.bb_code]
+        barcodes = [i.sku_code for i in body.items if i.sku_code]
+        existing_by_bb: dict[str, dict] = {}
+        existing_by_sku: dict[str, dict] = {}
+        or_clauses = []
+        if bb_codes:
+            or_clauses.append({"cf_sku_code": {"$in": bb_codes}})
+        if barcodes:
+            or_clauses.append({"sku": {"$in": barcodes}})
+        if or_clauses:
+            for p in products_col.find(
+                {"$or": or_clauses},
+                {"cf_sku_code": 1, "sku": 1, "item_id": 1, "name": 1, "status": 1},
+            ):
+                if p.get("cf_sku_code"):
+                    existing_by_bb.setdefault(p["cf_sku_code"], p)
+                if p.get("sku"):
+                    existing_by_sku.setdefault(p["sku"], p)
 
         for item in body.items:
+            existing = None
+            if item.bb_code and item.bb_code in existing_by_bb:
+                existing = existing_by_bb[item.bb_code]
+            elif item.sku_code and item.sku_code in existing_by_sku:
+                existing = existing_by_sku[item.sku_code]
+            if existing:
+                skipped.append({
+                    "item_name": item.item_name,
+                    "bb_code": item.bb_code,
+                    "manufacturer_code": item.manufacturer_code,
+                    "item_id": existing.get("item_id", ""),
+                    "status": existing.get("status", ""),
+                })
+                continue
+
             barcode = item.sku_code or ""
             upc = item.upc_code or barcode
             ean = item.ean_code or barcode
@@ -883,6 +931,7 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
                     "item_name": item.item_name,
                     "bb_code": item.bb_code,
                     "manufacturer_code": item.manufacturer_code,
+                    "sku_code": item.sku_code,
                     "item_id": zoho_item.get("item_id", ""),
                 })
             except Exception as exc:
@@ -894,10 +943,10 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
                     "error": str(exc),
                 })
 
-        return created, failed
+        return created, failed, skipped
 
     try:
-        created, failed = await asyncio.to_thread(_do_create)
+        created, failed, skipped = await asyncio.to_thread(_do_create)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -905,9 +954,20 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
         def _set_purchase_status():
             products_col = db.get_collection(PRODUCTS_COLLECTION)
             for c in created:
+                # Store identifying fields too so a re-run in the same flow can dedup by
+                # cf_sku_code before the next full Zoho products sync repopulates them.
+                set_fields = {"purchase_status": "active"}
+                if c.get("bb_code"):
+                    set_fields["cf_sku_code"] = c["bb_code"]
+                if c.get("manufacturer_code"):
+                    set_fields["cf_item_code"] = c["manufacturer_code"]
+                if c.get("sku_code"):
+                    set_fields["sku"] = c["sku_code"]
+                if c.get("item_name"):
+                    set_fields.setdefault("name", c["item_name"])
                 products_col.update_one(
                     {"item_id": c["item_id"]},
-                    {"$set": {"purchase_status": "active"}},
+                    {"$set": set_fields},
                     upsert=True,
                 )
         await asyncio.to_thread(_set_purchase_status)
@@ -970,7 +1030,7 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
             logger.error("Failed to insert new items into master sheet: %s", e)
             masters_result = {"inserted": 0, "error": str(e)}
 
-    return {"created": created, "failed": failed, "masters_sheet": masters_result}
+    return {"created": created, "failed": failed, "skipped": skipped, "masters_sheet": masters_result}
 
 
 @router.get("/draft_orders")
