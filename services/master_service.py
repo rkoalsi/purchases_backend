@@ -1781,6 +1781,43 @@ class OptimizedMasterReportService:
             logger.error(f"Error fetching latest PO unit prices: {e}")
             return {}
 
+    async def fetch_managed_unit_prices(self, sku_codes: Set[str]) -> Dict[str, Dict]:
+        """Fetch buyer-managed unit prices from the `product_unit_prices` collection.
+
+        This is the source of truth for the master report "Unit Price" column — set
+        and maintained on the dedicated Unit Prices page. SKUs without a managed price
+        are simply absent from the result (the report then shows blank/zero), so unit
+        price is no longer derived from the latest purchase order rate.
+
+        Returns {sku_code: {"rate": float, "currency_code": str}}."""
+        if not sku_codes:
+            return {}
+        try:
+            collection = self.database.get_collection("product_unit_prices")
+            sku_list = [s for s in sku_codes if s]
+
+            def _fetch():
+                result: Dict[str, Dict] = {}
+                for doc in collection.find(
+                    {"sku_code": {"$in": sku_list}},
+                    {"_id": 0, "sku_code": 1, "unit_price": 1, "currency": 1},
+                ):
+                    sku = doc.get("sku_code")
+                    if not sku:
+                        continue
+                    result[sku] = {
+                        "rate": float(doc.get("unit_price") or 0),
+                        "currency_code": doc.get("currency", "") or "",
+                    }
+                return result
+
+            result = await asyncio.to_thread(_fetch)
+            logger.info(f"Fetched managed unit prices for {len(result)} SKUs")
+            return result
+        except Exception as e:
+            logger.error(f"Error fetching managed unit prices: {e}")
+            return {}
+
     @staticmethod
     def _apply_lookback_to_item(item: Dict, lb: Dict, start_date: str) -> None:
         """Apply a single DRR lookback result to an item, setting all drr/highlight fields in-place."""

@@ -446,9 +446,11 @@ async def _generate_master_report_data(
                         "is_combo_product": pdata.get("is_combo_product", False),
                     }
 
-                # Kick off vendor-filtered PO price fetch now that product_brands is ready
+                # Kick off managed unit-price fetch now that product SKUs are known.
+                # Source of truth = `product_unit_prices` collection (the Unit Prices
+                # page), NOT the latest purchase order rate.
                 _po_prices_task = asyncio.create_task(
-                    report_service.fetch_latest_po_unit_prices(set(product_brands.keys()), product_brands)
+                    report_service.fetch_managed_unit_prices(set(product_brands.keys()))
                 )
 
                 if brand:
@@ -747,14 +749,14 @@ async def _generate_master_report_data(
                 logger.error(f"Error in movement classification and order calculations: {e}")
                 errors.append(f"Movement/order enrichment error: {str(e)}")
 
-            # Await vendor-filtered PO unit prices (started after product_brands was built)
+            # Await managed unit prices (started after product SKUs were built)
             po_prices_by_sku: Dict[str, Dict] = {}
             if _po_prices_task is not None:
                 try:
                     po_prices_by_sku = await asyncio.wait_for(_po_prices_task, timeout=30.0)
-                    logger.info(f"PO unit prices resolved for {len(po_prices_by_sku)} SKUs")
+                    logger.info(f"Managed unit prices resolved for {len(po_prices_by_sku)} SKUs")
                 except Exception as _e:
-                    logger.error(f"PO unit prices fetch failed: {_e}")
+                    logger.error(f"Managed unit prices fetch failed: {_e}")
                     if not _po_prices_task.done():
                         _po_prices_task.cancel()
 
@@ -769,9 +771,11 @@ async def _generate_master_report_data(
                 item["prev_zoho_stock"] = max(0, round(prev_zoho_by_sku.get(sku, 0), 2))
                 item["prev_fba_stock"] = round(prev_fba_by_sku.get(sku, 0), 2)
                 _pdata = all_product_data.get(sku, {})
+                # Managed unit price (from the Unit Prices page). No PO / purchase_price
+                # fallback — SKUs without a managed price intentionally show blank/zero.
                 _po_price = po_prices_by_sku.get(sku, {})
-                item["unit_price"] = _po_price.get("rate") or _pdata.get("purchase_price", 0) or 0
-                item["unit_price_currency"] = _po_price.get("currency_code") or _pdata.get("currency", "") or ""
+                item["unit_price"] = _po_price.get("rate", 0) or 0
+                item["unit_price_currency"] = _po_price.get("currency_code", "") or ""
                 item["manufacturer_code"] = all_product_data.get(sku, {}).get("manufacturer_code", "")
                 item["mrp"] = product_rates.get(sku)
                 item["brand"] = product_brands.get(sku, "")
