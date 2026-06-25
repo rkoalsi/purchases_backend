@@ -778,6 +778,43 @@ def _insert_items_into_master_sheet(items_data: list[dict]) -> dict:
     return {"inserted": len(rows_to_insert), "error": None}
 
 
+def _build_po_line_items(db, items: list[dict], default_account_id: str) -> list[dict]:
+    """Build Zoho PO line items, backfilling hsn_or_sac / name / purchase account from the
+    products collection by item_id.
+
+    The request payload's hsn_or_sac is populated from products at validate time, which
+    can pre-date the Zoho sync for freshly-created items — so it may be empty even though
+    the item now has an HSN. Re-fetching by item_id here guarantees each PO line carries
+    the item's current HSN.
+    """
+    item_ids = [it["item_id"] for it in items if it.get("item_id")]
+    prod_by_id: dict[str, dict] = {}
+    if item_ids:
+        for p in db.get_collection(PRODUCTS_COLLECTION).find(
+            {"item_id": {"$in": item_ids}},
+            {"item_id": 1, "hsn_or_sac": 1, "name": 1, "purchase_account_id": 1},
+        ):
+            prod_by_id[p["item_id"]] = p
+
+    line_items = []
+    for it in items:
+        if not it.get("item_id"):
+            continue
+        prod = prod_by_id.get(it["item_id"], {})
+        line_items.append({
+            "item_id": it["item_id"],
+            "name": it.get("product_name") or prod.get("name", ""),
+            "quantity": it["qty"],
+            "rate": it["unit_price"],
+            "account_id": it.get("purchase_account_id") or prod.get("purchase_account_id") or default_account_id,
+            "hsn_or_sac": it.get("hsn_or_sac") or prod.get("hsn_or_sac", ""),
+            "unit": "pcs",
+            "tags": [],
+            "item_custom_fields": [],
+        })
+    return line_items
+
+
 @router.post("/draft_orders/create_zoho_items")
 async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_database)):
     """Create missing items on Zoho Books. Returns per-item created/failed results."""
@@ -1216,21 +1253,7 @@ async def update_draft_order_po(
         DEFAULT_ACCOUNT_ID = "3220178000000034001"
         DEFAULT_WAREHOUSE_ID = "3220178000000403010"
 
-        line_items = [
-            {
-                "item_id": it["item_id"],
-                "name": it.get("product_name", ""),
-                "quantity": it["qty"],
-                "rate": it["unit_price"],
-                "account_id": it.get("purchase_account_id") or DEFAULT_ACCOUNT_ID,
-                "hsn_or_sac": it.get("hsn_or_sac", ""),
-                "unit": "pcs",
-                "tags": [],
-                "item_custom_fields": [],
-            }
-            for it in body.items
-            if it.get("item_id")
-        ]
+        line_items = _build_po_line_items(db, body.items, DEFAULT_ACCOUNT_ID)
 
         billing_addr = vd.get("billing_address") or {}
         shipping_addr = vd.get("shipping_address") or {}
@@ -1367,21 +1390,7 @@ async def create_draft_order_po(
         DEFAULT_ACCOUNT_ID = "3220178000000034001"
         DEFAULT_WAREHOUSE_ID = "3220178000000403010"
 
-        line_items = [
-            {
-                "item_id": it["item_id"],
-                "name": it.get("product_name", ""),
-                "quantity": it["qty"],
-                "rate": it["unit_price"],
-                "account_id": it.get("purchase_account_id") or DEFAULT_ACCOUNT_ID,
-                "hsn_or_sac": it.get("hsn_or_sac", ""),
-                "unit": "pcs",
-                "tags": [],
-                "item_custom_fields": [],
-            }
-            for it in body.items
-            if it.get("item_id")
-        ]
+        line_items = _build_po_line_items(db, body.items, DEFAULT_ACCOUNT_ID)
 
         billing_addr = vd.get("billing_address") or {}
         shipping_addr = vd.get("shipping_address") or {}
