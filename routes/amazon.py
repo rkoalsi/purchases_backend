@@ -3724,8 +3724,9 @@ def _build_active_days_df(vc_daily_by_asin: dict, fba_daily_by_asin: dict, repor
 def _fetch_sf_fba_inventory_latest_sync(db, end):
     """Returns ({asin: {"sf": qty|None, "fba": qty|None}}, date_str). SF=VKSX, FBA=all others.
 
-    Uses per-ASIN latest date per channel so ASINs absent from the most recent upload
-    still appear as qty=0 ("Not Live") rather than None ("Not Listed").
+    Uses only the latest ledger snapshot date. ASINs absent from that snapshot are
+    omitted (None → "Not Listed") instead of carrying forward a stale balance from an
+    old upload — so discontinued ASINs no longer show a years-old qty under a current date.
     """
     latest_doc = db["amazon_ledger"].find_one(
         {"date": {"$lte": end}}, sort=[("date", -1)], projection={"date": 1}
@@ -3736,7 +3737,10 @@ def _fetch_sf_fba_inventory_latest_sync(db, end):
     date_str = latest_date.strftime("%-d %b %Y") if hasattr(latest_date, "strftime") else str(latest_date)
     inv: dict = {}
     for doc in db["amazon_ledger"].aggregate([
-        {"$match": {"date": {"$lte": end}}},
+        # Latest snapshot only: an ASIN absent from the newest ledger upload is
+        # treated as "Not Listed"/0 rather than carrying forward a stale balance
+        # (e.g. a discontinued ASIN whose last record is years old).
+        {"$match": {"date": latest_date}},
         # Sum per asin+date+channel to handle multiple location entries on the same day
         {"$group": {
             "_id": {
@@ -3775,12 +3779,11 @@ def _fetch_vc_inventory_latest_sync(db, end):
     latest_date = latest_doc["date"]
     date_str = latest_date.strftime("%-d %b %Y") if hasattr(latest_date, "strftime") else str(latest_date)
     inv: dict = {}
-    # Use per-ASIN latest value so ASINs whose most recent record predates the
-    # global latest_date (e.g. Amazon omitted them from the newest upload) still
-    # appear in inv with qty=0 ("Not Live") rather than being absent ("Not Listed").
-    # null sellableOnHandInventoryUnits also maps to 0 ("Not Live").
+    # Latest snapshot only: ASINs absent from the newest upload are omitted
+    # (None → "Not Listed") rather than carrying forward a stale balance.
+    # null sellableOnHandInventoryUnits still maps to 0 ("Not Live").
     for doc in db["amazon_vendor_inventory"].aggregate([
-        {"$match": {"date": {"$lte": end}}},
+        {"$match": {"date": latest_date}},
         {"$sort": {"date": -1}},
         {"$group": {"_id": "$asin", "stock": {"$first": "$sellableOnHandInventoryUnits"}}},
     ]):
@@ -3792,8 +3795,8 @@ def _fetch_vc_inventory_latest_sync(db, end):
 def _fetch_df_inventory_latest_sync(db, end):
     """Returns ({asin: qty}, date_str) from amazon_df_inventory (empty until populated).
 
-    Uses per-ASIN latest date so ASINs absent from the most recent upload still
-    appear as qty=0 ("Not Live") rather than None ("Not Listed").
+    Uses only the latest snapshot date. ASINs absent from that snapshot are omitted
+    (None → "Not Listed") rather than carrying forward a stale balance.
     """
     # Support both datetime-stored (new uploads) and string-stored (legacy) dates.
     end_str = end.strftime("%Y-%m-%d 23:59:59")
@@ -3815,8 +3818,10 @@ def _fetch_df_inventory_latest_sync(db, end):
             date_str = str(latest_date)
 
     inv: dict = {}
+    # Latest snapshot only: ASINs absent from the newest upload are omitted
+    # (None → "Not Listed") rather than carrying forward a stale balance.
     for doc in db["amazon_df_inventory"].aggregate([
-        {"$match": date_filter},
+        {"$match": {"date": latest_date}},
         {"$sort": {"date": -1}},
         {"$group": {"_id": "$asin", "stock": {"$first": "$available_units"}}},
     ]):
