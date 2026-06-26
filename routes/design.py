@@ -129,6 +129,7 @@ _CATALOGUE_LOOKUP_FIELDS = {
     "age_group": 1, "pet_size": 1, "chewing_style": 1,
     "size_chart": 1, "ingredient_list": 1, "nutritional_analysis": 1,
     "gst_percentage": 1, "treats_attributes": 1, "product_category": 1,
+    "amazon_title": 1, "amazon_description": 1, "amazon_features": 1,
 }
 
 
@@ -231,6 +232,9 @@ class CatalogueItemPatch(BaseModel):
     catnip: Optional[bool] = None
     size_chart: Optional[str] = None
     dimensions: Optional[dict] = None
+    amazon_title: Optional[str] = None
+    amazon_description: Optional[str] = None
+    amazon_features: Optional[List[Any]] = None
 
 
 @router.get("/catalogue-items")
@@ -1310,6 +1314,609 @@ def download_pis_template():
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": 'attachment; filename="PIS_Template.xlsx"'},
     )
+
+
+# ─── Bulk edit (download / preview / confirm) ─────────────────────────────────
+#
+# One Excel, one row per product. Editable: catalogue "Details" fields, Ecom
+# Information (Amazon Title / Description / Features 1-9) and Ecom Image URLs.
+# Read-only context: SKU, Name, Brand, Supplier Images. On re-upload a dry-run
+# diff is returned so the UI can show exactly what changes before committing.
+
+_BULK_ECOM_FEATURES = 9
+_BULK_IMAGE_SLOTS   = 16
+
+# Ordered column descriptors. kind drives both the download getter and the
+# upload parser; "fill" tags a column group for cell shading.
+_BULK_COLUMNS: list[dict] = (
+    [
+        {"h": "SKU Code",     "kind": "key",         "fill": None},
+        {"h": "Product Name", "kind": "ro_name",     "fill": None},
+        {"h": "Brand",        "kind": "ro_brand",    "fill": None},
+        {"h": "Sub Category", "kind": "cat_text", "key": "sub_category",  "fill": "detail"},
+        {"h": "Series",       "kind": "cat_text", "key": "series",        "fill": "detail"},
+        {"h": "Material",     "kind": "cat_text", "key": "material",      "fill": "detail"},
+        {"h": "Age Group",    "kind": "cat_text", "key": "age_group",     "fill": "detail"},
+        {"h": "Pet Size",     "kind": "cat_text", "key": "pet_size",      "fill": "detail"},
+        {"h": "Chewing Style","kind": "cat_text", "key": "chewing_style", "fill": "detail"},
+        {"h": "Squeaker (Yes/No)", "kind": "cat_bool", "key": "squeaker", "fill": "detail"},
+        {"h": "Catnip (Yes/No)",   "kind": "cat_bool", "key": "catnip",   "fill": "detail"},
+        {"h": "MRP",   "kind": "cat_num", "key": "mrp",            "fill": "detail"},
+        {"h": "GST %", "kind": "cat_num", "key": "gst_percentage", "fill": "detail"},
+        {"h": "Length (cm)",   "kind": "dim", "key": "length_cm",   "fill": "detail"},
+        {"h": "Breadth (cm)",  "kind": "dim", "key": "breadth_cm",  "fill": "detail"},
+        {"h": "Height (cm)",   "kind": "dim", "key": "height_cm",   "fill": "detail"},
+        {"h": "Net Weight (g)","kind": "dim", "key": "net_weight_g","fill": "detail"},
+        {"h": "Detail Features (| separated)", "kind": "features", "fill": "detail"},
+        {"h": "Drive Image Links (| separated)", "kind": "links",  "fill": "detail"},
+        {"h": "Amazon Title",       "kind": "ecom_title", "fill": "ecom"},
+        {"h": "Amazon Description",  "kind": "ecom_desc",  "fill": "ecom"},
+    ]
+    + [{"h": f"Ecom Feature {i}", "kind": "ecom_feat", "idx": i - 1, "fill": "ecom"}
+       for i in range(1, _BULK_ECOM_FEATURES + 1)]
+    + [{"h": f"Image URL {s}", "kind": "image", "slot": s, "fill": "image"}
+       for s in range(1, _BULK_IMAGE_SLOTS + 1)]
+    + [{"h": "Supplier Images", "kind": "ro_supplier", "fill": None}]
+    # ── Conditional tabs (Nutrition / Treats / Grooming) — at the end ──
+    + [
+        {"h": "Nutrition: Ingredient List",      "kind": "cat_text", "key": "ingredient_list",      "fill": "nutrition"},
+        {"h": "Nutrition: Nutritional Analysis", "kind": "cat_text", "key": "nutritional_analysis", "fill": "nutrition"},
+    ]
+    + [{"h": f"Treats: {a.replace('_', ' ').title()} (Yes/No)", "kind": "sub_bool",
+        "sub": "treats_attributes", "key": a, "fill": "nutrition"} for a in _TREATS_BOOL_ATTRS.values()]
+    + [{"h": f"Treats: {a.replace('_', ' ').title()}", "kind": "sub_text",
+        "sub": "treats_attributes", "key": a, "fill": "nutrition"} for a in _TREATS_TEXT_ATTRS.values()]
+    + [{"h": f"Grooming: {a.replace('_', ' ').title()} (Yes/No)", "kind": "sub_bool",
+        "sub": "grooming_attributes", "key": a, "fill": "nutrition"} for a in _GROOMING_BOOL_ATTRS.values()]
+    + [{"h": f"Grooming: {a.replace('_', ' ').title()}", "kind": "sub_text",
+        "sub": "grooming_attributes", "key": a, "fill": "nutrition"} for a in _GROOMING_TEXT_ATTRS.values()]
+)
+
+_BULK_FILL = {
+    "detail":    PatternFill("solid", fgColor="EFF6FF"),  # light blue
+    "ecom":      PatternFill("solid", fgColor="FEF3C7"),  # light amber
+    "image":     PatternFill("solid", fgColor="F0FDF4"),  # light green
+    "nutrition": PatternFill("solid", fgColor="FCE7F3"),  # light pink
+}
+
+
+def _pipe(vals) -> str:
+    return " | ".join(str(v) for v in (vals or []) if v not in (None, ""))
+
+
+def _norm_ws(v) -> str:
+    """Normalise a cell/DB string for comparison. openpyxl surfaces a carriage
+    return as the literal '_x000D_' (so a DB '\\r\\n' round-trips as '_x000D_\\n').
+    Map '_x000D_' back to '\\r' FIRST, then collapse all CR/LF to a single '\\n',
+    so an untouched round-trip doesn't register as a change."""
+    s = "" if v is None else str(v)
+    s = s.replace("_x000D_", "\r")
+    return s.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _bulk_cell_value(col: dict, p: dict, cat: dict, md: dict) -> Any:
+    kind = col["kind"]
+    if kind == "key":
+        return p.get("cf_sku_code") or cat.get("bb_code") or ""
+    if kind == "ro_name":
+        return p.get("name") or cat.get("product_name") or ""
+    if kind == "ro_brand":
+        return p.get("brand") or ""
+    if kind == "ro_supplier":
+        return _pipe(p.get("supplier_images"))
+    if kind == "cat_text":
+        return cat.get(col["key"]) or ""
+    if kind == "cat_bool":
+        v = cat.get(col["key"])
+        return "Yes" if v is True else ("No" if v is False else "")
+    if kind == "cat_num":
+        return cat.get(col["key"])
+    if kind == "dim":
+        d = (cat.get("dimensions") or {}).get("without_packaging") or {}
+        return d.get(col["key"])
+    if kind == "features":
+        return _pipe(cat.get("features"))
+    if kind == "links":
+        return _pipe(cat.get("image_links"))
+    if kind == "ecom_title":
+        return cat.get("amazon_title") or md.get("amazon_title") or ""
+    if kind == "ecom_desc":
+        return cat.get("amazon_description") or md.get("amazon_description") or ""
+    if kind == "ecom_feat":
+        feats = cat.get("amazon_features") or md.get("amazon_features") or []
+        i = col["idx"]
+        return feats[i] if i < len(feats) else ""
+    if kind == "image":
+        return (md.get("images") or {}).get(str(col["slot"]), "")
+    if kind == "sub_text":
+        return (cat.get(col["sub"]) or {}).get(col["key"]) or ""
+    if kind == "sub_bool":
+        v = (cat.get(col["sub"]) or {}).get(col["key"])
+        return "Yes" if v is True else ("No" if v is False else "")
+    return ""
+
+
+def _make_bulk_edit_xlsx(products: list, master_data: dict) -> io.BytesIO:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Products"
+    headers = [c["h"] for c in _BULK_COLUMNS]
+    ws.append(headers)
+    _style_header_row(ws, 1, len(headers))
+    ws.freeze_panes = "B2"
+
+    thin = Side(style="thin", color="D1D5DB")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for r, p in enumerate(products, start=2):
+        cat = p.get("catalogue") or {}
+        md = master_data.get(p.get("cf_sku_code") or "", {})
+        for c, col in enumerate(_BULK_COLUMNS, start=1):
+            cell = ws.cell(row=r, column=c, value=_bulk_cell_value(col, p, cat, md))
+            cell.border = border
+            cell.alignment = Alignment(vertical="center", wrap_text=False)
+            fill = _BULK_FILL.get(col.get("fill"))
+            if fill:
+                cell.fill = fill
+
+    _auto_col_width(ws)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def _bulk_query(db, search, brand, zoho_status, purchase_status, category) -> list:
+    col = db[PRODUCTS_COLLECTION]
+    q: dict = {"is_combo_product": {"$ne": True}}
+    if search:
+        rgx = {"$regex": re.escape(search), "$options": "i"}
+        cat_ids = db[DESIGN_CATALOGUE_COLLECTION].distinct("product_id", {"bb_code": rgx})
+        q["$or"] = [{"name": rgx}, {"cf_sku_code": rgx}, {"sku": rgx}, {"_id": {"$in": cat_ids}}]
+    if brand:
+        q["brand"] = brand
+    if zoho_status:
+        q["status"] = zoho_status.lower()
+    if purchase_status:
+        q["purchase_status"] = purchase_status
+    if category:
+        cat_ids_for_cat = db[DESIGN_CATALOGUE_COLLECTION].distinct("product_id", {"product_category": category})
+        q["_id"] = {"$in": cat_ids_for_cat}
+    pipeline = [
+        {"$match": q},
+        {"$sort": {"created_at": -1, "_id": -1}},
+        # Join by bb_code == cf_sku_code (the SKU key) so the download matches
+        # exactly how the upload looks up catalogue docs — joining by product_id
+        # silently blanked rows whose catalogue doc had a mismatched product_id.
+        {"$lookup": {
+            "from": DESIGN_CATALOGUE_COLLECTION,
+            "localField": "cf_sku_code", "foreignField": "bb_code", "as": "_cat",
+            "pipeline": [{"$project": {**_CATALOGUE_LOOKUP_FIELDS, "image_links": 1, "grooming_attributes": 1}}],
+        }},
+        {"$addFields": {"catalogue": {"$arrayElemAt": ["$_cat", 0]}}},
+        {"$project": {"_cat": 0}},
+    ]
+    return list(col.aggregate(pipeline))
+
+
+@router.get("/products/bulk-edit/download")
+def bulk_edit_download(
+    search: str = Query(None),
+    brand: str = Query(None),
+    zoho_status: str = Query(None),
+    purchase_status: str = Query(None),
+    category: str = Query(None),
+):
+    """Download all matching products as a single bulk-edit XLSX (all tabs' data)."""
+    from .sheets_updater import bulk_read_master_sync
+    try:
+        db = get_database()
+        products = serialize_mongo_document(
+            _bulk_query(db, search, brand, zoho_status, purchase_status, category)
+        )
+        skus = {p.get("cf_sku_code") for p in products if p.get("cf_sku_code")}
+        try:
+            master_data = bulk_read_master_sync(skus) if skus else {}
+        except Exception as exc:
+            logger.warning("bulk-edit download: master read failed (%s) — images blank", exc)
+            master_data = {}
+        buf = _make_bulk_edit_xlsx(products, master_data)
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": 'attachment; filename="bulk_edit.xlsx"'},
+        )
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _embedded_images_by_cell(ws) -> dict[tuple[int, int], Any]:
+    """(0-based row, 0-based col) → openpyxl image object anchored to that cell."""
+    out: dict[tuple[int, int], Any] = {}
+    for img in (getattr(ws, "_images", []) or []):
+        try:
+            anc = img.anchor._from
+            out[(anc.row, anc.col)] = img
+        except Exception:
+            continue
+    return out
+
+
+def _extract_rich_value_images(data: bytes) -> dict[tuple[int, int], tuple[bytes, str]]:
+    """Extract Excel 'Place in cell' (rich-value) images → {(row0,col0): (bytes,ext)}.
+
+    openpyxl surfaces these cells as the error '#VALUE!' and does NOT expose the
+    image via ws._images. The image is reachable through the chain:
+    cell@vm → metadata.xml valueMetadata → richValueRel.xml → _rels → xl/media.
+    """
+    import zipfile
+    import xml.etree.ElementTree as ET
+    from openpyxl.utils.cell import coordinate_to_tuple
+
+    out: dict[tuple[int, int], tuple[bytes, str]] = {}
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception:
+        return out
+    names = set(zf.namelist())
+
+    def _ln(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    def _parse(name: str):
+        try:
+            return ET.fromstring(zf.read(name)) if name in names else None
+        except Exception:
+            return None
+
+    # 1) cell ref → vm (value-metadata index, 1-based) across all worksheets
+    cell_vm: dict[tuple[int, int], int] = {}
+    for wsname in [n for n in names if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]:
+        root = _parse(wsname)
+        if root is None:
+            continue
+        for c in root.iter():
+            if _ln(c.tag) != "c" or not c.get("vm") or not c.get("r"):
+                continue
+            try:
+                r1, c1 = coordinate_to_tuple(c.get("r"))
+                cell_vm[(r1 - 1, c1 - 1)] = int(c.get("vm"))
+            except Exception:
+                continue
+    if not cell_vm:
+        return out
+
+    # 2) vm (1-based) → rich-value index (metadata.xml valueMetadata[bk].rc.v)
+    vm_to_rv: dict[int, int] = {}
+    meta = _parse("xl/metadata.xml")
+    if meta is None:
+        return out
+    vmeta = next((e for e in meta.iter() if _ln(e.tag) == "valueMetadata"), None)
+    if vmeta is None:
+        return out
+    for i, bk in enumerate([e for e in list(vmeta) if _ln(e.tag) == "bk"], start=1):
+        rc = next((x for x in bk.iter() if _ln(x.tag) == "rc"), None)
+        if rc is not None and rc.get("v") is not None:
+            try:
+                vm_to_rv[i] = int(rc.get("v"))
+            except Exception:
+                pass
+
+    # 3) rich-value index (0-based) → relationship id (richValueRel.xml order)
+    rv_to_rid: dict[int, str] = {}
+    rvr = _parse("xl/richData/richValueRel.xml")
+    if rvr is not None:
+        for i, rel in enumerate([e for e in rvr.iter() if _ln(e.tag) == "rel"]):
+            rid = next((v for k, v in rel.attrib.items() if _ln(k) == "id"), None)
+            if rid:
+                rv_to_rid[i] = rid
+
+    # 4) relationship id → media path
+    rid_to_media: dict[str, str] = {}
+    relsx = _parse("xl/richData/_rels/richValueRel.xml.rels")
+    if relsx is not None:
+        for rel in relsx.iter():
+            if _ln(rel.tag) != "Relationship":
+                continue
+            rid, tgt = rel.get("Id"), rel.get("Target")
+            if rid and tgt:
+                p = tgt.replace("../", "xl/")
+                rid_to_media[rid] = p if p.startswith("xl/") else "xl/" + p.lstrip("/")
+
+    # combine the chain
+    for cell, vm in cell_vm.items():
+        rv = vm_to_rv.get(vm)
+        if rv is None:
+            continue
+        rid = rv_to_rid.get(rv)
+        media = rid_to_media.get(rid) if rid else None
+        if not media or media not in names:
+            continue
+        try:
+            out[cell] = (zf.read(media), media.rsplit(".", 1)[-1].lower() if "." in media else "png")
+        except Exception:
+            continue
+    return out
+
+
+def _img_bytes_ext(img) -> tuple[bytes | None, str]:
+    data = None
+    try:
+        data = img._data()
+    except Exception:
+        ref = getattr(img, "ref", None)
+        if hasattr(ref, "getvalue"):
+            data = ref.getvalue()
+    ext = (getattr(img, "format", None) or "png").lower()
+    return data, ext
+
+
+def _process_bulk_edit_workbook(data: bytes, db, dry_run: bool) -> dict:
+    from .sheets_updater import (
+        bulk_read_master_sync, bulk_write_master_sync,
+        upload_image_bytes_to_public_s3, _sync_order_form_images_sync,
+    )
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read Excel file")
+    ws = wb[wb.sheetnames[0]]
+    if ws.max_row < 2:
+        return {"summary": {"total_rows": 0, "updated": 0, "not_found": 0, "skipped": 0},
+                "updated": [], "not_found": [], "skipped": []}
+
+    # Map column index (0-based) → descriptor, via header text.
+    header_to_col = {c["h"].strip().lower(): c for c in _BULK_COLUMNS}
+    col_specs: dict[int, dict] = {}
+    key_col_idx = -1
+    for ci, cell in enumerate(ws[1]):
+        spec = header_to_col.get(str(cell.value or "").strip().lower())
+        if spec:
+            col_specs[ci] = spec
+            if spec["kind"] == "key":
+                key_col_idx = ci
+    if key_col_idx == -1:
+        raise HTTPException(status_code=400, detail="Missing 'SKU Code' column")
+
+    # Collect SKUs to bulk-fetch products + master state.
+    skus: list[str] = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        s = str(row[key_col_idx]).strip() if key_col_idx < len(row) and row[key_col_idx] is not None else ""
+        if s:
+            skus.append(s)
+    sku_set = set(skus)
+    prods = {
+        p.get("cf_sku_code"): p
+        for p in db[PRODUCTS_COLLECTION].find({"cf_sku_code": {"$in": list(sku_set)}})
+    }
+    cats = {
+        c.get("bb_code"): c
+        for c in db[DESIGN_CATALOGUE_COLLECTION].find({"bb_code": {"$in": list(sku_set)}})
+    }
+    try:
+        master_data = bulk_read_master_sync(sku_set) if sku_set else {}
+    except Exception:
+        master_data = {}
+    embedded = _embedded_images_by_cell(ws)
+    rich_imgs = _extract_rich_value_images(data)
+
+    updated: list[dict] = []
+    not_found: list[dict] = []
+    skipped: list[dict] = []
+    master_payload: dict[str, dict] = {}
+    image_sync_jobs: list[tuple[str, dict]] = []
+
+    for r_off, row in enumerate(ws.iter_rows(min_row=2, values_only=True)):
+        row_num = r_off + 2  # 1-based sheet row
+        sku = str(row[key_col_idx]).strip() if key_col_idx < len(row) and row[key_col_idx] is not None else ""
+        if not sku:
+            continue
+        prod = prods.get(sku)
+        if not prod:
+            not_found.append({"identifier": sku, "row": row_num})
+            continue
+        cat = cats.get(sku) or {}
+        md = master_data.get(sku, {})
+
+        cat_set: dict[str, Any] = {}
+        changes: list[dict] = []
+        ecom_title = ecom_desc = None
+        ecom_feats: list[str | None] = [None] * _BULK_ECOM_FEATURES
+        ecom_touched = False
+        image_changes: dict[str, str] = {}
+
+        def _cell(ci: int):
+            return row[ci] if ci < len(row) else None
+
+        for ci, spec in col_specs.items():
+            kind = spec["kind"]
+            raw = _cell(ci)
+            sval = _norm_ws(raw)
+
+            if kind in ("key", "ro_name", "ro_brand", "ro_supplier"):
+                continue
+
+            if kind == "cat_text":
+                old = cat.get(spec["key"]) or ""
+                if sval != _norm_ws(old):
+                    cat_set[spec["key"]] = sval or None
+                    changes.append({"field": spec["h"], "old": old, "new": sval})
+            elif kind == "cat_bool":
+                new_b = _to_bool(raw)
+                old = cat.get(spec["key"])
+                if new_b is not None and new_b != old:
+                    cat_set[spec["key"]] = new_b
+                    changes.append({"field": spec["h"], "old": "Yes" if old else ("No" if old is False else ""),
+                                    "new": "Yes" if new_b else "No"})
+            elif kind == "cat_num":
+                new_n = _to_float(raw)
+                old = cat.get(spec["key"])
+                if new_n != old:
+                    cat_set[spec["key"]] = new_n
+                    changes.append({"field": spec["h"], "old": old, "new": new_n})
+            elif kind == "dim":
+                new_n = _to_float(raw)
+                old = ((cat.get("dimensions") or {}).get("without_packaging") or {}).get(spec["key"])
+                if new_n != old:
+                    cat_set.setdefault("__dims", {})[spec["key"]] = new_n
+                    changes.append({"field": spec["h"], "old": old, "new": new_n})
+            elif kind == "sub_text":
+                old = (cat.get(spec["sub"]) or {}).get(spec["key"]) or ""
+                if sval != _norm_ws(old):
+                    cat_set.setdefault("__sub", {}).setdefault(spec["sub"], {})[spec["key"]] = sval or None
+                    changes.append({"field": spec["h"], "old": old, "new": sval})
+            elif kind == "sub_bool":
+                new_b = _to_bool(raw)
+                old = (cat.get(spec["sub"]) or {}).get(spec["key"])
+                if new_b is not None and new_b != old:
+                    cat_set.setdefault("__sub", {}).setdefault(spec["sub"], {})[spec["key"]] = new_b
+                    changes.append({"field": spec["h"], "old": "Yes" if old else ("No" if old is False else ""),
+                                    "new": "Yes" if new_b else "No"})
+            elif kind in ("features", "links"):
+                # Compare the whole pipe-joined string (both sides built by _pipe)
+                # rather than re-splitting — feature/link TEXT itself can contain
+                # ' | ' and internal newlines, so splitting on '|' breaks element
+                # boundaries and yields phantom diffs. Only re-split to store.
+                field_key = "features" if kind == "features" else "image_links"
+                old_joined = _norm_ws(_pipe(cat.get(field_key)))
+                if sval != old_joined:
+                    cat_set[field_key] = [x.strip() for x in sval.split("|") if x.strip()] if sval else []
+                    changes.append({"field": spec["h"], "old": old_joined, "new": sval})
+            elif kind == "ecom_title":
+                old = cat.get("amazon_title") or md.get("amazon_title") or ""
+                if sval != _norm_ws(old):
+                    ecom_title = sval; ecom_touched = True
+                    changes.append({"field": spec["h"], "old": old, "new": sval})
+            elif kind == "ecom_desc":
+                old = cat.get("amazon_description") or md.get("amazon_description") or ""
+                if sval != _norm_ws(old):
+                    ecom_desc = sval; ecom_touched = True
+                    changes.append({"field": spec["h"], "old": old, "new": sval})
+            elif kind == "ecom_feat":
+                idx = spec["idx"]
+                old_list = cat.get("amazon_features") or md.get("amazon_features") or []
+                old = old_list[idx] if idx < len(old_list) else ""
+                ecom_feats[idx] = sval
+                if sval != _norm_ws(old):
+                    ecom_touched = True
+                    changes.append({"field": spec["h"], "old": old, "new": sval})
+            elif kind == "image":
+                slot = spec["slot"]
+                old = (md.get("images") or {}).get(str(slot), "")
+                cell_key = (row_num - 1, ci)
+                emb = embedded.get(cell_key)            # floating image
+                rich = rich_imgs.get(cell_key)          # 'place in cell' image
+                # An Excel error string ('#VALUE!', '#REF!', …) means a rich-value
+                # image lives in the cell — never treat it as a URL.
+                is_error = sval.startswith("#") and sval.endswith(("!", "?", "A", "0"))
+                has_url = bool(sval) and not is_error
+                if has_url and sval != old:
+                    image_changes[str(slot)] = sval
+                    changes.append({"field": spec["h"], "old": old, "new": sval})
+                elif rich is not None or emb is not None:
+                    if dry_run:
+                        changes.append({"field": spec["h"], "old": old, "new": "(image in cell → will upload to S3)"})
+                        image_changes[str(slot)] = "__EMBEDDED__"
+                    else:
+                        if rich is not None:
+                            img_bytes, ext = rich
+                        else:
+                            img_bytes, ext = _img_bytes_ext(emb)
+                        if img_bytes:
+                            ctype = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext or 'png'}"
+                            url = upload_image_bytes_to_public_s3(
+                                str(prod.get("item_id") or sku), img_bytes, ext, content_type=ctype,
+                            )
+                            image_changes[str(slot)] = url
+                            changes.append({"field": spec["h"], "old": old, "new": url})
+
+        if not changes:
+            skipped.append({"identifier": sku, "row": row_num, "reason": "No changes"})
+            continue
+
+        # ── Apply (confirm only) ──
+        if not dry_run:
+            if "__dims" in cat_set:
+                dims = dict((cat.get("dimensions") or {}))
+                wp = dict(dims.get("without_packaging") or {})
+                wp.update(cat_set.pop("__dims"))
+                dims["without_packaging"] = wp
+                cat_set["dimensions"] = dims
+            if "__sub" in cat_set:
+                for subname, vals in cat_set.pop("__sub").items():
+                    merged = dict(cat.get(subname) or {})
+                    merged.update(vals)
+                    cat_set[subname] = merged
+            if ecom_touched:
+                cat_set["amazon_title"] = ecom_title if ecom_title is not None else (cat.get("amazon_title") or md.get("amazon_title") or "")
+                cat_set["amazon_description"] = ecom_desc if ecom_desc is not None else (cat.get("amazon_description") or md.get("amazon_description") or "")
+                merged_feats = list(cat.get("amazon_features") or md.get("amazon_features") or [])
+                merged_feats = (merged_feats + [""] * _BULK_ECOM_FEATURES)[:_BULK_ECOM_FEATURES]
+                for i, fv in enumerate(ecom_feats):
+                    if fv is not None:
+                        merged_feats[i] = fv
+                cat_set["amazon_features"] = merged_feats
+            if cat_set:
+                cat_set["updated_at"] = utcnow()
+                # Match by bb_code — the same key the rows were read with — so we
+                # update the existing doc instead of creating a product_id duplicate.
+                db[DESIGN_CATALOGUE_COLLECTION].update_one(
+                    {"bb_code": sku},
+                    {"$set": cat_set, "$setOnInsert": {"product_id": prod["_id"]}},
+                    upsert=True,
+                )
+            # Master sheet ecom + images
+            entry: dict = {}
+            if ecom_touched:
+                entry["ecom"] = {
+                    "amazon_title": cat_set.get("amazon_title", ""),
+                    "amazon_description": cat_set.get("amazon_description", ""),
+                    "amazon_features": cat_set.get("amazon_features", []),
+                }
+            real_imgs = {s: u for s, u in image_changes.items() if u != "__EMBEDDED__"}
+            if real_imgs:
+                entry["images"] = real_imgs
+                # Full slot dict for products.images sync
+                full = dict(md.get("images") or {})
+                full.update(real_imgs)
+                image_sync_jobs.append((sku, full))
+            if entry:
+                master_payload[sku] = entry
+
+        updated.append({"identifier": sku, "product_name": prod.get("name", ""),
+                        "row": row_num, "fields_changed": changes})
+
+    if not dry_run:
+        if master_payload:
+            try:
+                bulk_write_master_sync(master_payload)
+            except Exception as exc:
+                logger.warning("bulk-edit confirm: master write failed: %s", exc)
+        for sku, full in image_sync_jobs:
+            try:
+                _sync_order_form_images_sync(sku, full, db)
+            except Exception:
+                logger.warning("bulk-edit confirm: image sync failed for %s", sku)
+
+    return {
+        "summary": {
+            "total_rows": len(updated) + len(not_found) + len(skipped),
+            "updated": len(updated), "not_found": len(not_found), "skipped": len(skipped),
+        },
+        "updated": updated, "not_found": not_found, "skipped": skipped,
+    }
+
+
+@router.post("/products/bulk-edit/preview")
+async def bulk_edit_preview(file: UploadFile = File(...), db=Depends(get_database)):
+    data = await file.read()
+    return await asyncio.to_thread(_process_bulk_edit_workbook, data, db, True)
+
+
+@router.post("/products/bulk-edit/confirm")
+async def bulk_edit_confirm(file: UploadFile = File(...), db=Depends(get_database)):
+    data = await file.read()
+    return await asyncio.to_thread(_process_bulk_edit_workbook, data, db, False)
 
 
 # ─── designer orders ──────────────────────────────────────────────────────────

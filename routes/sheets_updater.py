@@ -857,6 +857,12 @@ _BASE_URL = os.getenv("BASE_URL", "https://purchase.pupscribe.in/api").rstrip("/
 _ECOM_ZIP_COL_INDEX     = 84  # CF — Ecom Images zip
 _SUPPLIER_ZIP_COL_INDEX = 90  # CL — Supplier Images zip
 
+# Master-sheet columns for Ecom Information (1-indexed).
+_ECOM_TITLE_COL         = 26  # Z  — Amazon Title
+_ECOM_FEATURE_START_COL = 55  # BC — Feature 1 (Primary) … BK = 63 (Feature 9)
+_ECOM_FEATURE_COUNT     = 9
+_ECOM_DESC_COL          = 64  # BL — Description
+
 
 def _public_s3():
     import boto3
@@ -1147,6 +1153,237 @@ async def update_product_images(
         "order_form_synced": synced > 0,
         "ecom_zip_url": ecom_zip_url,
     }
+
+
+# ── Ecom Information (Amazon Title / Description / Features → Master sheet) ───
+
+
+class EcomInfoUpdateRequest(BaseModel):
+    amazon_title: str = ""
+    amazon_description: str = ""
+    amazon_features: list[str] = []  # up to 9; padded/truncated on write
+
+
+def _ecom_info_extra_cols(title: str, description: str, features: list[str]) -> dict[int, str]:
+    """Build the {1-indexed col → value} map for the ecom-info Master columns.
+
+    Features are padded to _ECOM_FEATURE_COUNT with "" so cleared values
+    overwrite stale cells; extras beyond 9 are dropped.
+    """
+    extra: dict[int, str] = {
+        _ECOM_TITLE_COL: title or "",
+        _ECOM_DESC_COL:  description or "",
+    }
+    feats = (list(features) + [""] * _ECOM_FEATURE_COUNT)[:_ECOM_FEATURE_COUNT]
+    for i, feat in enumerate(feats):
+        extra[_ECOM_FEATURE_START_COL + i] = feat or ""
+    return extra
+
+
+def _upsert_ecom_info_catalogue_sync(sku_code: str, body: "EcomInfoUpdateRequest", db) -> None:
+    """Persist ecom info into design_catalogue, matched by bb_code == sku_code."""
+    feats = [f for f in (body.amazon_features or [])][:_ECOM_FEATURE_COUNT]
+    db["design_catalogue"].update_one(
+        {"bb_code": sku_code},
+        {"$set": {
+            "amazon_title": body.amazon_title or "",
+            "amazon_description": body.amazon_description or "",
+            "amazon_features": feats,
+            "updated_at": datetime.utcnow(),
+        }},
+        upsert=True,
+    )
+
+
+def _read_ecom_info_sync(sku_code: str) -> dict | None:
+    """Read Amazon Title / Description / Features 1-9 from the Master sheet
+    (cols Z, BC-BK, BL) for the matching SKU row. None if the SKU isn't found."""
+    _, sh = _open_sheet(MASTER_SHEET_ID, writable=False)
+    ws = sh.worksheet(MASTER_SHEET_NAME)
+    all_rows = ws.get_all_values()
+    if len(all_rows) <= HEADER_ROW_INDEX:
+        return None
+    sku_col, _ = _master_col_maps(all_rows)
+
+    def _cell(row: list[str], col_1: int) -> str:
+        i = col_1 - 1
+        return row[i].strip() if i < len(row) else ""
+
+    for row in all_rows[DATA_START_ROW:]:
+        if (row[sku_col].strip() if sku_col < len(row) else "") != sku_code:
+            continue
+        return {
+            "amazon_title": _cell(row, _ECOM_TITLE_COL),
+            "amazon_description": _cell(row, _ECOM_DESC_COL),
+            "amazon_features": [
+                _cell(row, _ECOM_FEATURE_START_COL + i)
+                for i in range(_ECOM_FEATURE_COUNT)
+            ],
+        }
+    return None
+
+
+@router.get("/ecom-info/{sku_code}")
+async def get_ecom_info(sku_code: str, db=Depends(get_database)):
+    """Pull the SKU's Ecom Information live from the Master sheet for display.
+    Falls back to design_catalogue if the sheet read fails or the row is absent."""
+    info = None
+    try:
+        info = await asyncio.to_thread(_read_ecom_info_sync, sku_code)
+    except Exception as exc:
+        logger.warning("ecom-info read failed for %s: %s", sku_code, exc)
+
+    if info is None:
+        def _from_cat():
+            cat = db["design_catalogue"].find_one(
+                {"bb_code": sku_code},
+                {"amazon_title": 1, "amazon_description": 1, "amazon_features": 1},
+            ) or {}
+            feats = list(cat.get("amazon_features") or [])
+            feats = (feats + [""] * _ECOM_FEATURE_COUNT)[:_ECOM_FEATURE_COUNT]
+            return {
+                "amazon_title": cat.get("amazon_title") or "",
+                "amazon_description": cat.get("amazon_description") or "",
+                "amazon_features": feats,
+                "source": "catalogue",
+            }
+        result = await asyncio.to_thread(_from_cat)
+        return result
+
+    info["source"] = "master_sheet"
+    return info
+
+
+@router.put("/ecom-info/{sku_code}")
+async def update_ecom_info(
+    sku_code: str,
+    body: EcomInfoUpdateRequest,
+    db=Depends(get_database),
+):
+    """Save Amazon Title / Description / Features 1-9 to design_catalogue and the
+    Master sheet (cols Z, BC-BK, BL) for the matching SKU row."""
+    await asyncio.to_thread(_upsert_ecom_info_catalogue_sync, sku_code, body, db)
+    extra_cols = _ecom_info_extra_cols(
+        body.amazon_title, body.amazon_description, body.amazon_features
+    )
+    cells = await asyncio.to_thread(
+        _write_product_images_sync, sku_code, "Master", {}, extra_cols
+    )
+    return {"success": True, "sku_code": sku_code, "cells_updated": cells}
+
+
+# ── Bulk helpers (shared by the design.py bulk-edit endpoints) ───────────────
+
+
+def _master_col_maps(all_rows: list[list[str]]) -> tuple[int, dict[str, int]]:
+    """Return (sku_col_idx, {slot_str: col_idx}) from the Master header row."""
+    header_lower = [h.strip().lower() for h in all_rows[HEADER_ROW_INDEX]]
+    sku_col = next((i for i, h in enumerate(header_lower) if h == "sku code (final)"), 3)
+    img_col: dict[str, int] = {}
+    for slot in range(1, _NUM_IMAGE_SLOTS + 1):
+        idx = next((i for i, h in enumerate(header_lower) if h == f"image url {slot}"), -1)
+        if idx != -1:
+            img_col[str(slot)] = idx
+    return sku_col, img_col
+
+
+def bulk_read_master_sync(skus: set[str]) -> dict[str, dict]:
+    """One Master read → {sku: {images:{slot:url}, amazon_title, amazon_description,
+    amazon_features:[...]}}, for the bulk-edit download."""
+    _, sh = _open_sheet(MASTER_SHEET_ID, writable=False)
+    ws = sh.worksheet(MASTER_SHEET_NAME)
+    all_rows = ws.get_all_values()
+    if len(all_rows) <= HEADER_ROW_INDEX:
+        return {}
+    sku_col, img_col = _master_col_maps(all_rows)
+
+    def _cell(row: list[str], col_1: int) -> str:
+        i = col_1 - 1
+        return row[i].strip() if i < len(row) else ""
+
+    out: dict[str, dict] = {}
+    for row in all_rows[DATA_START_ROW:]:
+        sku = (row[sku_col].strip() if sku_col < len(row) else "")
+        if not sku or sku not in skus or sku in out:
+            continue
+        out[sku] = {
+            "images": {
+                s: (row[c].strip() if c < len(row) else "")
+                for s, c in img_col.items()
+            },
+            "amazon_title": _cell(row, _ECOM_TITLE_COL),
+            "amazon_description": _cell(row, _ECOM_DESC_COL),
+            "amazon_features": [
+                _cell(row, _ECOM_FEATURE_START_COL + i)
+                for i in range(_ECOM_FEATURE_COUNT)
+            ],
+        }
+    return out
+
+
+def bulk_write_master_sync(payload: dict[str, dict]) -> int:
+    """One Master read + one batch_update. payload[sku] may contain:
+    {"ecom": {"amazon_title","amazon_description","amazon_features"}, "images": {slot: url}}.
+    Returns the number of matched SKU rows written."""
+    import gspread
+
+    if not payload:
+        return 0
+    _, sh = _open_sheet(MASTER_SHEET_ID, writable=True)
+    ws = sh.worksheet(MASTER_SHEET_NAME)
+    all_rows = ws.get_all_values()
+    if len(all_rows) <= HEADER_ROW_INDEX:
+        return 0
+    sku_col, img_col = _master_col_maps(all_rows)
+
+    row_for_sku: dict[str, int] = {}
+    for ridx, row in enumerate(all_rows[DATA_START_ROW:]):
+        s = (row[sku_col].strip() if sku_col < len(row) else "")
+        if s and s in payload and s not in row_for_sku:
+            row_for_sku[s] = DATA_START_ROW + 1 + ridx
+
+    updates: list[dict] = []
+    for sku, data in payload.items():
+        rownum = row_for_sku.get(sku)
+        if not rownum:
+            continue
+        ecom = data.get("ecom")
+        if ecom:
+            extra = _ecom_info_extra_cols(
+                ecom.get("amazon_title", ""),
+                ecom.get("amazon_description", ""),
+                ecom.get("amazon_features", []) or [],
+            )
+            for col_1, val in extra.items():
+                updates.append({
+                    "range": gspread.utils.rowcol_to_a1(rownum, col_1),
+                    "values": [[val]],
+                })
+        for slot, url in (data.get("images") or {}).items():
+            col = img_col.get(str(slot))
+            if col is not None:
+                updates.append({
+                    "range": gspread.utils.rowcol_to_a1(rownum, col + 1),
+                    "values": [[url]],
+                })
+
+    if updates:
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+    return len(row_for_sku)
+
+
+def upload_image_bytes_to_public_s3(item_id: str, data: bytes, ext: str, content_type: str = "image/png") -> str:
+    """Upload raw image bytes (e.g. an embedded xlsx image) to the public bucket and
+    return its public URL. Mirrors the product-images key format."""
+    import time as _time
+
+    safe_ext = ext if ext.startswith(".") else f".{ext or 'png'}"
+    key = f"product_images/{item_id}_{int(_time.time() * 1000)}{safe_ext}"
+    _public_s3().put_object(
+        Bucket=_PUBLIC_S3_BUCKET, Key=key, Body=data,
+        ContentType=content_type, ACL="public-read",
+    )
+    return f"{_PUBLIC_S3_URL}/{key}"
 
 
 # ── Ecom / Supplier image zip downloads (public, on-the-fly) ─────────────────
