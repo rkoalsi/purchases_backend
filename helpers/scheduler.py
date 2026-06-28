@@ -588,14 +588,40 @@ async def generate_and_send_draft_order_slack_report():
 
         currency_symbols = {"USD": "$", "EUR": "€", "GBP": "£", "CNY": "¥", "INR": "₹"}
 
+        def _normalize_brand(name: str) -> str:
+            return "Petfest" if name in ("Dogfest", "Catfest") else name
+
+        # Determine all brands whose vendor is overseas (gst_treatment == "overseas").
+        # These must always appear in the summary, even with zero draft-order activity
+        # (e.g. Afterbath), so they're pre-seeded into brand_totals below.
+        def _fetch_overseas_brands() -> set:
+            overseas: set = set()
+            brands = list(db.get_collection("brands").find({}, {"name": 1, "vendor_id": 1}))
+            vendor_ids = [b["vendor_id"] for b in brands if b.get("vendor_id")]
+            vendor_docs = db.get_collection("vendors").find(
+                {"vendor_id": {"$in": vendor_ids}},
+                {"vendor_id": 1, "gst_treatment": 1},
+            )
+            overseas_vendor_ids = {
+                v["vendor_id"] for v in vendor_docs if v.get("gst_treatment") == "overseas"
+            }
+            for b in brands:
+                name = b.get("name")
+                if name and b.get("vendor_id") in overseas_vendor_ids:
+                    overseas.add(_normalize_brand(name))
+            return overseas
+
+        overseas_brands = await asyncio.to_thread(_fetch_overseas_brands)
+
         # Aggregate by brand
-        brand_totals: Dict[str, Dict] = {}
+        brand_totals: Dict[str, Dict] = {
+            brand: {"total_cbm": 0.0, "amounts": {}, "always_show": True}
+            for brand in overseas_brands
+        }
         for item in combined_data:
             if not isinstance(item, dict):
                 continue
-            brand = item.get("brand") or "Unknown"
-            if brand in ("Dogfest", "Catfest"):
-                brand = "Petfest"
+            brand = _normalize_brand(item.get("brand") or "Unknown")
             total_cbm = float(item.get("total_cbm") or 0)
             qty_rounded = float(item.get("order_qty_plus_extra_qty_rounded") or 0)
             unit_price = float(item.get("unit_price") or 0)
@@ -639,7 +665,8 @@ async def generate_and_send_draft_order_slack_report():
             cbm = data["total_cbm"]
             amounts = {cur: amt for cur, amt in data["amounts"].items() if amt > 0}
 
-            if cbm == 0 and not amounts:
+            # Always show overseas brands (e.g. Afterbath) even with no activity.
+            if cbm == 0 and not amounts and not data.get("always_show"):
                 continue
 
             amount_str = "  |  ".join(fmt_amount(cur, amt) for cur, amt in amounts.items())
@@ -750,7 +777,7 @@ def setup_scheduler():
     # Daily draft order report at 11 AM IST (05:30 UTC)
     scheduler.add_job(
         scheduled_draft_order_report,
-        trigger=CronTrigger(hour=4, minute=0, timezone="UTC"),
+        trigger=CronTrigger(hour=20, minute=14),
         id="daily_draft_order_report",
         name="Daily Draft Order Slack Report",
         replace_existing=True,
