@@ -767,14 +767,24 @@ def _parse_template(file_bytes: bytes) -> list[dict]:
                 pass
         if duty is not None:
             try:
-                product["custom_duty"] = float(duty)
+                duty_val = float(duty)
+                # Percentage-formatted cells (e.g. "10%") come through as 0.10;
+                # plain numbers come through as 10. Normalise to a whole percent.
+                if 0 < duty_val < 1:
+                    duty_val *= 100
+                product["custom_duty"] = duty_val
             except (ValueError, TypeError):
                 pass
         if hsn is not None:
             product["hsn_or_sac"] = str(hsn)
         if gst is not None:
             try:
-                product["gst_pct"] = float(gst)
+                gst_val = float(gst)
+                # Percentage-formatted cells (e.g. "5%") come through as 0.05;
+                # plain numbers come through as 5. Normalise to a whole percent.
+                if 0 < gst_val < 1:
+                    gst_val *= 100
+                product["gst_pct"] = gst_val
             except (ValueError, TypeError):
                 pass
 
