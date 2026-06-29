@@ -118,11 +118,13 @@ def _fetch_data(db, drr_map: dict) -> tuple:
     # 6. Open PO from vendor_purchase_orders:
     #    processing → supply_qty_override if set, else final_supply_fo if set,
     #                 else supply_qty if > 0, else requested_qty
-    #    pending/packed/closed/intransit → final_supply_fo if set, else accepted_qty
+    #    pending/packed/intransit → final_supply_fo if set, else accepted_qty
     #                              (accepted_qty is often 0 while still packed/pending)
+    #    "closed" is intentionally excluded — a closed PO is no longer open, so it
+    #    must not contribute to the Open PO qty (even if final_supply_fo is set).
     open_po_by_asin: dict[str, int] = {}
     for doc in db["vendor_purchase_orders"].aggregate([
-        {"$match": {"po_status": {"$in": ["processing", "pending", "packed", "closed", "intransit"]}}},
+        {"$match": {"po_status": {"$in": ["processing", "pending", "packed", "intransit"]}}},
         {"$unwind": "$items"},
         {"$match": {"items.asin": {"$in": asins}}},
         {"$group": {
