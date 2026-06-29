@@ -691,14 +691,16 @@ def _enrich_items(
                 )
 
         # open PO: processing → supply_qty_override if set, else final_supply_fo if set, else supply_qty if > 0, else requested_qty
-        #          packed/closed/intransit → final_supply_fo if set, else accepted_qty
+        #          packed/intransit → final_supply_fo if set, else accepted_qty
+        # "closed" is intentionally excluded — a closed PO is no longer open, so it
+        # must not contribute to the Open PO qty (even if final_supply_fo is set).
         for doc in db[PO_COLLECTION].aggregate(
             [
                 {
                     "$match": {
                         "po_number": {"$ne": po_number},
                         "po_status": {
-                            "$in": ["processing", "packed", "closed", "intransit"]
+                            "$in": ["processing", "packed", "intransit"]
                         },
                     }
                 },
@@ -710,7 +712,7 @@ def _enrich_items(
                         "total": {
                             "$sum": {
                                 # processing priority: supply_qty_override → final_supply_fo → supply_qty (>0) → requested_qty
-                                # packed/closed/intransit: final_supply_fo if set, else accepted_qty
+                                # packed/intransit: final_supply_fo if set, else accepted_qty
                                 "$switch": {
                                     "branches": [
                                         {
