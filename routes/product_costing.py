@@ -809,7 +809,7 @@ async def upload_price_list(
     excel_bytes = await asyncio.to_thread(
         _build_workbook,
         [tab], [products],
-        None, None,
+        None,
         datetime.now().strftime("%d %b %Y"), "",
     )
 
