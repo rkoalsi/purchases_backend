@@ -3746,7 +3746,7 @@ def _fetch_sf_fba_inventory_latest_sync(db, end):
             "_id": {
                 "asin": "$asin",
                 "date": "$date",
-                "is_sf": {"$eq": ["$location_key", "VKSX"]},
+                "is_sf": {"$eq": ["$location", "VKSX"]},
             },
             "stock": {"$sum": "$ending_warehouse_balance"},
         }},

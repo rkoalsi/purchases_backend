@@ -16,7 +16,20 @@ import logging
 import re
 import requests
 
-from .amazon import compute_drr_for_asins_sync, generate_report_by_date_range, get_amazon_token, make_sp_api_request
+from .amazon import (
+    compute_drr_for_asins_sync,
+    generate_report_by_date_range,
+    get_amazon_token,
+    make_sp_api_request,
+    _fetch_sf_fba_inventory_latest_sync,
+)
+
+
+def _live_status(inv_val):
+    """Match the Amazon PSR sheet: absent from latest ledger → Not Listed, qty>0 → Live, else Not Live."""
+    if inv_val is None:
+        return "Not Listed"
+    return "Live" if inv_val > 0 else "Not Live"
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -421,20 +434,52 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
         ):
             fba_inv_by_asin[doc["_id"]] = int(doc["total"] or 0)
 
-    # 4. Open shipment qty from FBA processing sheet (uploaded shipments)
+    # 4. Open shipment qty = units shipped to FBA but NOT yet inwarded (in-transit/pending),
+    #    sourced from the live Amazon queue (amazon_fba_shipments) — the authoritative
+    #    SP-API sync — NOT the manual processing upload's requested_qty.
+    #    Rationale:
+    #      • requested_qty is what was *planned*; only QuantityShipped was actually sent.
+    #      • Once units are received/inwarded they become FBA sellable inventory (counted in
+    #        FBA Inv), so they must drop out of "open" to avoid double counting — even if the
+    #        shipment's status still reads RECEIVING.
+    #    Open = Σ max(0, QuantityShipped − QuantityReceived) per ASIN, only for shipments
+    #    still in-flight (_ACTIVE_STATUSES). CLOSED shipments are finalised — any un-received
+    #    units there are permanent short-receipts that will never arrive, so they are NOT open.
+    sku_to_asin: dict[str, str] = {
+        d["sku_code"]: d["item_id"]
+        for d in sku_map_docs
+        if d.get("item_id") and d.get("sku_code")
+    }
     open_fba_shipment: dict[str, int] = {}
-    for doc in db[PROCESSING_COLLECTION].aggregate(
+    for doc in db[FBA_SHIPMENTS_COLLECTION].aggregate(
         [
-            {"$match": {"asin": {"$in": asins}}},
+            {"$match": {"ShipmentStatus": {"$in": _ACTIVE_STATUSES}}},
+            {"$unwind": "$items"},
             {
                 "$group": {
-                    "_id": "$asin",
-                    "total": {"$sum": {"$ifNull": ["$requested_qty", 0]}},
+                    "_id": "$items.SellerSKU",
+                    "pending": {
+                        "$sum": {
+                            "$max": [
+                                0,
+                                {
+                                    "$subtract": [
+                                        {"$ifNull": ["$items.QuantityShipped", 0]},
+                                        {"$ifNull": ["$items.QuantityReceived", 0]},
+                                    ]
+                                },
+                            ]
+                        }
+                    },
                 }
             },
         ]
     ):
-        open_fba_shipment[doc["_id"]] = int(doc["total"] or 0)
+        asin = sku_to_asin.get(doc["_id"])
+        if asin:
+            open_fba_shipment[asin] = open_fba_shipment.get(asin, 0) + int(
+                doc["pending"] or 0
+            )
 
     # 5. Latest Zoho stock by item_id
     zoho_item_ids = list(
@@ -636,6 +681,28 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
 
     month_labels = [f"{MONTH_NAMES[m]} {y}" for (y, m) in months]
 
+    # 8b. FBA / SF live status — latest amazon_ledger snapshot (same source as Amazon PSR sheet)
+    sf_fba_live_inv, _ = _fetch_sf_fba_inventory_latest_sync(db, today)
+
+    # 8c. Units Sold (last 30 days) — all channels (FBA + SF + VC), matching the all-channel DRR.
+    #     FBA + SF come from amazon_ledger.customer_shipments; VC from amazon_vendor_sales.orderedUnits.
+    units_sold_30d: dict[str, int] = {a: 0 for a in asins}
+    sales_start = today - timedelta(days=30)
+    for doc in db["amazon_ledger"].aggregate(
+        [
+            {"$match": {"asin": {"$in": asins}, "date": {"$gte": sales_start, "$lte": today}}},
+            {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$customer_shipments", 0]}}}},
+        ]
+    ):
+        units_sold_30d[doc["_id"]] = units_sold_30d.get(doc["_id"], 0) + int(doc["total"] or 0)
+    for doc in db["amazon_vendor_sales"].aggregate(
+        [
+            {"$match": {"asin": {"$in": asins}, "date": {"$gte": sales_start, "$lte": today}}},
+            {"$group": {"_id": "$asin", "total": {"$sum": "$orderedUnits"}}},
+        ]
+    ):
+        units_sold_30d[doc["_id"]] = units_sold_30d.get(doc["_id"], 0) + int(doc["total"] or 0)
+
     # 9. Load overrides
     overrides: dict[str, dict] = {}
     for doc in db[PLANNING_OVERRIDES_COLLECTION].find({"asin": {"$in": asins}}):
@@ -740,8 +807,11 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
                     "item_name": prod.get("name", ""),
                     "mrp": mrp,
                     "sp": sp,
+                    "fba_live_status": _live_status((sf_fba_live_inv.get(asin) or {}).get("fba")),
+                    "sf_live_status": _live_status((sf_fba_live_inv.get(asin) or {}).get("sf")),
                     "current_fba_inventory": current_fba_inv,
                     "open_shipment_qty": open_shipment_qty,
+                    "units_sold_30d": units_sold_30d.get(asin, 0),
                     "open_shipment_qty_auto": open_fba_shipment.get(asin, 0),
                     "total_inventory": total_inventory,
                     "drr": round(drr, 2),
@@ -982,13 +1052,14 @@ def _generate_planning_excel(
     month_labels = rows[0].get("month_labels", [])
 
     # Column layout:
-    # A(1) ASIN  B(2) FNSKU  C(3) Amazon Status  D(4) SKU  E(5) Item Name
-    # F(6) MRP  G(7) SP  H(8) FBA Inv  I(9) Open Shipment  J(10)=H+I Total Inv
-    # K(11) DRR  L(12)=J/K Net Days  M(13) Lead  N(14) Coverage
-    # O(15)=M+N Target Days  P(16)=K*O Target Stock  Q(17) Final Units
-    # R(18) Zoho  S(19) Status  T(20) Platform
-    # U(21) Etrade Inv  V(22) Open PO  W(23)=U+V Total Qty
-    # X+(24+) Monthly Sales
+    # A(1) ASIN  B(2) FNSKU  C(3) Purchase Status  D(4) FBA Live Status  E(5) SF Live Status
+    # F(6) Amazon Status  G(7) SKU  H(8) Item Name  I(9) MRP  J(10) SP
+    # K(11) FBA Inv  L(12) Open Shipment  M(13) Units Sold (30d)  N(14)=K+L Total Inv
+    # O(15) DRR  P(16)=N/O Net Days  Q(17) Lead  R(18) Coverage
+    # S(19)=Q+R Target Days  T(20)=O*S Target Stock  U(21) Final Units
+    # V(22) Zoho  W(23) Platform
+    # X(24) Etrade Inv  Y(25) Open PO  Z(26)=X+Y Total Qty
+    # AA+(27+) Monthly Sales
 
     fba_inv_label = (
         f"Current FBA\nInventory\n({fba_inv_date})"
@@ -1006,28 +1077,31 @@ def _generate_planning_excel(
     headers = [
         "ASIN",                                          # A  1
         "FNSKU",                                         # B  2
-        "Amazon Status",                                 # C  3
-        "SKU Code",                                      # D  4
-        "Item Name",                                     # E  5
-        "MRP",                                           # F  6
-        "SP",                                            # G  7
-        fba_inv_label,                                   # H  8
-        "Open Shipment\nQty",                            # I  9
-        "Total Inventory\n(FBA + Open Shipment)",        # J 10  =H+I
-        drr_label,                                       # K 11
-        "Net Total Days\n(=Total Inv ÷ DRR)",            # L 12  =J/K
-        "Lead Time",                                     # M 13
-        "Coverage Days",                                 # N 14
-        "Total Target Days\n(=Lead + Coverage)",         # O 15  =M+N
-        "Target Stock\n(=DRR × Total Target Days)",      # P 16  =K*O
-        "Final Units\n(under-ordering formula)",         # Q 17
-        zoho_label,                                      # R 18
-        "Purchase Status",                               # S 19
-        "Platform",                                      # T 20
-        etrade_label,                                    # U 21
-        "Open PO",                                       # V 22
-        "Total Qty\n(Etrade + Open PO)",                 # W 23  =U+V
-    ] + [f"{label}\nUnits Sold" for label in month_labels]  # X+ 24+
+        "Purchase Status",                               # C  3
+        "FBA Live Status",                               # D  4
+        "SF Live Status",                                # E  5
+        "Amazon Status",                                 # F  6
+        "SKU Code",                                      # G  7
+        "Item Name",                                     # H  8
+        "MRP",                                           # I  9
+        "SP",                                            # J 10
+        fba_inv_label,                                   # K 11
+        "Open Shipment\nQty",                            # L 12
+        "Units Sold\n(Last 30 Days)",                    # M 13
+        "Total Inventory\n(FBA + Open Shipment)",        # N 14  =K+L
+        drr_label,                                       # O 15
+        "Net Total Days\n(=Total Inv ÷ DRR)",            # P 16  =N/O
+        "Lead Time",                                     # Q 17
+        "Coverage Days",                                 # R 18
+        "Total Target Days\n(=Lead + Coverage)",         # S 19  =Q+R
+        "Target Stock\n(=DRR × Total Target Days)",      # T 20  =O*S
+        "Final Units\n(under-ordering formula)",         # U 21
+        zoho_label,                                      # V 22
+        "Platform",                                      # W 23
+        etrade_label,                                    # X 24
+        "Open PO",                                       # Y 25
+        "Total Qty\n(Etrade + Open PO)",                 # Z 26  =X+Y
+    ] + [f"{label}\nUnits Sold" for label in month_labels]  # AA+ 27+
 
     header_fill = PatternFill("solid", fgColor="4472C4")
     header_font = Font(bold=True, color="FFFFFF")
@@ -1052,67 +1126,73 @@ def _generate_planning_excel(
 
         ws.cell(row=r, column=1,  value=row.get("asin", ""))                        # A ASIN
         ws.cell(row=r, column=2,  value=row.get("fnsku") or None)                   # B FNSKU
-        ws.cell(row=r, column=3,  value=row.get("amazon_status") or None)           # C Amazon Status
-        ws.cell(row=r, column=4,  value=row.get("sku_code", ""))                    # D SKU Code
-        c = ws.cell(row=r, column=5, value=row.get("item_name") or None)            # E Item Name
+        ws.cell(row=r, column=3,  value=row.get("purchase_status") or None)         # C Purchase Status
+        ws.cell(row=r, column=4,  value=row.get("fba_live_status") or None)         # D FBA Live Status
+        ws.cell(row=r, column=5,  value=row.get("sf_live_status") or None)          # E SF Live Status
+        ws.cell(row=r, column=6,  value=row.get("amazon_status") or None)           # F Amazon Status
+        ws.cell(row=r, column=7,  value=row.get("sku_code", ""))                    # G SKU Code
+        c = ws.cell(row=r, column=8, value=row.get("item_name") or None)            # H Item Name
         c.alignment = left_wrap
-        ws.cell(row=r, column=6,  value=_num(row.get("mrp")))                       # F MRP
-        ws.cell(row=r, column=7,  value=_num(row.get("sp")))                        # G SP
-        ws.cell(row=r, column=8,  value=_num(row.get("current_fba_inventory")))     # H FBA Inv
-        ws.cell(row=r, column=9,  value=_num(row.get("open_shipment_qty")))         # I Open Shipment
-        ws.cell(row=r, column=10, value=f"=H{r}+I{r}")                             # J Total Inv
-        ws.cell(row=r, column=11, value=drr_val)                                    # K DRR
-        ws.cell(row=r, column=12, value=f'=IF(K{r}=0,"",ROUND(J{r}/K{r},2))')     # L Net Days
-        ws.cell(row=r, column=13, value=row.get("lead_time", DEFAULT_LEAD_TIME))    # M Lead Time
-        ws.cell(row=r, column=14, value=row.get("coverage_days", DEFAULT_COVERAGE_DAYS))  # N Coverage
-        ws.cell(row=r, column=15, value=f"=M{r}+N{r}")                             # O Target Days
-        ws.cell(row=r, column=16, value=f"=IF(K{r}=0,0,ROUND(K{r}*O{r},0))")      # P Target Stock
+        ws.cell(row=r, column=9,  value=_num(row.get("mrp")))                       # I MRP
+        ws.cell(row=r, column=10, value=_num(row.get("sp")))                        # J SP
+        ws.cell(row=r, column=11, value=_num(row.get("current_fba_inventory")))     # K FBA Inv
+        ws.cell(row=r, column=12, value=_num(row.get("open_shipment_qty")))         # L Open Shipment
+        ws.cell(row=r, column=13, value=_num(row.get("units_sold_30d")))            # M Units Sold (30d)
+        ws.cell(row=r, column=14, value=f"=K{r}+L{r}")                             # N Total Inv
+        ws.cell(row=r, column=15, value=drr_val)                                    # O DRR
+        ws.cell(row=r, column=16, value=f'=IF(O{r}=0,"",ROUND(N{r}/O{r},2))')     # P Net Days
+        ws.cell(row=r, column=17, value=row.get("lead_time", DEFAULT_LEAD_TIME))    # Q Lead Time
+        ws.cell(row=r, column=18, value=row.get("coverage_days", DEFAULT_COVERAGE_DAYS))  # R Coverage
+        ws.cell(row=r, column=19, value=f"=Q{r}+R{r}")                             # S Target Days
+        ws.cell(row=r, column=20, value=f"=IF(O{r}=0,0,ROUND(O{r}*S{r},0))")      # T Target Stock
         ws.cell(
-            row=r, column=17,
-            value=f'=IF(K{r}=0,"",IF(L{r}<M{r},ROUND(K{r}*O{r},0),IF(L{r}>O{r},0,MAX(0,ROUND((O{r}-L{r})*K{r},0)))))',
-        )                                                                            # Q Final Units
-        ws.cell(row=r, column=18, value=_num(row.get("zoho_stock")))                # R Zoho Stock
-        ws.cell(row=r, column=19, value=row.get("purchase_status") or None)         # S Purchase Status
-        ws.cell(row=r, column=20, value=row.get("platform") or None)                # T Platform
-        ws.cell(row=r, column=21, value=_num(row.get("current_inventory_etrade")))  # U Etrade Inv
-        ws.cell(row=r, column=22, value=_num(row.get("open_po")))                   # V Open PO
-        ws.cell(row=r, column=23, value=f"=U{r}+V{r}")                             # W Total Qty
+            row=r, column=21,
+            value=f'=IF(O{r}=0,"",IF(P{r}<Q{r},ROUND(O{r}*S{r},0),IF(P{r}>S{r},0,MAX(0,ROUND((S{r}-P{r})*O{r},0)))))',
+        )                                                                            # U Final Units
+        ws.cell(row=r, column=22, value=_num(row.get("zoho_stock")))                # V Zoho Stock
+        ws.cell(row=r, column=23, value=row.get("platform") or None)                # W Platform
+        ws.cell(row=r, column=24, value=_num(row.get("current_inventory_etrade")))  # X Etrade Inv
+        ws.cell(row=r, column=25, value=_num(row.get("open_po")))                   # Y Open PO
+        ws.cell(row=r, column=26, value=f"=X{r}+Y{r}")                             # Z Total Qty
 
         monthly_sales = row.get("monthly_sales", {})
         for offset, label in enumerate(month_labels):
             val = monthly_sales.get(label)
-            ws.cell(row=r, column=24 + offset, value=_num(val))                    # X+ Monthly Sales
+            ws.cell(row=r, column=27 + offset, value=_num(val))                    # AA+ Monthly Sales
 
     col_widths = [
         14,  # A ASIN
         14,  # B FNSKU
-        22,  # C Amazon Status
-        18,  # D SKU Code
-        50,  # E Item Name
-        8,   # F MRP
-        8,   # G SP
-        12,  # H FBA Inv
-        12,  # I Open Shipment
-        14,  # J Total Inv
-        10,  # K DRR
-        12,  # L Net Days
-        9,   # M Lead Time
-        10,  # N Coverage
-        14,  # O Target Days
-        14,  # P Target Stock
-        14,  # Q Final Units
-        10,  # R Zoho Stock
-        12,  # S Status
-        12,  # T Platform
-        15,  # U Etrade Inv
-        9,   # V Open PO
-        12,  # W Total Qty
+        14,  # C Purchase Status
+        14,  # D FBA Live Status
+        14,  # E SF Live Status
+        22,  # F Amazon Status
+        18,  # G SKU Code
+        50,  # H Item Name
+        8,   # I MRP
+        8,   # J SP
+        12,  # K FBA Inv
+        12,  # L Open Shipment
+        13,  # M Units Sold (30d)
+        14,  # N Total Inv
+        10,  # O DRR
+        12,  # P Net Days
+        9,   # Q Lead Time
+        10,  # R Coverage
+        14,  # S Target Days
+        14,  # T Target Stock
+        14,  # U Final Units
+        10,  # V Zoho Stock
+        12,  # W Platform
+        15,  # X Etrade Inv
+        9,   # Y Open PO
+        12,  # Z Total Qty
     ]
     col_widths += [14] * len(month_labels)
     for col_idx, width in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
-    ws.freeze_panes = "F2"
+    ws.freeze_panes = "I2"
 
     buf = io.BytesIO()
     wb.save(buf)
