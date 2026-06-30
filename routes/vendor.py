@@ -977,6 +977,7 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
                     "bb_code": item.bb_code,
                     "manufacturer_code": item.manufacturer_code,
                     "sku_code": item.sku_code,
+                    "brand": item.brand or "",
                     "item_id": zoho_item.get("item_id", ""),
                 })
             except Exception as exc:
@@ -1005,6 +1006,8 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
                 # /design/new-items (which filters on that field); newly-created items
                 # are never combos.
                 set_fields = {"purchase_status": "active", "is_combo_product": False}
+                if c.get("brand"):
+                    set_fields["brand"] = c["brand"]
                 if c.get("bb_code"):
                     set_fields["cf_sku_code"] = c["bb_code"]
                 if c.get("manufacturer_code"):
