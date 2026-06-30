@@ -22,6 +22,7 @@ from .amazon import (
     get_amazon_token,
     make_sp_api_request,
     _fetch_sf_fba_inventory_latest_sync,
+    format_amazon_platform_status,
 )
 
 
@@ -140,7 +141,13 @@ MONTH_NAMES = {
     12: "Dec",
 }
 
-EXCLUDED_ASINS = [
+# Emptied per request (2026-06-30): the FBA shipment planning report must show ALL
+# products from amazon_sku_mapping. The previous block-list is preserved below under
+# _EXCLUDED_ASINS_ARCHIVED so it can be restored if ever needed — it is NOT referenced
+# anywhere, so nothing is excluded now.
+EXCLUDED_ASINS: list[str] = []
+
+_EXCLUDED_ASINS_ARCHIVED = [
     "B0FRLVMP6V",
     "B0C5HPTBMH",
     "B09V2XYPX1",
@@ -344,7 +351,7 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
     # 1. All ASINs from amazon_sku_mapping
     sku_map_docs = list(
         db[SKU_MAPPING_COLLECTION].find(
-            {}, {"item_id": 1, "sku_code": 1, "fnsku": 1, "amazon_status": 1, "_id": 0}
+            {}, {"item_id": 1, "sku_code": 1, "fnsku": 1, "amazon_status": 1, "active_platforms": 1, "_id": 0}
         )
     )
     if not sku_map_docs:
@@ -359,8 +366,10 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
     asin_to_fnsku_default: dict[str, str] = {
         d["item_id"]: d.get("fnsku", "") for d in sku_map_docs if d.get("item_id")
     }
-    asin_to_amazon_status: dict[str, str] = {
-        d["item_id"]: d.get("amazon_status", "") for d in sku_map_docs if d.get("item_id")
+    asin_to_platform_status: dict[str, str] = {
+        d["item_id"]: format_amazon_platform_status(d.get("amazon_status"), d.get("active_platforms"))
+        for d in sku_map_docs
+        if d.get("item_id")
     }
 
     # Platform derived from vendor_margins flags
@@ -803,7 +812,7 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
                     "sku_code": sku,
                     "fnsku": override.get("fnsku")
                     or asin_to_fnsku_default.get(asin, ""),
-                    "amazon_status": asin_to_amazon_status.get(asin, "") or None,
+                    "platform_status": asin_to_platform_status.get(asin, "") or None,
                     "item_name": prod.get("name", ""),
                     "mrp": mrp,
                     "sp": sp,
@@ -1129,7 +1138,7 @@ def _generate_planning_excel(
         ws.cell(row=r, column=3,  value=row.get("purchase_status") or None)         # C Purchase Status
         ws.cell(row=r, column=4,  value=row.get("fba_live_status") or None)         # D FBA Live Status
         ws.cell(row=r, column=5,  value=row.get("sf_live_status") or None)          # E SF Live Status
-        ws.cell(row=r, column=6,  value=row.get("amazon_status") or None)           # F Amazon Status
+        ws.cell(row=r, column=6,  value=row.get("platform_status") or None)         # F Platform Status
         ws.cell(row=r, column=7,  value=row.get("sku_code", ""))                    # G SKU Code
         c = ws.cell(row=r, column=8, value=row.get("item_name") or None)            # H Item Name
         c.alignment = left_wrap
@@ -1166,7 +1175,7 @@ def _generate_planning_excel(
         14,  # C Purchase Status
         14,  # D FBA Live Status
         14,  # E SF Live Status
-        22,  # F Amazon Status
+        24,  # F Amazon Status (status + platforms, e.g. "Active - SF, FBA")
         18,  # G SKU Code
         50,  # H Item Name
         8,   # I MRP

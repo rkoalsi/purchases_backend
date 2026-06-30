@@ -21,7 +21,7 @@ import xlrd
 import xlwt
 from xlutils.copy import copy as xl_copy
 
-from .amazon import compute_drr_for_asins_sync, generate_report_by_date_range
+from .amazon import compute_drr_for_asins_sync, generate_report_by_date_range, format_amazon_platform_status
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -576,12 +576,17 @@ def _enrich_items(
         if sku not in products_by_model or p.get("status") == "active":
             products_by_model[sku] = p
 
-    # --- batch load sku mapping for ASIN → sku_code fallback ---
+    # --- batch load sku mapping for ASIN → sku_code fallback (+ combined amazon status) ---
     sku_map_by_asin: dict[str, str] = {}
+    platforms_by_asin: dict[str, str] = {}
     for m in db[SKU_MAPPING_COLLECTION].find(
-        {"item_id": {"$in": asins}}, {"item_id": 1, "sku_code": 1}
+        {"item_id": {"$in": asins}},
+        {"item_id": 1, "sku_code": 1, "amazon_status": 1, "active_platforms": 1},
     ):
         sku_map_by_asin[m["item_id"]] = m["sku_code"]
+        platforms_by_asin[m["item_id"]] = format_amazon_platform_status(
+            m.get("amazon_status"), m.get("active_platforms")
+        )
 
     extra_skus = [
         sku_map_by_asin[asin]
@@ -1120,6 +1125,7 @@ def _enrich_items(
                 "final_supply_fo_override": item.get("final_supply_fo_override"),
                 "monthly_sales": monthly_sales,
                 "month_labels": month_labels,
+                "platform_status": platforms_by_asin.get(asin, ""),
             }
         )
 
@@ -2880,7 +2886,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
         ("Target Stock", True),
         ("Final Units\n(For Under-ordering)", True),
         ("Final Supply Qty\n(For Over-ordering)", True),
-    ] + [(lbl, True) for lbl in _month_headers]
+    ] + [(lbl, True) for lbl in _month_headers] + [("Amazon Status", True)]
 
     for col_idx, (label, highlight) in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_idx, value=label)
@@ -2991,7 +2997,9 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             static[42] = sq_fallback
 
         total_cols = 42 + len(_month_headers)
-        for col_idx in range(1, total_cols + 1):
+        platform_col = total_cols + 1  # appended Platform Status (text)
+        static[platform_col] = item.get("platform_status", "")
+        for col_idx in range(1, platform_col + 1):
             if col_idx in formulas:
                 cell = ws.cell(row=r, column=col_idx, value=formulas[col_idx])
             else:
@@ -3005,7 +3013,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
                 cell.number_format = pct_format
             elif (
                 col_idx in (8, 10, 12, 27, 28, 29, 30, 32, 33, 34, 37, 38, 39, 40, 41, 42)
-                or col_idx >= 43
+                or (43 <= col_idx <= total_cols)  # monthly sales ints (not the text platform col)
             ):
                 cell.number_format = int_format
             elif col_idx == 35:  # Final DRR

@@ -2044,6 +2044,62 @@ async def update_sku_amazon_status(
     return {"message": "Status updated"}
 
 
+# ─── Platform status (SF / FBA / VC / DF) ─────────────────────────────────────
+# Replaces the single Active/Inactive/Discontinued amazon_status: an item can be
+# "active" on any combination of selling platforms. Stored on amazon_sku_mapping
+# as active_platforms: list[str] ⊆ _VALID_PLATFORMS. Empty list = not active anywhere.
+
+_VALID_PLATFORMS = ["SF", "FBA", "VC", "DF"]  # canonical order
+
+
+def _normalize_platforms(raw) -> list[str]:
+    """Parse platforms from a comma-separated string or list → canonical, de-duped,
+    ordered subset of _VALID_PLATFORMS. Unknown/blank tokens are dropped."""
+    if raw is None:
+        return []
+    tokens = raw.split(",") if isinstance(raw, str) else list(raw)
+    seen = {t.strip().upper() for t in tokens if str(t).strip()}
+    return [p for p in _VALID_PLATFORMS if p in seen]
+
+
+def format_amazon_platform_status(amazon_status, active_platforms) -> str:
+    """Combine the Amazon status + active platforms into ONE label for report sheets.
+
+    Examples:
+      Active  + [SF, FBA] → "Active - SF, FBA"
+      Active  + [FBA]     → "Active - FBA"
+      Active  + []        → "Active"
+      ""      + [SF]      → "SF"           (status unknown, platforms only)
+      ""      + []        → ""
+    """
+    status = (amazon_status or "").strip()
+    plats_str = ", ".join(_normalize_platforms(active_platforms))
+    if status and plats_str:
+        return f"{status} - {plats_str}"
+    return status or plats_str
+
+
+@router.put("/sku-mapping/{asin}/platforms")
+async def update_sku_platforms(
+    asin: str,
+    platforms: str = Query("", description="Comma-separated subset of SF,FBA,VC,DF (empty = none)"),
+    database=Depends(get_database),
+):
+    """Set the active_platforms list on an amazon_sku_mapping document."""
+    normalized = _normalize_platforms(platforms)
+
+    def _update():
+        return database.get_collection(SKU_COLLECTION).update_one(
+            {"item_id": asin},
+            {"$set": {"active_platforms": normalized}},
+        )
+
+    result = await asyncio.to_thread(_update)
+    if result.matched_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ASIN not found")
+    return {"message": "Platforms updated", "active_platforms": normalized}
+
+
 @router.post("/upload-sku-mapping")
 async def upload_sku_mapping(
     file: UploadFile = File(...), database=Depends(get_database)
@@ -2224,10 +2280,20 @@ async def upload_etrade_margins(
                 fnsku_val = str(row["FNSKU"]).strip()
                 if fnsku_val:
                     sku_fields["fnsku"] = fnsku_val
+            # Amazon Status (Active / Inactive / Discontinued on Amazon) — independent field.
             if "Amazon Status" in df.columns and pd.notna(row["Amazon Status"]):
                 status_val = str(row["Amazon Status"]).strip()
                 if status_val in _VALID_AMAZON_STATUSES:
                     sku_fields["amazon_status"] = status_val
+            # Platforms (comma-separated SF,FBA,VC,DF) — independent field. Blank cell
+            # clears all platforms; absent column leaves the field untouched.
+            if "Platforms" in df.columns:
+                if pd.notna(row["Platforms"]):
+                    sku_fields["active_platforms"] = _normalize_platforms(
+                        str(row["Platforms"])
+                    )
+                else:
+                    sku_fields["active_platforms"] = []
 
             if sku_fields:
                 sku_collection.update_one(
@@ -2272,7 +2338,7 @@ def download_etrade_margins_template(database=Depends(get_database)):
 
         skus = list(sku_collection.find(
             {},
-            {"item_id": 1, "item_name": 1, "sku_code": 1, "fnsku": 1, "amazon_status": 1, "_id": 0},
+            {"item_id": 1, "item_name": 1, "sku_code": 1, "fnsku": 1, "amazon_status": 1, "active_platforms": 1, "_id": 0},
         ))
         margins_list = list(margins_collection.find(
             {},
@@ -2285,7 +2351,7 @@ def download_etrade_margins_template(database=Depends(get_database)):
         ws.title = "Amazon Items"
 
         headers = [
-            "ASIN", "Item Name", "SKU Code", "FNSKU", "Amazon Status",
+            "ASIN", "Item Name", "SKU Code", "FNSKU", "Amazon Status", "Platforms",
             "ASP", "New Margin", "Cost Price w/o Tax", "Etrade PO", "Etrade DF",
         ]
         header_fill = PatternFill("solid", fgColor="1E3A5F")
@@ -2304,13 +2370,14 @@ def download_etrade_margins_template(database=Depends(get_database)):
             ws.cell(row=row_idx, column=3,  value=sku.get("sku_code", ""))
             ws.cell(row=row_idx, column=4,  value=sku.get("fnsku") or "")
             ws.cell(row=row_idx, column=5,  value=sku.get("amazon_status") or "")
-            ws.cell(row=row_idx, column=6,  value=m.get("etrade_asp"))
-            ws.cell(row=row_idx, column=7,  value=m.get("margin"))
-            ws.cell(row=row_idx, column=8,  value=m.get("cost_price_wo_tax"))
-            ws.cell(row=row_idx, column=9,  value="Yes" if m.get("etrade_po") else ("No" if "etrade_po" in m else ""))
-            ws.cell(row=row_idx, column=10, value="Yes" if m.get("etrade_df") else ("No" if "etrade_df" in m else ""))
+            ws.cell(row=row_idx, column=6,  value=", ".join(sku.get("active_platforms") or []))
+            ws.cell(row=row_idx, column=7,  value=m.get("etrade_asp"))
+            ws.cell(row=row_idx, column=8,  value=m.get("margin"))
+            ws.cell(row=row_idx, column=9,  value=m.get("cost_price_wo_tax"))
+            ws.cell(row=row_idx, column=10, value="Yes" if m.get("etrade_po") else ("No" if "etrade_po" in m else ""))
+            ws.cell(row=row_idx, column=11, value="Yes" if m.get("etrade_df") else ("No" if "etrade_df" in m else ""))
 
-        col_widths = [16, 45, 18, 14, 26, 10, 12, 22, 10, 10]
+        col_widths = [16, 45, 18, 14, 26, 18, 10, 12, 22, 10, 10]
         for col_idx, width in enumerate(col_widths, 1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
 
@@ -3994,6 +4061,7 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
     vc_date_str   = extra_inventory.get("vc_date")
     df_date_str   = extra_inventory.get("df_date")
     zoho_date_str = extra_inventory.get("zoho_date")
+    platform_status_map = extra_inventory.get("platform_status", {})
 
     def _live_status(inv_val):
         if inv_val is None:
@@ -4005,48 +4073,49 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
 
     # ── Column index constants (1-based) ────────────────────────────────
     COL_STATUS   = 1    # Item Status
-    COL_ASIN     = 2    # ASIN
-    COL_SKU      = 3    # SKU Code
-    COL_SF_LIVE  = 4    # SF Live (Date)           [Section 1 – new]
-    COL_FBA_LIVE = 5    # FBA Live (Date)          [Section 1 – new]
-    COL_VC_LIVE  = 6    # VC Live (Date)           [Section 1 – new]
-    COL_DF_LIVE  = 7    # DF Live (Date)           [Section 1 – new]
-    COL_NAME     = 8    # Item Name
-    COL_B        = 9    # FBA Sales (incl. SF)
-    COL_C        = 10   # VC Sales
-    COL_D        = 11   # FBA Returns
-    COL_E        = 12   # SF Returns
-    COL_F        = 13   # VC Returns
-    COL_G        = 14   # Total Returns (=D+E+F)
-    COL_H        = 15   # blank spacer
-    COL_D1       = 16   # D1 – most recent day
-    COL_D90      = 105  # D90 – oldest day  (16 + 89)
-    COL_H1       = 106  # H1 – first helper
-    COL_H90      = 195  # H90 – last helper (106 + 89)
-    COL_GF       = 196  # Total Active Days (max 30)
-    COL_GG       = 197  # Selected Sum (30 days)
-    COL_GH       = 198  # Raw Mean (÷30)
-    COL_GI       = 199  # Spike Threshold (2× Mean)
-    COL_GJ       = 200  # Cleaned Units (spikes→threshold)
-    COL_GK       = 201  # Spike Days Found
-    COL_GL       = 202  # Net Units (after returns)
-    COL_GM       = 203  # blank spacer
-    COL_GN       = 204  # Final DRR (units/day)
-    COL_GO       = 205  # DRR Flag
+    COL_PLATFORM = 2    # Amazon Status (status - platforms) — placed next to Item Status
+    COL_ASIN     = 3    # ASIN
+    COL_SKU      = 4    # SKU Code
+    COL_SF_LIVE  = 5    # SF Live (Date)           [Section 1 – new]
+    COL_FBA_LIVE = 6    # FBA Live (Date)          [Section 1 – new]
+    COL_VC_LIVE  = 7    # VC Live (Date)           [Section 1 – new]
+    COL_DF_LIVE  = 8    # DF Live (Date)           [Section 1 – new]
+    COL_NAME     = 9    # Item Name
+    COL_B        = 10   # FBA Sales (incl. SF)
+    COL_C        = 11   # VC Sales
+    COL_D        = 12   # FBA Returns
+    COL_E        = 13   # SF Returns
+    COL_F        = 14   # VC Returns
+    COL_G        = 15   # Total Returns (=D+E+F)
+    COL_H        = 16   # blank spacer
+    COL_D1       = 17   # D1 – most recent day
+    COL_D90      = 106  # D90 – oldest day  (17 + 89)
+    COL_H1       = 107  # H1 – first helper
+    COL_H90      = 196  # H90 – last helper (107 + 89)
+    COL_GF       = 197  # Total Active Days (max 30)
+    COL_GG       = 198  # Selected Sum (30 days)
+    COL_GH       = 199  # Raw Mean (÷30)
+    COL_GI       = 200  # Spike Threshold (2× Mean)
+    COL_GJ       = 201  # Cleaned Units (spikes→threshold)
+    COL_GK       = 202  # Spike Days Found
+    COL_GL       = 203  # Net Units (after returns)
+    COL_GM       = 204  # blank spacer
+    COL_GN       = 205  # Final DRR (units/day)
+    COL_GO       = 206  # DRR Flag
     # Sections 2–4 (new)
-    COL_ZOHO     = 206  # Zoho Stock (Date)
-    COL_FBA_INV  = 207  # FBA inventory (Date)
-    COL_SF_INV   = 208  # SF inventory (Date)
-    COL_VC_INV   = 209  # VC inventory (Date)
-    COL_DF_INV   = 210  # DF inventory (Date)
-    COL_DAYS_FBA = 211  # Days Until Stock Lasts – FBA
-    COL_DAYS_SF  = 212  # Days Until Stock Lasts – SF
-    COL_DAYS_VC  = 213  # Days Until Stock Lasts – VC
-    COL_DAYS_DF  = 214  # Days Until Stock Lasts – DF
-    COL_OPEN_PO  = 215  # Open PO Qty
-    COL_DAYS_PO  = 216  # Days Until Stock Lasts – Open PO + VC
-    COL_FBA_SIT  = 217  # FBA Stock in Transit
-    COL_DAYS_SIT = 218  # Days Until Stock Lasts – FBA + SIT
+    COL_ZOHO     = 207  # Zoho Stock (Date)
+    COL_FBA_INV  = 208  # FBA inventory (Date)
+    COL_SF_INV   = 209  # SF inventory (Date)
+    COL_VC_INV   = 210  # VC inventory (Date)
+    COL_DF_INV   = 211  # DF inventory (Date)
+    COL_DAYS_FBA = 212  # Days Until Stock Lasts – FBA
+    COL_DAYS_SF  = 213  # Days Until Stock Lasts – SF
+    COL_DAYS_VC  = 214  # Days Until Stock Lasts – VC
+    COL_DAYS_DF  = 215  # Days Until Stock Lasts – DF
+    COL_OPEN_PO  = 216  # Open PO Qty
+    COL_DAYS_PO  = 217  # Days Until Stock Lasts – Open PO + VC
+    COL_FBA_SIT  = 218  # FBA Stock in Transit
+    COL_DAYS_SIT = 219  # Days Until Stock Lasts – FBA + SIT  (last column)
 
     R_TITLE      = 1
     R_SECTION    = 2
@@ -4071,6 +4140,7 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
     ws.cell(row=R_SECTION, column=COL_ZOHO).value    = "INVENTORY"
     ws.cell(row=R_SECTION, column=COL_DAYS_FBA).value = "DAYS UNTIL STOCK LASTS"
     ws.cell(row=R_SECTION, column=COL_OPEN_PO).value  = "OPEN PO / IN TRANSIT"
+    ws.cell(row=R_SECTION, column=COL_PLATFORM).value = "AMAZON STATUS"
     ws.row_dimensions[R_SECTION].height = 30
 
     # ── Row 3: column headers ────────────────────────────────────────────
@@ -4111,6 +4181,7 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
         COL_DAYS_PO:  "Days Until Stock\nLasts (Open PO + VC)",
         COL_FBA_SIT:  "FBA Stock\nin Transit",
         COL_DAYS_SIT: "Days Until Stock\nLasts (FBA + SIT)",
+        COL_PLATFORM: "Amazon Status\n(status - platforms)",
     }
     for k in range(90):
         fixed_headers[COL_D1 + k] = f"D{k + 1}"
@@ -4140,6 +4211,9 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
         # Item Status
         sku  = item.get("sku_code", "")
         ws.cell(row=r, column=COL_STATUS).value = purchase_status_map.get(sku, "")
+
+        # Platform Status (SF/FBA/VC/DF) — appended column
+        ws.cell(row=r, column=COL_PLATFORM).value = platform_status_map.get(asin, "")
 
         # Section 1 – Live status per platform
         asin_ledger = sf_fba_inv.get(asin, {})
@@ -4345,7 +4419,7 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
         c = ws.cell(row=R_HEADERS, column=col_idx)
         if not c.value:
             continue
-        if col_idx == COL_STATUS:
+        if col_idx in (COL_STATUS, COL_PLATFORM):
             c.font = Font(bold=True, color="000000")
             c.fill = yellow_fill
         elif col_idx in (COL_SF_LIVE, COL_FBA_LIVE, COL_VC_LIVE, COL_DF_LIVE):
@@ -4382,6 +4456,7 @@ def _build_drr_calculator_sheet(ws, report_data, drr_vc_daily_by_asin, drr_fba_d
 
     # ── Column widths ────────────────────────────────────────────────────
     ws.column_dimensions[L(COL_STATUS)].width   = 18
+    ws.column_dimensions[L(COL_PLATFORM)].width = 24
     ws.column_dimensions[L(COL_ASIN)].width     = 16
     ws.column_dimensions[L(COL_SKU)].width      = 18
     for ci in (COL_SF_LIVE, COL_FBA_LIVE, COL_VC_LIVE, COL_DF_LIVE):
@@ -5004,6 +5079,24 @@ async def download_report_by_date_range(
             )
             for doc in docs:
                 purchase_status_map[doc["cf_sku_code"]] = doc.get("purchase_status", "")
+
+        # --- Platform status (SF/FBA/VC/DF) per ASIN from amazon_sku_mapping ---
+        report_asins = [item.get("asin", "") for item in report_data if item.get("asin")]
+        platform_status_map: dict[str, str] = {}
+        if report_asins:
+            sku_col = database.get_collection(SKU_COLLECTION)
+            pdocs = await asyncio.to_thread(
+                lambda: list(sku_col.find(
+                    {"item_id": {"$in": report_asins}},
+                    {"item_id": 1, "amazon_status": 1, "active_platforms": 1, "_id": 0},
+                ))
+            )
+            for d in pdocs:
+                platform_status_map[d["item_id"]] = format_amazon_platform_status(
+                    d.get("amazon_status"), d.get("active_platforms")
+                )
+        if extra_inventory is not None:
+            extra_inventory["platform_status"] = platform_status_map
 
         # --- Write Excel ---
         excel_buffer = io.BytesIO()

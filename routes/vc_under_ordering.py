@@ -14,7 +14,7 @@ from typing import Optional
 from pydantic import BaseModel
 import logging
 
-from .amazon import compute_drr_for_asins_sync, generate_report_by_date_range
+from .amazon import compute_drr_for_asins_sync, generate_report_by_date_range, format_amazon_platform_status
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -83,9 +83,13 @@ def _fetch_data(db, drr_map: dict) -> tuple:
     # 2. amazon_sku_mapping for these ASINs
     sku_docs = list(db[SKU_MAPPING_COLLECTION].find(
         {"item_id": {"$in": list(asins_with_asp)}},
-        {"item_id": 1, "sku_code": 1, "_id": 0},
+        {"item_id": 1, "sku_code": 1, "amazon_status": 1, "active_platforms": 1, "_id": 0},
     ))
     asin_to_sku: dict[str, str] = {d["item_id"]: d["sku_code"] for d in sku_docs if d.get("item_id") and d.get("sku_code")}
+    asin_to_status: dict[str, str] = {
+        d["item_id"]: format_amazon_platform_status(d.get("amazon_status"), d.get("active_platforms"))
+        for d in sku_docs if d.get("item_id")
+    }
     asins = list(asin_to_sku.keys())
 
     if not asins:
@@ -368,6 +372,7 @@ def _fetch_data(db, drr_map: dict) -> tuple:
             "etrade_asp": etrade_asp_by_asin.get(asin),
             "monthly_sales": monthly_sales.get(asin, {}),
             "month_labels": month_labels,
+            "platform_status": asin_to_status.get(asin, ""),
         })
 
     return rows, inventory_date_str, drr_period_label, zoho_date_str
@@ -494,7 +499,7 @@ async def download_xlsx(db=Depends(get_database)):
         "Stock in Transit\n(Open Zoho POs)",
         "SIT Brands",
         "Status",
-    ] + month_labels
+    ] + month_labels + ["Amazon Status"]
 
     # Row 1: headers
     for col_idx, h in enumerate(headers, 1):
@@ -569,8 +574,11 @@ async def download_xlsx(db=Depends(get_database)):
         for lbl_idx, lbl in enumerate(month_labels):
             ws.cell(r, 20 + lbl_idx, ms.get(lbl, 0))
 
+        # Platform Status (appended after monthly columns)
+        ws.cell(r, 20 + len(month_labels), row.get("platform_status", ""))
+
     # Column widths
-    col_widths = [14, 14, 42, 12, 10, 14, 10, 14, 10, 12, 16, 18, 18, 20, 20, 10, 14, 36, 12] + [12] * len(month_labels)
+    col_widths = [14, 14, 42, 12, 10, 14, 10, 14, 10, 12, 16, 18, 18, 20, 20, 10, 14, 36, 12] + [12] * len(month_labels) + [16]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
