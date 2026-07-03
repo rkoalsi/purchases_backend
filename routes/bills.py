@@ -5,6 +5,7 @@ from typing import Optional
 import io
 import logging
 import os
+import re
 import requests
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -172,14 +173,57 @@ def _link_adjustment_to_bill(db, bill_id: str, adjustment_id: str):
     )
 
 
+def _resolve_bill_and_po_numbers(db, bill_id: str) -> tuple[Optional[str], Optional[str]]:
+    """Live-fetch the bill from Zoho for its bill_number + linked PO number — doesn't depend on a
+    local `bills` doc existing, since plain GETs never upsert one."""
+    try:
+        bill = _fetch_bill(bill_id)
+    except Exception as e:
+        logger.warning("Could not fetch bill %s to resolve numbers: %s", bill_id, e)
+        return None, None
+
+    bill_number = bill.get("bill_number")
+    po_number = None
+    po_ids = bill.get("purchaseorder_ids") or []
+    if po_ids:
+        po_doc = db.get_collection(PURCHASE_ORDERS_COLLECTION).find_one(
+            {"purchaseorder_id": po_ids[0]}, {"purchaseorder_number": 1}
+        )
+        po_number = (po_doc or {}).get("purchaseorder_number")
+    return bill_number, po_number
+
+
 def _linked_adjustments_for_bill(db, bill_id: str) -> list[dict]:
     bill_doc = db.get_collection(BILLS_COLLECTION).find_one({"bill_id": bill_id}, {"linked_inventory_adjustment_ids": 1})
-    ids = (bill_doc or {}).get("linked_inventory_adjustment_ids") or []
-    if not ids:
+    ids = set((bill_doc or {}).get("linked_inventory_adjustment_ids") or [])
+
+    # Auto-discover adjustments created manually in Zoho whose reference_number embeds this bill's
+    # number or its PO's number (the convention used historically, e.g. "SH26E0558 ( PO-PETZOO066 )"),
+    # even though no explicit link action was ever taken for them.
+    bill_number, po_number = _resolve_bill_and_po_numbers(db, bill_id)
+    or_clauses = [
+        {"reference_number": {"$regex": re.escape(ref), "$options": "i"}} for ref in (bill_number, po_number) if ref
+    ]
+    discovered_ids: set[str] = set()
+    if or_clauses:
+        for doc in db.get_collection(INVENTORY_ADJUSTMENTS_COLLECTION).find({"$or": or_clauses}, {"inventory_adjustment_id": 1}):
+            discovered_ids.add(doc["inventory_adjustment_id"])
+
+    new_ids = discovered_ids - ids
+    if new_ids:
+        db.get_collection(BILLS_COLLECTION).update_one(
+            {"bill_id": bill_id},
+            {"$addToSet": {"linked_inventory_adjustment_ids": {"$each": list(new_ids)}}},
+            upsert=True,
+        )
+
+    all_ids = list(ids | discovered_ids)
+    if not all_ids:
         return []
+
     docs = list(
         db.get_collection(INVENTORY_ADJUSTMENTS_COLLECTION).find(
-            {"inventory_adjustment_id": {"$in": ids}},
+            {"inventory_adjustment_id": {"$in": all_ids}},
             {
                 "inventory_adjustment_id": 1,
                 "reference_number": 1,
@@ -294,35 +338,73 @@ def po_groups(search: Optional[str] = Query(None), po: Optional[str] = Query(Non
             if pon and pon not in order_by_po:
                 order_by_po[pon] = o
 
-    po_ids = [p["purchaseorder_id"] for p in pos if p.get("purchaseorder_id")]
-    bills_by_po: dict[str, list[dict]] = {}
+    po_number_by_id = {p["purchaseorder_id"]: p.get("purchaseorder_number") for p in pos if p.get("purchaseorder_id")}
+    po_ids = list(po_number_by_id.keys())
+    bill_docs: list[dict] = []
     if po_ids:
-        for b in db.get_collection(BILLS_COLLECTION).find(
-            {"purchaseorder_ids": {"$in": po_ids}},
-            {
-                "bill_id": 1,
-                "bill_number": 1,
-                "status": 1,
-                "total": 1,
-                "total_formatted": 1,
-                "currency_code": 1,
-                "currency_symbol": 1,
-                "purchaseorder_ids": 1,
-                "line_items": 1,
-            },
-        ):
-            entry = {
-                "bill_id": b.get("bill_id"),
-                "bill_number": b.get("bill_number"),
-                "status": b.get("status"),
-                "total": b.get("total"),
-                "total_formatted": b.get("total_formatted"),
-                "currency_code": b.get("currency_code"),
-                "currency_symbol": b.get("currency_symbol"),
-                "needs_fix": _needs_fix(b),
-            }
-            for pid in b.get("purchaseorder_ids") or []:
-                bills_by_po.setdefault(pid, []).append(entry)
+        bill_docs = list(
+            db.get_collection(BILLS_COLLECTION).find(
+                {"purchaseorder_ids": {"$in": po_ids}},
+                {
+                    "bill_id": 1,
+                    "bill_number": 1,
+                    "status": 1,
+                    "total": 1,
+                    "total_formatted": 1,
+                    "currency_code": 1,
+                    "currency_symbol": 1,
+                    "purchaseorder_ids": 1,
+                    "line_items": 1,
+                    "linked_inventory_adjustment_ids": 1,
+                },
+            )
+        )
+
+    # Batch-detect inventory adjustments per bill — same "reference_number contains bill/PO
+    # number" convention as _linked_adjustments_for_bill, but done once for the whole page
+    # (one query) instead of per-bill, so it shows up here without needing to open each bill.
+    all_candidate_refs: set[str] = set()
+    bill_candidate_refs: dict[str, set[str]] = {}
+    for b in bill_docs:
+        refs = {b["bill_number"]} if b.get("bill_number") else set()
+        for pid in b.get("purchaseorder_ids") or []:
+            pon = po_number_by_id.get(pid)
+            if pon:
+                refs.add(pon)
+        bill_candidate_refs[b["bill_id"]] = refs
+        all_candidate_refs.update(refs)
+
+    matched_adjustments: list[dict] = []
+    if all_candidate_refs:
+        or_clauses = [{"reference_number": {"$regex": re.escape(ref), "$options": "i"}} for ref in all_candidate_refs]
+        matched_adjustments = list(
+            db.get_collection(INVENTORY_ADJUSTMENTS_COLLECTION).find({"$or": or_clauses}, {"inventory_adjustment_id": 1, "reference_number": 1})
+        )
+
+    def _adjustment_count_for(bill: dict) -> int:
+        ids = set(bill.get("linked_inventory_adjustment_ids") or [])
+        refs = bill_candidate_refs.get(bill["bill_id"], set())
+        for adj in matched_adjustments:
+            ref_number = (adj.get("reference_number") or "").lower()
+            if any(ref.lower() in ref_number for ref in refs):
+                ids.add(adj["inventory_adjustment_id"])
+        return len(ids)
+
+    bills_by_po: dict[str, list[dict]] = {}
+    for b in bill_docs:
+        entry = {
+            "bill_id": b.get("bill_id"),
+            "bill_number": b.get("bill_number"),
+            "status": b.get("status"),
+            "total": b.get("total"),
+            "total_formatted": b.get("total_formatted"),
+            "currency_code": b.get("currency_code"),
+            "currency_symbol": b.get("currency_symbol"),
+            "needs_fix": _needs_fix(b),
+            "adjustment_count": _adjustment_count_for(b),
+        }
+        for pid in b.get("purchaseorder_ids") or []:
+            bills_by_po.setdefault(pid, []).append(entry)
 
     groups: dict[str, dict] = {}
     for p in pos:
@@ -839,6 +921,34 @@ def search_inventory_adjustments(search: Optional[str] = Query(None), limit: int
         .limit(limit)
     )
     return {"options": serialize_mongo_document(docs)}
+
+
+@router.get("/inventory-adjustments/{inventory_adjustment_id}")
+def get_inventory_adjustment_detail(inventory_adjustment_id: str, db=Depends(get_database)):
+    doc = db.get_collection(INVENTORY_ADJUSTMENTS_COLLECTION).find_one({"inventory_adjustment_id": inventory_adjustment_id})
+    if doc and doc.get("line_items"):
+        return {"inventory_adjustment": serialize_mongo_document(doc)}
+
+    # Local doc missing or line-item-less (e.g. only summary fields synced so far) — fetch live.
+    try:
+        token = _get_inventory_token()
+        r = requests.get(
+            f"{ZOHO_INVENTORY_BASE}/inventoryadjustments/{inventory_adjustment_id}",
+            headers={"Authorization": f"Zoho-oauthtoken {token}"},
+            params={"organization_id": ORGANIZATION_ID},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != 0:
+            raise ValueError(f"Zoho error: {data.get('message', 'Unknown error')}")
+        adjustment = data["inventory_adjustment"]
+    except Exception as e:
+        logger.error("Failed to fetch inventory adjustment %s: %s", inventory_adjustment_id, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    _upsert_inventory_adjustment(db, adjustment)
+    return {"inventory_adjustment": adjustment}
 
 
 @router.get("/{bill_id}/inventory-adjustments")
