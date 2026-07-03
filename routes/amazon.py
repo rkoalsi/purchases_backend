@@ -2016,7 +2016,7 @@ async def get_sku_mapping(database=Depends(get_database)):
         )
 
 
-_VALID_AMAZON_STATUSES = {"Active", "Inactive", "Discontinued on Amazon"}
+_VALID_AMAZON_STATUSES = {"Active", "Inactive", "Discontinued until stock lasts"}
 
 
 @router.put("/sku-mapping/{asin}/status")
@@ -2280,7 +2280,7 @@ async def upload_etrade_margins(
                 fnsku_val = str(row["FNSKU"]).strip()
                 if fnsku_val:
                     sku_fields["fnsku"] = fnsku_val
-            # Amazon Status (Active / Inactive / Discontinued on Amazon) — independent field.
+            # Amazon Status (Active / Inactive / Discontinued until stock lasts) — independent field.
             if "Amazon Status" in df.columns and pd.notna(row["Amazon Status"]):
                 status_val = str(row["Amazon Status"]).strip()
                 if status_val in _VALID_AMAZON_STATUSES:
