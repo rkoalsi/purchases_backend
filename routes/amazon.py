@@ -2017,6 +2017,14 @@ async def get_sku_mapping(database=Depends(get_database)):
 
 
 _VALID_AMAZON_STATUSES = {"Active", "Inactive", "Discontinued until stock lasts", "Parent"}
+# Case-insensitive lookup so uploaded files with differing casing (e.g.
+# "discontinued until stock lasts") normalize to the canonical stored value.
+_AMAZON_STATUS_BY_LOWER = {s.lower(): s for s in _VALID_AMAZON_STATUSES}
+
+
+def _canonical_amazon_status(val) -> str | None:
+    """Return the canonical amazon_status for a raw cell value, case-insensitively."""
+    return _AMAZON_STATUS_BY_LOWER.get(str(val).strip().lower())
 
 
 @router.put("/sku-mapping/{asin}/status")
@@ -2282,8 +2290,8 @@ async def upload_etrade_margins(
                     sku_fields["fnsku"] = fnsku_val
             # Amazon Status (Active / Inactive / Discontinued until stock lasts / Parent) — independent field.
             if "Amazon Status" in df.columns and pd.notna(row["Amazon Status"]):
-                status_val = str(row["Amazon Status"]).strip()
-                if status_val in _VALID_AMAZON_STATUSES:
+                status_val = _canonical_amazon_status(row["Amazon Status"])
+                if status_val:
                     sku_fields["amazon_status"] = status_val
             # Platforms (comma-separated SF,FBA,VC,DF) — independent field. Blank cell
             # clears all platforms; absent column leaves the field untouched.
