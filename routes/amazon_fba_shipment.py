@@ -694,23 +694,29 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
     sf_fba_live_inv, _ = _fetch_sf_fba_inventory_latest_sync(db, today)
 
     # 8c. Units Sold (last 30 days) — all channels (FBA + SF + VC), matching the all-channel DRR.
-    #     FBA + SF come from amazon_ledger.customer_shipments; VC from amazon_vendor_sales.orderedUnits.
+    #     FBA + SF come from amazon_sales_traffic.salesByAsin.unitsOrdered (keyed by parentAsin) —
+    #     the SAME source compute_drr_for_asins_sync uses. (amazon_ledger.customer_shipments is a
+    #     stock-ledger movement, not orders, and can go negative on returns/reversals — do NOT use it.)
+    #     VC from amazon_vendor_sales.orderedUnits.
     units_sold_30d: dict[str, int] = {a: 0 for a in asins}
     sales_start = today - timedelta(days=30)
-    for doc in db["amazon_ledger"].aggregate(
+    for doc in db["amazon_sales_traffic"].aggregate(
         [
-            {"$match": {"asin": {"$in": asins}, "date": {"$gte": sales_start, "$lte": today}}},
-            {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$customer_shipments", 0]}}}},
+            {"$match": {"parentAsin": {"$in": asins}, "date": {"$gte": sales_start, "$lte": today}}},
+            {"$group": {"_id": "$parentAsin", "total": {"$sum": {"$ifNull": ["$salesByAsin.unitsOrdered", 0]}}}},
         ]
     ):
         units_sold_30d[doc["_id"]] = units_sold_30d.get(doc["_id"], 0) + int(doc["total"] or 0)
     for doc in db["amazon_vendor_sales"].aggregate(
         [
             {"$match": {"asin": {"$in": asins}, "date": {"$gte": sales_start, "$lte": today}}},
-            {"$group": {"_id": "$asin", "total": {"$sum": "$orderedUnits"}}},
+            {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$orderedUnits", 0]}}}},
         ]
     ):
         units_sold_30d[doc["_id"]] = units_sold_30d.get(doc["_id"], 0) + int(doc["total"] or 0)
+
+    # Floor at 0 — matches the max(0, …) net-units convention used elsewhere.
+    units_sold_30d = {a: max(0, v) for a, v in units_sold_30d.items()}
 
     # 9. Load overrides
     overrides: dict[str, dict] = {}
