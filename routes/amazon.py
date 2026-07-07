@@ -5,7 +5,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends,
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta, timezone
 from ..helpers.datetime_utils import utcnow
-from pymongo import ASCENDING
+from pymongo import ASCENDING, UpdateOne
 from pymongo.errors import PyMongoError
 from ..database import get_database, serialize_mongo_document
 import os
@@ -2249,6 +2249,8 @@ async def upload_etrade_margins(
 
         margins_collection = database.get_collection(MARGINS_COLLECTION)
         sku_collection = database.get_collection(SKU_COLLECTION)
+        margin_ops: list = []
+        sku_ops: list = []
         upserted = 0
         skipped = 0
 
@@ -2276,10 +2278,12 @@ async def upload_etrade_margins(
                     margin_fields["etrade_df"] = v
 
             if margin_fields:
-                margins_collection.update_one(
-                    {"asin": asin},
-                    {"$set": {"asin": asin, **margin_fields}},
-                    upsert=True,
+                margin_ops.append(
+                    UpdateOne(
+                        {"asin": asin},
+                        {"$set": {"asin": asin, **margin_fields}},
+                        upsert=True,
+                    )
                 )
 
             # ── amazon_sku_mapping fields ──────────────────────────────────────
@@ -2304,15 +2308,25 @@ async def upload_etrade_margins(
                     sku_fields["active_platforms"] = []
 
             if sku_fields:
-                sku_collection.update_one(
-                    {"item_id": asin},
-                    {"$set": sku_fields},
+                sku_ops.append(
+                    UpdateOne({"item_id": asin}, {"$set": sku_fields})
                 )
 
             if margin_fields or sku_fields:
                 upserted += 1
             else:
                 skipped += 1
+
+        # Flush all writes in two bulk operations off the event loop, instead of
+        # thousands of sequential blocking update_one round-trips (which hung the
+        # request at "Uploading…").
+        def _flush():
+            if margin_ops:
+                margins_collection.bulk_write(margin_ops, ordered=False)
+            if sku_ops:
+                sku_collection.bulk_write(sku_ops, ordered=False)
+
+        await asyncio.to_thread(_flush)
 
         return {
             "message": f"Successfully updated {upserted} records.",
