@@ -663,6 +663,10 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
         e = datetime(y + 1, 1, 1) if m == 12 else datetime(y, m + 1, 1)
         return s, e
 
+    # Monthly Units Sold — SAME sources as the 30-day column and the DRR:
+    # FBA/SF = amazon_sales_traffic.salesByAsin.unitsOrdered (keyed by parentAsin),
+    # VC = amazon_vendor_sales.orderedUnits. (Do NOT use amazon_ledger.customer_shipments —
+    # it's a stock movement that goes negative on returns and understates real orders.)
     monthly_sales: dict[str, dict] = {a: {} for a in asins}
     for y, m in months:
         label = f"{MONTH_NAMES[m]} {y}"
@@ -670,23 +674,27 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
         for doc in db["amazon_vendor_sales"].aggregate(
             [
                 {"$match": {"asin": {"$in": asins}, "date": {"$gte": ms, "$lt": me}}},
-                {"$group": {"_id": "$asin", "total": {"$sum": "$orderedUnits"}}},
+                {"$group": {"_id": "$asin", "total": {"$sum": {"$ifNull": ["$orderedUnits", 0]}}}},
             ]
         ):
             monthly_sales[doc["_id"]][label] = int(doc["total"] or 0)
-        for doc in db["amazon_ledger"].aggregate(
+        for doc in db["amazon_sales_traffic"].aggregate(
             [
-                {"$match": {"asin": {"$in": asins}, "date": {"$gte": ms, "$lt": me}}},
+                {"$match": {"parentAsin": {"$in": asins}, "date": {"$gte": ms, "$lt": me}}},
                 {
                     "$group": {
-                        "_id": "$asin",
-                        "total": {"$sum": {"$ifNull": ["$customer_shipments", 0]}},
+                        "_id": "$parentAsin",
+                        "total": {"$sum": {"$ifNull": ["$salesByAsin.unitsOrdered", 0]}},
                     }
                 },
             ]
         ):
             existing = monthly_sales[doc["_id"]].get(label, 0)
             monthly_sales[doc["_id"]][label] = existing + int(doc["total"] or 0)
+        # Floor at 0 — matches the 30-day column and the max(0, …) net-units convention.
+        for a in monthly_sales:
+            if label in monthly_sales[a]:
+                monthly_sales[a][label] = max(0, monthly_sales[a][label])
 
     month_labels = [f"{MONTH_NAMES[m]} {y}" for (y, m) in months]
 
