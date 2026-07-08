@@ -555,6 +555,7 @@ async def validate_draft_order(
                         "bb_code": it["bb_code"],
                         "item_name": enriched["product_name"] or it["item_name"],
                         "status": item_status,
+                        "item_id": product.get("item_id", ""),
                     })
                 else:
                     validated.append(enriched)
@@ -677,6 +678,78 @@ async def save_pending_item(body: SavePendingItemRequest, db=Depends(get_databas
         upsert=True,
     )
     return {"ok": True}
+
+
+class MarkItemActiveRequest(BaseModel):
+    item_id: str = ""
+    bb_code: str = ""
+    manufacturer_code: str = ""
+
+
+@router.post("/draft_orders/mark_item_active")
+async def mark_item_active(body: MarkItemActiveRequest, db=Depends(get_database)):
+    """Reactivate an inactive product: marks it active on Zoho Books and flips the
+    local products.status → "active" so it stops being dropped from draft-order
+    validation. Called from the re-upload dialog's inactive-items panel.
+    """
+    products_col = db.get_collection(PRODUCTS_COLLECTION)
+
+    def _resolve_item_id() -> tuple[str, dict | None]:
+        # Trust the caller's item_id when present; otherwise resolve from the
+        # unique bb_code (cf_sku_code), preferring the inactive doc we need to fix.
+        if body.item_id:
+            prod = products_col.find_one({"item_id": body.item_id}, {"item_id": 1})
+            return body.item_id, prod
+        query = None
+        if body.bb_code:
+            query = {"cf_sku_code": body.bb_code}
+        elif body.manufacturer_code:
+            query = {"cf_item_code": body.manufacturer_code}
+        if not query:
+            return "", None
+        prod = products_col.find_one(query, {"item_id": 1})
+        return (prod.get("item_id", "") if prod else ""), prod
+
+    def _process():
+        item_id, _ = _resolve_item_id()
+        if not item_id:
+            raise ValueError("Could not resolve Zoho item_id for this product")
+
+        token = _get_zoho_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+        # https://www.zoho.com/books/api/v3/items/#mark-as-active
+        r = requests.post(
+            f"{ZOHO_BOOKS_BASE}/items/{item_id}/active",
+            headers=headers,
+            params={"organization_id": ORGANIZATION_ID},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        # code 0 = success. Zoho returns a non-zero code if the item is already active,
+        # which is fine for our purposes — treat "already active" as success.
+        if data.get("code") not in (0, None) and "already" not in (data.get("message") or "").lower():
+            raise ValueError(data.get("message", "Zoho error marking item active"))
+
+        # Reflect locally so re-validation immediately includes the item.
+        products_col.update_many(
+            {"item_id": item_id},
+            {"$set": {"status": "active", "updated_at": utcnow()}},
+        )
+        return item_id
+
+    try:
+        item_id = await asyncio.to_thread(_process)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except requests.HTTPError as e:
+        logger.error("Zoho mark-active HTTP error for item %s: %s", body.item_id, e)
+        raise HTTPException(status_code=502, detail=f"Zoho error: {e}")
+    except Exception as e:
+        logger.error("mark_item_active failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"ok": True, "item_id": item_id, "status": "active"}
 
 
 _MASTER_SHEET_ID   = "1tn_Lj3KR0zXY8B-8ZUkSznZgE4YzyjtAkcpdHzBCgt4"
