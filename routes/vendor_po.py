@@ -325,6 +325,64 @@ def _so_package_numbers_for_estimate(est_id: str, db) -> list[str]:
     ]
 
 
+def _fetch_package_from_zoho(package_number: str) -> dict | None:
+    """Fetch a package (with line_items) live from Zoho Inventory by its number.
+
+    The local `packages` collection is synced by an external job, so a package that
+    already exists in Zoho — and is referenced by a sales order — can be missing here
+    for a while. This lets callers fall back to the source of truth. Returns the Zoho
+    package dict (including `line_items`) or None if not found in Zoho either.
+    """
+    token = _get_inventory_token()
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    # 1) resolve package_id from the number
+    r = requests.get(
+        f"{ZOHO_INVENTORY_BASE}/packages",
+        headers=headers,
+        params={
+            "organization_id": ORGANIZATION_ID,
+            "package_number": package_number,
+        },
+        timeout=30,
+    )
+    if not r.ok:
+        return None
+    matches = r.json().get("packages") or []
+    pkg_id = next(
+        (p.get("package_id") for p in matches
+         if p.get("package_number") == package_number),
+        None,
+    ) or (matches[0].get("package_id") if matches else None)
+    if not pkg_id:
+        return None
+    # 2) fetch detail (carries line_items)
+    r = requests.get(
+        f"{ZOHO_INVENTORY_BASE}/packages/{pkg_id}",
+        headers=headers,
+        params={"organization_id": ORGANIZATION_ID},
+        timeout=30,
+    )
+    if not r.ok:
+        return None
+    return r.json().get("package")
+
+
+def _load_package(package_number: str, db):
+    """Return a package doc by number: local `packages` collection first, else live
+    from Zoho (upserting the result locally so subsequent reads hit the cache)."""
+    pkg = db[PACKAGES_COLLECTION].find_one({"package_number": package_number})
+    if pkg:
+        return pkg
+    pkg = _fetch_package_from_zoho(package_number)
+    if pkg:
+        db[PACKAGES_COLLECTION].update_one(
+            {"package_number": package_number},
+            {"$set": {**pkg, "synced_from_zoho_at": datetime.now()}},
+            upsert=True,
+        )
+    return pkg
+
+
 def _compute_packages_accepted_costs(
     package_numbers: list[str], db
 ) -> tuple[float | None, float | None]:
@@ -4899,9 +4957,12 @@ async def create_transfer_order(
         if not pkg_number:
             raise ValueError("No package linked to this PO — link a package first")
 
-        pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_number})
+        pkg = _load_package(pkg_number, db)
         if not pkg:
-            raise ValueError(f"Package {pkg_number!r} not found")
+            raise ValueError(
+                f"Package {pkg_number!r} not found in our records or in Zoho — "
+                "confirm the package has been created on Zoho for this PO"
+            )
 
         line_items_raw = pkg.get("line_items") or []
         if not line_items_raw:
@@ -5101,9 +5162,12 @@ async def create_assemblies(po_number: str, db=Depends(get_database)):
         if not pkg_number:
             raise ValueError("No package linked — link a package first")
 
-        pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_number})
+        pkg = _load_package(pkg_number, db)
         if not pkg:
-            raise ValueError(f"Package {pkg_number} not found")
+            raise ValueError(
+                f"Package {pkg_number!r} not found in our records or in Zoho — "
+                "confirm the package has been created on Zoho for this PO"
+            )
 
         line_items = pkg.get("line_items") or []
         item_ids = [li.get("item_id") for li in line_items if li.get("item_id")]
