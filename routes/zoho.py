@@ -673,6 +673,15 @@ _item_name_cache = {}
 _cache_ttl = 300  # 5 minutes
 _cache_lock = threading.Lock()
 
+# Merged brand dropdown options → their constituent product brands.
+# A single option (e.g. "Barkbutler / FOFOS") maps to multiple real brands.
+# Keys are lowercased for case-insensitive lookup.
+# Keep in sync with frontend util/brandGroups.ts BRAND_GROUPS.
+BRAND_GROUPS = {
+    "petfest": ["Dogfest", "Catfest"],
+    "barkbutler / fofos": ["Barkbutler", "FOFOS"],
+}
+
 
 def get_item_names_by_brand(db, brand: str) -> tuple:
     """
@@ -695,8 +704,11 @@ def get_item_names_by_brand(db, brand: str) -> tuple:
     try:
         products_collection = db.get_collection(PRODUCTS_COLLECTION)
 
-        if brand and brand.lower() == "petfest":
-            match_stage = {"$match": {"brand": {"$in": ["Dogfest", "Catfest"]}}}
+        # Merged/grouped brands: a single dropdown option maps to several real
+        # product brands. Keep in sync with frontend util/brandGroups.ts BRAND_GROUPS.
+        group_members = BRAND_GROUPS.get(brand.lower()) if brand else None
+        if group_members:
+            match_stage = {"$match": {"brand": {"$in": group_members}}}
         elif brand:
             match_stage = {"$match": {"brand": brand}}
         else:
