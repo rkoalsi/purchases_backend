@@ -3506,7 +3506,8 @@ async def upload_invoice_line_items(
         sku_qty_map: dict[str, float] = {}
         all_skus: list[str] = []
         for pkg_num in pkg_numbers:
-            pkg = db[PACKAGES_COLLECTION].find_one({"package_number": pkg_num})
+            # Local `packages` collection is synced externally and can lag; fall back to Zoho.
+            pkg = _load_package(pkg_num, db)
             if not pkg:
                 continue
             sku_rows = _extract_sku_rows_from_line_items(pkg.get("line_items") or [], db)
