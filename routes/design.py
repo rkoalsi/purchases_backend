@@ -473,6 +473,128 @@ async def upload_product_video(product_id: str, file: UploadFile = File(...)):
     return JSONResponse(content={"url": f"{PUBLIC_S3_URL}/{key}"})
 
 
+# ─── Brands (mirrors order_form admin brands page; same shared `brands` collection) ─
+# NOTE: these `/brands/...` routes are defined here (before the `/{order_id}/...`
+# routes further down) so the literal `image` / `secondary_image` / `refresh`
+# segments resolve before the `/brands/{brand_id}` path param.
+
+_BRAND_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "svg", "webp", "gif"}
+
+
+def _brand_slug(brand: str) -> str:
+    """Slug identical to order_form_backend so both apps map a brand to the same S3 key."""
+    brand = brand.lower()
+    return brand.replace(" ", "_") if len(brand.split()) >= 2 else brand
+
+
+def _upload_brand_image(file: UploadFile, brand_name: str, suffix: str, url_field: str):
+    """Shared upload logic for primary/secondary brand images → public S3 + brands doc."""
+    if not brand_name or not brand_name.strip():
+        raise HTTPException(status_code=400, detail="Brand name is required")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
+
+    brand_name = brand_name.strip()
+    ext = file.filename.split(".")[-1].lower() if "." in file.filename else "jpg"
+    if ext not in _BRAND_IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed: {', '.join(sorted(_BRAND_IMAGE_EXTENSIONS))}",
+        )
+
+    file_content = file.file.read()
+    if len(file_content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 10MB)")
+    if len(file_content) == 0:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
+
+    key = f"brands/{_brand_slug(brand_name)}{suffix}.{ext}"
+    try:
+        _public_s3_client().put_object(
+            Bucket=PUBLIC_S3_BUCKET,
+            Key=key,
+            Body=file_content,
+            ContentType=file.content_type or "application/octet-stream",
+            ACL="public-read",
+        )
+    except Exception as e:
+        logger.exception("Brand image S3 upload failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to upload image to S3: {e}")
+
+    new_url = f"{PUBLIC_S3_URL}/{key}"
+    db = get_database()
+    db[BRANDS_COLLECTION].update_one(
+        {"name": brand_name}, {"$set": {url_field: new_url}}
+    )
+    return new_url
+
+
+@router.get("/brands")
+async def design_list_brands(search: Optional[str] = Query(None)):
+    """List all brands (optionally filtered by name) with their image URLs."""
+    db = get_database()
+    condition: dict = {}
+    if search:
+        condition["name"] = {"$regex": re.escape(search), "$options": "i"}
+    brands = list(db[BRANDS_COLLECTION].find(condition).sort("name", 1))
+    return {"brands": serialize_mongo_document(brands)}
+
+
+@router.get("/brands/refresh")
+async def design_refresh_brands():
+    """Ensure every active in-stock product brand has a row in the brands collection."""
+    db = get_database()
+    product_brands = db[PRODUCTS_COLLECTION].distinct(
+        "brand",
+        {"stock": {"$gt": 0}, "status": "active", "is_deleted": {"$exists": False}},
+    )
+    created = 0
+    for brand in [b for b in product_brands if b]:
+        if not db[BRANDS_COLLECTION].find_one({"name": brand}):
+            db[BRANDS_COLLECTION].insert_one({"name": brand, "image_url": ""})
+            created += 1
+    return {"message": "Updated Brands Collection", "created": created}
+
+
+@router.put("/brands/image")
+async def design_update_brand_image(
+    file: UploadFile = File(...), brand_name: str = Form(...)
+):
+    """Upload/replace a brand's primary image."""
+    url = _upload_brand_image(file, brand_name, "", "image_url")
+    return {"message": "Brand image updated.", "image_url": url}
+
+
+@router.put("/brands/secondary_image")
+async def design_update_brand_secondary_image(
+    file: UploadFile = File(...), brand_name: str = Form(...)
+):
+    """Upload/replace a brand's secondary image."""
+    url = _upload_brand_image(file, brand_name, "_secondary", "secondary_image_url")
+    return {"message": "Brand secondary image updated.", "secondary_image_url": url}
+
+
+class BrandUpdateRequest(BaseModel):
+    description: Optional[str] = None
+    status: Optional[str] = None
+    hidden: Optional[bool] = None
+
+
+@router.put("/brands/{brand_id}")
+async def design_update_brand(brand_id: str, payload: BrandUpdateRequest):
+    """Update a brand's description / status / visibility."""
+    update_data = {k: v for k, v in payload.dict(exclude_unset=True).items() if v is not None or k == "description"}
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    db = get_database()
+    result = db[BRANDS_COLLECTION].update_one(
+        {"_id": ObjectId(brand_id)}, {"$set": update_data}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    return {"message": "Brand updated successfully"}
+
+
 # ─── XLSX helpers ─────────────────────────────────────────────────────────────
 
 def _style_header_row(ws, row: int, col_count: int, fill_hex: str = "6B21A8"):
