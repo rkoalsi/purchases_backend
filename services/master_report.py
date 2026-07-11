@@ -691,6 +691,83 @@ async def _generate_master_report_data(
                         injected += 1
                     logger.info(f"Injected {injected} zero-activity brand stub items into combined_data")
 
+            # Inject stub rows for SKUs that have open stock-in-transit but never appeared
+            # in any sales report (no sales in the window) and have no FBA stock, so no
+            # entry was ever created.  Without this, an unfiltered (all-brand) report drops
+            # the transit qty of purely in-transit SKUs entirely — e.g. new colour variants
+            # on an open PO — understating each brand's Total Stock in Transit.  The brand
+            # stub block above only covers this when a brand filter is active.
+            if transit_data:
+                existing_skus = {item.get("sku_code") for item in combined_data if item.get("sku_code")}
+                transit_only_skus = {
+                    sku for sku, td in transit_data.items()
+                    if sku and sku not in existing_skus and (td.get("total", 0) or 0) > 0
+                }
+                if transit_only_skus:
+                    transit_only_product_data = await report_service.batch_load_all_product_data(transit_only_skus)
+                    all_product_data.update(transit_only_product_data)
+                    for _s, _pd in transit_only_product_data.items():
+                        _r = _pd.get("rate")
+                        if _r is not None:
+                            try:
+                                product_rates[_s] = float(_r)
+                            except (ValueError, TypeError):
+                                pass
+                    injected = 0
+                    for sku in sorted(transit_only_skus):
+                        pdata = transit_only_product_data.get(sku, {})
+                        # Respect brand filter if active
+                        stub_brand = pdata.get("brand", "") or ""
+                        if brand:
+                            if brand.lower() == "petfest":
+                                if stub_brand.lower() not in {"dogfest", "catfest"}:
+                                    continue
+                            elif stub_brand.lower() != brand.lower():
+                                continue
+                        name = pdata.get("name") or "Unknown Item"
+                        td = transit_data.get(sku, {})
+                        # Register stub so classify_movement groups it and enrichment picks up
+                        # its metadata.  Transit values themselves are re-attached downstream
+                        # from transit_data, but seed logistics_data for consistency.
+                        product_brands[sku] = stub_brand
+                        logistics_data[sku] = {
+                            "cbm": pdata.get("cbm", 0) or 0,
+                            "case_pack": pdata.get("case_pack", 0) or 0,
+                            "purchase_status": pdata.get("purchase_status", ""),
+                            "stock_in_transit_1": td.get("transit_1", 0) or 0,
+                            "stock_in_transit_2": td.get("transit_2", 0) or 0,
+                            "stock_in_transit_3": td.get("transit_3", 0) or 0,
+                            "is_new": pdata.get("is_new", False),
+                            "hsn_or_sac": pdata.get("hsn_or_sac", ""),
+                            "is_combo_product": pdata.get("is_combo_product", False),
+                        }
+                        stub = {
+                            "sku_code": sku,
+                            "item_name": name,
+                            "sources": [],
+                            "combined_metrics": {
+                                "total_units_sold": 0.0,
+                                "total_units_returned": 0.0,
+                                "total_credit_notes": 0.0,
+                                "total_amount": 0.0,
+                                "total_closing_stock": 0.0,
+                                "total_days_in_stock": 0.0,
+                                "avg_daily_run_rate": 0.0,
+                                "avg_days_of_coverage": 0.0,
+                                "fba_closing_stock": 0.0,
+                                "pupscribe_wh_stock": 0.0,
+                                "transfer_orders": 0.0,
+                                "total_sales": 0.0,
+                            },
+                            "in_stock": False,
+                            "drr_source": "current_period",
+                            "drr_lookback_period": "",
+                            "highlight": None,
+                        }
+                        combined_data.append(stub)
+                        injected += 1
+                    logger.info(f"Injected {injected} transit-only stub items into combined_data")
+
             # ── Second-pass DRR lookback for stub items ──────────────────────────────
             # FBA-only and brand stubs are injected AFTER the first lookback pass, so
             # they never enter skus_needing_lookback_list.  Run a targeted lookback now
