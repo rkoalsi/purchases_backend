@@ -1,7 +1,7 @@
 import pandas as pd
 from io import BytesIO
 from bson import ObjectId
-from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends, Query
+from fastapi import APIRouter, UploadFile, File, HTTPException, status, Depends, Query, BackgroundTasks, Body
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta, timezone
 from ..helpers.datetime_utils import utcnow
@@ -18,7 +18,13 @@ from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 import logging
 import asyncio
-from .amazon_vc import router as amazon_vendor_router
+from .amazon_vc import (
+    router as amazon_vendor_router,
+    get_vendor_sales,
+    get_vendor_inventory,
+    SALES_COLLECTION as VC_SALES_COLLECTION,
+    INVENTORY_COLLECTION as VC_INVENTORY_COLLECTION,
+)
 
 # --- Configuration ---
 # Configure logging
@@ -35,6 +41,18 @@ FBA_RETURNS_COLLECTION = "amazon_fba_returns"
 SC_RETURNS_COLLECTION = "amazon_seller_central_returns"
 SELLER_FLEX_RETURNS_COLLECTION = "amazon_seller_flex_returns"
 VENDOR_CENTRAL_RETURNS_COLLECTION = "amazon_vendor_central_returns"
+
+# ── Data backfill (user-triggered refetch of missing dates) ──────────────────
+BACKFILL_JOBS_COLLECTION = "amazon_backfill_jobs"
+# Per (source, date) hard timeout. VC report polling can take several minutes.
+BACKFILL_JOB_TIMEOUT_SECONDS = int(os.getenv("BACKFILL_JOB_TIMEOUT_SECONDS", "900"))
+# Human labels + which report_type of GET /amazon/status each source maps to.
+BACKFILL_SOURCES = {
+    "fba_sales": "FBA / Seller-Flex Sales",
+    "fba_inventory": "FBA / Seller-Flex Inventory",
+    "vc_sales": "Vendor Central Sales",
+    "vc_inventory": "Vendor Central Inventory",
+}
 
 router = APIRouter()
 
@@ -1585,6 +1603,297 @@ async def sync_status(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
+
+
+# ─── Data Backfill: user-triggered refetch of missing dates ───────────────────
+#
+# Jobs are persisted in `amazon_backfill_jobs` so the frontend can poll for
+# progress and survive page reloads. Each (source, date) is one job. A single
+# BackgroundTask drains a batch sequentially; each source runs its existing
+# blocking fetch in a thread with a hard per-job timeout. A reaper marks jobs
+# left "running" past the timeout (e.g. server restart) as failed on read.
+
+
+def _backfill_day_window(date_str: str):
+    """Aware-UTC [start, end] for a calendar day — mirrors GET /amazon/status so
+    the same rows are matched for the idempotent delete-before-insert."""
+    day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
+    )
+    day_end = day_start.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return day_start, day_end
+
+
+def _run_backfill_source_sync(source: str, date_str: str, db) -> int:
+    """Blocking fetch + idempotent insert for one (source, date).
+
+    Returns number of records written; raises on any failure. Deletes existing
+    rows for the day first so re-running a date refreshes cleanly instead of
+    duplicating (the frontend only offers missing dates, but this keeps re-runs
+    safe).
+    """
+    start_dt = f"{date_str}T00:00:00Z"
+    day_start, day_end = _backfill_day_window(date_str)
+    date_filter = {"date": {"$gte": day_start, "$lte": day_end}}
+
+    if source == "fba_sales":
+        data = get_amazon_sales_traffic_data(
+            start_dt, f"{date_str}T23:59:59Z", db, [MARKETPLACE_ID]
+        )
+        db[SALES_COLLECTION].delete_many(date_filter)
+        if not data:
+            return 0
+        return len(db[SALES_COLLECTION].insert_many(data).inserted_ids)
+
+    if source == "fba_inventory":
+        data = get_amazon_ledger_data(
+            start_dt, f"{date_str}T00:00:00Z", db, [MARKETPLACE_ID], "FC", "DAILY"
+        )
+        db[INVENTORY_COLLECTION].delete_many(date_filter)
+        if not data:
+            return 0
+        return len(db[INVENTORY_COLLECTION].insert_many(data).inserted_ids)
+
+    # Vendor Central — raw data has no date/created_at; add them like the cron.
+    if source in ("vc_sales", "vc_inventory"):
+        if source == "vc_sales":
+            collection_name = VC_SALES_COLLECTION
+            data = get_vendor_sales(start_dt, f"{date_str}T23:59:59Z")
+        else:
+            collection_name = VC_INVENTORY_COLLECTION
+            data = get_vendor_inventory(start_dt, f"{date_str}T00:00:00Z")
+        db[collection_name].delete_many(date_filter)
+        if not data:
+            return 0
+        now = datetime.now()
+        for rec in data:
+            rec["date"] = day_start
+            rec["created_at"] = now
+        return len(db[collection_name].insert_many(data, ordered=False).inserted_ids)
+
+    raise ValueError(f"Unknown backfill source: {source}")
+
+
+def _reap_stale_backfill_jobs(db) -> None:
+    """Fail jobs stuck in pending/running past the timeout (e.g. server restart
+    killed the BackgroundTask). Runs opportunistically on every list request."""
+    cutoff = utcnow() - timedelta(seconds=BACKFILL_JOB_TIMEOUT_SECONDS)
+    db[BACKFILL_JOBS_COLLECTION].update_many(
+        {"status": {"$in": ["pending", "running"]}, "created_at": {"$lt": cutoff}},
+        {
+            "$set": {
+                "status": "failed",
+                "error": "Timed out — no result within the allowed window.",
+                "completed_at": utcnow(),
+            }
+        },
+    )
+
+
+async def _process_backfill_jobs(job_ids: List[ObjectId], db) -> None:
+    """Drain a batch of queued jobs sequentially (one Amazon report at a time)."""
+    collection = db[BACKFILL_JOBS_COLLECTION]
+    for job_id in job_ids:
+        job = await asyncio.to_thread(collection.find_one, {"_id": job_id})
+        # Skip if it was cancelled/superseded between queue and run.
+        if not job or job.get("status") != "pending":
+            continue
+        await asyncio.to_thread(
+            collection.update_one,
+            {"_id": job_id},
+            {"$set": {"status": "running", "started_at": utcnow()}},
+        )
+        source = job["source"]
+        date_str = job["date"]
+        try:
+            inserted = await asyncio.wait_for(
+                asyncio.to_thread(_run_backfill_source_sync, source, date_str, db),
+                timeout=BACKFILL_JOB_TIMEOUT_SECONDS,
+            )
+            await asyncio.to_thread(
+                collection.update_one,
+                {"_id": job_id},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "records_inserted": inserted,
+                        "error": None,
+                        "completed_at": utcnow(),
+                    }
+                },
+            )
+            logger.info(
+                f"✅ Backfill {source} {date_str} completed — {inserted} records"
+            )
+        except asyncio.TimeoutError:
+            await asyncio.to_thread(
+                collection.update_one,
+                {"_id": job_id},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "error": f"Timed out after {BACKFILL_JOB_TIMEOUT_SECONDS}s.",
+                        "completed_at": utcnow(),
+                    }
+                },
+            )
+            logger.error(f"⏱️ Backfill {source} {date_str} timed out")
+        except Exception as e:
+            await asyncio.to_thread(
+                collection.update_one,
+                {"_id": job_id},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "error": str(e)[:500],
+                        "completed_at": utcnow(),
+                    }
+                },
+            )
+            logger.error(f"❌ Backfill {source} {date_str} failed: {e}")
+
+
+@router.post("/backfill")
+async def create_backfill_jobs(
+    background_tasks: BackgroundTasks,
+    payload: Dict[str, Any] = Body(...),
+    db=Depends(get_database),
+):
+    """Queue backfill jobs for the given sources × dates.
+
+    Body: {"sources": ["fba_sales", ...], "dates": ["YYYY-MM-DD", ...],
+           "requested_by": "email"}
+
+    A (source, date) already pending/running is reused (not duplicated). Returns
+    the created/existing jobs; poll GET /amazon/backfill for progress.
+    """
+    sources = payload.get("sources") or []
+    dates = payload.get("dates") or []
+    requested_by = payload.get("requested_by")
+
+    bad_sources = [s for s in sources if s not in BACKFILL_SOURCES]
+    if bad_sources:
+        raise HTTPException(400, detail=f"Unknown sources: {bad_sources}")
+    if not sources or not dates:
+        raise HTTPException(400, detail="Provide at least one source and one date.")
+    for d in dates:
+        try:
+            datetime.strptime(d, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(400, detail=f"Invalid date: {d} (use YYYY-MM-DD)")
+
+    collection = db[BACKFILL_JOBS_COLLECTION]
+    new_ids: List[ObjectId] = []
+    jobs_out = []
+    for source in sources:
+        for date_str in dates:
+            existing = await asyncio.to_thread(
+                collection.find_one,
+                {
+                    "source": source,
+                    "date": date_str,
+                    "status": {"$in": ["pending", "running"]},
+                },
+            )
+            if existing:
+                jobs_out.append(existing)
+                continue
+            doc = {
+                "source": source,
+                "date": date_str,
+                "status": "pending",
+                "records_inserted": None,
+                "error": None,
+                "requested_by": requested_by,
+                "created_at": utcnow(),
+                "started_at": None,
+                "completed_at": None,
+            }
+            res = await asyncio.to_thread(collection.insert_one, doc)
+            doc["_id"] = res.inserted_id
+            new_ids.append(res.inserted_id)
+            jobs_out.append(doc)
+
+    if new_ids:
+        background_tasks.add_task(_process_backfill_jobs, new_ids, db)
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "queued": len(new_ids),
+            "jobs": [serialize_mongo_document(j) for j in jobs_out],
+        },
+    )
+
+
+@router.get("/backfill")
+async def list_backfill_jobs(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    since_hours: int = Query(48, ge=1, le=720),
+    limit: int = Query(200, ge=1, le=1000),
+    db=Depends(get_database),
+):
+    """List recent backfill jobs (newest first) for polling. Reaps stale jobs
+    first so a crash-orphaned 'running' job resolves to 'failed' on read."""
+    await asyncio.to_thread(_reap_stale_backfill_jobs, db)
+
+    query: Dict[str, Any] = {
+        "created_at": {"$gte": utcnow() - timedelta(hours=since_hours)}
+    }
+    if status_filter:
+        query["status"] = status_filter
+
+    def _fetch():
+        return list(
+            db[BACKFILL_JOBS_COLLECTION]
+            .find(query)
+            .sort([("created_at", -1), ("_id", -1)])
+            .limit(limit)
+        )
+
+    jobs = await asyncio.to_thread(_fetch)
+    active = sum(1 for j in jobs if j.get("status") in ("pending", "running"))
+    return {
+        "jobs": [serialize_mongo_document(j) for j in jobs],
+        "active": active,
+    }
+
+
+@router.post("/backfill/{job_id}/retry")
+async def retry_backfill_job(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    db=Depends(get_database),
+):
+    """Re-queue a failed/completed job (resets it to pending and re-runs)."""
+    try:
+        oid = ObjectId(job_id)
+    except Exception:
+        raise HTTPException(400, detail="Invalid job id")
+
+    collection = db[BACKFILL_JOBS_COLLECTION]
+    job = await asyncio.to_thread(collection.find_one, {"_id": oid})
+    if not job:
+        raise HTTPException(404, detail="Job not found")
+    if job.get("status") in ("pending", "running"):
+        raise HTTPException(409, detail="Job is already queued or running.")
+
+    await asyncio.to_thread(
+        collection.update_one,
+        {"_id": oid},
+        {
+            "$set": {
+                "status": "pending",
+                "records_inserted": None,
+                "error": None,
+                "created_at": utcnow(),
+                "started_at": None,
+                "completed_at": None,
+            }
+        },
+    )
+    background_tasks.add_task(_process_backfill_jobs, [oid], db)
+    return {"status": "queued", "job_id": job_id}
 
 
 @router.post("/sync/fba-returns")
