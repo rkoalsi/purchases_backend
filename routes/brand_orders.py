@@ -30,9 +30,34 @@ PO_COLLECTION = "purchase_orders"
 VENDORS_COLLECTION = "vendors"
 CATEGORIES_COLLECTION = "brand_order_upload_categories"
 NOTIFICATIONS_COLLECTION = "notifications"
+CATALOGUES_COLLECTION = "vendor_catalogues"
 S3_BUCKET = os.getenv("S3_BUCKET", "pupscribe-purchases")
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 DEFAULT_CATEGORIES = ["PI", "CL", "Bill of Lading", "Bill of Entry", "Insurance"]
+
+# Public S3 bucket (files served without a signed URL)
+PUBLIC_S3_BUCKET = os.getenv("PUBLIC_S3_BUCKET", "order-form")
+PUBLIC_S3_REGION = os.getenv("PUBLIC_S3_REGION", "ap-south-1")
+PUBLIC_S3_URL = os.getenv("PUBLIC_S3_URL", "https://assets.pupscribe.in")
+
+
+def _public_s3_client():
+    return boto3.client(
+        "s3",
+        region_name=PUBLIC_S3_REGION,
+        aws_access_key_id=os.getenv("PUBLIC_S3_ACCESS_KEY"),
+        aws_secret_access_key=os.getenv("PUBLIC_S3_SECRET_KEY"),
+    )
+
+
+def _public_s3_key_from_url(url: str) -> Optional[str]:
+    """Return the S3 key for a URL hosted on our public bucket, else None."""
+    if not url:
+        return None
+    prefix = f"{PUBLIC_S3_URL.rstrip('/')}/"
+    if url.startswith(prefix):
+        return url[len(prefix):]
+    return None
 
 
 class AddCategoryRequest(BaseModel):
@@ -535,6 +560,99 @@ async def rename_category(name: str, request: Request, db=Depends(get_database))
         )
     await asyncio.to_thread(_rename)
     return {"old_name": name, "new_name": new_name}
+
+
+# ─── vendor catalogues (public S3) ─────────────────────────────────────────────
+
+MAX_CATALOGUE_MB = 50
+
+
+@router.get("/catalogues")
+async def list_catalogues(db=Depends(get_database)):
+    """Return a map of vendor_id → catalogue record for all vendors."""
+    def _fetch():
+        docs = list(db[CATALOGUES_COLLECTION].find({}))
+        return {d["vendor_id"]: serialize_mongo_document(d) for d in docs}
+    return await asyncio.to_thread(_fetch)
+
+
+@router.put("/catalogues/{vendor_id}")
+async def upsert_catalogue(
+    vendor_id: str,
+    file: UploadFile = File(...),
+    uploaded_by: Optional[str] = Form(None),
+    db=Depends(get_database),
+):
+    """Upload (or replace) a vendor's catalogue in the public S3 bucket."""
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(data) > MAX_CATALOGUE_MB * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"File exceeds {MAX_CATALOGUE_MB} MB.")
+
+    safe_name = _sanitize_folder_name(file.filename or "catalogue")
+    ext = os.path.splitext(file.filename or "")[1] or ""
+    ts = utcnow().strftime("%Y%m%d_%H%M%S")
+    key = f"vendor_catalogues/{vendor_id}/{ts}_{safe_name}"
+    content_type = file.content_type or "application/octet-stream"
+
+    def _save():
+        # Remove the previous catalogue file from S3, if any.
+        existing = db[CATALOGUES_COLLECTION].find_one({"vendor_id": vendor_id})
+        if existing and existing.get("s3_key"):
+            try:
+                _public_s3_client().delete_object(
+                    Bucket=PUBLIC_S3_BUCKET, Key=existing["s3_key"]
+                )
+            except Exception as e:
+                logger.warning("Failed to delete old catalogue: %s", e)
+        try:
+            _public_s3_client().put_object(
+                Bucket=PUBLIC_S3_BUCKET, Key=key, Body=data,
+                ContentType=content_type, ACL="public-read",
+            )
+        except Exception as e:
+            logger.exception("Catalogue S3 upload failed: %s", e)
+            raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
+
+        url = f"{PUBLIC_S3_URL}/{key}"
+        record = {
+            "vendor_id": vendor_id,
+            "s3_key": key,
+            "url": url,
+            "filename": file.filename or safe_name,
+            "content_type": content_type,
+            "size": len(data),
+            "uploaded_by": uploaded_by,
+            "uploaded_at": utcnow(),
+        }
+        db[CATALOGUES_COLLECTION].update_one(
+            {"vendor_id": vendor_id}, {"$set": record}, upsert=True
+        )
+        return serialize_mongo_document(
+            db[CATALOGUES_COLLECTION].find_one({"vendor_id": vendor_id})
+        )
+
+    return await asyncio.to_thread(_save)
+
+
+@router.delete("/catalogues/{vendor_id}")
+async def delete_catalogue(vendor_id: str, db=Depends(get_database)):
+    """Delete a vendor's catalogue from S3 and the DB."""
+    def _delete():
+        existing = db[CATALOGUES_COLLECTION].find_one({"vendor_id": vendor_id})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Catalogue not found.")
+        if existing.get("s3_key"):
+            try:
+                _public_s3_client().delete_object(
+                    Bucket=PUBLIC_S3_BUCKET, Key=existing["s3_key"]
+                )
+            except Exception as e:
+                logger.warning("Failed to delete catalogue from S3: %s", e)
+        db[CATALOGUES_COLLECTION].delete_one({"vendor_id": vendor_id})
+        return {"vendor_id": vendor_id, "deleted": True}
+    return await asyncio.to_thread(_delete)
 
 
 # ─── folders ──────────────────────────────────────────────────────────────────
