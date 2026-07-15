@@ -559,6 +559,9 @@ async def download_master_report(
                                            "for Red/uncertain rows."),
                 ("Order Qty + Extra Qty (Rounded down)", "Final recommended order quantity, floored to the nearest Case Pack. "
                                            "If the floor would round to 0 and status is ORDER, bumped to 1 case pack."),
+                ("FBA Inventory",          "Amazon FBA inventory from the latest FBA snapshot (date shown in the column header)."),
+                ("Etrade Inventory",       "Vendor Central (Etrade) closing stock at the latest snapshot (date shown in the column header)."),
+                ("Amazon Total Inventory", "FBA Inventory + Etrade Inventory — combined stock available across Amazon channels."),
                 ("Amazon DRR",             "Final DRR (units/day) from the Amazon PSR report for the same date range — "
                                            "identical to the 'Final DRR' column in the Amazon Sales vs Inventory report. "
                                            "Combines VC + FBA sales. 0 when the SKU has no Amazon sales history."),
@@ -755,7 +758,9 @@ async def download_master_report(
                         "Final order Qty": None,  # formula injected below
                         "Final order Qty (rounded up/down)": None,  # formula injected below
                         "Final CBM": None,         # formula injected below
-                        f"Amazon Total Inventory ({_latest_fba_label})": round(item.get("latest_fba_stock", 0) + metrics.get("etrade_inventory", 0), 2),
+                        f"FBA Inventory ({_latest_fba_label})": round(item.get("latest_fba_stock", 0), 2),
+                        f"Etrade Inventory ({_etrade_inv_label})": round(metrics.get("etrade_inventory", 0), 2),
+                        f"Amazon Total Inventory ({_latest_fba_label})": None,  # formula: FBA + Etrade
                         f"Blinkit Inventory ({_blinkit_inv_label})": item.get("blinkit_inventory", 0),
                         "Amazon DRR": item.get("amazon_final_drr", 0.0),
                         "Days Total Inventory Lasts (Amazon)": 0,  # formula: Amazon Total Inv / Amazon DRR
@@ -829,6 +834,8 @@ async def download_master_report(
                 _final_qty   = _col("Final order Qty")
                 _final_qty_rounded = _col("Final order Qty (rounded up/down)")
                 _final_cbm   = _col("Final CBM")
+                _fba_inv = _col(f"FBA Inventory ({_latest_fba_label})")
+                _etrade_inv = _col(f"Etrade Inventory ({_etrade_inv_label})")
                 _amz_total_inv = _col(f"Amazon Total Inventory ({_latest_fba_label})")
                 _etrade_drr  = _col("Amazon DRR")
                 _etrade_days = _col("Days Total Inventory Lasts (Amazon)")
@@ -1000,6 +1007,9 @@ async def download_master_report(
 
                     # Final CBM = (Final order Qty / Case Pack) × CBM
                     ws[f"{_final_cbm}{r}"] = f"=IF({inactive},0,IF({_AS}{r}>0,({_final_qty}{r}/{_AS}{r})*{_AR}{r},0))"
+
+                    # Amazon Total Inventory = FBA Inventory + Etrade Inventory
+                    ws[f"{_amz_total_inv}{r}"] = f"={_fba_inv}{r}+{_etrade_inv}{r}"
 
                     # Days Total Inventory Lasts (Amazon) = Amazon Total Inventory / Amazon DRR
                     ws[f"{_etrade_days}{r}"] = f"=IF({_etrade_drr}{r}>0,{_amz_total_inv}{r}/{_etrade_drr}{r},0)"
