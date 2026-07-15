@@ -1127,6 +1127,128 @@ def _sync_order_form_images_sync(sku_code: str, images: dict[str, str], db) -> i
     return result.modified_count
 
 
+class OrderFormImagesSyncRequest(BaseModel):
+    images: dict[str, str]  # "1" → url … "16" → url
+
+
+def _gdrive_direct_url(url: str) -> str:
+    """Convert a Google Drive share URL into a direct-download URL (mirrors add_images.py)."""
+    if "drive.google.com" not in url:
+        return url
+    if "uc?id=" in url and "export=download" in url:
+        return url if "confirm=t" in url else f"{url}&confirm=t"
+    file_id = None
+    if "/file/d/" in url:
+        file_id = url.split("/file/d/")[1].split("/")[0]
+    elif "open?id=" in url:
+        file_id = url.split("open?id=")[1].split("&")[0]
+    elif "id=" in url:
+        file_id = url.split("id=")[1].split("&")[0]
+    if file_id:
+        return f"https://drive.google.com/uc?id={file_id}&export=download&confirm=t"
+    return url
+
+
+def _ext_from_content_type(content_type: str) -> str:
+    ct = (content_type or "").lower()
+    if "png" in ct:
+        return "png"
+    if "webp" in ct:
+        return "webp"
+    if "gif" in ct:
+        return "gif"
+    return "jpg"
+
+
+def _fetch_and_upload_to_public_s3(item_id: str, url: str) -> str | None:
+    """Download an external/Drive image and re-upload it to the public bucket.
+
+    Returns the new public S3 URL, or None if the download wasn't a valid image.
+    """
+    import requests
+
+    try:
+        resp = requests.get(_gdrive_direct_url(url), stream=True, timeout=30)
+        content_type = resp.headers.get("Content-Type", "")
+        if resp.status_code != 200 or not content_type.startswith("image/"):
+            logger.warning("order-form sync: skipping non-image URL %s (%s)", url, content_type)
+            return None
+        data = resp.content
+    except Exception as exc:
+        logger.warning("order-form sync: download failed for %s: %s", url, exc)
+        return None
+
+    return upload_image_bytes_to_public_s3(
+        item_id, data, _ext_from_content_type(content_type), content_type or "image/jpeg"
+    )
+
+
+def _order_form_images_full_sync(sku_code: str, images: dict[str, str], db) -> dict:
+    """Push the item's Master-sheet images into the order-form products collection.
+
+    Walks the order-form priority slots (2, 12, 4, 5, 6, 7, 8, 3 — the columns used
+    by order_form_backend/db/add_images.py). URLs already hosted on our public
+    bucket are kept as-is; Drive/external links are downloaded and re-uploaded to
+    the public S3 bucket so the DB stores stable public S3 URLs — never raw Drive
+    links. Order is preserved; ``image_url`` is the first (slot 2 first).
+    """
+    product = db["products"].find_one({"cf_sku_code": sku_code}, {"item_id": 1})
+    if not product:
+        return {"matched": 0, "modified": 0, "count": 0, "failed": []}
+
+    item_id = str(product.get("item_id") or sku_code)
+    our_prefix = f"{_PUBLIC_S3_URL.rstrip('/')}/"
+
+    synced: list[str] = []
+    failed: list[str] = []
+    for slot in _ORDER_FORM_SLOT_PRIORITY:
+        url = images.get(str(slot), "").strip()
+        if not url:
+            continue
+        if url.startswith(our_prefix):
+            synced.append(url)  # already on our public bucket
+            continue
+        new_url = _fetch_and_upload_to_public_s3(item_id, url)
+        if new_url:
+            synced.append(new_url)
+        else:
+            failed.append(url)
+
+    update_fields: dict = {"images": synced}
+    if synced:
+        update_fields["image_url"] = synced[0]
+
+    result = db["products"].update_one(
+        {"cf_sku_code": sku_code},
+        {"$set": update_fields},
+    )
+    return {
+        "matched": result.matched_count,
+        "modified": result.modified_count,
+        "count": len(synced),
+        "failed": failed,
+        "images": synced,
+        "image_url": synced[0] if synced else "",
+    }
+
+
+@router.post("/product-images/{sku_code}/order-form-sync")
+async def sync_product_images_to_order_form(
+    sku_code: str,
+    body: OrderFormImagesSyncRequest,
+    db=Depends(get_database),
+):
+    res = await asyncio.to_thread(
+        _order_form_images_full_sync, sku_code, body.images, db
+    )
+    if res["matched"] == 0 and res["count"] == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Product with SKU '{sku_code}' not found in order form",
+        )
+    return {"success": True, "sku_code": sku_code, **res}
+
+
 @router.put("/product-images/{sku_code}")
 async def update_product_images(
     sku_code: str,
