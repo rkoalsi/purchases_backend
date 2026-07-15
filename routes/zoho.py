@@ -283,6 +283,36 @@ def update_purchase_status(item_id: str, body: PurchaseStatusUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ZohoStatusUpdate(BaseModel):
+    status: str
+
+
+@router.patch("/products/{item_id}/status")
+def update_zoho_status(item_id: str, body: ZohoStatusUpdate):
+    """Update the Zoho status field of a product (active/inactive only)."""
+    new_status = (body.status or "").strip().lower()
+    if new_status not in {"active", "inactive"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid status. Must be one of: active, inactive",
+        )
+    try:
+        db = get_database()
+        collection = db[PRODUCTS_COLLECTION]
+        result = collection.update_one(
+            {"_id": ObjectId(item_id)},
+            {"$set": {"status": new_status, "is_active": new_status == "active"}},
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Product not found")
+        return JSONResponse(content={"success": True, "status": new_status})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.info(f"Error updating zoho status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/sku-brand-map")
 def get_sku_brand_map():
     """
