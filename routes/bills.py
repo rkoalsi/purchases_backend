@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, Query, Body, UploadFile, File
 from fastapi.responses import StreamingResponse
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 import io
 import logging
@@ -41,7 +41,25 @@ BILL_LINE_ITEM_CF_MFR_CODE = "3220178000000075182"  # api_name cf_item_code, lab
 BILL_LINE_ITEM_CF_SKU_CODE = "3220178000000075204"  # api_name cf_sku_code, label "SKU Code"
 
 
+# Zoho access tokens live ~1 hour. Zoho rate-limits the OAuth token endpoint hard
+# ("You have made too many requests continuously"), so we MUST NOT refresh on every
+# request — cache each token in-process and reuse until shortly before it expires.
+_books_access_token: Optional[str] = None
+_books_token_expires_at: Optional[datetime] = None
+_inventory_access_token: Optional[str] = None
+_inventory_token_expires_at: Optional[datetime] = None
+_TOKEN_REFRESH_BUFFER = timedelta(minutes=5)
+
+
 def _get_zoho_token() -> str:
+    global _books_access_token, _books_token_expires_at
+    if (
+        _books_access_token
+        and _books_token_expires_at
+        and datetime.now() < (_books_token_expires_at - _TOKEN_REFRESH_BUFFER)
+    ):
+        return _books_access_token
+
     url = BOOKS_URL.format(
         clientId=CLIENT_ID,
         clientSecret=CLIENT_SECRET,
@@ -50,10 +68,21 @@ def _get_zoho_token() -> str:
     )
     r = requests.post(url, timeout=30)
     r.raise_for_status()
-    return r.json()["access_token"]
+    data = r.json()
+    _books_access_token = data["access_token"]
+    _books_token_expires_at = datetime.now() + timedelta(seconds=data.get("expires_in", 3600))
+    return _books_access_token
 
 
 def _get_inventory_token() -> str:
+    global _inventory_access_token, _inventory_token_expires_at
+    if (
+        _inventory_access_token
+        and _inventory_token_expires_at
+        and datetime.now() < (_inventory_token_expires_at - _TOKEN_REFRESH_BUFFER)
+    ):
+        return _inventory_access_token
+
     r = requests.post(
         _ZOHO_TOKEN_URL,
         params={
@@ -65,7 +94,10 @@ def _get_inventory_token() -> str:
         timeout=30,
     )
     r.raise_for_status()
-    return r.json()["access_token"]
+    data = r.json()
+    _inventory_access_token = data["access_token"]
+    _inventory_token_expires_at = datetime.now() + timedelta(seconds=data.get("expires_in", 3600))
+    return _inventory_access_token
 
 
 _INVENTORY_TRANSIT_ACCOUNT_NAME = "Inventory Transit (Loss/Gain)"
