@@ -151,7 +151,11 @@ def _line_item_custom_fields(prod: dict) -> list[dict]:
 
 
 def _needs_fix(bill: dict) -> bool:
-    return any(not li.get("item_custom_fields") for li in bill.get("line_items", []))
+    # Only inventory lines (those with an item_id) can carry SKU/Manufacturer-Code custom
+    # fields — and only those can be repaired by fix-custom-fields. Non-product lines
+    # (freight, "Samples", other service/charge lines with no item_id) legitimately have
+    # none, so flagging them would show an amber warning that the Fix button can never clear.
+    return any(li.get("item_id") and not li.get("item_custom_fields") for li in bill.get("line_items", []))
 
 
 # Zoho's bill-update API only accepts a small subset of the fields it returns on GET —
