@@ -1244,7 +1244,7 @@ async def sync_product_images_to_order_form(
     if res["matched"] == 0 and res["count"] == 0:
         raise HTTPException(
             status_code=404,
-            detail=f"Product with SKU '{sku_code}' not found in order form",
+            detail=f"Product with SKU '{sku_code}' not found in Pupscribe Marketplace",
         )
     return {"success": True, "sku_code": sku_code, **res}
 
