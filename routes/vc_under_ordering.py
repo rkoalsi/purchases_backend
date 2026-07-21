@@ -120,6 +120,9 @@ def _fetch_data(db, drr_map: dict) -> tuple:
             etrade_inv_by_asin[doc["asin"]] = int(doc.get("sellableOnHandInventoryUnits") or 0)
 
     # 6. Open PO from vendor_purchase_orders:
+    #    final_supply_fo_override (manual "Final Supply Qty (For Over-ordering)" cell)
+    #      takes precedence over everything for any status — mirrors the estimate
+    #      supply-qty fallback chain (final_supply_fo_override → final_supply_fo → ...).
     #    processing → supply_qty_override if set, else final_supply_fo if set,
     #                 else supply_qty if > 0, else requested_qty
     #    pending/packed/intransit → final_supply_fo if set, else accepted_qty
@@ -135,31 +138,38 @@ def _fetch_data(db, drr_map: dict) -> tuple:
             "_id": "$items.asin",
             "total": {"$sum": {
                 "$cond": {
-                    "if": {"$eq": ["$po_status", "processing"]},
-                    "then": {
+                    # Manual over-ordering override always wins, regardless of status.
+                    "if": {"$ne": [{"$ifNull": ["$items.final_supply_fo_override", None]}, None]},
+                    "then": {"$ifNull": ["$items.final_supply_fo_override", 0]},
+                    "else": {
                         "$cond": {
-                            "if": {"$ne": [{"$ifNull": ["$items.supply_qty_override", None]}, None]},
-                            "then": {"$ifNull": ["$items.supply_qty_override", 0]},
-                            "else": {
+                            "if": {"$eq": ["$po_status", "processing"]},
+                            "then": {
                                 "$cond": {
-                                    "if": {"$ne": [{"$ifNull": ["$items.final_supply_fo", None]}, None]},
-                                    "then": {"$ifNull": ["$items.final_supply_fo", 0]},
+                                    "if": {"$ne": [{"$ifNull": ["$items.supply_qty_override", None]}, None]},
+                                    "then": {"$ifNull": ["$items.supply_qty_override", 0]},
                                     "else": {
                                         "$cond": {
-                                            "if": {"$gt": [{"$ifNull": ["$items.supply_qty", 0]}, 0]},
-                                            "then": {"$ifNull": ["$items.supply_qty", 0]},
-                                            "else": {"$ifNull": ["$items.requested_qty", 0]},
+                                            "if": {"$ne": [{"$ifNull": ["$items.final_supply_fo", None]}, None]},
+                                            "then": {"$ifNull": ["$items.final_supply_fo", 0]},
+                                            "else": {
+                                                "$cond": {
+                                                    "if": {"$gt": [{"$ifNull": ["$items.supply_qty", 0]}, 0]},
+                                                    "then": {"$ifNull": ["$items.supply_qty", 0]},
+                                                    "else": {"$ifNull": ["$items.requested_qty", 0]},
+                                                }
+                                            },
                                         }
                                     },
                                 }
                             },
-                        }
-                    },
-                    "else": {
-                        "$cond": {
-                            "if": {"$ne": [{"$ifNull": ["$items.final_supply_fo", None]}, None]},
-                            "then": {"$ifNull": ["$items.final_supply_fo", 0]},
-                            "else": {"$ifNull": ["$items.accepted_qty", 0]},
+                            "else": {
+                                "$cond": {
+                                    "if": {"$ne": [{"$ifNull": ["$items.final_supply_fo", None]}, None]},
+                                    "then": {"$ifNull": ["$items.final_supply_fo", 0]},
+                                    "else": {"$ifNull": ["$items.accepted_qty", 0]},
+                                }
+                            },
                         }
                     },
                 }
