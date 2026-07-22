@@ -1115,6 +1115,12 @@ def _enrich_items(
         else:
             final_supply_fo = None
 
+        # Total Coverage Days = (Final Units + Total Qty) / Final DRR  (Excel col AQ)
+        if final_drr and final_units is not None:
+            total_coverage_days = round((final_units + total_qty) / final_drr, 2)
+        else:
+            total_coverage_days = None
+
         # Costs based on final_supply_fo (matches the Excel "Supply Qty" column I = AM)
         if final_supply_fo is not None:
             if mrp_wo_gst is not None and margin is not None:
@@ -1181,6 +1187,7 @@ def _enrich_items(
                 "final_units_override": item.get("final_units_override"),
                 "final_supply_fo": final_supply_fo,
                 "final_supply_fo_override": item.get("final_supply_fo_override"),
+                "total_coverage_days": total_coverage_days,
                 "monthly_sales": monthly_sales,
                 "month_labels": month_labels,
                 "platform_status": platforms_by_asin.get(asin, ""),
@@ -2900,7 +2907,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
     # AE=TotalQty, AF=FinalDRR, AG=NetTotalDays, AH=LeadTime, AI=CoverageDays
     # AJ=TotalTargetDays, AK=TargetStock
     # AL=FinalUnits(For Under-ordering), AM=FinalSupplyQty(For Over-ordering)
-    # AN-AR=5 months Amazon sales
+    # AQ=Total Coverage Days (blue), then 5 months Amazon sales + Amazon Status
     headers = [
         ("PO Date", False),
         ("PO", False),
@@ -2944,14 +2951,19 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
         ("Target Stock", True),
         ("Final Units\n(For Under-ordering)", True),
         ("Final Supply Qty\n(For Over-ordering)", True),
+        ("Total Coverage Days", "blue"),
     ] + [(lbl, True) for lbl in _month_headers] + [("Amazon Status", True)]
+
+    blue_fill = PatternFill("solid", fgColor="A3DBFF")
 
     for col_idx, (label, highlight) in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_idx, value=label)
         cell.font = header_font
         cell.alignment = center_align
         cell.border = thin_border
-        if highlight:
+        if highlight == "blue":
+            cell.fill = blue_fill
+        elif highlight:
             cell.fill = yellow_fill
 
     pct_format = "0.00%"
@@ -3001,9 +3013,9 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             37: item.get("lead_time", 10),  # AK Lead Time
             38: item.get("coverage_days", COVERAGE_DAYS),  # AL Coverage Days
         }
-        # Monthly sales cols 43-47 (AQ-AU)
+        # Monthly sales cols 44-48 (AR-AV) — after Total Coverage Days (AQ)
         for mi, units in enumerate(monthly_sales[:5]):
-            static[43 + mi] = units
+            static[44 + mi] = units
 
         supply_qty_override = item.get("supply_qty_override")
         final_units_override = item.get("final_units_override")
@@ -3025,6 +3037,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             40: f'=IF(ISNUMBER(AI{r}),ROUND(AI{r}*AM{r},0),"")',  # AN  Target Stock = DRR * Total Target Days
             41: f'=IF(NOT(ISNUMBER(AI{r})),"",IF(AI{r}=0,"",IF(AJ{r}<AK{r},ROUND(AI{r}*AM{r},0),IF(AJ{r}>AM{r},0,ROUND((AM{r}-AJ{r})*AI{r},0)))))',  # AO  Final Units (For Under-ordering)
             42: f'=IF(AO{r}="","",MIN(AO{r},H{r}))',  # AP  Final Supply Qty (For Over-ordering)
+            43: f"=(AO{r}+AH{r})/AI{r}",  # AQ  Total Coverage Days
         }
         if supply_qty_override is not None:
             formulas.pop(9, None)
@@ -3054,7 +3067,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             static[9] = sq_fallback
             static[42] = sq_fallback
 
-        total_cols = 42 + len(_month_headers)
+        total_cols = 43 + len(_month_headers)
         platform_col = total_cols + 1  # appended Platform Status (text)
         static[platform_col] = item.get("platform_status", "")
         for col_idx in range(1, platform_col + 1):
@@ -3070,10 +3083,12 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             elif col_idx in (16, 18):  # GST%, Margin%
                 cell.number_format = pct_format
             elif (
-                col_idx in (8, 10, 12, 27, 28, 29, 30, 32, 33, 34, 37, 38, 39, 40, 41, 42)
-                or (43 <= col_idx <= total_cols)  # monthly sales ints (not the text platform col)
+                col_idx in (8, 10, 12, 27, 28, 29, 30, 32, 33, 34, 37, 38, 39, 40, 41, 42, 43)
+                or (44 <= col_idx <= total_cols)  # monthly sales ints (not the text platform col)
             ):
                 cell.number_format = int_format
+                if col_idx == 43:  # AQ  Total Coverage Days (blue)
+                    cell.fill = blue_fill
             elif col_idx == 35:  # Final DRR
                 cell.number_format = "0.00"
             elif col_idx == 36:  # Net Total Days
