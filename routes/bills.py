@@ -150,6 +150,47 @@ def _line_item_custom_fields(prod: dict) -> list[dict]:
     ]
 
 
+def _unbilled_receive_lines(headers: dict, po_data: dict) -> list[dict]:
+    """Receive line items on this PO that are received but not yet billed.
+
+    Once a PO has un-billed receives, Zoho refuses a plain PO→bill conversion
+    (error 36510 "The purchase order(s) have un-billed receive(s) …") — the bill must be
+    raised against the receives. Each returned line carries the receive_id/receive_item_id
+    pair Zoho expects on the bill line item.
+    """
+    receives = po_data.get("purchasereceives") or []
+    open_receives = [r for r in receives if (r.get("billed_status") or "") != "billed"]
+    if not open_receives:
+        return []
+
+    lines = []
+    for rcv in open_receives:
+        receive_id = rcv.get("receive_id") or rcv.get("purchasereceive_id")
+        if not receive_id:
+            continue
+        r = requests.get(
+            f"{ZOHO_BOOKS_BASE}/purchasereceives/{receive_id}",
+            headers=headers,
+            params={"organization_id": ORGANIZATION_ID},
+            timeout=30,
+        )
+        r.raise_for_status()
+        detail = r.json().get("purchasereceive") or {}
+        for rli in detail.get("line_items", []):
+            qty = (rli.get("quantity") or 0) - (rli.get("quantity_billed") or 0)
+            if qty <= 0:
+                continue
+            lines.append(
+                {
+                    "item_id": rli.get("item_id"),
+                    "quantity": qty,
+                    "receive_id": receive_id,
+                    "receive_item_id": rli.get("line_item_id"),
+                }
+            )
+    return lines
+
+
 def _needs_fix(bill: dict) -> bool:
     # Only inventory lines (those with an item_id) can carry SKU/Manufacturer-Code custom
     # fields — and only those can be repaired by fix-custom-fields. Non-product lines
@@ -656,19 +697,55 @@ def create_bill(
 
         prod_by_id = _load_products_by_item_id(db, [li.get("item_id") for li in po_line_items])
 
-        line_items = []
-        for pli in po_line_items:
+        def _bill_line(pli: dict, quantity, extra: Optional[dict] = None) -> dict:
             prod = prod_by_id.get(pli.get("item_id"), {})
-            line_items.append(
-                {
-                    "item_id": pli["item_id"],
-                    "quantity": pli.get("quantity_ordered") or pli.get("quantity") or 0,
-                    "rate": pli.get("rate", 0),
-                    "account_id": DEFAULT_ACCOUNT_ID,
-                    "hsn_or_sac": pli.get("hsn_or_sac") or prod.get("hsn_or_sac", ""),
-                    "item_custom_fields": _line_item_custom_fields(prod),
-                }
-            )
+            return {
+                "item_id": pli["item_id"],
+                "quantity": quantity,
+                "rate": pli.get("rate", 0),
+                "account_id": DEFAULT_ACCOUNT_ID,
+                "hsn_or_sac": pli.get("hsn_or_sac") or prod.get("hsn_or_sac", ""),
+                "item_custom_fields": _line_item_custom_fields(prod),
+                **(extra or {}),
+            }
+
+        receive_lines = _unbilled_receive_lines(headers, po_data["purchaseorder"])
+        if receive_lines:
+            # Bill the receives, not the PO lines — Zoho rejects the PO-level conversion while
+            # un-billed receives exist. Match each receive line back to its PO line by item_id
+            # (consuming PO lines in order so a repeated item maps to distinct PO lines).
+            po_lines_by_item: dict[str, list[dict]] = {}
+            for pli in po_line_items:
+                po_lines_by_item.setdefault(pli.get("item_id"), []).append(pli)
+            used: dict[str, int] = {}
+
+            line_items = []
+            for rl in receive_lines:
+                candidates = po_lines_by_item.get(rl["item_id"]) or []
+                if not candidates:
+                    raise ValueError(
+                        f"Receive line item {rl['item_id']} is not on purchase order {purchaseorder_number}"
+                    )
+                idx = min(used.get(rl["item_id"], 0), len(candidates) - 1)
+                used[rl["item_id"]] = idx + 1
+                pli = candidates[idx]
+                line_items.append(
+                    _bill_line(
+                        pli,
+                        rl["quantity"],
+                        {
+                            "purchaseorder_id": po["purchaseorder_id"],
+                            "purchaseorder_item_id": pli.get("line_item_id"),
+                            "receive_id": rl["receive_id"],
+                            "receive_item_id": rl["receive_item_id"],
+                        },
+                    )
+                )
+        else:
+            line_items = [
+                _bill_line(pli, pli.get("quantity_ordered") or pli.get("quantity") or 0)
+                for pli in po_line_items
+            ]
 
         payload = {
             "vendor_id": po.get("vendor_id"),
@@ -691,7 +768,14 @@ def create_bill(
             timeout=30,
         )
         logger.info("Zoho bill create response %s: %s", r.status_code, r.text)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # Surface Zoho's own message (e.g. "un-billed receive(s) …") instead of the bare
+            # "400 Client Error" requests puts in HTTPError.
+            try:
+                msg = r.json().get("message")
+            except ValueError:
+                msg = None
+            raise ValueError(f"Zoho error: {msg or r.text}")
         data = r.json()
         if data.get("code") != 0:
             raise ValueError(f"Zoho error: {data.get('message', 'Unknown error')}")
