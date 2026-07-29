@@ -38,6 +38,7 @@ from .routes.product_costing import router as product_costing_router
 from .routes.unit_prices import router as unit_prices_router
 from .routes.amazon_listing import router as amazon_listing_router
 from .routes.bills import router as bills_router
+from .routes.finance import router as finance_router
 from .database import connect_db, close_db, get_database
 from contextlib import asynccontextmanager
 from .helpers.scheduler import scheduler, api_scheduler, setup_scheduler
@@ -155,6 +156,7 @@ app.include_router(product_costing_router, prefix="/product-costing", tags=["pro
 app.include_router(unit_prices_router, prefix="/unit_prices", tags=["unit_prices"])
 app.include_router(amazon_listing_router, prefix="/amazon_listing", tags=["amazon_listing"])
 app.include_router(bills_router, prefix="/bills", tags=["bills"])
+app.include_router(finance_router, prefix="/finance", tags=["finance"])
 
 
 # --- Protected Swagger / ReDoc / OpenAPI schema ---
