@@ -322,19 +322,18 @@ def _cash_position_sync(db) -> Dict:
     }
 
 
-def _monthly_opex_sync(db, months: int = 3) -> Dict:
-    """Trailing average monthly operating outflow.
+def _monthly_opex_sync(db, start: datetime, end: datetime) -> Dict:
+    """Average monthly operating outflow, measured over an explicit window.
 
     Uses `expense` transactions only. `signed_amount` is negative for cash out
     (a credit on the bank account), so the sum is negated to get a positive
     burn figure. Transfers are excluded as internal movement.
     """
-    today = datetime.now()
-    since = today - timedelta(days=30 * months)
+    days = max(1, (end - start).days)
 
     pipeline = [
         {"$match": {
-            "transaction_date": {"$gte": since, "$lte": today},
+            "transaction_date": {"$gte": start, "$lte": end},
             "transaction_type": {"$in": ["expense", "tds_payment"]},
         }},
         {"$group": {"_id": None, "net": {"$sum": "$signed_amount"}, "n": {"$sum": 1}}},
@@ -344,27 +343,30 @@ def _monthly_opex_sync(db, months: int = 3) -> Dict:
     count = res[0]["n"] if res else 0
 
     return {
-        "monthly_opex": round(max(0.0, net_out) / months, 2),
-        "months_sampled": months,
+        "monthly_opex": round(max(0.0, net_out) / days * 30, 2),
+        "window_days": days,
+        "window_start": start.date().isoformat(),
+        "window_end": end.date().isoformat(),
+        "spent_in_window": round(max(0.0, net_out), 2),
         "transactions_sampled": count,
     }
 
 
-def _collection_run_rate_sync(db, days: int = 90) -> Dict:
-    """How fast money actually comes in, from `bank_transactions`.
+def _collection_run_rate_sync(db, start: datetime, end: datetime) -> Dict:
+    """How fast money actually comes in, measured over an explicit window.
 
     The invoice ledger tells us exactly *how much* is owed, but not how much of
-    it will land inside a planning horizon — plenty of the ₹1.8 Cr overdue book
-    has been overdue for months. Rather than asking someone to guess a
-    percentage, we measure the rate at which customer payments have genuinely
-    been hitting the bank and project that forward.
+    it will land inside a planning horizon — plenty of the overdue book has been
+    overdue for months. Rather than asking someone to guess a percentage, we
+    measure the rate at which customer payments have genuinely been hitting the
+    bank and project that forward. Widening or narrowing the window is how you
+    plan against a seasonal stretch rather than the trailing quarter.
     """
-    today = datetime.now()
-    since = today - timedelta(days=days)
+    days = max(1, (end - start).days)
 
     pipeline = [
         {"$match": {
-            "transaction_date": {"$gte": since, "$lte": today},
+            "transaction_date": {"$gte": start, "$lte": end},
             "transaction_type": {"$in": ["customer_payment", "payment_refund"]},
         }},
         {"$group": {"_id": None, "net": {"$sum": "$signed_amount"}, "n": {"$sum": 1}}},
@@ -376,6 +378,8 @@ def _collection_run_rate_sync(db, days: int = 90) -> Dict:
     return {
         "daily_collection_rate": round(max(0.0, net_in) / days, 2),
         "window_days": days,
+        "window_start": start.date().isoformat(),
+        "window_end": end.date().isoformat(),
         "collected_in_window": round(net_in, 2),
         "transactions_sampled": count,
     }
@@ -627,19 +631,49 @@ async def get_working_capital(
     cny_inr: Optional[float] = Query(
         None, gt=0, description="CNY/RMB→INR override; omit to use the live rate"
     ),
-    opex_months: int = Query(3, ge=1, le=12, description="Months sampled for the opex average"),
-    collection_window_days: int = Query(
-        90, ge=30, le=365,
-        description="Trailing window used to measure the actual collection run rate",
+    start_date: Optional[str] = Query(
+        None,
+        description="Start of the window used to measure collection and expense rates "
+                    "(YYYY-MM-DD). Defaults to 90 days ago.",
+    ),
+    end_date: Optional[str] = Query(
+        None, description="End of that window (YYYY-MM-DD). Defaults to today."
     ),
     db=Depends(get_database),
 ):
     """Cash on hand + expected collections − committed outflows, per horizon.
 
-    Sources: `bank_accounts` (net of credit-card liability), `invoices` (AR,
-    excluding void/draft), `bills` (AP), issued `purchase_orders` converted to
-    INR at the live or supplied rate, and an opex average from `bank_transactions`.
+    Balances are always **current** — bank balances, receivables and payables
+    describe today, and cannot be rewound. The date range instead sets the window
+    over which the **rates** are measured: how fast money is being collected and
+    how fast it is being spent. Widen it to smooth out a lumpy month, or point it
+    at last year's peak season to plan against that behaviour.
+
+    Sources: `bank_accounts` (bank feed where present, net of credit-card
+    liability), `invoices` (AR, excluding void/draft), `bills` (AP), issued
+    `purchase_orders` converted to INR at the live or supplied rate, and
+    `bank_transactions` for both rates.
     """
+    try:
+        window_end = (
+            datetime.strptime(end_date, "%Y-%m-%d") if end_date else datetime.now()
+        )
+        window_start = (
+            datetime.strptime(start_date, "%Y-%m-%d")
+            if start_date
+            else window_end - timedelta(days=90)
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="start_date and end_date must be YYYY-MM-DD",
+        )
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="start_date must be before end_date",
+        )
+
     fx_resolved = await _resolve_fx(usd_inr, cny_inr)
     fx = fx_resolved["rates"]
     try:
@@ -648,8 +682,8 @@ async def get_working_capital(
             asyncio.to_thread(_receivables_sync, db),
             asyncio.to_thread(_payables_sync, db),
             asyncio.to_thread(_open_po_commitment_sync, db, fx),
-            asyncio.to_thread(_monthly_opex_sync, db, opex_months),
-            asyncio.to_thread(_collection_run_rate_sync, db, collection_window_days),
+            asyncio.to_thread(_monthly_opex_sync, db, window_start, window_end),
+            asyncio.to_thread(_collection_run_rate_sync, db, window_start, window_end),
         )
     except Exception as e:
         logger.error(f"working-capital failed: {e}", exc_info=True)
@@ -662,6 +696,11 @@ async def get_working_capital(
         cash, receivables, payables, open_pos, opex, collection
     )
     payload["fx"] = fx_resolved["meta"]
+    payload["rate_window"] = {
+        "start_date": window_start.date().isoformat(),
+        "end_date": window_end.date().isoformat(),
+        "days": (window_end - window_start).days,
+    }
     return JSONResponse(status_code=status.HTTP_200_OK, content=payload)
 
 
@@ -962,8 +1001,12 @@ async def _brand_order_plan_data(
     ar_task = asyncio.to_thread(_receivables_sync, db)
     ap_task = asyncio.to_thread(_payables_sync, db)
     po_task = asyncio.to_thread(_open_po_commitment_sync, db, fx)
-    opex_task = asyncio.to_thread(_monthly_opex_sync, db, 3)
-    collection_task = asyncio.to_thread(_collection_run_rate_sync, db, 90)
+    # Measure the cash rates over the same period the demand figures come from,
+    # so the plan is internally consistent.
+    _win_end = datetime.strptime(end_date, "%Y-%m-%d")
+    _win_start = datetime.strptime(start_date, "%Y-%m-%d")
+    opex_task = asyncio.to_thread(_monthly_opex_sync, db, _win_start, _win_end)
+    collection_task = asyncio.to_thread(_collection_run_rate_sync, db, _win_start, _win_end)
     fallback_task = asyncio.to_thread(_fallback_unit_costs_sync, db, fx)
 
     (master, cash, receivables, payables, open_pos, opex,
