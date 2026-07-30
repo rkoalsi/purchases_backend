@@ -11,7 +11,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from typing import Optional
+from typing import List, Optional
 from pydantic import BaseModel
 import logging
 import boto3
@@ -323,6 +323,28 @@ def _so_package_numbers_for_estimate(est_id: str, db) -> list[str]:
         for p in (s.get("packages") or [])
         if p.get("package_number")
     ]
+
+
+def _resolve_po_package_numbers(doc: dict, db) -> list[str]:
+    """All package numbers linked to a PO, de-duplicated and order-preserved.
+
+    Sources, in priority order: manually linked `packages[]`, legacy single
+    `package_number`, then packages derived from the estimate's sales order(s).
+    """
+    nums: list[str] = []
+
+    def _add(n):
+        if n and n not in nums:
+            nums.append(n)
+
+    for n in doc.get("packages") or []:
+        _add(n)
+    _add(doc.get("package_number"))
+    est_id = doc.get("zoho_estimate_id")
+    if est_id:
+        for n in _so_package_numbers_for_estimate(est_id, db):
+            _add(n)
+    return nums
 
 
 def _fetch_package_from_zoho(package_number: str) -> dict | None:
@@ -4941,6 +4963,8 @@ class TransferOrderCreateRequest(BaseModel):
     date: Optional[str] = None  # YYYY-MM-DD; defaults to today
     from_warehouse_id: Optional[str] = None
     to_warehouse_id: Optional[str] = None
+    # Subset of the PO's linked packages to transfer. Omit/empty = ALL linked packages.
+    package_numbers: Optional[List[str]] = None
 
 
 class TransferOrderLinkRequest(BaseModel):
@@ -4962,47 +4986,57 @@ async def create_transfer_order(
                 f"PO already has transfer order {doc.get('transfer_order_number')} — unlink it first"
             )
 
-        pkg_number = doc.get("package_number")
-        if not pkg_number:
-            # Fall back to SO-linked package (auto-derived from estimate → sales order)
-            est_id = doc.get("zoho_estimate_id")
-            if est_id:
-                pkg_nums = _so_package_numbers_for_estimate(est_id, db)
-                if pkg_nums:
-                    pkg_number = pkg_nums[0]
-        if not pkg_number:
+        available = _resolve_po_package_numbers(doc, db)
+        if not available:
             raise ValueError("No package linked to this PO — link a package first")
 
-        pkg = _load_package(pkg_number, db)
-        if not pkg:
-            raise ValueError(
-                f"Package {pkg_number!r} not found in our records or in Zoho — "
-                "confirm the package has been created on Zoho for this PO"
-            )
+        requested = [p.strip() for p in (body.package_numbers or []) if p and p.strip()]
+        if requested:
+            unknown = [p for p in requested if p not in available]
+            if unknown:
+                raise ValueError(
+                    f"Package(s) {', '.join(unknown)} are not linked to this PO. "
+                    f"Linked packages: {', '.join(available)}"
+                )
+            selected = [p for p in available if p in requested]  # preserve order
+        else:
+            selected = available  # default: transfer every linked package
 
-        line_items_raw = pkg.get("line_items") or []
-        if not line_items_raw:
-            raise ValueError("Package has no line items")
+        # Merge line items across the selected packages, summing qty per item
+        merged: dict[str, dict] = {}
+        for pkg_number in selected:
+            pkg = _load_package(pkg_number, db)
+            if not pkg:
+                raise ValueError(
+                    f"Package {pkg_number!r} not found in our records or in Zoho — "
+                    "confirm the package has been created on Zoho for this PO"
+                )
+            pkg_lines = pkg.get("line_items") or []
+            if not pkg_lines:
+                raise ValueError(f"Package {pkg_number} has no line items")
+            for li in pkg_lines:
+                item_id = li.get("item_id")
+                if not item_id:
+                    continue
+                qty = float(li.get("quantity") or 0)
+                if qty <= 0:
+                    continue
+                existing = merged.get(item_id)
+                if existing:
+                    existing["quantity_transfer"] += qty
+                else:
+                    merged[item_id] = {
+                        "item_id": item_id,
+                        "name": li.get("name") or "",
+                        "quantity_transfer": qty,
+                        "unit": li.get("unit", "pcs"),
+                    }
 
-        line_items: list[dict] = []
-        for li in line_items_raw:
-            item_id = li.get("item_id")
-            if not item_id:
-                continue
-            qty = float(li.get("quantity") or 0)
-            if qty <= 0:
-                continue
-            line_items.append(
-                {
-                    "item_id": item_id,
-                    "name": li.get("name") or "",
-                    "quantity_transfer": qty,
-                    "unit": li.get("unit", "pcs"),
-                }
-            )
-
+        line_items = list(merged.values())
         if not line_items:
-            raise ValueError("No valid line items found in package")
+            raise ValueError(
+                f"No valid line items found in package(s) {', '.join(selected)}"
+            )
 
         # Compute next transfer order number (numeric sort, not lexicographic)
         agg = list(db[TRANSFER_ORDERS_COLLECTION].aggregate([
@@ -5061,13 +5095,14 @@ async def create_transfer_order(
             {"$set": {
                 "transfer_order_id": to["transfer_order_id"],
                 "transfer_order_number": to["transfer_order_number"],
+                "transfer_order_package_numbers": selected,
                 "updated_at": now,
             }},
         )
-        return to
+        return to, selected
 
     try:
-        to = await asyncio.to_thread(_create)
+        to, selected_pkgs = await asyncio.to_thread(_create)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except requests.HTTPError as e:
@@ -5082,6 +5117,7 @@ async def create_transfer_order(
             "transfer_order_id": to["transfer_order_id"],
             "transfer_order_number": to["transfer_order_number"],
             "status": to.get("status"),
+            "package_numbers": selected_pkgs,
         },
     )
 
@@ -5137,7 +5173,11 @@ async def unlink_transfer_order(po_number: str, db=Depends(get_database)):
         result = db[PO_COLLECTION].update_one(
             {"po_number": po_number},
             {
-                "$unset": {"transfer_order_id": "", "transfer_order_number": ""},
+                "$unset": {
+                    "transfer_order_id": "",
+                    "transfer_order_number": "",
+                    "transfer_order_package_numbers": "",
+                },
                 "$set": {"updated_at": datetime.now()},
             },
         )
