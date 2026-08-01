@@ -859,6 +859,10 @@ def _build_po_line_items(db, items: list[dict], default_account_id: str) -> list
     can pre-date the Zoho sync for freshly-created items — so it may be empty even though
     the item now has an HSN. Re-fetching by item_id here guarantees each PO line carries
     the item's current HSN.
+
+    If it still resolves to empty, the key is omitted entirely: sending "" overrides the
+    Zoho item master and prints a blank HSN on the PO, whereas omitting it lets Zoho fall
+    back to the item's own HSN.
     """
     item_ids = [it["item_id"] for it in items if it.get("item_id")]
     prod_by_id: dict[str, dict] = {}
@@ -874,17 +878,25 @@ def _build_po_line_items(db, items: list[dict], default_account_id: str) -> list
         if not it.get("item_id"):
             continue
         prod = prod_by_id.get(it["item_id"], {})
-        line_items.append({
+        line = {
             "item_id": it["item_id"],
             "name": it.get("product_name") or prod.get("name", ""),
             "quantity": it["qty"],
             "rate": it["unit_price"],
             "account_id": it.get("purchase_account_id") or prod.get("purchase_account_id") or default_account_id,
-            "hsn_or_sac": it.get("hsn_or_sac") or prod.get("hsn_or_sac", ""),
             "unit": "pcs",
             "tags": [],
             "item_custom_fields": [],
-        })
+        }
+        hsn = (it.get("hsn_or_sac") or prod.get("hsn_or_sac") or "").strip()
+        if hsn:
+            line["hsn_or_sac"] = hsn
+        else:
+            logger.warning(
+                "PO line for item_id %s has no HSN in products — omitting hsn_or_sac so "
+                "Zoho falls back to the item master", it["item_id"],
+            )
+        line_items.append(line)
     return line_items
 
 
@@ -1052,6 +1064,7 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
                     "sku_code": item.sku_code,
                     "brand": item.brand or "",
                     "item_id": zoho_item.get("item_id", ""),
+                    "hsn_or_sac": zoho_item.get("hsn_or_sac") or item.hsn_or_sac or "",
                 })
             except Exception as exc:
                 logger.error("Failed to create Zoho item '%s': %s", item.item_name, exc)
@@ -1089,6 +1102,11 @@ async def create_zoho_items(body: CreateZohoItemsRequest, db=Depends(get_databas
                     set_fields["sku"] = c["sku_code"]
                 if c.get("item_name"):
                     set_fields.setdefault("name", c["item_name"])
+                # Store the HSN now — a PO created in the same session reads it back from
+                # here, and the next full Zoho sync may be hours away. Without it the PO
+                # line goes to Zoho with a blank HSN.
+                if c.get("hsn_or_sac"):
+                    set_fields["hsn_or_sac"] = c["hsn_or_sac"]
                 products_col.update_one(
                     {"item_id": c["item_id"]},
                     {"$set": set_fields},
