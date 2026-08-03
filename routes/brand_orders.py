@@ -388,7 +388,7 @@ async def download_lead_time_report(
 
     def _fetch(email, brand_filter):
         user = db["purchase_users"].find_one({"email": email}, {"role": 1})
-        if not user or user.get("role") != "admin":
+        if not user:
             return None
         query = {"brand": brand_filter} if brand_filter else {}
         return list(db[COLLECTION].find(query, {
@@ -433,7 +433,7 @@ async def download_payment_report(
 
     def _fetch_payment(email, brand_filter):
         user = db["purchase_users"].find_one({"email": email}, {"role": 1})
-        if not user or user.get("role") != "admin":
+        if not user:
             return None
         query = {"brand": brand_filter} if brand_filter else {}
         pipeline = [
