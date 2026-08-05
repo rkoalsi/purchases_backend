@@ -57,6 +57,9 @@ INVENTORY_REFRESH_TOKEN = os.getenv("INVENTORY_REFRESH_TOKEN", BOOKS_REFRESH_TOK
 
 COVERAGE_DAYS = 35
 
+# Number of complete calendar months of Amazon sales shown as columns.
+MONTHLY_SALES_MONTHS = 8
+
 _ZOHO_TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token"
 
 
@@ -110,8 +113,8 @@ def _extract_gst(item_tax_preferences: list) -> float:
     return float(item_tax_preferences[0].get("tax_percentage", 0))
 
 
-def _fetch_monthly_amazon_sales(db, asins: list, num_months: int = 5):
-    """Return ({asin: [units_m1, ..., units_m5]}, [(year, month, label), ...]) for the last num_months complete calendar months.
+def _fetch_monthly_amazon_sales(db, asins: list, num_months: int = MONTHLY_SALES_MONTHS):
+    """Return ({asin: [units_m1, ..., units_mN]}, [(year, month, label), ...]) for the last num_months complete calendar months.
 
     Mirrors the Amazon report page: sums FBA sales (amazon_sales_traffic.salesByAsin.unitsOrdered)
     + VC sales (amazon_vendor_sales.orderedUnits) per month, matching parentAsin / asin respectively.
@@ -928,7 +931,7 @@ def _enrich_items(
     else:
         _drr_map = drr_map
 
-    # --- fetch last 5 months Amazon sales per ASIN ---
+    # --- fetch last MONTHLY_SALES_MONTHS months of Amazon sales per ASIN ---
     monthly_sales_by_asin: dict = {}
     month_labels: list = []
     if asins:
@@ -1100,7 +1103,7 @@ def _enrich_items(
         coverage_days_item = item.get("coverage_days_override") or COVERAGE_DAYS
         total_target_days = lead_time + coverage_days_item
         net_total_days = round(total_qty / final_drr, 2) if final_drr else None
-        monthly_sales = monthly_sales_by_asin.get(asin, [0] * 5)
+        monthly_sales = monthly_sales_by_asin.get(asin, [0] * MONTHLY_SALES_MONTHS)
 
         # Final Units (for under-ordering): formula per overstock sheet
         final_units_override = item.get("final_units_override")
@@ -2913,15 +2916,15 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
     except (ValueError, TypeError):
         _drr_range = po_date_str_raw
 
-    # Month labels for last 5 months (from first enriched item if available)
+    # Month labels for the last MONTHLY_SALES_MONTHS months (from first enriched item if available)
     _month_labels = (enriched[0].get("month_labels") or []) if enriched else []
     _month_headers = (
         [lbl for (_, _, lbl) in _month_labels]
         if _month_labels
-        else [f"Month {i+1} Sales" for i in range(5)]
+        else [f"Month {i+1} Sales" for i in range(MONTHLY_SALES_MONTHS)]
     )
 
-    # Column layout (41 cols + 5 monthly = 46 total):
+    # Column layout (43 fixed cols + MONTHLY_SALES_MONTHS monthly + Amazon Status):
     # A-H: meta+qty, I=Supply(formula=AM), J=Accepted, K=ShortSupply, L=Received, M=Mismatch
     # N=ZohoMRP, O=eTrade ASP, P=GST, Q=MRPwoGST, R=Margin, S=CostPrice
     # T=TotalCost(SupplyQty), U=TotalCostwoGST(SupplyQty), V=TotalCost(AcceptedQty), W=TotalCostwoGST(AcceptedQty)
@@ -2929,7 +2932,7 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
     # AE=TotalQty, AF=FinalDRR, AG=NetTotalDays, AH=LeadTime, AI=CoverageDays
     # AJ=TotalTargetDays, AK=TargetStock
     # AL=FinalUnits(For Under-ordering), AM=FinalSupplyQty(For Over-ordering)
-    # AQ=Total Coverage Days (blue), then 5 months Amazon sales + Amazon Status
+    # AQ=Total Coverage Days (blue), then MONTHLY_SALES_MONTHS months Amazon sales + Amazon Status
     headers = [
         ("PO Date", False),
         ("PO", False),
@@ -3035,8 +3038,8 @@ def _build_po_excel(doc: dict, enriched: list) -> bytes:
             37: item.get("lead_time", 10),  # AK Lead Time
             38: item.get("coverage_days", COVERAGE_DAYS),  # AL Coverage Days
         }
-        # Monthly sales cols 44-48 (AR-AV) — after Total Coverage Days (AQ)
-        for mi, units in enumerate(monthly_sales[:5]):
+        # Monthly sales cols 44+ (AR onwards) — after Total Coverage Days (AQ)
+        for mi, units in enumerate(monthly_sales[:MONTHLY_SALES_MONTHS]):
             static[44 + mi] = units
 
         supply_qty_override = item.get("supply_qty_override")

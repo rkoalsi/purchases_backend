@@ -25,6 +25,12 @@ MARGINS_COLLECTION = "vendor_margins"
 INVENTORY_COLLECTION = "amazon_vendor_inventory"
 SALES_COLLECTION = "amazon_vendor_sales"
 ZOHO_STOCK_COLLECTION = "zoho_warehouse_stock"
+LEDGER_COLLECTION = "amazon_ledger"
+FBA_SHIPMENTS_COLLECTION = "amazon_fba_shipments"
+
+# Shipments still in-flight — units shipped but not yet received count as FBA in transit.
+# CLOSED is excluded: any un-received units there are permanent short-receipts.
+_FBA_ACTIVE_STATUSES = ["WORKING", "SHIPPED", "IN_TRANSIT", "DELIVERED", "CHECKED_IN", "RECEIVING"]
 
 DEFAULT_LEAD_TIME = 10
 DEFAULT_COVERAGE_DAYS = 35
@@ -33,6 +39,9 @@ MONTH_NAMES = {
     1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
     7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
 }
+
+# Number of complete calendar months of Amazon sales shown as columns.
+MONTHLY_SALES_MONTHS = 8
 
 
 class UnderOrderingOverride(BaseModel):
@@ -78,7 +87,7 @@ def _fetch_data(db, drr_map: dict) -> tuple:
     }
 
     if not asins_with_asp:
-        return []
+        return [], "", drr_period_label, "", ""
 
     # 2. amazon_sku_mapping for these ASINs
     sku_docs = list(db[SKU_MAPPING_COLLECTION].find(
@@ -93,7 +102,7 @@ def _fetch_data(db, drr_map: dict) -> tuple:
     asins = list(asin_to_sku.keys())
 
     if not asins:
-        return []
+        return [], "", drr_period_label, "", ""
 
     # 3. Product details by SKU
     skus = list(set(asin_to_sku.values()))
@@ -248,10 +257,54 @@ def _fetch_data(db, drr_map: dict) -> tuple:
 
     sit_qty_by_asin, sit_brands_by_asin = _build_sit()
 
-    # 9. Monthly sales — last 4 calendar months (FBA + VC combined, matching Amazon PSR)
+    # 8b. FBA inventory (amazon_ledger, latest snapshot, SELLABLE, excluding SF/VKSX)
+    #     — same source as the FBA shipment planning page's "FBA Inv" column.
+    fba_inv_by_asin: dict[str, int] = {}
+    fba_inventory_date_str = ""
+    ledger_latest = db[LEDGER_COLLECTION].find_one(
+        {"asin": {"$in": asins}, "location": {"$ne": "VKSX"}, "disposition": "SELLABLE"},
+        {"date": 1},
+        sort=[("date", -1)],
+    )
+    if ledger_latest:
+        fba_date = ledger_latest["date"]
+        fba_inventory_date_str = (
+            fba_date.strftime("%-d %b %Y") if isinstance(fba_date, datetime) else str(fba_date)
+        )
+        for doc in db[LEDGER_COLLECTION].aggregate([
+            {"$match": {
+                "asin": {"$in": asins},
+                "date": fba_date,
+                "location": {"$ne": "VKSX"},
+                "disposition": "SELLABLE",
+            }},
+            {"$group": {"_id": "$asin", "total": {"$sum": "$ending_warehouse_balance"}}},
+        ]):
+            fba_inv_by_asin[doc["_id"]] = int(doc.get("total") or 0)
+
+    # 8c. FBA in transit = Σ max(0, QuantityShipped − QuantityReceived) over in-flight
+    #     shipments (amazon_fba_shipments, live SP-API queue). Received units already
+    #     show up in FBA inventory above, so they drop out here to avoid double counting.
+    fba_transit_by_asin: dict[str, int] = {}
+    for doc in db[FBA_SHIPMENTS_COLLECTION].aggregate([
+        {"$match": {"ShipmentStatus": {"$in": _FBA_ACTIVE_STATUSES}}},
+        {"$unwind": "$items"},
+        {"$group": {
+            "_id": "$items.SellerSKU",
+            "pending": {"$sum": {"$max": [0, {"$subtract": [
+                {"$ifNull": ["$items.QuantityShipped", 0]},
+                {"$ifNull": ["$items.QuantityReceived", 0]},
+            ]}]}},
+        }},
+    ]):
+        asin = sku_to_asin.get(doc["_id"])
+        if asin:
+            fba_transit_by_asin[asin] = fba_transit_by_asin.get(asin, 0) + int(doc.get("pending") or 0)
+
+    # 9. Monthly sales — last 8 calendar months (FBA + VC combined, matching Amazon PSR)
     months: list[tuple[int, int]] = []
     ref = today.replace(day=1)
-    for _ in range(4):
+    for _ in range(MONTHLY_SALES_MONTHS):
         ref = (ref - timedelta(days=1)).replace(day=1)
         months.append((ref.year, ref.month))
     months.reverse()
@@ -378,6 +431,8 @@ def _fetch_data(db, drr_map: dict) -> tuple:
             "zoho_stock": zoho_stock,
             "sit_total": round(sit_total, 2),
             "sit_brands": sit_brands,
+            "fba_inventory": fba_inv_by_asin.get(asin, 0),
+            "fba_in_transit": fba_transit_by_asin.get(asin, 0),
             "status": prod.get("purchase_status") or prod.get("status") or "",
             "etrade_asp": etrade_asp_by_asin.get(asin),
             "monthly_sales": monthly_sales.get(asin, {}),
@@ -385,7 +440,7 @@ def _fetch_data(db, drr_map: dict) -> tuple:
             "platform_status": asin_to_status.get(asin, ""),
         })
 
-    return rows, inventory_date_str, drr_period_label, zoho_date_str
+    return rows, inventory_date_str, drr_period_label, zoho_date_str, fba_inventory_date_str
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -408,8 +463,14 @@ async def get_data(db=Depends(get_database)):
         )
         asins = [d["item_id"] for d in sku_docs if d.get("item_id")]
         drr_map = await _compute_drr_async(db, today, asins) if asins else {}
-        result, inv_date, drr_period, zoho_date = await asyncio.to_thread(_fetch_data, db, drr_map)
-        return JSONResponse({"rows": result, "inventory_date": inv_date, "drr_period": drr_period, "zoho_date": zoho_date})
+        result, inv_date, drr_period, zoho_date, fba_inv_date = await asyncio.to_thread(_fetch_data, db, drr_map)
+        return JSONResponse({
+            "rows": result,
+            "inventory_date": inv_date,
+            "drr_period": drr_period,
+            "zoho_date": zoho_date,
+            "fba_inventory_date": fba_inv_date,
+        })
     except Exception as e:
         logger.error(f"VC under ordering data error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -465,7 +526,7 @@ async def download_xlsx(db=Depends(get_database)):
         )
         asins = [d["item_id"] for d in sku_docs if d.get("item_id")]
         drr_map = await _compute_drr_async(db, today, asins) if asins else {}
-        result, inv_date, drr_period, zoho_date = await asyncio.to_thread(_fetch_data, db, drr_map)
+        result, inv_date, drr_period, zoho_date, fba_inv_date = await asyncio.to_thread(_fetch_data, db, drr_map)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -492,7 +553,10 @@ async def download_xlsx(db=Depends(get_database)):
     # M=13 Final Units (formula or override)
     # N=14 Days Until Final Units Lasts (formula)
     # O=15 Total Days Until Stock Lasts (formula)
-    # P=16 Zoho Stock  Q=17 SIT Total  R=18 SIT Brands  S=19 Status  T+ monthly sales
+    # P=16 Zoho Stock  Q=17 SIT Total  R=18 SIT Brands
+    # S=19 FBA Inventory  T=20 FBA In Transit  U=21 Status  V+ monthly sales
+
+    fba_inv_label = f"FBA Inventory{(chr(10) + '(' + fba_inv_date + ')') if fba_inv_date else ''}"
 
     headers = [
         "ASIN", "SKU Code", "Item Name",
@@ -508,6 +572,8 @@ async def download_xlsx(db=Depends(get_database)):
         zoho_label,
         "Stock in Transit\n(Open Zoho POs)",
         "SIT Brands",
+        fba_inv_label,
+        "FBA In Transit\n(shipped, not yet received)",
         "Status",
     ] + month_labels + ["Amazon Status"]
 
@@ -578,17 +644,21 @@ async def download_xlsx(db=Depends(get_database)):
         ws.cell(r, 16, row["zoho_stock"])
         ws.cell(r, 17, row["sit_total"])
         ws.cell(r, 18, row["sit_brands"]).alignment = left_wrap
-        ws.cell(r, 19, row["status"])
+
+        # S: FBA Inventory  T: FBA In Transit  U: Status
+        ws.cell(r, 19, row.get("fba_inventory", 0))
+        ws.cell(r, 20, row.get("fba_in_transit", 0))
+        ws.cell(r, 21, row["status"])
 
         # Monthly sales
         for lbl_idx, lbl in enumerate(month_labels):
-            ws.cell(r, 20 + lbl_idx, ms.get(lbl, 0))
+            ws.cell(r, 22 + lbl_idx, ms.get(lbl, 0))
 
         # Platform Status (appended after monthly columns)
-        ws.cell(r, 20 + len(month_labels), row.get("platform_status", ""))
+        ws.cell(r, 22 + len(month_labels), row.get("platform_status", ""))
 
     # Column widths
-    col_widths = [14, 14, 42, 12, 10, 14, 10, 14, 10, 12, 16, 18, 18, 20, 20, 10, 14, 36, 12] + [12] * len(month_labels) + [16]
+    col_widths = [14, 14, 42, 12, 10, 14, 10, 14, 10, 12, 16, 18, 18, 20, 20, 10, 14, 36, 14, 16, 12] + [12] * len(month_labels) + [16]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 

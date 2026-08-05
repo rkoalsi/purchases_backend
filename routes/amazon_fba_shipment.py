@@ -141,6 +141,9 @@ MONTH_NAMES = {
     12: "Dec",
 }
 
+# Number of complete calendar months of Amazon sales shown as columns.
+MONTHLY_SALES_MONTHS = 8
+
 # Emptied per request (2026-06-30): the FBA shipment planning report must show ALL
 # products from amazon_sku_mapping. The previous block-list is preserved below under
 # _EXCLUDED_ASINS_ARCHIVED so it can be restored if ever needed — it is NOT referenced
@@ -650,10 +653,10 @@ def _fetch_planning_data(db, drr_map: dict) -> tuple:
     ):
         open_etrade_po[doc["_id"]] = int(doc["total"] or 0)
 
-    # 8. Monthly sales — last 4 calendar months
+    # 8. Monthly sales — last 8 calendar months
     months: list[tuple[int, int]] = []
     ref = today.replace(day=1)
-    for _ in range(4):
+    for _ in range(MONTHLY_SALES_MONTHS):
         ref = (ref - timedelta(days=1)).replace(day=1)
         months.append((ref.year, ref.month))
     months.reverse()  # oldest first
