@@ -270,17 +270,35 @@ def _resolve_bill_and_po_numbers(db, bill_id: str) -> tuple[Optional[str], Optio
     return bill_number, po_number
 
 
+# Reference numbers shorter than this are too generic to auto-discover on. Vendor bill numbers are
+# often a bare counter ("1"), which as a substring matches half the adjustments in the system
+# (e.g. bill "1" matched "CN/26-27/0241"). Real linking conventions use the full PO/shipment number.
+_MIN_DISCOVERY_REF_LEN = 4
+
+
+def _discovery_refs(*refs: Optional[str]) -> list[str]:
+    """The subset of candidate reference numbers distinctive enough to auto-link on."""
+    return [r for r in refs if r and len(r.strip()) >= _MIN_DISCOVERY_REF_LEN]
+
+
+def _ref_regex(ref: str) -> str:
+    """Match `ref` only as a whole token, so "PO-X01" doesn't match "PO-X011"."""
+    return rf"(?<![A-Za-z0-9]){re.escape(ref.strip())}(?![A-Za-z0-9])"
+
+
+def _ref_matches(ref: str, reference_number: Optional[str]) -> bool:
+    return bool(reference_number) and re.search(_ref_regex(ref), reference_number, re.IGNORECASE) is not None
+
+
 def _linked_adjustments_for_bill(db, bill_id: str) -> list[dict]:
     bill_doc = db.get_collection(BILLS_COLLECTION).find_one({"bill_id": bill_id}, {"linked_inventory_adjustment_ids": 1})
     ids = set((bill_doc or {}).get("linked_inventory_adjustment_ids") or [])
 
     # Auto-discover adjustments created manually in Zoho whose reference_number embeds this bill's
-    # number or its PO's number (the convention used historically, e.g. "SH26E0558 ( PO-PETZOO066 )"),
-    # even though no explicit link action was ever taken for them.
+    # number or its PO's number as a whole token (the convention used historically, e.g.
+    # "SH26E0558 ( PO-PETZOO066 )"), even though no explicit link action was ever taken for them.
     bill_number, po_number = _resolve_bill_and_po_numbers(db, bill_id)
-    or_clauses = [
-        {"reference_number": {"$regex": re.escape(ref), "$options": "i"}} for ref in (bill_number, po_number) if ref
-    ]
+    or_clauses = [{"reference_number": {"$regex": _ref_regex(ref), "$options": "i"}} for ref in _discovery_refs(bill_number, po_number)]
     discovered_ids: set[str] = set()
     if or_clauses:
         for doc in db.get_collection(INVENTORY_ADJUSTMENTS_COLLECTION).find({"$or": or_clauses}, {"inventory_adjustment_id": 1}):
@@ -437,23 +455,20 @@ def po_groups(search: Optional[str] = Query(None), po: Optional[str] = Query(Non
             )
         )
 
-    # Batch-detect inventory adjustments per bill — same "reference_number contains bill/PO
-    # number" convention as _linked_adjustments_for_bill, but done once for the whole page
-    # (one query) instead of per-bill, so it shows up here without needing to open each bill.
+    # Batch-detect inventory adjustments per bill — same whole-token reference_number convention
+    # as _linked_adjustments_for_bill, but done once for the whole page (one query) instead of
+    # per-bill, so it shows up here without needing to open each bill.
     all_candidate_refs: set[str] = set()
     bill_candidate_refs: dict[str, set[str]] = {}
     for b in bill_docs:
-        refs = {b["bill_number"]} if b.get("bill_number") else set()
-        for pid in b.get("purchaseorder_ids") or []:
-            pon = po_number_by_id.get(pid)
-            if pon:
-                refs.add(pon)
+        refs = set(_discovery_refs(b.get("bill_number")))
+        refs.update(_discovery_refs(*(po_number_by_id.get(pid) for pid in b.get("purchaseorder_ids") or [])))
         bill_candidate_refs[b["bill_id"]] = refs
         all_candidate_refs.update(refs)
 
     matched_adjustments: list[dict] = []
     if all_candidate_refs:
-        or_clauses = [{"reference_number": {"$regex": re.escape(ref), "$options": "i"}} for ref in all_candidate_refs]
+        or_clauses = [{"reference_number": {"$regex": _ref_regex(ref), "$options": "i"}} for ref in all_candidate_refs]
         matched_adjustments = list(
             db.get_collection(INVENTORY_ADJUSTMENTS_COLLECTION).find({"$or": or_clauses}, {"inventory_adjustment_id": 1, "reference_number": 1})
         )
@@ -462,8 +477,7 @@ def po_groups(search: Optional[str] = Query(None), po: Optional[str] = Query(Non
         ids = set(bill.get("linked_inventory_adjustment_ids") or [])
         refs = bill_candidate_refs.get(bill["bill_id"], set())
         for adj in matched_adjustments:
-            ref_number = (adj.get("reference_number") or "").lower()
-            if any(ref.lower() in ref_number for ref in refs):
+            if any(_ref_matches(ref, adj.get("reference_number")) for ref in refs):
                 ids.add(adj["inventory_adjustment_id"])
         return len(ids)
 
