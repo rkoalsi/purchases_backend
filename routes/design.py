@@ -2066,17 +2066,30 @@ async def search_designer_documents(q: str, db=Depends(get_database)):
 
 @router.get("/vendor-brands")
 async def get_vendor_brands(db=Depends(get_database)):
-    """Return a map of vendor_id → [brand names] from the brands collection."""
+    """Return a map of vendor_id → [brand names] from the brands collection.
+
+    Brands carry either a single `vendor_id` or a `vendor_ids` list (or both) —
+    both shapes are folded into the same map.
+    """
     def _fetch():
         result: dict[str, list[str]] = {}
-        for brand in db[BRANDS_COLLECTION].find({"vendor_id": {"$exists": True, "$ne": None}}, {"name": 1, "vendor_id": 1}):
-            vid = brand.get("vendor_id")
+        query = {"$or": [
+            {"vendor_id": {"$exists": True, "$ne": None}},
+            {"vendor_ids": {"$exists": True, "$ne": None}},
+        ]}
+        for brand in db[BRANDS_COLLECTION].find(query, {"name": 1, "vendor_id": 1, "vendor_ids": 1}):
             name = brand.get("name")
-            if not vid or not name:
+            if not name:
                 continue
-            result.setdefault(vid, [])
-            if name not in result[vid]:
-                result[vid].append(name)
+            vids = list(brand.get("vendor_ids") or [])
+            if brand.get("vendor_id"):
+                vids.append(brand["vendor_id"])
+            for vid in vids:
+                if not vid:
+                    continue
+                result.setdefault(vid, [])
+                if name not in result[vid]:
+                    result[vid].append(name)
         for vid in result:
             result[vid].sort()
         return result
