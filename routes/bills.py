@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Query, Body, UploadFile, File
+from fastapi import APIRouter, HTTPException, Depends, Query, Body, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from datetime import datetime, timedelta
 from typing import Optional
@@ -21,6 +21,14 @@ PURCHASE_ORDERS_COLLECTION = "purchase_orders"
 BILLS_COLLECTION = "bills"
 BRAND_ORDERS_COLLECTION = "brand_orders"
 INVENTORY_ADJUSTMENTS_COLLECTION = "inventory_adjustments"
+
+# Bill creation defaults. "Advance" and "Due on Receipt" are both 0-day terms in Zoho — only the
+# label separates them, so payment_terms_label must always be sent alongside payment_terms.
+DEFAULT_PAYMENT_TERMS_LABEL = "Advance"
+# Zoho custom field "Original Bill Date" (the vendor's own invoice date, distinct from the bill's
+# posting date). Matched by api_name; customfield_id 3220178000122463035.
+ORIGINAL_BILL_DATE_FIELD = "cf_original_bill_date"
+BASE_CURRENCY = "INR"
 
 ZOHO_BOOKS_BASE = "https://books.zoho.com/api/v3"
 ZOHO_INVENTORY_BASE = os.getenv("ZOHO_INVENTORY_BASE", "https://www.zohoapis.com/inventory/v1")
@@ -199,6 +207,230 @@ def _needs_fix(bill: dict) -> bool:
     return any(li.get("item_id") and not li.get("item_custom_fields") for li in bill.get("line_items", []))
 
 
+# ---------------------------------------------------------------------------
+# PO ↔ Bill discrepancy comparison
+# ---------------------------------------------------------------------------
+# Zoho does NOT retro-apply a PO edit to a bill that was already raised against it, so a
+# bill can silently drift from its PO (e.g. PO-JOLLYPAWPS01: one line's rate was corrected
+# on the PO after the bill existed, leaving the bill $23.48 over). Nothing in Zoho surfaces
+# that, hence this comparison.
+
+_AMOUNT_EPS = 0.005  # Zoho rounds money to 2dp; anything smaller is float noise, not a discrepancy
+_QTY_EPS = 0.0005
+_VOID_BILL_STATUSES = {"void", "cancelled"}
+
+
+def _f(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _po_ids_for_bill(bill: dict) -> list[str]:
+    """PO ids this bill is raised against.
+
+    `purchaseorder_ids` is the header-level link, but bills built from receives also carry
+    `purchaseorder_id` per line — and on some older bills only the line-level link is set.
+    """
+    po_ids: list[str] = []
+    for pid in bill.get("purchaseorder_ids") or []:
+        if pid and pid not in po_ids:
+            po_ids.append(pid)
+    for li in bill.get("line_items") or []:
+        pid = li.get("purchaseorder_id")
+        if pid and pid not in po_ids:
+            po_ids.append(pid)
+    return po_ids
+
+
+def _line_label(li: dict) -> dict:
+    return {
+        "item_id": li.get("item_id"),
+        "name": li.get("name") or li.get("description") or "",
+        "sku": li.get("sku") or "",
+    }
+
+
+def _match_bill_lines_to_po_lines(po_lines: list[dict], bill_lines: list[dict]) -> tuple[dict[str, list[dict]], list[dict]]:
+    """Group bill lines under the PO line they bill.
+
+    One PO line commonly maps to SEVERAL bill lines — a receive-derived line per receipt plus
+    a balance line for the un-received remainder — so this is many-to-one, not one-to-one.
+    Matching prefers Zoho's own `purchaseorder_item_id` back-reference; where that is absent
+    (manually keyed bills) it falls back to item_id, consuming PO lines in order so a repeated
+    item still maps to distinct PO lines.
+    """
+    by_po_line_id = {pl["line_item_id"]: pl for pl in po_lines if pl.get("line_item_id")}
+    grouped: dict[str, list[dict]] = {pl_id: [] for pl_id in by_po_line_id}
+    unmatched: list[dict] = []
+
+    po_lines_by_item: dict[str, list[dict]] = {}
+    for pl in po_lines:
+        if pl.get("item_id"):
+            po_lines_by_item.setdefault(pl["item_id"], []).append(pl)
+    fallback_cursor: dict[str, int] = {}
+
+    for bl in bill_lines:
+        po_item_id = bl.get("purchaseorder_item_id")
+        if po_item_id and po_item_id in by_po_line_id:
+            grouped[po_item_id].append(bl)
+            continue
+
+        candidates = po_lines_by_item.get(bl.get("item_id") or "") or []
+        if not candidates:
+            unmatched.append(bl)
+            continue
+        # Reuse the last candidate once exhausted: extra bill lines for an item that IS on the
+        # PO are an over-billing of that PO line, not an unrelated line.
+        idx = min(fallback_cursor.get(bl["item_id"], 0), len(candidates) - 1)
+        fallback_cursor[bl["item_id"]] = idx + 1
+        grouped[candidates[idx]["line_item_id"]].append(bl)
+
+    return grouped, unmatched
+
+
+def _compare_bill_to_pos(db, bill: dict) -> dict:
+    """Line-by-line diff of a bill against the PO(s) it is raised against."""
+    po_ids = _po_ids_for_bill(bill)
+    if not po_ids:
+        return {"linked": False, "has_discrepancy": False, "reason": "This bill is not linked to a purchase order."}
+
+    pos = list(db.get_collection(PURCHASE_ORDERS_COLLECTION).find({"purchaseorder_id": {"$in": po_ids}}))
+    if not pos:
+        return {"linked": False, "has_discrepancy": False, "reason": "Linked purchase order not found in the local sync."}
+
+    po_lines: list[dict] = []
+    for po in pos:
+        for pl in po.get("line_items") or []:
+            po_lines.append({**pl, "_po_number": po.get("purchaseorder_number")})
+
+    bill_lines = bill.get("line_items") or []
+    grouped, unmatched = _match_bill_lines_to_po_lines(po_lines, bill_lines)
+
+    lines: list[dict] = []
+    for pl in po_lines:
+        billed = grouped.get(pl.get("line_item_id"), [])
+        po_qty = _f(pl.get("quantity"))
+        po_rate = _f(pl.get("rate"))
+        po_amount = _f(pl.get("item_total"))
+        bill_qty = sum(_f(b.get("quantity")) for b in billed)
+        bill_amount = sum(_f(b.get("item_total")) for b in billed)
+        # A PO line split across receives can legitimately produce several bill lines; only the
+        # distinct RATES matter, and only when they disagree with the PO.
+        bill_rates = sorted({round(_f(b.get("rate")), 6) for b in billed})
+
+        qty_diff = round(bill_qty - po_qty, 4)
+        amount_diff = round(bill_amount - po_amount, 2)
+        rate_mismatch = [r for r in bill_rates if abs(r - po_rate) > 1e-9]
+
+        issues: list[str] = []
+        if billed and rate_mismatch:
+            issues.append("rate")
+        if abs(qty_diff) > _QTY_EPS:
+            issues.append("over_billed" if qty_diff > 0 else ("not_billed" if not billed else "under_billed"))
+        if abs(amount_diff) > _AMOUNT_EPS and not issues:
+            # Amount moved without qty or rate moving — discount/tax-inclusive settings differ.
+            issues.append("amount")
+
+        lines.append(
+            {
+                **_line_label(pl),
+                "po_number": pl.get("_po_number"),
+                "po_line_item_id": pl.get("line_item_id"),
+                "po_quantity": round(po_qty, 4),
+                "bill_quantity": round(bill_qty, 4),
+                "quantity_diff": qty_diff,
+                "po_rate": round(po_rate, 6),
+                "bill_rates": bill_rates,
+                "rate_diff": round(rate_mismatch[0] - po_rate, 6) if rate_mismatch else 0.0,
+                "po_amount": round(po_amount, 2),
+                "bill_amount": round(bill_amount, 2),
+                "amount_diff": amount_diff,
+                "bill_line_count": len(billed),
+                "issues": issues,
+            }
+        )
+
+    extra_lines = [
+        {
+            **_line_label(bl),
+            "bill_quantity": round(_f(bl.get("quantity")), 4),
+            "bill_rate": round(_f(bl.get("rate")), 6),
+            "bill_amount": round(_f(bl.get("item_total")), 2),
+        }
+        for bl in unmatched
+    ]
+
+    # Other bills against the same PO(s) — without this, a PO billed in two parts reads as a
+    # large "under-billed" discrepancy on each bill when nothing is actually wrong.
+    other_bills = list(
+        db.get_collection(BILLS_COLLECTION).find(
+            {"purchaseorder_ids": {"$in": po_ids}, "bill_id": {"$ne": bill.get("bill_id")}},
+            {"bill_id": 1, "bill_number": 1, "status": 1, "total": 1, "currency_code": 1},
+        )
+    )
+    other_bills = [b for b in other_bills if (b.get("status") or "").lower() not in _VOID_BILL_STATUSES]
+
+    po_total = round(sum(_f(p.get("total")) for p in pos), 2)
+    po_sub_total = round(sum(_f(p.get("sub_total")) for p in pos), 2)
+    po_tax_total = round(sum(_f(p.get("tax_total")) for p in pos), 2)
+    po_quantity = round(sum(_f(pl.get("quantity")) for pl in po_lines), 4)
+    bill_total = round(_f(bill.get("total")), 2)
+    bill_quantity = round(sum(_f(b.get("quantity")) for b in bill_lines), 4)
+
+    po_currency = (pos[0].get("currency_code") or "").upper()
+    bill_currency = (bill.get("currency_code") or "").upper()
+    po_fx = round(_f(pos[0].get("exchange_rate")), 6)
+    bill_fx = round(_f(bill.get("exchange_rate")), 6)
+
+    header_issues: list[dict] = []
+    if po_currency and bill_currency and po_currency != bill_currency:
+        header_issues.append({"field": "Currency", "po": po_currency, "bill": bill_currency, "severity": "error"})
+    if po_fx and bill_fx and abs(po_fx - bill_fx) > 1e-6:
+        # Normal FX drift between PO date and bill date — informational, never an error.
+        header_issues.append({"field": "Exchange rate", "po": po_fx, "bill": bill_fx, "severity": "info"})
+    if abs(po_tax_total - round(_f(bill.get("tax_total")), 2)) > _AMOUNT_EPS:
+        header_issues.append(
+            {"field": "Tax total", "po": po_tax_total, "bill": round(_f(bill.get("tax_total")), 2), "severity": "warn"}
+        )
+    if abs(_f(bill.get("adjustment"))) > _AMOUNT_EPS:
+        header_issues.append(
+            {"field": "Adjustment on bill", "po": 0, "bill": round(_f(bill.get("adjustment")), 2), "severity": "warn"}
+        )
+
+    flagged = [ln for ln in lines if ln["issues"]]
+    has_discrepancy = bool(flagged or extra_lines) or any(h["severity"] != "info" for h in header_issues)
+
+    return {
+        "linked": True,
+        "has_discrepancy": has_discrepancy,
+        "purchase_orders": [
+            {"purchaseorder_id": p.get("purchaseorder_id"), "purchaseorder_number": p.get("purchaseorder_number"), "status": p.get("status")}
+            for p in pos
+        ],
+        "currency_code": bill_currency or po_currency,
+        "totals": {
+            "po_total": po_total,
+            "bill_total": bill_total,
+            "total_diff": round(bill_total - po_total, 2),
+            "po_sub_total": po_sub_total,
+            "bill_sub_total": round(_f(bill.get("sub_total")), 2),
+            "po_tax_total": po_tax_total,
+            "bill_tax_total": round(_f(bill.get("tax_total")), 2),
+            "po_quantity": po_quantity,
+            "bill_quantity": bill_quantity,
+            "quantity_diff": round(bill_quantity - po_quantity, 4),
+        },
+        "lines": lines,
+        "flagged_count": len(flagged),
+        "extra_lines": extra_lines,
+        "header_issues": header_issues,
+        "other_bills": serialize_mongo_document(other_bills),
+        "other_bills_total": round(sum(_f(b.get("total")) for b in other_bills), 2),
+    }
+
+
 # Zoho's bill-update API only accepts a small subset of the fields it returns on GET —
 # echoing the full GET response back (e.g. purchaseorder_details, item_type_formatted,
 # rate_formatted, ...) trips its own field-length/type validation on unrelated read-only
@@ -326,6 +558,7 @@ def _linked_adjustments_for_bill(db, bill_id: str) -> list[dict]:
                 "reason": 1,
                 "status": 1,
                 "adjustment_type": 1,
+                "description": 1,
             },
         )
     )
@@ -410,6 +643,7 @@ def po_groups(search: Optional[str] = Query(None), po: Optional[str] = Query(Non
         "date": 1,
         "total": 1,
         "currency_code": 1,
+        "exchange_rate": 1,
         "status": 1,
     }
     pos = list(db.get_collection(PURCHASE_ORDERS_COLLECTION).find(query, projection))
@@ -513,6 +747,23 @@ def po_groups(search: Optional[str] = Query(None), po: Optional[str] = Query(Non
         order_info = order_by_po.get(p.get("purchaseorder_number")) or {}
         real_ts = order_info.get("created_at") or ""  # only counts if backed by an actual brand_orders doc
         sort_ts = real_ts or p.get("date") or ""  # PO date is just a display-order fallback within the vendor
+        po_bills = bills_by_po.get(p.get("purchaseorder_id"), [])
+
+        # Cheap header-level discrepancy flag for the collapsed row: total of all live bills vs
+        # the PO total. Deliberately NOT the full line-by-line diff — that needs every PO's line
+        # items loaded for every vendor on the page. Opening the bill runs the real comparison.
+        live_bills = [b for b in po_bills if (b.get("status") or "").lower() not in _VOID_BILL_STATUSES]
+        billed_total = round(sum(_f(b.get("total")) for b in live_bills), 2)
+        same_currency = all(
+            not b.get("currency_code") or not p.get("currency_code") or b["currency_code"] == p["currency_code"]
+            for b in live_bills
+        )
+        bill_total_diff = (
+            round(billed_total - _f(p.get("total")), 2)
+            if live_bills and same_currency and abs(billed_total - _f(p.get("total"))) > _AMOUNT_EPS
+            else None
+        )
+
         group["purchase_orders"].append(
             {
                 "purchaseorder_number": p.get("purchaseorder_number"),
@@ -521,8 +772,11 @@ def po_groups(search: Optional[str] = Query(None), po: Optional[str] = Query(Non
                 "date": p.get("date"),
                 "total": p.get("total"),
                 "currency_code": p.get("currency_code"),
+                "exchange_rate": p.get("exchange_rate"),
                 "status": p.get("status"),
-                "bills": bills_by_po.get(p.get("purchaseorder_id"), []),
+                "bills": po_bills,
+                "billed_total": billed_total if live_bills else None,
+                "bill_total_diff": bill_total_diff,
                 "_sort_ts": sort_ts,
                 "_real_ts": real_ts,
             }
@@ -573,6 +827,10 @@ def po_options(
                 "vendor_name": 1,
                 "date": 1,
                 "total": 1,
+                # drive the Create Bill modal's conversion-rate field (shown only for foreign
+                # currency; the PO's own rate is the prefill)
+                "currency_code": 1,
+                "exchange_rate": 1,
             },
         )
         .sort([("date", -1), ("_id", -1)])
@@ -604,7 +862,15 @@ def get_bill(bill_id: str, db=Depends(get_database)):
         logger.error("Failed to fetch bill %s: %s", bill_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    return {"bill": bill, "needs_fix": _needs_fix(bill)}
+    # Folded into the detail response rather than its own endpoint: the panel that renders it
+    # opens with the bill, so a second round-trip would only add latency.
+    try:
+        comparison = _compare_bill_to_pos(db, bill)
+    except Exception as e:
+        logger.error("Failed to compare bill %s to its PO: %s", bill_id, e)
+        comparison = {"linked": False, "has_discrepancy": False, "reason": "Could not compare against the purchase order."}
+
+    return {"bill": bill, "needs_fix": _needs_fix(bill), "comparison": comparison}
 
 
 @router.post("/{bill_id}/fix-custom-fields")
@@ -677,14 +943,28 @@ def create_bill(
     purchaseorder_number: str = Body(..., embed=True),
     bill_number: str = Body(..., embed=True),
     date: str = Body(..., embed=True),
+    original_bill_date: Optional[str] = Body(None, embed=True),
+    payment_terms: int = Body(0, embed=True),
+    payment_terms_label: str = Body(DEFAULT_PAYMENT_TERMS_LABEL, embed=True),
+    exchange_rate: Optional[float] = Body(None, embed=True),
     db=Depends(get_database),
 ):
     po = db.get_collection(PURCHASE_ORDERS_COLLECTION).find_one(
         {"purchaseorder_number": purchaseorder_number},
-        {"purchaseorder_id": 1, "vendor_id": 1},
+        {"purchaseorder_id": 1, "vendor_id": 1, "currency_code": 1},
     )
     if not po or not po.get("purchaseorder_id"):
         raise HTTPException(status_code=404, detail=f"Purchase order {purchaseorder_number} not found")
+
+    # Zoho rejects an exchange_rate on base-currency bills.
+    if exchange_rate is not None:
+        if (po.get("currency_code") or BASE_CURRENCY) == BASE_CURRENCY:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Purchase order {purchaseorder_number} is in {BASE_CURRENCY}; a conversion rate does not apply.",
+            )
+        if exchange_rate <= 0:
+            raise HTTPException(status_code=400, detail="Conversion rate must be greater than zero.")
 
     brand_order = db.get_collection(BRAND_ORDERS_COLLECTION).find_one(
         {"purchaseorder_number": purchaseorder_number}, {"name": 1}
@@ -767,8 +1047,18 @@ def create_bill(
             "bill_number": bill_number,
             "reference_number": order_number,
             "date": date,
+            "payment_terms": payment_terms,
+            "payment_terms_label": payment_terms_label,
             "line_items": line_items,
         }
+
+        if original_bill_date:
+            payload["custom_fields"] = [{"api_name": ORIGINAL_BILL_DATE_FIELD, "value": original_bill_date}]
+
+        # Without an explicit rate Zoho silently applies its own daily one, which is what drifted
+        # this bill's total off the PO's (95.2 vs 95.360558).
+        if exchange_rate is not None:
+            payload["exchange_rate"] = exchange_rate
 
         logger.info("Zoho bill create payload: %s", payload)
         r = requests.post(
@@ -936,7 +1226,12 @@ async def inventory_adjustment_preview(bill_id: str, file: UploadFile = File(...
 
 
 @router.post("/{bill_id}/inventory-adjustment/confirm")
-async def inventory_adjustment_confirm(bill_id: str, file: UploadFile = File(...), db=Depends(get_database)):
+async def inventory_adjustment_confirm(
+    bill_id: str,
+    file: UploadFile = File(...),
+    description: Optional[str] = Form(None),
+    db=Depends(get_database),
+):
     try:
         bill = _fetch_bill(bill_id)
     except Exception as e:
@@ -994,7 +1289,10 @@ async def inventory_adjustment_confirm(bill_id: str, file: UploadFile = File(...
 
     bill_number = bill.get("bill_number")
     reference_number = f"{bill_number} ( {po_number} )" if po_number else bill_number
-    description = f"Shortage & Excess Received in Order {order_name or po_number or bill_number}"
+    # User-supplied notes win; otherwise fall back to the auto-generated description.
+    final_description = (description or "").strip() or (
+        f"Shortage & Excess Received in Order {order_name or po_number or bill_number}"
+    )
 
     def _do_create():
         token = _get_inventory_token()
@@ -1002,7 +1300,7 @@ async def inventory_adjustment_confirm(bill_id: str, file: UploadFile = File(...
         payload = {
             "date": datetime.now().strftime("%Y-%m-%d"),
             "reason": "Shipment Inward adjustment",
-            "description": description,
+            "description": final_description,
             "adjustment_type": "quantity",
             "reference_number": reference_number,
             "location_id": DEFAULT_WAREHOUSE_ID,
@@ -1083,6 +1381,46 @@ def get_inventory_adjustment_detail(inventory_adjustment_id: str, db=Depends(get
 
     _upsert_inventory_adjustment(db, adjustment)
     return {"inventory_adjustment": adjustment}
+
+
+@router.patch("/inventory-adjustments/{inventory_adjustment_id}/description")
+def update_inventory_adjustment_description(
+    inventory_adjustment_id: str,
+    description: str = Body("", embed=True),
+    db=Depends(get_database),
+):
+    """Rewrite an adjustment's description (the notes shown on the adjustment in Zoho)."""
+
+    def _do_update():
+        token = _get_inventory_token()
+        r = requests.put(
+            f"{ZOHO_INVENTORY_BASE}/inventoryadjustments/{inventory_adjustment_id}",
+            headers={"Authorization": f"Zoho-oauthtoken {token}"},
+            json={"description": description},
+            params={"organization_id": ORGANIZATION_ID},
+            timeout=30,
+        )
+        logger.info("Zoho IA description update response %s: %s", r.status_code, r.text)
+        if r.status_code >= 400:
+            # Zoho refuses edits on some adjustment states — surface its own wording.
+            try:
+                msg = r.json().get("message")
+            except ValueError:
+                msg = None
+            raise ValueError(f"Zoho error: {msg or r.text}")
+        data = r.json()
+        if data.get("code") != 0:
+            raise ValueError(f"Zoho error: {data.get('message', 'Unknown error')}")
+        return data["inventory_adjustment"]
+
+    try:
+        adjustment = _do_update()
+    except Exception as e:
+        logger.error("Failed to update description for adjustment %s: %s", inventory_adjustment_id, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    _upsert_inventory_adjustment(db, adjustment)
+    return {"inventory_adjustment": serialize_mongo_document(adjustment)}
 
 
 @router.get("/{bill_id}/inventory-adjustments")
