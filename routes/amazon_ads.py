@@ -20,7 +20,7 @@ import logging
 from datetime import datetime, timedelta, timezone, date
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from pymongo import UpdateOne, ASCENDING, DESCENDING
@@ -422,6 +422,108 @@ def _store_campaign_meta_sync(db, rows: list[dict]) -> int:
     return len(latest)
 
 
+# --------------------------------------------------------------------------
+# Console export import
+#
+# The Ads console retains data longer than the reporting API, so a console
+# export is the only way to recover dates that have aged out (e.g. Sponsored
+# Brands before its retention floor). Exports carry campaign NAMES but no
+# campaign ids, and always use 14-day attribution.
+# --------------------------------------------------------------------------
+_CONSOLE_COLUMNS = {
+    # canonical -> candidate header names, matched case-insensitively after
+    # stripping whitespace (Amazon ships headers with stray trailing spaces).
+    "date": ["date"],
+    "campaign_name": ["campaign name"],
+    "campaign_status": ["status"],
+    "impressions": ["impressions"],
+    "clicks": ["clicks"],
+    "cost": ["spend - converted", "spend"],
+    "sales": ["14 day total sales - converted", "14 day total sales"],
+    "orders": ["14 day total orders (#)"],
+    "units": ["14 day total units (#)"],
+}
+
+
+def _resolve_console_columns(df) -> dict:
+    lookup = {str(c).strip().lower(): c for c in df.columns}
+    resolved = {}
+    for canon, candidates in _CONSOLE_COLUMNS.items():
+        for cand in candidates:
+            if cand in lookup:
+                resolved[canon] = lookup[cand]
+                break
+    missing = [c for c in ("date", "campaign_name", "impressions", "clicks", "cost") if c not in resolved]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Console export is missing required columns: {missing}. Found: {list(df.columns)[:15]}",
+        )
+    return resolved
+
+
+def _parse_console_export_sync(db, file_bytes: bytes, ad_product: str) -> tuple[list[dict], dict]:
+    """Turn a console xlsx export into normalised daily rows."""
+    import pandas as pd
+
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    cols = _resolve_console_columns(df)
+
+    # Exports have no campaign id, so names are mapped back to the ids already
+    # known from the API. Unmatched names get a stable synthetic id that can
+    # never collide with Amazon's numeric ids.
+    known = {
+        d["campaign_name"]: d["campaign_id"]
+        for d in db[CAMPAIGNS_COLLECTION].find(
+            {"profile_id": _ADS_PROFILE_ID}, {"campaign_name": 1, "campaign_id": 1}
+        )
+        if d.get("campaign_name")
+    }
+
+    rows, unmatched = [], set()
+    for _, r in df.iterrows():
+        name = str(r[cols["campaign_name"]]).strip()
+        if not name or name == "nan":
+            continue
+        raw_date = pd.to_datetime(r[cols["date"]], errors="coerce")
+        if pd.isna(raw_date):
+            continue
+
+        cid = known.get(name)
+        if not cid:
+            unmatched.add(name)
+            cid = f"NAME:{name}"
+
+        get = lambda k: _num(r[cols[k]]) if k in cols else 0
+        cost, sales, clicks, impressions = get("cost"), get("sales"), get("clicks"), get("impressions")
+
+        rows.append({
+            "date": raw_date.date().isoformat(),
+            "campaign_id": str(cid),
+            "campaign_name": name,
+            "campaign_status": (str(r[cols["campaign_status"]]).strip().upper()
+                                if "campaign_status" in cols and str(r[cols["campaign_status"]]) != "nan" else None),
+            "ad_product": ad_product,
+            "profile_id": _ADS_PROFILE_ID,
+            "impressions": impressions,
+            "clicks": clicks,
+            "cost": round(cost, 2),
+            "orders": get("orders"),
+            "sales": round(sales, 2),
+            "units": get("units"),
+            "ctr": round(clicks / impressions * 100, 4) if impressions else 0,
+            "cpc": round(cost / clicks, 2) if clicks else 0,
+            "acos": round(cost / sales * 100, 2) if sales else None,
+            "roas": round(sales / cost, 2) if cost else None,
+            # Provenance: console exports are 14-day attribution, API SP is 30-day.
+            "source": "console_upload",
+            "attribution": "14d",
+            "updated_at": datetime.now(timezone.utc),
+        })
+
+    return rows, {"unmatched_campaign_names": sorted(unmatched)[:20], "unmatched_count": len(unmatched)}
+
+
 _indexes_ready = False
 
 
@@ -745,6 +847,94 @@ async def initiate_sync(payload: SyncRequest, db=Depends(get_database)):
 async def collect_sync(max_jobs: int = Query(20, le=100), db=Depends(get_database)):
     """Download and store any queued reports Amazon has finished."""
     return await collect_ads_reports(db, max_jobs)
+
+
+@router.post("/upload")
+async def upload_console_export(
+    file: UploadFile = File(...),
+    ad_product: str = Form(...),
+    mode: str = Form("fill_missing"),
+    uploaded_by: str | None = Form(None),
+    db=Depends(get_database),
+):
+    """
+    Import an Amazon Ads console campaign export (xlsx).
+
+    The console retains data past the reporting API's retention floor, so this
+    is the only route to dates the API refuses to serve.
+
+    mode:
+      fill_missing (default) — only writes dates with no existing rows for this
+                               ad product, so API data is never disturbed.
+      replace                — overwrites every date present in the file.
+
+    Note the two sources are not interchangeable: console exports are 14-day
+    attribution, while Sponsored Products from the API is 30-day. Replacing SP
+    data therefore changes its basis and will not match previously stored rows.
+    """
+    if ad_product not in _REPORT_SPECS:
+        raise HTTPException(status_code=400, detail=f"ad_product must be one of {list(_REPORT_SPECS)}")
+    if mode not in ("fill_missing", "replace"):
+        raise HTTPException(status_code=400, detail="mode must be 'fill_missing' or 'replace'")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    def _work():
+        _ensure_indexes_sync(db)
+        rows, meta = _parse_console_export_sync(db, content, ad_product)
+        if not rows:
+            return {"status": "no_rows", **meta}
+
+        file_dates = sorted({r["date"] for r in rows})
+        existing = set(
+            db[DAILY_COLLECTION].distinct(
+                "date",
+                {"ad_product": ad_product, "profile_id": _ADS_PROFILE_ID,
+                 "date": {"$gte": file_dates[0], "$lte": file_dates[-1]}},
+            )
+        )
+
+        if mode == "fill_missing":
+            target = [r for r in rows if r["date"] not in existing]
+            skipped_dates = sorted(existing & set(file_dates))
+        else:
+            target = rows
+            skipped_dates = []
+
+        stored = _store_rows_sync(db, target)
+        _store_campaign_meta_sync(db, target)
+
+        db[SYNC_RUNS_COLLECTION].insert_one({
+            "started_at": datetime.now(timezone.utc),
+            "finished_at": datetime.now(timezone.utc),
+            "status": "completed",
+            "source": "console_upload",
+            "mode": mode,
+            "ad_products": [ad_product],
+            "filename": file.filename,
+            "uploaded_by": uploaded_by,
+            "start_date": file_dates[0],
+            "end_date": file_dates[-1],
+            "total_rows": len(target),
+            "profile_id": _ADS_PROFILE_ID,
+        })
+
+        return {
+            "status": "ok",
+            "ad_product": ad_product,
+            "mode": mode,
+            "file_dates": f"{file_dates[0]} .. {file_dates[-1]}",
+            "rows_in_file": len(rows),
+            "rows_written": len(target),
+            "stored": stored,
+            "dates_written": sorted({r["date"] for r in target}),
+            "dates_skipped_already_present": skipped_dates,
+            **meta,
+        }
+
+    return await asyncio.to_thread(_work)
 
 
 @router.get("/report-jobs")
