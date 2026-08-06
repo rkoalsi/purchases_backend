@@ -2830,6 +2830,11 @@ async def delete_designer_document(order_id: str, doc_id: str, db=Depends(get_da
 
 CATALOGUES_COLLECTION = "catalogues"
 
+# These endpoints have no logged-in user attached, so audit rows are stamped
+# with the surface instead — enough for the order-form admin to tell a design
+# portal edit apart from one made in /admin/catalogues.
+DESIGN_PORTAL_ACTOR = "Design portal"
+
 
 @router.get("/brand-catalogues")
 async def list_brand_catalogues(
@@ -2839,6 +2844,9 @@ async def list_brand_catalogues(
 ):
     def _fetch():
         pipeline = [
+            # Rows written before timestamps existed borrow the ObjectId's
+            # embedded UTC creation time so the column is never blank.
+            {"$addFields": {"created_at": {"$ifNull": ["$created_at", {"$toDate": "$_id"}]}}},
             {"$sort": {"created_at": -1, "_id": -1}},
             {"$skip": page * limit},
             {"$limit": limit},
@@ -2875,7 +2883,16 @@ class BrandCatalogueBody(BaseModel):
 @router.post("/brand-catalogues")
 async def create_brand_catalogue(body: BrandCatalogueBody, db=Depends(get_database)):
     def _insert():
-        doc = {**body.model_dump(), "created_at": datetime.now()}
+        # utcnow() (naive UTC), not datetime.now(): the order-form admin reads
+        # these same documents and renders them in IST, so a local-clock write
+        # from a dev machine would show up hours off.
+        now = utcnow()
+        doc = {
+            **body.model_dump(),
+            "created_at": now,
+            "updated_at": now,
+            "history": [{"action": "created", "at": now, "by": DESIGN_PORTAL_ACTOR}],
+        }
         result = db[CATALOGUES_COLLECTION].insert_one(doc)
         return serialize_mongo_document(db[CATALOGUES_COLLECTION].find_one({"_id": result.inserted_id}))
 
@@ -2885,9 +2902,23 @@ async def create_brand_catalogue(body: BrandCatalogueBody, db=Depends(get_databa
 @router.put("/brand-catalogues/{catalogue_id}")
 async def update_brand_catalogue(catalogue_id: str, body: BrandCatalogueBody, db=Depends(get_database)):
     def _update():
-        update = {**body.model_dump(), "updated_at": datetime.now()}
+        now = utcnow()
+        payload = body.model_dump()
+        existing = db[CATALOGUES_COLLECTION].find_one({"_id": ObjectId(catalogue_id)}) or {}
+        changed = [k for k, v in payload.items() if existing.get(k) != v]
         result = db[CATALOGUES_COLLECTION].update_one(
-            {"_id": ObjectId(catalogue_id)}, {"$set": update}
+            {"_id": ObjectId(catalogue_id)},
+            {
+                "$set": {**payload, "updated_at": now},
+                "$push": {
+                    "history": {
+                        "action": "updated",
+                        "at": now,
+                        "by": DESIGN_PORTAL_ACTOR,
+                        "fields": changed,
+                    }
+                },
+            },
         )
         if result.matched_count == 0:
             return None
@@ -2906,8 +2937,19 @@ async def toggle_brand_catalogue(catalogue_id: str, db=Depends(get_database)):
         if not doc:
             return None
         new_state = not doc.get("is_active", True)
+        now = utcnow()
         db[CATALOGUES_COLLECTION].update_one(
-            {"_id": ObjectId(catalogue_id)}, {"$set": {"is_active": new_state}}
+            {"_id": ObjectId(catalogue_id)},
+            {
+                "$set": {"is_active": new_state, "updated_at": now},
+                "$push": {
+                    "history": {
+                        "action": "activated" if new_state else "deactivated",
+                        "at": now,
+                        "by": DESIGN_PORTAL_ACTOR,
+                    }
+                },
+            },
         )
         return new_state
 

@@ -1,6 +1,7 @@
 import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 import httpx
 import os
 from dotenv import load_dotenv
@@ -742,6 +743,108 @@ async def scheduled_sheets_update():
         )
 
 
+async def scheduled_amazon_ads_initiate():
+    """
+    Phase 1 of the daily Amazon Ads pull (SP + SB + SD) — 06:00 IST (00:30 UTC).
+
+    Queues the reports and returns; Amazon's build times run from minutes to
+    well over an hour, so downloading is a separate job. Re-pulls a trailing
+    14-day window rather than yesterday alone, because Amazon restates
+    attributed sales for roughly two weeks after the fact. Upserts are keyed on
+    (date, campaign_id, ad_product), so repeats are safe.
+    """
+    from ..routes.amazon_ads import initiate_ads_reports
+
+    try:
+        db = get_database()
+        result = await initiate_ads_reports(db)
+        errors = result.get("errors") or {}
+        if errors:
+            send_slack_notification(
+                "Amazon Ads Sync — Initiate", success=False,
+                error_msg="; ".join(f"{k}: {v}" for k, v in errors.items()),
+            )
+        logger.info("Amazon Ads reports queued: %s", result.get("queued"))
+    except Exception as e:
+        logger.error(f"Amazon Ads initiate failed: {e}")
+        send_slack_notification("Amazon Ads Sync — Initiate", success=False, error_msg=str(e))
+
+
+# Sponsored Products reports for this account have taken 2+ hours to build, so
+# a fixed set of passes can miss them entirely. Whenever a pass still sees
+# pending reports it schedules itself again, up to a bounded number of times.
+_COLLECT_RETRY_MINUTES = 90
+_MAX_COLLECT_FOLLOWUPS = 8  # 8 x 90 min = up to ~12 extra hours of runway
+
+
+async def scheduled_amazon_ads_collect(attempt: int = 0):
+    """
+    Phase 2 — download whatever Amazon has finished building.
+
+    Runs at 03:30, 06:30 and 09:30 UTC after the 00:30 initiate, and re-queues
+    itself 90 minutes later whenever reports are still building. A slow report
+    costs a delay rather than a day of data; only exhausting every follow-up
+    raises an alert, so silence can no longer hide a stuck sync.
+    """
+    from ..routes.amazon_ads import collect_ads_reports
+
+    try:
+        db = get_database()
+        result = await collect_ads_reports(db)
+        collected = result.get("collected") or []
+        still = result.get("still_pending", 0)
+
+        # Only notify when something actually landed, otherwise the later
+        # passes would post an empty message every day.
+        if collected or result.get("failed"):
+            send_slack_notification(
+                "Amazon Ads Sync — Collect",
+                success=not result.get("failed"),
+                details={"processed": result.get("total_rows", 0)},
+                error_msg="; ".join(
+                    f"{f['ad_product']}: {f.get('reason')}" for f in result.get("failed", [])
+                ) or None,
+            )
+
+        if still:
+            if attempt < _MAX_COLLECT_FOLLOWUPS:
+                run_at = datetime.now(timezone.utc) + timedelta(minutes=_COLLECT_RETRY_MINUTES)
+                # A fixed id per attempt keeps re-queues idempotent if two
+                # scheduled passes overlap while reports are still pending.
+                scheduler.add_job(
+                    scheduled_amazon_ads_collect,
+                    trigger=DateTrigger(run_date=run_at),
+                    id=f"amazon_ads_collect_followup_{attempt + 1}",
+                    name=f"Amazon Ads Collect (follow-up {attempt + 1})",
+                    args=[attempt + 1],
+                    replace_existing=True,
+                    misfire_grace_time=900,
+                )
+                logger.info(
+                    "Amazon Ads: %d report(s) still building — follow-up %d scheduled for %s UTC",
+                    still, attempt + 1, run_at.strftime("%H:%M"),
+                )
+            else:
+                # Every retry used up: this is the stuck case worth waking someone for.
+                send_slack_notification(
+                    "Amazon Ads Sync — Collect",
+                    success=False,
+                    error_msg=(
+                        f"{still} report(s) still pending after {attempt} follow-up passes "
+                        f"(~{attempt * _COLLECT_RETRY_MINUTES // 60}h). Amazon may be stuck; "
+                        f"run scripts/amazon_ads_backfill.py --collect-only to retry."
+                    ),
+                )
+
+        logger.info(
+            "Amazon Ads collect (attempt %d): %d reports, %s rows, %s still pending",
+            attempt, len(collected), result.get("total_rows"), still,
+        )
+    except Exception as e:
+        logger.error(f"Amazon Ads collect failed: {e}")
+        send_slack_notification("Amazon Ads Sync — Collect", success=False, error_msg=str(e))
+
+
 def setup_scheduler():
     """Configure and start the scheduler"""
     # Daily tasks
@@ -805,7 +908,29 @@ def setup_scheduler():
             misfire_grace_time=300,
         )
 
+    # Amazon Ads — queue reports at 00:30 UTC (06:00 IST). Amazon's data lags
+    # ~12h, so the window ends at yesterday; running earlier fetches nothing new.
+    scheduler.add_job(
+        scheduled_amazon_ads_initiate,
+        trigger=CronTrigger(hour=0, minute=30, timezone="UTC"),
+        id="amazon_ads_initiate",
+        name="Amazon Ads Initiate (SP/SB/SD)",
+        replace_existing=True,
+        misfire_grace_time=900,
+    )
+
+    # Collect in three passes — reports still building are retried next pass.
+    for collect_hour in (3, 6, 9):
+        scheduler.add_job(
+            scheduled_amazon_ads_collect,
+            trigger=CronTrigger(hour=collect_hour, minute=30, timezone="UTC"),
+            id=f"amazon_ads_collect_{collect_hour:02d}",
+            name=f"Amazon Ads Collect ({collect_hour:02d}:30 UTC)",
+            replace_existing=True,
+            misfire_grace_time=900,
+        )
+
     logger.info(
-        "Scheduler configured successfully with daily, weekly, composite items, FBA shipments, and sheets updater tasks"
+        "Scheduler configured successfully with daily, weekly, composite items, FBA shipments, sheets updater, and Amazon Ads tasks"
     )
 
