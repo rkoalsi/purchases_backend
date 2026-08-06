@@ -2120,7 +2120,14 @@ def bulk_edit_upload_history(
     try:
         q: dict = {}
         if sku:
-            q["updated.identifier"] = sku.strip()
+            # A SKU can land in any of the three buckets — "no changes" is just as
+            # much an answer to "did this run touch it?" as an edit is.
+            s = sku.strip()
+            q["$or"] = [
+                {"updated.identifier": s},
+                {"skipped.identifier": s},
+                {"not_found.identifier": s},
+            ]
         docs = list(
             db[BULK_EDIT_UPLOADS_COLLECTION]
             .find(q)
