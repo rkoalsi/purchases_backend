@@ -35,6 +35,7 @@ PO_COLLECTION = "purchase_orders"
 VENDORS_COLLECTION = "vendors"
 BRANDS_COLLECTION = "brands"
 DESIGN_CATALOGUE_COLLECTION = "design_catalogue"
+BULK_EDIT_UPLOADS_COLLECTION = "bulk_edit_uploads"
 S3_BUCKET = os.getenv("S3_BUCKET", "pupscribe-purchases")
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 S3_PUBLIC_URL = os.getenv("S3_PUBLIC_URL", f"https://{os.getenv('S3_BUCKET', 'pupscribe-purchases')}.s3.{os.getenv('AWS_REGION', 'ap-south-1')}.amazonaws.com")
@@ -130,6 +131,8 @@ _CATALOGUE_LOOKUP_FIELDS = {
     "size_chart": 1, "ingredient_list": 1, "nutritional_analysis": 1,
     "gst_percentage": 1, "treats_attributes": 1, "product_category": 1,
     "amazon_title": 1, "amazon_description": 1, "amazon_features": 1,
+    # Provenance — lets the UI show who last wrote this row and how.
+    "updated_at": 1, "updated_by": 1, "updated_via": 1,
 }
 
 
@@ -1068,7 +1071,7 @@ def _parse_image_links(val: Any) -> list[str] | None:
     return parts if parts else None
 
 
-def _process_pis_sheet(ws, sheet_name: str, db, dry_run: bool = False) -> dict:
+def _process_pis_sheet(ws, sheet_name: str, db, dry_run: bool = False, actor_email: str | None = None) -> dict:
     """Parse one PIS sheet. If dry_run=True, checks matches without writing. Returns result dict."""
     updated = []
     not_found = []
@@ -1211,7 +1214,10 @@ def _process_pis_sheet(ws, sheet_name: str, db, dry_run: bool = False) -> dict:
         # Snapshot values before adding timestamp (used in preview tooltips)
         fields_values: dict[str, Any] = dict(set_fields)
 
-        set_fields["updated_at"] = utcnow()
+        now = utcnow()
+        set_fields["updated_at"] = now
+        set_fields["updated_by"] = actor_email or "unknown"
+        set_fields["updated_via"] = "pis"
 
         # Match catalogue doc
         if bb_code:
@@ -1235,7 +1241,7 @@ def _process_pis_sheet(ws, sheet_name: str, db, dry_run: bool = False) -> dict:
                     db[DESIGN_CATALOGUE_COLLECTION].update_one(
                         {"bb_code": bb_code},
                         {
-                            "$setOnInsert": {"product_id": product["_id"]},
+                            "$setOnInsert": {"product_id": product["_id"], "created_at": now},
                             "$set": set_fields,
                         },
                         upsert=True,
@@ -1262,7 +1268,7 @@ def _process_pis_sheet(ws, sheet_name: str, db, dry_run: bool = False) -> dict:
     return {"updated": updated, "not_found": not_found, "skipped": skipped}
 
 
-def _parse_pis_workbook(data: bytes, db, dry_run: bool) -> dict:
+def _parse_pis_workbook(data: bytes, db, dry_run: bool, actor_email: str | None = None) -> dict:
     """Load and process all sheets from PIS XLSX bytes. Returns combined result dict."""
     try:
         wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
@@ -1277,7 +1283,7 @@ def _parse_pis_workbook(data: bytes, db, dry_run: bool) -> dict:
         ws = wb[sheet_name]
         if ws.max_row < 2:
             continue
-        result = _process_pis_sheet(ws, sheet_name, db, dry_run=dry_run)
+        result = _process_pis_sheet(ws, sheet_name, db, dry_run=dry_run, actor_email=actor_email)
         all_updated.extend(result["updated"])
         all_not_found.extend(result["not_found"])
         all_skipped.extend(result["skipped"])
@@ -1334,7 +1340,7 @@ async def confirm_pis(
     data = await file.read()
     db = get_database()
 
-    result = await asyncio.to_thread(_parse_pis_workbook, data, db, False)
+    result = await asyncio.to_thread(_parse_pis_workbook, data, db, False, email)
 
     # Upload to S3 for audit trail
     ts = utcnow().strftime("%Y%m%d_%H%M%S")
@@ -1447,6 +1453,7 @@ def download_pis_template():
 
 _BULK_ECOM_FEATURES = 9
 _BULK_IMAGE_SLOTS   = 16
+_BULK_CONTENT_TYPE  = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 # Ordered column descriptors. kind drives both the download getter and the
 # upload parser; "fill" tags a column group for cell shading.
@@ -1773,7 +1780,7 @@ def _img_bytes_ext(img) -> tuple[bytes | None, str]:
     return data, ext
 
 
-def _process_bulk_edit_workbook(data: bytes, db, dry_run: bool) -> dict:
+def _process_bulk_edit_workbook(data: bytes, db, dry_run: bool, actor_email: str | None = None) -> dict:
     from .sheets_updater import (
         bulk_read_master_sync, bulk_write_master_sync,
         upload_image_bytes_to_public_s3, _sync_order_form_images_sync,
@@ -1979,12 +1986,20 @@ def _process_bulk_edit_workbook(data: bytes, db, dry_run: bool) -> dict:
                         merged_feats[i] = fv
                 cat_set["amazon_features"] = merged_feats
             if cat_set:
-                cat_set["updated_at"] = utcnow()
+                now = utcnow()
+                cat_set["updated_at"] = now
+                # Attribution — without this a bulk edit is indistinguishable from
+                # any other writer once the row lands in design_catalogue.
+                cat_set["updated_by"] = actor_email or "unknown"
+                cat_set["updated_via"] = "bulk_edit"
                 # Match by bb_code — the same key the rows were read with — so we
                 # update the existing doc instead of creating a product_id duplicate.
                 db[DESIGN_CATALOGUE_COLLECTION].update_one(
                     {"bb_code": sku},
-                    {"$set": cat_set, "$setOnInsert": {"product_id": prod["_id"]}},
+                    {
+                        "$set": cat_set,
+                        "$setOnInsert": {"product_id": prod["_id"], "created_at": now},
+                    },
                     upsert=True,
                 )
             # Master sheet ecom + images
@@ -2030,15 +2045,101 @@ def _process_bulk_edit_workbook(data: bytes, db, dry_run: bool) -> dict:
 
 
 @router.post("/products/bulk-edit/preview")
-async def bulk_edit_preview(file: UploadFile = File(...), db=Depends(get_database)):
+async def bulk_edit_preview(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+    db=Depends(get_database),
+):
     data = await file.read()
-    return await asyncio.to_thread(_process_bulk_edit_workbook, data, db, True)
+    email = _extract_email_from_token(authorization)
+    return await asyncio.to_thread(_process_bulk_edit_workbook, data, db, True, email)
 
 
 @router.post("/products/bulk-edit/confirm")
-async def bulk_edit_confirm(file: UploadFile = File(...), db=Depends(get_database)):
+async def bulk_edit_confirm(
+    file: UploadFile = File(...),
+    source: str = Form(None, description="Page that ran the upload, e.g. items/zoho"),
+    authorization: str | None = Header(default=None),
+    db=Depends(get_database),
+):
+    """Apply a bulk-edit workbook, archive the file to S3 and log who ran it.
+
+    The archive + log exist because a bulk edit silently overwrites catalogue
+    fields that later uploads (e.g. PIS) never clear — without a trail there is
+    no way to answer "where did this value come from?" after the fact.
+    """
     data = await file.read()
-    return await asyncio.to_thread(_process_bulk_edit_workbook, data, db, False)
+    email = _extract_email_from_token(authorization)
+
+    result = await asyncio.to_thread(_process_bulk_edit_workbook, data, db, False, email)
+
+    ts = utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_email = re.sub(r"[^\w@.\-]", "_", email or "unknown")
+    safe_filename = re.sub(r"[^\w.\-]", "_", file.filename or "bulk_edit.xlsx")
+    s3_key = f"bulk_edit_uploads/{safe_email}/{ts}_{safe_filename}"
+    try:
+        await asyncio.to_thread(_upload_to_s3, data, s3_key, _BULK_CONTENT_TYPE)
+    except Exception as exc:
+        logger.warning("bulk-edit confirm: S3 archive failed: %s", exc)
+        s3_key = None
+
+    audit = {
+        "uploaded_by": email or "unknown",
+        "uploaded_at": utcnow(),
+        # Both /items/zoho and /design/new-items post to this one endpoint.
+        "source": source or "unknown",
+        "filename": file.filename,
+        "size": len(data),
+        "s3_key": s3_key,
+        "summary": result["summary"],
+        # Full per-SKU diff — this is what answers "who set this field, to what".
+        "updated": result["updated"],
+        "not_found": result["not_found"],
+        "skipped": result["skipped"],
+    }
+    try:
+        await asyncio.to_thread(db[BULK_EDIT_UPLOADS_COLLECTION].insert_one, dict(audit))
+    except PyMongoError as exc:
+        logger.warning("bulk-edit confirm: audit log write failed: %s", exc)
+
+    result["audit"] = {
+        "uploaded_by": audit["uploaded_by"],
+        "uploaded_at": ts,
+        "s3_key": s3_key,
+    }
+    return result
+
+
+@router.get("/products/bulk-edit/uploads")
+def bulk_edit_upload_history(
+    limit: int = Query(50, ge=1, le=200),
+    sku: str = Query(None, description="Only runs that touched this SKU code"),
+    db=Depends(get_database),
+):
+    """Recent bulk-edit runs — who, when, what changed, and a link to the file."""
+    try:
+        q: dict = {}
+        if sku:
+            q["updated.identifier"] = sku.strip()
+        docs = list(
+            db[BULK_EDIT_UPLOADS_COLLECTION]
+            .find(q)
+            .sort([("uploaded_at", -1), ("_id", -1)])
+            .limit(limit)
+        )
+        for d in docs:
+            if d.get("s3_key"):
+                try:
+                    d["download_url"] = _presign_s3(d["s3_key"])
+                except Exception:
+                    d["download_url"] = None
+            if sku:
+                # Narrow the diff to the SKU asked about — these runs can carry
+                # hundreds of rows.
+                d["updated"] = [u for u in (d.get("updated") or []) if u.get("identifier") == sku.strip()]
+        return JSONResponse(content={"uploads": serialize_mongo_document(docs)})
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── designer orders ──────────────────────────────────────────────────────────

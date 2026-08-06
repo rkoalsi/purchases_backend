@@ -4924,7 +4924,7 @@ async def zoho_confirm_pis(
     data = await file.read()
     db = get_database()
 
-    result = await asyncio.to_thread(_parse_pis_workbook, data, db, False)
+    result = await asyncio.to_thread(_parse_pis_workbook, data, db, False, email)
 
     ts = utcnow().strftime("%Y%m%d_%H%M%S")
     safe_filename = re.sub(r"[^\w.\-]", "_", file.filename)
