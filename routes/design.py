@@ -1595,9 +1595,56 @@ def _make_bulk_edit_xlsx(products: list, master_data: dict) -> io.BytesIO:
     return buf
 
 
-def _bulk_query(db, search, brand, zoho_status, purchase_status, category) -> list:
+def _order_product_clause(db, order_id: str | None, purchaseorder_number: str | None) -> dict:
+    """Mongo clause restricting products to the line items of one brand order's PO.
+
+    Either a brand order `_id` or a `purchaseorder_number` may be given; the
+    order is only used to resolve its PO number.
+    """
+    po_number = (purchaseorder_number or "").strip()
+    if order_id:
+        try:
+            oid = ObjectId(order_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid order id")
+        order = db[BRAND_ORDERS_COLLECTION].find_one({"_id": oid}, {"purchaseorder_number": 1})
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        po_number = (order.get("purchaseorder_number") or "").strip()
+        if not po_number:
+            raise HTTPException(status_code=400, detail="Order has no purchase order linked")
+
+    po = db[PO_COLLECTION].find_one({"purchaseorder_number": po_number}, {"line_items": 1})
+    if not po:
+        raise HTTPException(status_code=404, detail=f"Purchase order {po_number} not found")
+
+    item_ids, skus = [], []
+    for li in po.get("line_items") or []:
+        if li.get("item_id"):
+            item_ids.append(str(li["item_id"]))
+        # PO lines carry the SKU under `sku` (barcode-style); keep it as a
+        # fallback so lines whose item_id drifted still resolve.
+        for key in ("cf_sku_code", "sku"):
+            if li.get(key):
+                skus.append(str(li[key]))
+    if not item_ids and not skus:
+        raise HTTPException(status_code=404, detail=f"Purchase order {po_number} has no line items")
+
+    return {"$or": [
+        {"item_id": {"$in": item_ids}},
+        {"cf_sku_code": {"$in": skus}},
+        {"sku": {"$in": skus}},
+    ]}
+
+
+def _bulk_query(db, search, brand, zoho_status, purchase_status, category,
+                order_id=None, purchaseorder_number=None) -> list:
     col = db[PRODUCTS_COLLECTION]
     q: dict = {"is_combo_product": {"$ne": True}}
+    if order_id or purchaseorder_number:
+        q.setdefault("$and", []).append(
+            _order_product_clause(db, order_id, purchaseorder_number)
+        )
     if search:
         rgx = {"$regex": re.escape(search), "$options": "i"}
         cat_ids = db[DESIGN_CATALOGUE_COLLECTION].distinct("product_id", {"bb_code": rgx})
@@ -1628,6 +1675,30 @@ def _bulk_query(db, search, brand, zoho_status, purchase_status, category) -> li
     return list(col.aggregate(pipeline))
 
 
+@router.get("/products/bulk-edit/orders")
+def bulk_edit_orders():
+    """Brand orders (brand + order name + PO number) for the bulk-edit order picker."""
+    try:
+        db = get_database()
+        pipeline = [
+            {"$match": {"purchaseorder_number": {"$exists": True, "$nin": [None, ""]}}},
+            {"$project": {"brand": 1, "name": 1, "purchaseorder_number": 1, "created_at": 1}},
+            {"$lookup": {
+                "from": PO_COLLECTION,
+                "localField": "purchaseorder_number",
+                "foreignField": "purchaseorder_number",
+                "as": "_po",
+                "pipeline": [{"$project": {"n": {"$size": {"$ifNull": ["$line_items", []]}}}}],
+            }},
+            {"$addFields": {"item_count": {"$ifNull": [{"$arrayElemAt": ["$_po.n", 0]}, 0]}}},
+            {"$project": {"_po": 0}},
+            {"$sort": {"brand": 1, "created_at": -1, "_id": -1}},
+        ]
+        return {"orders": serialize_mongo_document(list(db[BRAND_ORDERS_COLLECTION].aggregate(pipeline)))}
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/products/bulk-edit/download")
 def bulk_edit_download(
     search: str = Query(None),
@@ -1635,13 +1706,20 @@ def bulk_edit_download(
     zoho_status: str = Query(None),
     purchase_status: str = Query(None),
     category: str = Query(None),
+    order_id: str = Query(None, description="Brand order _id — limits the file to that order's PO line items"),
+    purchaseorder_number: str = Query(None, description="PO number — alternative to order_id"),
 ):
-    """Download all matching products as a single bulk-edit XLSX (all tabs' data)."""
+    """Download matching products as a single bulk-edit XLSX (all tabs' data).
+
+    With `order_id` / `purchaseorder_number` the file covers only the products on
+    that order's purchase order; otherwise it covers everything matching the filters.
+    """
     from .sheets_updater import bulk_read_master_sync
     try:
         db = get_database()
         products = serialize_mongo_document(
-            _bulk_query(db, search, brand, zoho_status, purchase_status, category)
+            _bulk_query(db, search, brand, zoho_status, purchase_status, category,
+                        order_id, purchaseorder_number)
         )
         skus = {p.get("cf_sku_code") for p in products if p.get("cf_sku_code")}
         try:
@@ -1650,10 +1728,20 @@ def bulk_edit_download(
             logger.warning("bulk-edit download: master read failed (%s) — images blank", exc)
             master_data = {}
         buf = _make_bulk_edit_xlsx(products, master_data)
+        fname = "bulk_edit.xlsx"
+        if order_id or purchaseorder_number:
+            po_no = purchaseorder_number
+            if not po_no and order_id:
+                order = db[BRAND_ORDERS_COLLECTION].find_one(
+                    {"_id": ObjectId(order_id)}, {"purchaseorder_number": 1}
+                ) or {}
+                po_no = order.get("purchaseorder_number")
+            if po_no:
+                fname = f"bulk_edit_{re.sub(r'[^A-Za-z0-9_-]+', '_', po_no)}.xlsx"
         return StreamingResponse(
             buf,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": 'attachment; filename="bulk_edit.xlsx"'},
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
         )
     except PyMongoError as e:
         raise HTTPException(status_code=500, detail=str(e))
