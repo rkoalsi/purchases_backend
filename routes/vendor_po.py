@@ -1,4 +1,14 @@
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, Body
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Depends,
+    UploadFile,
+    File,
+    Form,
+    Body,
+    Header,
+    Request,
+)
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime, timedelta
 from ..database import get_database, serialize_mongo_document
@@ -22,9 +32,16 @@ import xlwt
 from xlutils.copy import copy as xl_copy
 
 from .amazon import compute_drr_for_asins_sync, generate_report_by_date_range, format_amazon_platform_status
+from .vendor_po_history import (
+    HISTORY_COLLECTION,
+    extract_email_from_token,
+    log_po_history,
+    record_po_history,
+)
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+# record_po_history audits every mutating request on this router (see vendor_po_history.py)
+router = APIRouter(dependencies=[Depends(record_po_history)])
 
 PO_COLLECTION = "vendor_purchase_orders"
 MARGINS_COLLECTION = "vendor_margins"
@@ -1230,6 +1247,7 @@ async def upload_vendor_po(
     file: UploadFile = File(...),
     po_date: str = Form(...),
     db=Depends(get_database),
+    authorization: str | None = Header(default=None),
 ):
     """Upload a Vendor Central PO Excel file and store it."""
     try:
@@ -1289,7 +1307,7 @@ async def upload_vendor_po(
                     }
                 },
             )
-            return po_number, enriched_items, inventory_date, zoho_stock_date
+            return po_number, enriched_items, inventory_date, zoho_stock_date, True
 
         enriched_items, inventory_date, zoho_stock_date = _enrich_items(
             items, po_number, db, po_date_str=po_date, drr_map=drr_map
@@ -1308,14 +1326,31 @@ async def upload_vendor_po(
             "items": enriched_items,  # enriched items stored (stock/sales frozen at upload time)
         }
         db[PO_COLLECTION].insert_one(doc)
-        return po_number, enriched_items, inventory_date, zoho_stock_date
+        return po_number, enriched_items, inventory_date, zoho_stock_date, False
 
     try:
-        po_number, enriched_items, inventory_date, zoho_stock_date = (
+        po_number, enriched_items, inventory_date, zoho_stock_date, was_existing = (
             await asyncio.to_thread(_process)
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    await asyncio.to_thread(
+        log_po_history,
+        db,
+        po_number,
+        "upload",
+        "Re-uploaded PO file" if was_existing else "Uploaded PO",
+        actor_email=extract_email_from_token(authorization),
+        details={
+            "filename": file.filename,
+            "po_date": po_date,
+            "vendor": vendor,
+            "item_count": len(enriched_items),
+        },
+        method="POST",
+        path="/vendor_po/upload",
+    )
 
     return JSONResponse(
         status_code=201,
@@ -1764,7 +1799,9 @@ async def download_shipment_summary(db=Depends(get_database)):
 
 @router.post("/shipment_summary/upload")
 async def upload_shipment_summary(
-    file: UploadFile = File(...), db=Depends(get_database)
+    file: UploadFile = File(...),
+    db=Depends(get_database),
+    authorization: str | None = Header(default=None),
 ):
     """Upload an edited Etrade Shipment Summary XLSX to bulk-update editable fields."""
     content = await file.read()
@@ -1840,6 +1877,27 @@ async def upload_shipment_summary(
             batch.append((po_number, fields))
 
     updated = await asyncio.to_thread(_bulk_update, batch) if batch else 0
+
+    if batch:
+        actor_email = extract_email_from_token(authorization)
+
+        def _log_shipment_upload():
+            for po, fields in batch:
+                log_po_history(
+                    db,
+                    po,
+                    "shipment_summary_upload",
+                    "Updated shipment details via Excel upload",
+                    actor_email=actor_email,
+                    details={
+                        "filename": file.filename,
+                        "fields": {k: v for k, v in fields.items() if v is not None},
+                    },
+                    method="POST",
+                    path="/vendor_po/shipment_summary/upload",
+                )
+
+        await asyncio.to_thread(_log_shipment_upload)
 
     result: dict = {"updated": updated}
     if errors:
@@ -2400,6 +2458,27 @@ VALID_STATUSES = {
 FROZEN_STATUSES = {"packed", "closed", "intransit", "delivered", "completed"}
 # Processing also triggers a freeze — stock/sales are locked when PO moves to processing
 FREEZE_ON_STATUS = FROZEN_STATUSES | {"processing"}
+
+
+@router.get("/{po_number}/history")
+async def get_po_history(
+    po_number: str,
+    limit: int = 300,
+    db=Depends(get_database),
+):
+    """Audit trail for a PO — uploads and every field change, with who and when."""
+    limit = max(1, min(limit, 1000))
+
+    def _fetch():
+        return list(
+            db[HISTORY_COLLECTION]
+            .find({"po_number": po_number}, {"_id": 0})
+            .sort([("created_at", -1)])
+            .limit(limit)
+        )
+
+    entries = await asyncio.to_thread(_fetch)
+    return {"po_number": po_number, "count": len(entries), "entries": serialize_mongo_document(entries)}
 
 
 @router.delete("/{po_number}")
@@ -3326,11 +3405,13 @@ def _presign_s3(s3_key: str, expires: int = 3600) -> str:
 
 @router.post("/{po_number}/upload_order")
 async def upload_order_file(
+    request: Request,
     po_number: str,
     file: UploadFile = File(...),
     db=Depends(get_database),
 ):
     """Upload a POItemExport XLS, fill Accepted qty & Availability from DB, store in S3."""
+    request.state.audit_details = {"filename": file.filename}
     if not file.filename or not file.filename.lower().endswith(".xls"):
         raise HTTPException(
             status_code=400, detail="File must be a .xls POItemExport file"
@@ -3508,12 +3589,14 @@ def _fill_invoice_line_items_xls(
 
 @router.post("/{po_number}/upload_invoice")
 async def upload_invoice_line_items(
+    request: Request,
     po_number: str,
     file: UploadFile = File(...),
     db=Depends(get_database),
 ):
     """Upload Amazon InvoiceLineItems .xls; fill Quantity/HSN/Tax rate from linked
     packages and product data, then return the completed file for download."""
+    request.state.audit_details = {"filename": file.filename}
     if not file.filename or not file.filename.lower().endswith(".xls"):
         raise HTTPException(status_code=400, detail="File must be a .xls Amazon Invoice file")
 
@@ -3904,6 +3987,7 @@ async def upsert_margin(
 async def bulk_update_vendor_pos(
     file: UploadFile = File(...),
     db=Depends(get_database),
+    authorization: str | None = Header(default=None),
 ):
     """Bulk-update accepted_qty, received_qty, and po_status for existing POs.
 
@@ -4070,6 +4154,28 @@ async def bulk_update_vendor_pos(
         results = await asyncio.to_thread(_process)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    actor_email = extract_email_from_token(authorization)
+
+    def _log_bulk():
+        for res in results:
+            if res.get("status") != "updated":
+                continue
+            log_po_history(
+                db,
+                res["po_number"],
+                "bulk_update",
+                "Bulk-updated via Excel upload",
+                actor_email=actor_email,
+                details={
+                    "filename": file.filename,
+                    "items_changed": res.get("items_changed", 0),
+                },
+                method="POST",
+                path="/vendor_po/bulk_update",
+            )
+
+    await asyncio.to_thread(_log_bulk)
 
     return JSONResponse(status_code=200, content={"results": results})
 

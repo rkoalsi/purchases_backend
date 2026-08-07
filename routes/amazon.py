@@ -2520,6 +2520,157 @@ async def update_sku_fnsku(
     return {"message": "FNSKU updated"}
 
 
+# --------------------------------------------------------------------------
+# Etrade Master sync
+#
+# The "E Trade Master" Google Sheet is the buyer-maintained source of truth for
+# ASP, margin, GST and cost price. The manual amz-metrics workbook pulled it
+# via IMPORTRANGE; here it is mirrored onto amazon_sku_mapping so the values
+# live in the DB and every report reads one source.
+# --------------------------------------------------------------------------
+_ETRADE_MASTER_SHEET_ID = os.getenv(
+    "ETRADE_MASTER_SHEET_ID", "1IcfVuenbsr01UO6zK8GA77XSkmkJniQtqkCOK3TPHQc"
+)
+_ETRADE_MASTER_TAB = "Master"
+
+# sheet header -> field stored on amazon_sku_mapping
+_ETRADE_FIELD_MAP = {
+    "ASIN": "item_id",
+    "SKU Code/Model Number": "etrade_sku_code",
+    "Item_Name": "etrade_item_name",
+    "BrandName": "etrade_brand",
+    "HSN": "hsn",
+    "MRP": "etrade_mrp",
+    "ASP": "etrade_asp",
+    "New Margin": "etrade_margin",
+    "Cost Price": "etrade_cost_price",
+    "GST %": "etrade_gst",
+    "Cost Price w/o Tax": "etrade_cost_price_wo_tax",
+    "PTD": "etrade_ptd",
+    "Status": "etrade_status",
+}
+# Percentages arrive as "33%" or "0.33"; money as "1,234.56".
+_ETRADE_PERCENT_FIELDS = {"etrade_margin", "etrade_gst"}
+_ETRADE_NUMERIC_FIELDS = {
+    "etrade_mrp", "etrade_asp", "etrade_cost_price", "etrade_cost_price_wo_tax",
+}
+
+
+def _parse_etrade_value(field: str, raw) -> object:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if field in _ETRADE_PERCENT_FIELDS:
+        try:
+            if s.endswith("%"):
+                return round(float(s[:-1].replace(",", "")) / 100, 6)
+            v = float(s.replace(",", ""))
+            # A bare number >1 is a percentage written without its sign.
+            return round(v / 100, 6) if v > 1 else round(v, 6)
+        except ValueError:
+            return None
+    if field in _ETRADE_NUMERIC_FIELDS:
+        try:
+            return float(s.replace(",", "").replace("₹", ""))
+        except ValueError:
+            return None
+    return s
+
+
+def _sync_etrade_master_sync(database, create_missing: bool = True) -> dict:
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    creds_path = os.path.join(backend_dir, "creds.json")
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    gc = gspread.authorize(Credentials.from_service_account_file(creds_path, scopes=scope))
+    ws = gc.open_by_key(_ETRADE_MASTER_SHEET_ID).worksheet(_ETRADE_MASTER_TAB)
+    values = ws.get_all_values()
+    if not values:
+        raise HTTPException(status_code=502, detail="Etrade Master sheet is empty")
+
+    header = [h.strip() for h in values[0]]
+    idx = {h: i for i, h in enumerate(header)}
+    missing = [h for h in _ETRADE_FIELD_MAP if h not in idx]
+    if "ASIN" in missing:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Etrade Master sheet has no ASIN column. Found: {header[:12]}",
+        )
+
+    ops, created, updated, skipped = [], 0, 0, 0
+    existing = {
+        d["item_id"]
+        for d in database[SKU_COLLECTION].find({"item_id": {"$ne": None}}, {"item_id": 1})
+    }
+    seen = set()
+
+    for row in values[1:]:
+        asin = (row[idx["ASIN"]] if idx["ASIN"] < len(row) else "").strip()
+        if not asin or asin in seen:
+            skipped += 1
+            continue
+        seen.add(asin)
+
+        doc = {}
+        for head, field in _ETRADE_FIELD_MAP.items():
+            if field == "item_id" or head not in idx:
+                continue
+            v = _parse_etrade_value(field, row[idx[head]] if idx[head] < len(row) else None)
+            if v is not None:
+                doc[field] = v
+        if not doc:
+            skipped += 1
+            continue
+        doc["etrade_synced_at"] = datetime.now(timezone.utc)
+
+        is_new = asin not in existing
+        if is_new and not create_missing:
+            skipped += 1
+            continue
+        ops.append(
+            UpdateOne(
+                {"item_id": asin},
+                {"$set": doc, "$setOnInsert": {"item_id": asin, "created_at": datetime.now(timezone.utc)}},
+                upsert=True,
+            )
+        )
+        created += is_new
+        updated += not is_new
+
+    if ops:
+        database[SKU_COLLECTION].bulk_write(ops, ordered=False)
+
+    return {
+        "sheet_rows": len(values) - 1,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "fields": sorted(set(_ETRADE_FIELD_MAP.values()) - {"item_id"}),
+        "missing_columns": [m for m in missing if m != "ASIN"],
+    }
+
+
+@router.post("/sync-etrade-master")
+async def sync_etrade_master(
+    create_missing: bool = Query(True, description="Create sku-mapping rows for unknown ASINs"),
+    database=Depends(get_database),
+):
+    """
+    Pull the Etrade Master Google Sheet into amazon_sku_mapping.
+
+    Stores ASP, margin, GST, MRP, cost price and Etrade status per ASIN so
+    reports read them from the DB rather than re-importing a spreadsheet.
+    """
+    return await asyncio.to_thread(_sync_etrade_master_sync, database, create_missing)
+
+
 @router.post("/upload-etrade-margins")
 async def upload_etrade_margins(
     file: UploadFile = File(...), database=Depends(get_database)

@@ -40,6 +40,7 @@ from .routes.amazon_listing import router as amazon_listing_router
 from .routes.bills import router as bills_router
 from .routes.finance import router as finance_router
 from .routes.amazon_ads import router as amazon_ads_router
+from .routes.amazon_metrics import router as amazon_metrics_router
 from .database import connect_db, close_db, get_database
 from contextlib import asynccontextmanager
 from .helpers.scheduler import scheduler, api_scheduler, setup_scheduler
@@ -159,6 +160,7 @@ app.include_router(amazon_listing_router, prefix="/amazon_listing", tags=["amazo
 app.include_router(bills_router, prefix="/bills", tags=["bills"])
 app.include_router(finance_router, prefix="/finance", tags=["finance"])
 app.include_router(amazon_ads_router, prefix="/amazon_ads", tags=["amazon_ads"])
+app.include_router(amazon_metrics_router, prefix="/amazon_metrics", tags=["amazon_metrics"])
 
 
 # --- Protected Swagger / ReDoc / OpenAPI schema ---

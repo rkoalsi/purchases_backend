@@ -15,9 +15,12 @@ crons/webhooks into the same database, so it is read directly here.
 
 from fastapi import APIRouter, HTTPException, Depends, Query, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from bson import ObjectId
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import asyncio
+import bisect
 import io
 import logging
 
@@ -37,6 +40,20 @@ INVOICES = "invoices"
 BILLS = "bills"
 PURCHASE_ORDERS = "purchase_orders"
 BRAND_LOGISTICS = "brand_logistics"
+NEW_BRAND_RESERVES = "finance_new_brand_reserves"
+
+# Ceiling on how much stock a single order may buy, expressed as days of cover.
+# The master report sizes orders from demand alone; without a ceiling a brand
+# whose lookback DRR spikes can ask for a year of stock in one go.
+DEFAULT_MAX_COVER_DAYS = 120
+
+# A brand needs at least this many days of selling before its run rate is
+# trusted enough to plan a purchase from. Jolly Pawps sold 884 units in its
+# first two days: divided by two days in stock that is a DRR of 442/day, which
+# reads as zero cover (CRITICAL, top of the funding queue) and would authorise
+# roughly 53,000 units against the 120-day cap. Two days of a launch is not a
+# run rate.
+DEFAULT_MIN_SELLING_DAYS = 30
 
 # Zoho keeps voided invoices at their full original balance, and drafts are not
 # yet receivable. Including either overstates AR by crores.
@@ -238,6 +255,124 @@ async def get_fx_rates():
     return JSONResponse(status_code=status.HTTP_200_OK, content=live)
 
 
+# ─── New-brand reserves ─────────────────────────────────────────────────────────
+#
+# Brands we are about to take on have no SKUs, no sales and no COGS, so the
+# master report cannot see them at all — yet the cash to launch them is spent out
+# of the same envelope as everything else. Without a provision the plan hands the
+# entire envelope to existing brands and a new-brand launch silently overspends.
+# A reserve is set aside off the top and the ranked allocation runs on what is
+# left, so both decisions are visible in one place.
+
+
+class NewBrandReserve(BaseModel):
+    brand: str = Field(..., min_length=1, description="Working name of the brand")
+    amount: float = Field(..., ge=0, description="Cash to set aside, in INR")
+    notes: Optional[str] = None
+    expected_order_date: Optional[str] = Field(
+        None, description="When the first order is expected, YYYY-MM-DD"
+    )
+    is_active: bool = True
+
+
+class NewBrandReserveUpdate(BaseModel):
+    brand: Optional[str] = Field(None, min_length=1)
+    amount: Optional[float] = Field(None, ge=0)
+    notes: Optional[str] = None
+    expected_order_date: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+def _serialise_reserve(doc: Dict) -> Dict:
+    return {
+        "id": str(doc["_id"]),
+        "brand": doc.get("brand", "") or "",
+        "amount": round(_f(doc.get("amount")), 2),
+        "notes": doc.get("notes") or "",
+        "expected_order_date": doc.get("expected_order_date") or "",
+        "is_active": bool(doc.get("is_active", True)),
+        "created_at": (doc["created_at"].isoformat() if isinstance(doc.get("created_at"), datetime) else None),
+        "updated_at": (doc["updated_at"].isoformat() if isinstance(doc.get("updated_at"), datetime) else None),
+    }
+
+
+def _new_brand_reserves_sync(db, active_only: bool = False) -> List[Dict]:
+    q = {"is_active": True} if active_only else {}
+    docs = list(
+        db.get_collection(NEW_BRAND_RESERVES)
+        .find(q)
+        .sort([("is_active", -1), ("amount", -1), ("_id", -1)])
+    )
+    return [_serialise_reserve(d) for d in docs]
+
+
+@router.get("/new-brand-reserves")
+async def list_new_brand_reserves(db=Depends(get_database)):
+    """Cash set aside for brands that do not exist in the system yet."""
+    rows = await asyncio.to_thread(_new_brand_reserves_sync, db, False)
+    return JSONResponse(status_code=status.HTTP_200_OK, content={
+        "reserves": rows,
+        "total_reserved": round(sum(r["amount"] for r in rows if r["is_active"]), 2),
+        "count": len(rows),
+    })
+
+
+@router.post("/new-brand-reserves")
+async def create_new_brand_reserve(body: NewBrandReserve, db=Depends(get_database)):
+    now = datetime.now()
+    doc = body.model_dump()
+    doc.update({"created_at": now, "updated_at": now})
+
+    def _insert():
+        res = db.get_collection(NEW_BRAND_RESERVES).insert_one(doc)
+        return db.get_collection(NEW_BRAND_RESERVES).find_one({"_id": res.inserted_id})
+
+    saved = await asyncio.to_thread(_insert)
+    return JSONResponse(status_code=status.HTTP_201_CREATED, content=_serialise_reserve(saved))
+
+
+@router.patch("/new-brand-reserves/{reserve_id}")
+async def update_new_brand_reserve(
+    reserve_id: str, body: NewBrandReserveUpdate, db=Depends(get_database)
+):
+    try:
+        oid = ObjectId(reserve_id)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid id")
+
+    changes = {k: v for k, v in body.model_dump(exclude_unset=True).items() if v is not None}
+    # is_active=False is a legitimate value that the None filter above would drop.
+    if "is_active" in body.model_dump(exclude_unset=True):
+        changes["is_active"] = bool(body.is_active)
+    if not changes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nothing to update")
+    changes["updated_at"] = datetime.now()
+
+    def _update():
+        db.get_collection(NEW_BRAND_RESERVES).update_one({"_id": oid}, {"$set": changes})
+        return db.get_collection(NEW_BRAND_RESERVES).find_one({"_id": oid})
+
+    saved = await asyncio.to_thread(_update)
+    if not saved:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reserve not found")
+    return JSONResponse(status_code=status.HTTP_200_OK, content=_serialise_reserve(saved))
+
+
+@router.delete("/new-brand-reserves/{reserve_id}")
+async def delete_new_brand_reserve(reserve_id: str, db=Depends(get_database)):
+    try:
+        oid = ObjectId(reserve_id)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid id")
+
+    res = await asyncio.to_thread(
+        lambda: db.get_collection(NEW_BRAND_RESERVES).delete_one({"_id": oid})
+    )
+    if not res.deleted_count:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reserve not found")
+    return JSONResponse(status_code=status.HTTP_200_OK, content={"deleted": True})
+
+
 # ─── Cash position ──────────────────────────────────────────────────────────────
 
 def _cash_position_sync(db) -> Dict:
@@ -322,33 +457,78 @@ def _cash_position_sync(db) -> Dict:
     }
 
 
+OPEX_BREAKDOWN_LIMIT = 15
+
+
 def _monthly_opex_sync(db, start: datetime, end: datetime) -> Dict:
     """Average monthly operating outflow, measured over an explicit window.
 
     Uses `expense` transactions only. `signed_amount` is negative for cash out
     (a credit on the bank account), so the sum is negated to get a positive
     burn figure. Transfers are excluded as internal movement.
+
+    Also returns what the money went on. `offset_account_name` is the account
+    the spend was booked against — salaries, loan EMIs, duty, reimbursements —
+    which is the only field on the transaction that says *what* it was. It is
+    granular (127 distinct names over a 90-day window, largely one per payee),
+    so the biggest are listed individually and the tail is rolled into "Other".
     """
     days = max(1, (end - start).days)
+    match = {
+        "transaction_date": {"$gte": start, "$lte": end},
+        "transaction_type": {"$in": ["expense", "tds_payment"]},
+    }
 
-    pipeline = [
-        {"$match": {
-            "transaction_date": {"$gte": start, "$lte": end},
-            "transaction_type": {"$in": ["expense", "tds_payment"]},
+    rows = list(db.get_collection(BANK_TRANSACTIONS).aggregate([
+        {"$match": match},
+        {"$group": {
+            "_id": {"$ifNull": ["$offset_account_name", ""]},
+            "out": {"$sum": "$signed_amount"},
+            "n": {"$sum": 1},
         }},
-        {"$group": {"_id": None, "net": {"$sum": "$signed_amount"}, "n": {"$sum": 1}}},
-    ]
-    res = list(db.get_collection(BANK_TRANSACTIONS).aggregate(pipeline))
-    net_out = -(res[0]["net"] if res else 0.0)
-    count = res[0]["n"] if res else 0
+        # signed_amount is negative for cash out, so ascending = biggest spend.
+        {"$sort": {"out": 1}},
+    ]))
+
+    net_out = -sum(r["out"] for r in rows)
+    count = sum(r["n"] for r in rows)
+    total = max(0.0, net_out)
+    per_month = (30.0 / days) if days else 0.0
+
+    breakdown = []
+    for r in rows[:OPEX_BREAKDOWN_LIMIT]:
+        amount = -r["out"]
+        if amount <= 0:
+            continue
+        breakdown.append({
+            "category": (r["_id"] or "").strip() or "Uncategorised",
+            "amount": round(amount, 2),
+            "monthly": round(amount * per_month, 2),
+            "pct": round(amount / total * 100, 1) if total > 0 else 0.0,
+            "transactions": r["n"],
+        })
+
+    tail = rows[OPEX_BREAKDOWN_LIMIT:]
+    tail_amount = -sum(r["out"] for r in tail)
+    if tail_amount > 0:
+        breakdown.append({
+            "category": f"Other ({len(tail)} categories)",
+            "amount": round(tail_amount, 2),
+            "monthly": round(tail_amount * per_month, 2),
+            "pct": round(tail_amount / total * 100, 1) if total > 0 else 0.0,
+            "transactions": sum(r["n"] for r in tail),
+            "is_other": True,
+        })
 
     return {
-        "monthly_opex": round(max(0.0, net_out) / days * 30, 2),
+        "monthly_opex": round(total / days * 30, 2),
         "window_days": days,
         "window_start": start.date().isoformat(),
         "window_end": end.date().isoformat(),
-        "spent_in_window": round(max(0.0, net_out), 2),
+        "spent_in_window": round(total, 2),
         "transactions_sampled": count,
+        "breakdown": breakdown,
+        "category_count": len(rows),
     }
 
 
@@ -382,6 +562,195 @@ def _collection_run_rate_sync(db, start: datetime, end: datetime) -> Dict:
         "window_end": end.date().isoformat(),
         "collected_in_window": round(net_in, 2),
         "transactions_sampled": count,
+    }
+
+
+# How far back to look when learning how a customer pays, and how many settled
+# invoices they need before we trust their own curve over the house average.
+AR_BEHAVIOUR_LOOKBACK_DAYS = 365
+AR_BEHAVIOUR_MIN_INVOICES = 5
+
+
+def _lateness_curve(points: List[tuple]) -> Optional[tuple]:
+    """Value-weighted CDF of how late invoices get paid.
+
+    `points` is [(days_late, invoice_value)]. Returns `(days[], cumulative[])`
+    for bisect. Weighted by value, not count: a customer who pays fifty ₹5k
+    invoices on time and one ₹20L invoice six months late is not a prompt payer
+    for planning purposes.
+    """
+    if not points:
+        return None
+    points.sort()
+    total = sum(v for _, v in points) or 1.0
+    days, cum, running = [], [], 0.0
+    for d, v in points:
+        running += v
+        days.append(d)
+        cum.append(running / total)
+    return days, cum
+
+
+def _curve_at(curve: Optional[tuple], day: int) -> Optional[float]:
+    """Fraction of value historically settled by `day` days after the due date."""
+    if not curve:
+        return None
+    days, cum = curve
+    i = bisect.bisect_right(days, day) - 1
+    return cum[i] if i >= 0 else 0.0
+
+
+_indexes_ensured = False
+
+
+def _ensure_indexes(db) -> None:
+    """Index the settled-invoice scan. Once per process; idempotent in Mongo.
+
+    Without it the behaviour model is a 67k-document collection scan and takes
+    ~10.7s; with it, 1.2s.
+    """
+    global _indexes_ensured
+    if _indexes_ensured:
+        return
+    try:
+        db.get_collection(INVOICES).create_index(
+            [("status", 1), ("last_payment_date", 1)],
+            name="fin_status_lastpay", background=True,
+        )
+    except Exception as e:
+        logger.warning(f"Could not ensure finance indexes: {e}")
+    _indexes_ensured = True
+
+
+def _ar_payment_curves_sync(db, as_of: datetime) -> tuple:
+    """Learn how each customer actually pays, from invoices they have settled.
+
+    Returns `(per_customer_curves, house_curve)`.
+    """
+    _ensure_indexes(db)
+    cutoff = (as_of - timedelta(days=AR_BEHAVIOUR_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    cursor = db.get_collection(INVOICES).find(
+        {
+            "status": "paid",
+            # due_date/last_payment_date are 'YYYY-MM-DD' strings, so a string
+            # comparison is a correct date comparison and stays indexable.
+            "last_payment_date": {"$gte": cutoff},
+        },
+        {"customer_id": 1, "due_date": 1, "last_payment_date": 1, "total": 1, "_id": 0},
+    )
+
+    by_customer: Dict[str, List[tuple]] = {}
+    house: List[tuple] = []
+    for inv in cursor:
+        due = _parse_date(inv.get("due_date"))
+        paid_on = _parse_date(inv.get("last_payment_date"))
+        if not due or not paid_on:
+            continue
+        value = _f(inv.get("total"))
+        if value <= 0:
+            continue
+        point = ((paid_on - due).days, value)
+        house.append(point)
+        by_customer.setdefault(inv.get("customer_id") or "", []).append(point)
+
+    curves = {
+        cid: _lateness_curve(pts)
+        for cid, pts in by_customer.items()
+        if cid and len(pts) >= AR_BEHAVIOUR_MIN_INVOICES
+    }
+    return curves, _lateness_curve(house)
+
+
+def _expected_collections_sync(db, as_of: datetime, horizons=HORIZONS) -> Dict:
+    """What will realistically be collected per horizon, customer by customer.
+
+    Treating every invoice due inside the window as collectable overstates
+    badly — back-tested against the 90 days to 2026-08-06 it predicted ₹286.6L
+    against ₹195.0L actually collected. The problem is that *who* owes it
+    matters more than when it is due: walk-in trade settles the same day, while
+    Blink Commerce's median invoice is paid **267 days** after its due date.
+
+    So each open invoice is scored against that customer's own history,
+    conditioned on the fact that it has not been paid yet:
+
+        P(paid within horizon | still unpaid today)
+            = (F(d + horizon) − F(d)) / (1 − F(d))
+
+    where `d` is how long the invoice is already past due and `F` is the
+    customer's value-weighted lateness curve. An invoice that has already
+    outlived everything that customer has ever done scores zero rather than
+    certainty — the conservative reading, and the honest one for a debt that is
+    behaving unlike every other debt they have settled.
+    """
+    curves, house = _ar_payment_curves_sync(db, as_of)
+
+    invoices = list(db.get_collection(INVOICES).find(
+        {"status": {"$in": list(AR_STATUSES)}},
+        {"customer_id": 1, "customer_name": 1, "balance": 1, "due_date": 1, "_id": 0},
+    ))
+
+    out: Dict[int, Dict] = {}
+    for horizon in horizons:
+        expected = 0.0
+        own_curve_value = 0.0
+        doubtful = 0.0
+        by_customer: Dict[str, Dict] = {}
+
+        for inv in invoices:
+            balance = _f(inv.get("balance"))
+            if balance <= 0:
+                continue
+            due = _parse_date(inv.get("due_date")) or as_of
+            past_due = (as_of - due).days
+            cid = inv.get("customer_id") or ""
+            curve = curves.get(cid)
+            has_own = curve is not None
+            curve = curve or house
+
+            settled_by_now = _curve_at(curve, past_due)
+            if settled_by_now is None or settled_by_now >= 0.999:
+                share = 0.0
+            else:
+                settled_by_then = _curve_at(curve, past_due + horizon) or settled_by_now
+                share = max(0.0, (settled_by_then - settled_by_now) / (1 - settled_by_now))
+
+            landing = balance * share
+            expected += landing
+            doubtful += balance - landing
+            if has_own:
+                own_curve_value += balance
+
+            name = inv.get("customer_name") or "Unknown"
+            row = by_customer.setdefault(name, {
+                "customer_name": name, "outstanding": 0.0,
+                "expected": 0.0, "has_own_history": has_own,
+            })
+            row["outstanding"] += balance
+            row["expected"] += landing
+
+        rows = sorted(by_customer.values(), key=lambda r: -r["outstanding"])[:20]
+        for r in rows:
+            r["outstanding"] = round(r["outstanding"], 2)
+            r["expected"] = round(r["expected"], 2)
+            r["expected_pct"] = (
+                round(r["expected"] / r["outstanding"] * 100, 1) if r["outstanding"] > 0 else 0.0
+            )
+
+        out[horizon] = {
+            "expected": round(expected, 2),
+            "not_expected_in_window": round(doubtful, 2),
+            "top_customers": rows,
+        }
+
+    total_ar = sum(_f(i.get("balance")) for i in invoices if _f(i.get("balance")) > 0)
+    return {
+        "by_horizon": out,
+        "customers_with_own_history": len(curves),
+        "invoices_scored": len(invoices),
+        "value_on_own_history": round(own_curve_value, 2),
+        "value_on_house_average": round(max(0.0, total_ar - own_curve_value), 2),
+        "lookback_days": AR_BEHAVIOUR_LOOKBACK_DAYS,
+        "min_invoices_for_own_curve": AR_BEHAVIOUR_MIN_INVOICES,
     }
 
 
@@ -565,14 +934,21 @@ def _fallback_unit_costs_sync(db, fx: Dict[str, float]) -> Dict[str, float]:
 def _build_working_capital(
     cash: Dict, receivables: Dict, payables: Dict,
     open_pos: Dict, opex: Dict, collection: Dict,
+    ar_behaviour: Optional[Dict] = None,
 ) -> Dict:
     """Assemble the cash bridge into 30/60/90-day projections.
 
-    Expected collections are bounded by two facts, not by a guess: the amount
-    actually owed and due inside the horizon (from the invoice ledger), and the
-    rate at which money has genuinely been arriving (from the bank). We take the
-    lower of the two and report which bound applied, so the number is always
-    traceable to real data.
+    Expected collections are bounded by three facts, never a guess:
+
+    1. **Who owes it and how they pay** — each open invoice scored against that
+       customer's own settlement history (`_expected_collections_sync`). This is
+       the binding constraint in practice and the most accurate: back-tested
+       over the 90 days to 2026-08-06 it predicted ₹175.3L against ₹195.0L
+       actually collected, where assuming everything due lands predicted ₹286.6L.
+    2. **How much is owed and due** inside the horizon, from the invoice ledger.
+    3. **How fast money has actually been arriving**, from the bank.
+
+    The lowest applies, and the payload names which one bound it.
     """
     monthly_opex = opex["monthly_opex"]
     net_cash = cash["net_cash"]
@@ -582,7 +958,15 @@ def _build_working_capital(
     for horizon in HORIZONS:
         ar_due = _within(receivables["buckets"], horizon)
         run_rate_ar = daily_rate * horizon
-        expected_ar = min(ar_due, run_rate_ar)
+        behaviour = (ar_behaviour or {}).get("by_horizon", {}).get(horizon)
+        behaviour_ar = behaviour["expected"] if behaviour else None
+
+        bounds = {"invoices_due": ar_due, "collection_speed": run_rate_ar}
+        if behaviour_ar is not None:
+            bounds["payment_behaviour"] = behaviour_ar
+        limited_by = min(bounds, key=lambda k: bounds[k])
+        expected_ar = bounds[limited_by]
+
         due_ap = _within(payables["buckets"], horizon)
         # Open POs have no reliable payment date on the record, so the whole
         # remaining commitment is charged to the nearest horizon. Conservative
@@ -596,9 +980,11 @@ def _build_working_capital(
             "expected_collections": round(expected_ar, 2),
             "ar_due_in_window": round(ar_due, 2),
             "run_rate_capacity": round(run_rate_ar, 2),
-            # Which constraint bound the estimate: are we short of invoices to
-            # collect, or short of collection speed?
-            "collections_limited_by": "invoices_due" if ar_due <= run_rate_ar else "collection_speed",
+            "behaviour_estimate": round(behaviour_ar, 2) if behaviour_ar is not None else None,
+            # Which constraint bound the estimate: too few invoices to collect,
+            # too little collection speed, or customers who simply do not pay
+            # that fast?
+            "collections_limited_by": limited_by,
             "implied_realisation_pct": round(expected_ar / ar_due * 100, 1) if ar_due > 0 else 0.0,
             "bills_due": round(due_ap, 2),
             "open_po_commitment": round(po_due, 2),
@@ -613,6 +999,7 @@ def _build_working_capital(
         "open_purchase_orders": open_pos,
         "opex": opex,
         "collection": collection,
+        "ar_behaviour": ar_behaviour or {},
         "projections": projections,
         # Default envelope. The order plan picks a horizon explicitly — orders
         # placed today are paid over a 60–96 day lead time, not within 30 days,
@@ -677,13 +1064,14 @@ async def get_working_capital(
     fx_resolved = await _resolve_fx(usd_inr, cny_inr)
     fx = fx_resolved["rates"]
     try:
-        cash, receivables, payables, open_pos, opex, collection = await asyncio.gather(
+        cash, receivables, payables, open_pos, opex, collection, ar_behaviour = await asyncio.gather(
             asyncio.to_thread(_cash_position_sync, db),
             asyncio.to_thread(_receivables_sync, db),
             asyncio.to_thread(_payables_sync, db),
             asyncio.to_thread(_open_po_commitment_sync, db, fx),
             asyncio.to_thread(_monthly_opex_sync, db, window_start, window_end),
             asyncio.to_thread(_collection_run_rate_sync, db, window_start, window_end),
+            asyncio.to_thread(_expected_collections_sync, db, datetime.now()),
         )
     except Exception as e:
         logger.error(f"working-capital failed: {e}", exc_info=True)
@@ -693,7 +1081,7 @@ async def get_working_capital(
         )
 
     payload = _build_working_capital(
-        cash, receivables, payables, open_pos, opex, collection
+        cash, receivables, payables, open_pos, opex, collection, ar_behaviour
     )
     payload["fx"] = fx_resolved["meta"]
     payload["rate_window"] = {
@@ -722,13 +1110,22 @@ async def get_cashflow(
 
 # ─── Brand order plan ───────────────────────────────────────────────────────────
 
-def _classify_urgency(coverage: float, lead_time: float, drr: float) -> str:
+def _classify_urgency(
+    coverage: float, lead_time: float, drr: float, is_new: bool = False
+) -> str:
     """Where a brand sits against its own lead time.
 
     The 3× lead-time ceiling matches the dead-SKU exclusion the dashboard already
     applies to weighted average cover, so the two pages never disagree about what
     counts as overstocked.
+
+    A brand still inside its selling threshold short-circuits to NEW. Everything
+    below this line divides by a run rate, and a brand a few days old does not
+    have one — its coverage reads near zero, which would otherwise put it at the
+    very top of the funding queue on the strength of a launch week.
     """
+    if is_new:
+        return "NEW"
     if drr <= 0:
         return "EXCESS"
     if coverage >= 3 * lead_time:
@@ -740,7 +1137,7 @@ def _classify_urgency(coverage: float, lead_time: float, drr: float) -> str:
     return "HEALTHY"
 
 
-URGENCY_RANK = {"CRITICAL": 0, "ORDER": 1, "HEALTHY": 2, "EXCESS": 3}
+URGENCY_RANK = {"CRITICAL": 0, "NEW": 1, "ORDER": 2, "HEALTHY": 3, "EXCESS": 4}
 
 
 def _unit_cost_for(
@@ -775,9 +1172,33 @@ def _unit_cost_for(
     return 0.0, "none"
 
 
+def _cap_order_qty(
+    order_qty: float, drr: float, on_hand: float, in_transit: float,
+    max_cover_days: Optional[int],
+) -> float:
+    """Trim a suggested order so it never buys more than `max_cover_days` of cover.
+
+    The master report sizes an order from demand alone. When a SKU's DRR comes
+    from a lookback window — or from a short burst of sales — the suggested
+    quantity can be several months of stock, and the plan would then spend real
+    cash on it. This ceiling counts what is already on hand and on the water, so
+    it only ever removes units that would push total cover past the limit.
+
+    A SKU with no run rate is left alone: there is no cover to compute, and the
+    master report has its own reasons for suggesting a quantity there (a demand
+    override, typically).
+    """
+    if not max_cover_days or order_qty <= 0 or drr <= 0:
+        return order_qty
+    room = drr * max_cover_days - (on_hand + in_transit)
+    return float(max(0.0, min(order_qty, round(room))))
+
+
 def _aggregate_brands(
     items: List[Dict], brand_logistics: Dict,
     fallback_costs: Dict[str, float], fx: Dict[str, float],
+    max_cover_days: Optional[int] = None,
+    min_selling_days: int = DEFAULT_MIN_SELLING_DAYS,
 ) -> List[Dict]:
     """Roll master-report SKUs into brand rows priced per `_unit_cost_for`.
 
@@ -794,12 +1215,36 @@ def _aggregate_brands(
         settings = brand_logistics.get(brand.lower(), {})
         lead_time = _f(settings.get("lead_time"), 60.0)
 
+        # How long the brand has actually been selling: the longest-running SKU
+        # in it. Max, not average — one new SKU inside an established brand does
+        # not make the brand new, but the brand can be no older than its oldest
+        # SKU's stock history.
+        selling_days = max(
+            (_f((it.get("combined_metrics") or {}).get("total_days_in_stock")) for it in group),
+            default=0.0,
+        )
+        has_sales = any(
+            _f((it.get("combined_metrics") or {}).get("avg_daily_run_rate")) > 0 for it in group
+        )
+        # No sales at all is not "new", it is dead — that is the EXCESS path.
+        is_new_brand = bool(has_sales and 0 < selling_days < min_selling_days)
+        # A launch DRR is a guess, so buy one lead time of cover at most: enough
+        # not to stock out before a real reorder, by which point there is real
+        # data to size it from.
+        brand_cover_cap = (
+            min(max_cover_days or int(lead_time), int(lead_time))
+            if is_new_brand
+            else max_cover_days
+        )
+
         stock_units = transit_units = 0.0
         stock_value = transit_value = 0.0
         order_units = capital_required = 0.0
+        suggested_units = suggested_capital = 0.0
         revenue = cogs_sold = 0.0
         drr = 0.0
         skus_to_order = 0
+        skus_capped = 0
         missing_cost = 0
         estimated_cost = 0
         sku_rows = []
@@ -810,9 +1255,12 @@ def _aggregate_brands(
             unit_cost, cost_source = _unit_cost_for(it, fallback_costs, fx)
             on_hand = _f(it.get("latest_total_stock"))
             transit = _f(it.get("total_stock_in_transit"))
-            order_qty = _f(it.get("order_qty_plus_extra_qty_rounded"))
+            suggested_qty = _f(it.get("order_qty_plus_extra_qty_rounded"))
             net_units = _f(cm.get("total_sales"))
             sku_drr = _f(cm.get("avg_daily_run_rate"))
+            order_qty = _cap_order_qty(
+                suggested_qty, sku_drr, on_hand, transit, brand_cover_cap
+            )
 
             drr += sku_drr
             stock_units += on_hand
@@ -821,6 +1269,11 @@ def _aggregate_brands(
             transit_value += transit * unit_cost
             revenue += _f(cm.get("total_amount"))
             cogs_sold += max(0.0, net_units) * unit_cost
+
+            suggested_units += suggested_qty
+            suggested_capital += suggested_qty * unit_cost
+            if suggested_qty > order_qty:
+                skus_capped += 1
 
             if order_qty > 0:
                 order_units += order_qty
@@ -842,7 +1295,10 @@ def _aggregate_brands(
                 "in_transit": round(transit, 2),
                 "drr": round(sku_drr, 3),
                 "current_days_coverage": round(_f(it.get("current_days_coverage")), 1),
+                # What demand asked for, before the cover ceiling.
+                "suggested_qty": round(suggested_qty, 0),
                 "order_qty": round(order_qty, 0),
+                "capped_units": round(max(0.0, suggested_qty - order_qty), 0),
                 "capital_required": round(order_qty * unit_cost, 2),
                 "excess_or_order": it.get("excess_or_order", ""),
             })
@@ -854,7 +1310,7 @@ def _aggregate_brands(
         avg_inventory = stock_value + transit_value
         gmroi = round(gross_margin / avg_inventory, 2) if avg_inventory > 0 else 0.0
         margin_pct = round(gross_margin / revenue * 100, 1) if revenue > 0 else 0.0
-        urgency = _classify_urgency(coverage, lead_time, drr)
+        urgency = _classify_urgency(coverage, lead_time, drr, is_new_brand)
 
         # What freeing this brand down to a healthy 2× lead time would release.
         cash_trapped = 0.0
@@ -888,6 +1344,16 @@ def _aggregate_brands(
             "gmroi": gmroi,
             "order_units": round(order_units, 0),
             "capital_required": round(capital_required, 2),
+            # Demand's ask before the cover ceiling, so the buyer can see what
+            # the limit removed rather than just a smaller number.
+            "suggested_units": round(suggested_units, 0),
+            "suggested_capital": round(suggested_capital, 2),
+            "capped_units": round(max(0.0, suggested_units - order_units), 0),
+            "capped_capital": round(max(0.0, suggested_capital - capital_required), 2),
+            "skus_capped": skus_capped,
+            "is_new_brand": is_new_brand,
+            "selling_days": round(selling_days, 0),
+            "cover_cap_days": brand_cover_cap,
             "urgency": urgency,
             "cash_trapped": round(cash_trapped, 2),
             "skus": sku_rows,
@@ -896,17 +1362,24 @@ def _aggregate_brands(
     return rows
 
 
-def _allocate(rows: List[Dict], envelope: float) -> Dict:
+def _allocate(rows: List[Dict], envelope: float, new_brand_reserve: float = 0.0) -> Dict:
     """Fund brands from the cash envelope, best return on inventory first.
 
     Ranking by GMROI within urgency tier is the point of the whole report: it
     stops the last of a tight cash position going to a slow, thin-margin brand
     while a fast high-margin one stocks out.
+
+    `new_brand_reserve` is taken off the top before any existing brand is funded.
+    A brand we are about to launch has no history for the ranking to work with,
+    so it cannot compete on GMROI — it has to be carved out, or it loses to the
+    incumbents every time.
     """
     fundable = [r for r in rows if r["urgency"] in ("CRITICAL", "ORDER") and r["capital_required"] > 0]
     fundable.sort(key=lambda r: (URGENCY_RANK[r["urgency"]], -r["gmroi"], -r["drr"]))
 
-    remaining = max(0.0, envelope)
+    reserve = max(0.0, new_brand_reserve)
+    available = max(0.0, envelope - reserve)
+    remaining = available
     total_requested = sum(r["capital_required"] for r in fundable)
 
     for rank, row in enumerate(fundable, start=1):
@@ -947,7 +1420,21 @@ def _allocate(rows: List[Dict], envelope: float) -> Dict:
             row["priority"] = None
             row["funded_amount"] = 0.0
             row["funded_pct"] = 0.0
-            if row["urgency"] in ("CRITICAL", "ORDER"):
+            if row["urgency"] == "NEW":
+                # Deliberately not auto-funded. Ranking is by GMROI over the
+                # period, and a brand a few days old has neither a trustworthy
+                # GMROI nor a trustworthy run rate — letting it compete would
+                # hand it cash ahead of established brands on the strength of a
+                # launch week. The buyer decides, and reserves cash for it the
+                # same way they would for a brand not yet in the system.
+                row["recommendation"] = "NEW - REVIEW"
+                row["review_reason"] = (
+                    f"Only {row['selling_days']:.0f} day(s) of selling history, so the run rate is "
+                    f"not yet reliable enough to size a purchase from. The quantity shown is "
+                    f"capped at one lead time ({row['cover_cap_days']} days) of cover as a "
+                    f"starting point — confirm it, then reserve the cash for it under New brands."
+                )
+            elif row["urgency"] in ("CRITICAL", "ORDER"):
                 # Needs stock but priced at nothing — never label this
                 # "DO NOT ORDER", which is the opposite of the truth. It means
                 # the master report suggested no quantity (usually because the
@@ -979,8 +1466,23 @@ def _allocate(rows: List[Dict], envelope: float) -> Dict:
         "total_funded": round(sum(r["funded_amount"] for r in fundable), 2),
         "unfunded": round(max(0.0, total_requested - sum(r["funded_amount"] for r in fundable)), 2),
         "envelope": round(envelope, 2),
+        "new_brand_reserve": round(reserve, 2),
+        # What the ranked allocation actually had to spend, after the carve-out.
+        "available_for_existing_brands": round(available, 2),
         "remaining_envelope": round(remaining, 2),
         "cash_trapped_in_excess": round(sum(r["cash_trapped"] for r in rows), 2),
+        # Not part of the funded total — new brands are a buyer decision, and
+        # this is what saying yes to all of them would cost on top.
+        "new_brands_indicative": round(
+            sum(r["capital_required"] for r in rows if r["urgency"] == "NEW"), 2
+        ),
+        "new_brands_count": sum(1 for r in rows if r["urgency"] == "NEW"),
+        "capped_units": round(sum(r.get("capped_units", 0) for r in rows), 0),
+        "capped_capital": round(sum(r.get("capped_capital", 0.0) for r in rows), 2),
+        "suggested_before_cap": round(
+            sum(r.get("suggested_capital", 0.0) for r in rows
+                if r["urgency"] in ("CRITICAL", "ORDER")), 2
+        ),
     }
 
 
@@ -988,6 +1490,9 @@ async def _brand_order_plan_data(
     start_date: str, end_date: str, db,
     usd_inr: Optional[float], cny_inr: Optional[float],
     envelope_override: Optional[float], horizon_days: int,
+    max_cover_days: Optional[int] = DEFAULT_MAX_COVER_DAYS,
+    include_new_brand_reserves: bool = True,
+    min_selling_days: int = DEFAULT_MIN_SELLING_DAYS,
 ) -> Dict:
     fx_resolved = await _resolve_fx(usd_inr, cny_inr)
     fx = fx_resolved["rates"]
@@ -1008,15 +1513,16 @@ async def _brand_order_plan_data(
     opex_task = asyncio.to_thread(_monthly_opex_sync, db, _win_start, _win_end)
     collection_task = asyncio.to_thread(_collection_run_rate_sync, db, _win_start, _win_end)
     fallback_task = asyncio.to_thread(_fallback_unit_costs_sync, db, fx)
+    behaviour_task = asyncio.to_thread(_expected_collections_sync, db, datetime.now())
 
     (master, cash, receivables, payables, open_pos, opex,
-     collection, fallback_costs) = await asyncio.gather(
+     collection, fallback_costs, ar_behaviour) = await asyncio.gather(
         master_task, cash_task, ar_task, ap_task, po_task, opex_task,
-        collection_task, fallback_task
+        collection_task, fallback_task, behaviour_task
     )
 
     working_capital = _build_working_capital(
-        cash, receivables, payables, open_pos, opex, collection
+        cash, receivables, payables, open_pos, opex, collection, ar_behaviour
     )
     # Fund against the horizon the buyer is actually planning over. A container
     # ordered today lands in 60-96 days, so the cash that pays for it is the cash
@@ -1037,11 +1543,19 @@ async def _brand_order_plan_data(
             for d in db.get_collection(BRAND_LOGISTICS).find({}, {"_id": 0})
         }
 
-    brand_logistics = await asyncio.to_thread(_load_logistics)
+    brand_logistics, reserves = await asyncio.gather(
+        asyncio.to_thread(_load_logistics),
+        asyncio.to_thread(_new_brand_reserves_sync, db, True),
+    )
+    if not include_new_brand_reserves:
+        reserves = []
+    reserve_total = sum(r["amount"] for r in reserves)
 
     items = master.get("combined_data", []) or []
-    rows = _aggregate_brands(items, brand_logistics, fallback_costs, fx)
-    allocation = _allocate(rows, envelope)
+    rows = _aggregate_brands(
+        items, brand_logistics, fallback_costs, fx, max_cover_days, min_selling_days
+    )
+    allocation = _allocate(rows, envelope, reserve_total)
 
     cogs_date = (master.get("latest_stock_dates") or {}).get("cogs", "")
     skus_missing_cost = sum(r["skus_missing_cost"] for r in rows)
@@ -1088,11 +1602,39 @@ async def _brand_order_plan_data(
             ),
         })
 
+    if allocation["new_brands_count"] > 0:
+        new_names = ", ".join(r["brand"] for r in rows if r["urgency"] == "NEW")
+        warnings.append({
+            "level": "info",
+            "count": allocation["new_brands_count"],
+            "cost_source": "new_brand",
+            "message": (
+                f"{new_names} {'has' if allocation['new_brands_count'] == 1 else 'have'} under "
+                f"{min_selling_days} days of selling history, so {'it is' if allocation['new_brands_count'] == 1 else 'they are'} "
+                f"held out of the automatic ranking and left for you to decide."
+            ),
+        })
+
+    if allocation["capped_units"] > 0:
+        warnings.append({
+            "level": "info",
+            "count": int(allocation["capped_units"]),
+            "cost_source": "order_cap",
+            "message": (
+                f"Order quantities are capped at {max_cover_days} days of cover: "
+                f"{int(allocation['capped_units']):,} unit(s) worth "
+                f"₹{int(allocation['capped_capital']):,} were trimmed from what demand asked for."
+            ),
+        })
+
     return {
         "period": {"start_date": start_date, "end_date": end_date},
         "working_capital": working_capital,
         "horizon_days": horizon_projection["horizon_days"],
+        "max_cover_days": max_cover_days,
+        "min_selling_days": min_selling_days,
         "allocation": allocation,
+        "new_brand_reserves": reserves,
         "brands": rows,
         "warnings": warnings,
         "cost_issues": cost_issues,
@@ -1114,6 +1656,18 @@ async def get_brand_order_plan(
     horizon_days: int = Query(
         90, description="Planning horizon whose free cash funds the plan (30, 60 or 90)"
     ),
+    max_cover_days: Optional[int] = Query(
+        DEFAULT_MAX_COVER_DAYS, ge=0,
+        description="Never order more than this many days of cover per SKU. 0 disables the cap.",
+    ),
+    include_new_brand_reserves: bool = Query(
+        True, description="Set aside the active new-brand reserves before funding existing brands"
+    ),
+    min_selling_days: int = Query(
+        DEFAULT_MIN_SELLING_DAYS, ge=0,
+        description="Days of selling history a brand needs before its run rate is trusted "
+                    "enough to auto-fund. Below this it is held out for review. 0 disables.",
+    ),
     db=Depends(get_database),
 ):
     """Which brands to order, ranked by GMROI and funded from available cash.
@@ -1129,6 +1683,7 @@ async def get_brand_order_plan(
         payload = await _brand_order_plan_data(
             start_date, end_date, db, usd_inr, cny_inr,
             envelope_override, horizon_days,
+            max_cover_days or None, include_new_brand_reserves, min_selling_days,
         )
     except HTTPException:
         raise
@@ -1151,6 +1706,7 @@ _THIN = Border(*(Side(style="thin", color="BFBFBF"),) * 4)
 
 _URGENCY_FILL = {
     "CRITICAL": PatternFill("solid", fgColor="FF6B6B"),
+    "NEW": PatternFill("solid", fgColor="D9C2F0"),
     "ORDER": PatternFill("solid", fgColor="FFD966"),
     "HEALTHY": PatternFill("solid", fgColor="C6E0B4"),
     "EXCESS": PatternFill("solid", fgColor="F4B183"),
@@ -1243,14 +1799,34 @@ def _build_plan_xlsx(data: Dict) -> bytes:
     r += 1
     for label, val in (
         ("Purchase envelope", alloc["envelope"]),
+        ("Reserved for new brands", -alloc.get("new_brand_reserve", 0.0)),
+        ("Available for existing brands", alloc.get("available_for_existing_brands", alloc["envelope"])),
         ("Total requested by brands", alloc["total_requested"]),
         ("Funded", alloc["total_funded"]),
         ("Unfunded shortfall", alloc["unfunded"]),
         ("Cash trapped in EXCESS brands", alloc["cash_trapped_in_excess"]),
+        (f"Trimmed by the {data.get('max_cover_days') or '—'}-day cover cap",
+         alloc.get("capped_capital", 0.0)),
+        (f"New brands held for review (< {data.get('min_selling_days')} days selling), indicative",
+         alloc.get("new_brands_indicative", 0.0)),
     ):
         ws.cell(row=r, column=1, value=label)
         ws.cell(row=r, column=2, value=val).number_format = _MONEY
         r += 1
+
+    if data.get("new_brand_reserves"):
+        r += 1
+        ws.cell(row=r, column=1, value="NEW BRANDS (RESERVED)").fill = _SECTION_FILL
+        ws.cell(row=r, column=1).font = Font(bold=True)
+        r += 1
+        _write_header(ws, ["Brand", "Reserved", "Expected order date", "Notes"], row=r)
+        r += 1
+        for nb in data["new_brand_reserves"]:
+            ws.cell(row=r, column=1, value=nb["brand"])
+            ws.cell(row=r, column=2, value=nb["amount"]).number_format = _MONEY
+            ws.cell(row=r, column=3, value=nb.get("expected_order_date") or "")
+            ws.cell(row=r, column=4, value=nb.get("notes") or "")
+            r += 1
 
     if data.get("warnings"):
         r += 1
@@ -1267,36 +1843,39 @@ def _build_plan_xlsx(data: Dict) -> bytes:
     ws2 = wb.create_sheet("Brand Plan")
     headers = [
         "Priority", "Brand", "Urgency", "Recommendation", "Lead Time",
-        "DRR", "On Hand", "In Transit", "Days Coverage",
+        "Days Selling", "DRR", "On Hand", "In Transit", "Days Coverage",
         "Inventory at Cost", "Revenue", "Gross Margin", "Margin %", "GMROI",
-        "SKUs to Order", "Order Units", "Capital Required",
-        "Funded Amount", "Funded %", "Cash Trapped",
+        "SKUs to Order", "Suggested Units", "Order Units (capped)", "Units Trimmed",
+        "Capital Required", "Funded Amount", "Funded %", "Cash Trapped",
     ]
     _write_header(ws2, headers)
     for i, b in enumerate(data["brands"], start=2):
         vals = [
             b.get("priority"), b["brand"], b["urgency"], b["recommendation"],
-            b["lead_time"], b["drr"], b["on_hand_units"], b["in_transit_units"],
+            b["lead_time"], b.get("selling_days"), b["drr"],
+            b["on_hand_units"], b["in_transit_units"],
             b["current_days_coverage"], b["inventory_at_cost"], b["revenue"],
             b["gross_margin"], b["margin_pct"], b["gmroi"], b["skus_to_order"],
-            b["order_units"], b["capital_required"], b["funded_amount"],
+            b.get("suggested_units", b["order_units"]), b["order_units"],
+            b.get("capped_units", 0), b["capital_required"], b["funded_amount"],
             b["funded_pct"], b["cash_trapped"],
         ]
         for col, v in enumerate(vals, start=1):
             c = ws2.cell(row=i, column=col, value=v)
             c.border = _THIN
-            if col in (10, 11, 12, 17, 18, 20):
+            if col in (11, 12, 13, 20, 21, 23):
                 c.number_format = _MONEY
         ws2.cell(row=i, column=3).fill = _URGENCY_FILL.get(b["urgency"], PatternFill())
     ws2.freeze_panes = "C2"
-    _autosize(ws2, [9, 22, 11, 16, 11, 9, 11, 11, 14, 18, 16, 16, 10, 9, 13, 13, 18, 16, 11, 16])
+    _autosize(ws2, [9, 22, 11, 16, 11, 12, 9, 11, 11, 14, 18, 16, 16, 10, 9, 13, 15, 18, 13, 18, 16, 11, 16])
 
     # ── Sheet 3: SKU detail for funded brands ───────────────────────────────
     ws3 = wb.create_sheet("SKU Detail")
     sku_headers = [
         "Brand", "Recommendation", "SKU Code", "Product Name", "Unit Cost",
         "Cost Source", "On Hand", "In Transit", "DRR", "Days Coverage",
-        "Order Qty", "Funded Qty", "Capital Required", "Excess / Order",
+        "Suggested Qty", "Order Qty (capped)", "Funded Qty", "Capital Required",
+        "Excess / Order",
     ]
     _COST_SOURCE_LABEL = {
         "unit_price": "Managed unit price",
@@ -1314,17 +1893,18 @@ def _build_plan_xlsx(data: Dict) -> bytes:
                 b["brand"], b["recommendation"], s["sku_code"], s["product_name"],
                 s["unit_cost"], _COST_SOURCE_LABEL.get(s.get("cost_source", ""), ""),
                 s["on_hand"], s["in_transit"], s["drr"],
-                s["current_days_coverage"], s["order_qty"], s.get("funded_qty", 0),
+                s["current_days_coverage"], s.get("suggested_qty", s["order_qty"]),
+                s["order_qty"], s.get("funded_qty", 0),
                 s["capital_required"], s["excess_or_order"],
             ]
             for col, v in enumerate(vals, start=1):
                 c = ws3.cell(row=row, column=col, value=v)
                 c.border = _THIN
-                if col in (5, 13):
+                if col in (5, 14):
                     c.number_format = _MONEY
             row += 1
     ws3.freeze_panes = "C2"
-    _autosize(ws3, [20, 16, 16, 44, 12, 18, 11, 11, 9, 14, 11, 12, 18, 15])
+    _autosize(ws3, [20, 16, 16, 44, 12, 18, 11, 11, 9, 14, 13, 16, 12, 18, 15])
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1340,6 +1920,9 @@ async def download_brand_order_plan(
     cny_inr: Optional[float] = Query(None, gt=0, description="CNY→INR override; omit for live rate"),
     envelope_override: Optional[float] = Query(None),
     horizon_days: int = Query(90),
+    max_cover_days: Optional[int] = Query(DEFAULT_MAX_COVER_DAYS, ge=0),
+    include_new_brand_reserves: bool = Query(True),
+    min_selling_days: int = Query(DEFAULT_MIN_SELLING_DAYS, ge=0),
     db=Depends(get_database),
 ):
     """Three-sheet workbook: cash bridge, brand plan, SKU detail."""
@@ -1347,6 +1930,7 @@ async def download_brand_order_plan(
         data = await _brand_order_plan_data(
             start_date, end_date, db, usd_inr, cny_inr,
             envelope_override, horizon_days,
+            max_cover_days or None, include_new_brand_reserves, min_selling_days,
         )
         content = await asyncio.to_thread(_build_plan_xlsx, data)
     except HTTPException:

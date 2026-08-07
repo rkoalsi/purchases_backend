@@ -34,6 +34,7 @@ router = APIRouter()
 # --- Collections ---
 CAMPAIGNS_COLLECTION = "amazon_ads_campaigns"
 DAILY_COLLECTION = "amazon_ads_daily"
+PRODUCT_DAILY_COLLECTION = "amazon_ads_product_daily"
 SYNC_RUNS_COLLECTION = "amazon_ads_sync_runs"
 REPORT_JOBS_COLLECTION = "amazon_ads_report_jobs"
 
@@ -73,6 +74,11 @@ _DEFAULT_RETENTION_DAYS = {
 _RETENTION_RE = re.compile(r"data retention start date \((\d{4}-\d{2}-\d{2})\)")
 # Only a column complaint should trigger the drop-optional-columns retry.
 _COLUMN_ERROR_RE = re.compile(r"column|field|metric", re.IGNORECASE)
+
+# Re-requesting an identical report returns 425 with the id of the report
+# Amazon already holds. That id is the useful part — treat it as success
+# rather than an error, otherwise a repeated window can never be queued.
+_DUPLICATE_RE = re.compile(r"duplicate of\s*:?\s*([0-9a-f-]{16,})", re.IGNORECASE)
 
 # Amazon's report queue is slow and highly variable — reports for this account
 # have been observed still PENDING after 50+ minutes. Holding a request or a
@@ -115,6 +121,39 @@ _REPORT_SPECS = {
         "units_field": "unitsSold",
     },
 }
+
+# ASIN-level reports. Campaign-level spend cannot be split across the products
+# inside a campaign, so per-ASIN economics need these instead.
+#
+# Sponsored Brands has no advertised-product report — its spend is brand-level
+# by design — so SB is deliberately absent here and handled separately by
+# mapping campaign names to SKU codes (approximate, kept in its own columns).
+_PRODUCT_SPECS = {
+    "SPONSORED_PRODUCTS": {
+        "reportTypeId": "spAdvertisedProduct",
+        "groupBy": ["advertiser"],
+        "asin_field": "advertisedAsin",
+        "sku_field": "advertisedSku",
+        "required": ["date", "advertisedAsin", "impressions", "clicks", "cost"],
+        "optional": ["advertisedSku", "campaignId", "purchases30d", "sales30d", "unitsSoldClicks30d"],
+        "orders_field": "purchases30d",
+        "sales_field": "sales30d",
+        "units_field": "unitsSoldClicks30d",
+    },
+    "SPONSORED_DISPLAY": {
+        "reportTypeId": "sdAdvertisedProduct",
+        "groupBy": ["advertiser"],
+        "asin_field": "promotedAsin",
+        "sku_field": "promotedSku",
+        "required": ["date", "promotedAsin", "impressions", "clicks", "cost"],
+        "optional": ["promotedSku", "campaignId", "purchases", "sales", "unitsSold"],
+        "orders_field": "purchases",
+        "sales_field": "sales",
+        "units_field": "unitsSold",
+    },
+}
+
+PRODUCT_AD_PRODUCTS = tuple(_PRODUCT_SPECS)
 
 _CREATE_REPORT_CT = "application/vnd.createasyncreportrequest.v3+json"
 
@@ -194,15 +233,24 @@ def _request_with_backoff(method: str, url: str, *, max_attempts: int = 6, **kwa
 # --------------------------------------------------------------------------
 # Report fetching
 # --------------------------------------------------------------------------
-def _create_report_sync(ad_product: str, start_date: str, end_date: str, columns: list[str]) -> str:
-    spec = _REPORT_SPECS[ad_product]
+def _spec_for(ad_product: str, kind: str) -> dict:
+    """kind: 'campaign' (spend by campaign) or 'product' (spend by ASIN)."""
+    table = _PRODUCT_SPECS if kind == "product" else _REPORT_SPECS
+    if ad_product not in table:
+        raise HTTPException(status_code=400, detail=f"{ad_product} has no {kind}-level report")
+    return table[ad_product]
+
+
+def _create_report_sync(ad_product: str, start_date: str, end_date: str, columns: list[str],
+                        kind: str = "campaign") -> str:
+    spec = _spec_for(ad_product, kind)
     body = {
         "name": f"{spec['reportTypeId']}_{start_date}_{end_date}",
         "startDate": start_date,
         "endDate": end_date,
         "configuration": {
             "adProduct": ad_product,
-            "groupBy": ["campaign"],
+            "groupBy": spec.get("groupBy", ["campaign"]),
             "columns": columns,
             "reportTypeId": spec["reportTypeId"],
             "timeUnit": "DAILY",
@@ -267,21 +315,30 @@ def _clamp_start_to_retention(ad_product: str, start_date: str) -> str:
     return max(start_date, floor)
 
 
-def _create_report_with_retries(ad_product: str, start_date: str, end_date: str) -> tuple[str, str, str]:
+def _create_report_with_retries(ad_product: str, start_date: str, end_date: str,
+                                kind: str = "campaign") -> tuple[str, str, str]:
     """
     Create one report, recovering from the two 400s Amazon actually returns.
 
     Returns (report_id, effective_start, effective_end) — the dates may differ
     from those requested when retention forced the start date forward.
     """
-    spec = _REPORT_SPECS[ad_product]
+    spec = _spec_for(ad_product, kind)
     columns = spec["required"] + spec["optional"]
 
     for attempt in range(3):
         try:
-            return _create_report_sync(ad_product, start_date, end_date, columns), start_date, end_date
+            return _create_report_sync(ad_product, start_date, end_date, columns, kind), start_date, end_date
         except RuntimeError as e:
             msg = str(e)
+
+            # 425: Amazon already has this exact report — reuse its id.
+            dup = _DUPLICATE_RE.search(msg)
+            if dup:
+                logger.info("%s %s..%s already queued as %s — reusing",
+                            ad_product, start_date, end_date, dup.group(1))
+                return dup.group(1), start_date, end_date
+
             if "400" not in msg:
                 raise
 
@@ -387,6 +444,65 @@ def _store_rows_sync(db, rows: list[dict]) -> int:
         for r in rows
     ]
     result = db[DAILY_COLLECTION].bulk_write(ops, ordered=False)
+    return (result.upserted_count or 0) + (result.modified_count or 0)
+
+
+def _normalize_product_row(row: dict, ad_product: str) -> dict | None:
+    """ASIN-level ad row. Spend here is genuinely attributable to one ASIN."""
+    spec = _PRODUCT_SPECS[ad_product]
+    asin = row.get(spec["asin_field"])
+    row_date = row.get("date")
+    if not asin or not row_date:
+        return None
+
+    cost = _num(row.get("cost"))
+    sales = _num(row.get(spec["sales_field"]))
+    clicks = _num(row.get("clicks"))
+    impressions = _num(row.get("impressions"))
+
+    return {
+        "date": str(row_date),
+        "asin": str(asin),
+        "sku": row.get(spec["sku_field"]),
+        "campaign_id": str(row["campaignId"]) if row.get("campaignId") else None,
+        "ad_product": ad_product,
+        "profile_id": _ADS_PROFILE_ID,
+        "impressions": impressions,
+        "clicks": clicks,
+        "cost": round(cost, 2),
+        "orders": _num(row.get(spec["orders_field"])),
+        "sales": round(sales, 2),
+        "units": _num(row.get(spec["units_field"])),
+        "acos": round(cost / sales * 100, 2) if sales else None,
+        "roas": round(sales / cost, 2) if cost else None,
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+
+def _store_product_rows_sync(db, rows: list[dict]) -> int:
+    """
+    Upsert by (date, asin, ad_product, campaign_id).
+
+    campaign_id is part of the key because one ASIN can be advertised by
+    several campaigns on the same day; collapsing them would drop spend.
+    """
+    if not rows:
+        return 0
+    ops = [
+        UpdateOne(
+            {
+                "date": r["date"],
+                "asin": r["asin"],
+                "ad_product": r["ad_product"],
+                "campaign_id": r["campaign_id"],
+                "profile_id": r["profile_id"],
+            },
+            {"$set": r},
+            upsert=True,
+        )
+        for r in rows
+    ]
+    result = db[PRODUCT_DAILY_COLLECTION].bulk_write(ops, ordered=False)
     return (result.upserted_count or 0) + (result.modified_count or 0)
 
 
@@ -539,6 +655,12 @@ def _ensure_indexes_sync(db):
         db[DAILY_COLLECTION].create_index([("date", DESCENDING)], name="ads_daily_date")
         db[DAILY_COLLECTION].create_index([("ad_product", ASCENDING)], name="ads_daily_product")
         db[CAMPAIGNS_COLLECTION].create_index([("campaign_id", ASCENDING)], name="ads_campaign_id")
+        db[PRODUCT_DAILY_COLLECTION].create_index(
+            [("date", ASCENDING), ("asin", ASCENDING), ("ad_product", ASCENDING), ("campaign_id", ASCENDING)],
+            name="ads_product_key",
+        )
+        db[PRODUCT_DAILY_COLLECTION].create_index([("asin", ASCENDING)], name="ads_product_asin")
+        db[PRODUCT_DAILY_COLLECTION].create_index([("date", DESCENDING)], name="ads_product_date")
         db[SYNC_RUNS_COLLECTION].create_index([("started_at", DESCENDING)], name="ads_runs_started")
         _indexes_ready = True
     except Exception as e:  # index creation must never block a sync
@@ -589,7 +711,8 @@ def _run_sync_sync(db, start_date: str, end_date: str, ad_products: list[str]) -
 # --------------------------------------------------------------------------
 # Two-phase sync: initiate (queue reports) -> collect (download when ready)
 # --------------------------------------------------------------------------
-def _initiate_reports_sync(db, start_date: str, end_date: str, ad_products: list[str]) -> dict:
+def _initiate_reports_sync(db, start_date: str, end_date: str, ad_products: list[str],
+                           kind: str = "campaign") -> dict:
     """
     Ask Amazon to build one report per ad product and record the ids.
 
@@ -599,7 +722,11 @@ def _initiate_reports_sync(db, start_date: str, end_date: str, ad_products: list
     _ensure_indexes_sync(db)
     queued, errors, skipped = [], {}, []
 
+    table = _PRODUCT_SPECS if kind == "product" else _REPORT_SPECS
     for ad_product in ad_products:
+        if ad_product not in table:
+            skipped.append({"ad_product": ad_product, "reason": f"no {kind}-level report exists"})
+            continue
         # Retention differs per ad product (Sponsored Brands is the shortest),
         # so each one gets its own clamped window before chunking.
         product_start = _clamp_start_to_retention(ad_product, start_date)
@@ -614,13 +741,16 @@ def _initiate_reports_sync(db, start_date: str, end_date: str, ad_products: list
 
         for chunk_start, chunk_end in _chunk_ranges(product_start, end_date):
             try:
-                report_id, eff_start, eff_end = _create_report_with_retries(ad_product, chunk_start, chunk_end)
+                report_id, eff_start, eff_end = _create_report_with_retries(
+                    ad_product, chunk_start, chunk_end, kind
+                )
                 db[REPORT_JOBS_COLLECTION].update_one(
                     {"report_id": report_id},
                     {
                         "$set": {
                             "report_id": report_id,
                             "ad_product": ad_product,
+                            "kind": kind,
                             "start_date": eff_start,
                             "end_date": eff_end,
                             "profile_id": _ADS_PROFILE_ID,
@@ -631,9 +761,9 @@ def _initiate_reports_sync(db, start_date: str, end_date: str, ad_products: list
                     },
                     upsert=True,
                 )
-                queued.append({"ad_product": ad_product, "report_id": report_id,
+                queued.append({"ad_product": ad_product, "kind": kind, "report_id": report_id,
                                "start_date": eff_start, "end_date": eff_end})
-                logger.info("Amazon Ads queued %s %s..%s -> %s", ad_product, eff_start, eff_end, report_id)
+                logger.info("Amazon Ads queued %s/%s %s..%s -> %s", ad_product, kind, eff_start, eff_end, report_id)
             except Exception as e:
                 # One chunk failing must not abandon the rest of the window.
                 logger.error("Failed to queue %s %s..%s: %s", ad_product, chunk_start, chunk_end, e)
@@ -676,9 +806,14 @@ def _collect_reports_sync(db, max_jobs: int = 20) -> dict:
 
             if status_ == "COMPLETED":
                 raw = _download_report_sync(data["url"])
-                rows = [n for n in (_normalize_row(r, job["ad_product"]) for r in raw) if n]
-                stored = _store_rows_sync(db, rows)
-                _store_campaign_meta_sync(db, rows)
+                # Jobs predating the product-level reports have no 'kind'.
+                if job.get("kind") == "product":
+                    rows = [n for n in (_normalize_product_row(r, job["ad_product"]) for r in raw) if n]
+                    stored = _store_product_rows_sync(db, rows)
+                else:
+                    rows = [n for n in (_normalize_row(r, job["ad_product"]) for r in raw) if n]
+                    stored = _store_rows_sync(db, rows)
+                    _store_campaign_meta_sync(db, rows)
                 total_rows += len(rows)
                 db[REPORT_JOBS_COLLECTION].update_one(
                     {"_id": job["_id"]},
@@ -689,8 +824,10 @@ def _collect_reports_sync(db, max_jobs: int = 20) -> dict:
                         "collected_at": datetime.now(timezone.utc),
                     }},
                 )
-                collected.append({"ad_product": job["ad_product"], "report_id": rid, "rows": len(rows)})
-                logger.info("Amazon Ads collected %s: %d rows", job["ad_product"], len(rows))
+                collected.append({"ad_product": job["ad_product"], "kind": job.get("kind", "campaign"),
+                                  "report_id": rid, "rows": len(rows)})
+                logger.info("Amazon Ads collected %s/%s: %d rows",
+                            job["ad_product"], job.get("kind", "campaign"), len(rows))
 
             elif status_ == "FAILED":
                 db[REPORT_JOBS_COLLECTION].update_one(
@@ -737,12 +874,14 @@ async def run_ads_sync(db, start_date: str | None = None, end_date: str | None =
 
 
 async def initiate_ads_reports(db, start_date: str | None = None, end_date: str | None = None,
-                               ad_products: list[str] | None = None, days: int | None = None) -> dict:
+                               ad_products: list[str] | None = None, days: int | None = None,
+                               kind: str = "campaign") -> dict:
     """Phase 1 — queue reports with Amazon. Returns immediately."""
     if not start_date or not end_date:
         start_date, end_date = _default_window(days)
-    products = ad_products or list(AD_PRODUCTS)
-    return await asyncio.to_thread(_initiate_reports_sync, db, start_date, end_date, products)
+    default = list(PRODUCT_AD_PRODUCTS) if kind == "product" else list(AD_PRODUCTS)
+    products = ad_products or default
+    return await asyncio.to_thread(_initiate_reports_sync, db, start_date, end_date, products, kind)
 
 
 async def collect_ads_reports(db, max_jobs: int = 20) -> dict:
@@ -758,6 +897,8 @@ class SyncRequest(BaseModel):
     end_date: str | None = None
     ad_products: list[str] | None = None
     days: int | None = None
+    # 'campaign' = spend by campaign, 'product' = spend by ASIN, 'both'
+    kind: str = "campaign"
 
 
 @router.get("/config")
@@ -840,7 +981,19 @@ async def initiate_sync(payload: SyncRequest, db=Depends(get_database)):
             detail=f"start_date {start_date} exceeds Amazon's ~{MAX_LOOKBACK_DAYS}-day retention (earliest available: {earliest})",
         )
 
-    return await initiate_ads_reports(db, start_date, end_date, payload.ad_products)
+    kinds = ["campaign", "product"] if payload.kind == "both" else [payload.kind]
+    if any(k not in ("campaign", "product") for k in kinds):
+        raise HTTPException(status_code=400, detail="kind must be 'campaign', 'product' or 'both'")
+
+    merged: dict = {"queued": [], "errors": {}, "skipped": [],
+                    "start_date": start_date, "end_date": end_date}
+    for k in kinds:
+        res = await initiate_ads_reports(db, start_date, end_date, payload.ad_products, kind=k)
+        merged["queued"] += res.get("queued", [])
+        merged["skipped"] += res.get("skipped", [])
+        for prod, errs in (res.get("errors") or {}).items():
+            merged["errors"].setdefault(f"{prod} ({k})", errs)
+    return merged
 
 
 @router.post("/sync/collect")
