@@ -1206,6 +1206,106 @@ def _brand_sales_3m_sync(db) -> Dict:
     }
 
 
+# Where an arrival date comes from, best first. `purchase_orders.delivery_date`
+# is deliberately absent: it is empty on every live open PO.
+_ETA_SOURCES = (
+    ("eta_port_date", "ETA port"),
+    ("etd_date", "ETD + in transit"),
+    ("ready_date", "ready at factory"),
+    ("po_due_date", "PO due"),
+)
+
+
+def _transit_arrivals_sync(db) -> Dict[str, List[Dict]]:
+    """When each brand's in-transit stock is expected, and how much of it.
+
+    Built from the same open POs the master report counts as stock in transit
+    (`order_status_formatted == "Issued"`, unreceived quantity only), so the
+    units reconcile with `in_transit_units` on the brand row.
+
+    Dates come from the brand order the buyers maintain on `/brand_orders`, not
+    from the PO — Zoho's `delivery_date` is empty on every live open PO. The
+    date used is labelled with its basis, because they mean different things:
+    **ETA port is not availability**, customs clearance and inland transport
+    still follow it.
+
+    Line items are attributed to a brand individually rather than assigning the
+    whole PO to the brand order's brand, since a PO can span brands.
+    """
+    pos = list(db.get_collection(PURCHASE_ORDERS).find(
+        {"order_status_formatted": "Issued"},
+        {"purchaseorder_number": 1, "vendor_name": 1, "line_items": 1, "_id": 0},
+    ))
+    if not pos:
+        return {}
+
+    numbers = [p.get("purchaseorder_number") for p in pos if p.get("purchaseorder_number")]
+    orders = {
+        bo["purchaseorder_number"]: bo
+        for bo in db.get_collection(BRAND_ORDERS).find(
+            {"purchaseorder_number": {"$in": numbers}},
+            {"_id": 0, "purchaseorder_number": 1, "name": 1, "ready_date": 1,
+             "etd_date": 1, "eta_port_date": 1, "po_due_date": 1},
+        )
+        if bo.get("purchaseorder_number")
+    }
+
+    item_ids = {
+        str(li.get("item_id")) for p in pos for li in p.get("line_items", []) if li.get("item_id")
+    }
+    products = {
+        str(p["item_id"]): p
+        for p in db.get_collection("products").find(
+            {"item_id": {"$in": list(item_ids)}},
+            {"item_id": 1, "brand": 1, "rate": 1, "_id": 0},
+        )
+        if p.get("item_id")
+    }
+
+    by_brand: Dict[str, List[Dict]] = {}
+    for po in pos:
+        number = po.get("purchaseorder_number") or ""
+        bo = orders.get(number) or {}
+
+        eta, basis = None, "no date set"
+        for field, label in _ETA_SOURCES:
+            parsed = _parse_date(bo.get(field))
+            if parsed:
+                eta, basis = parsed, label
+                break
+
+        # Roll the PO's unreceived lines up per brand.
+        per_brand: Dict[str, Dict[str, float]] = {}
+        for li in po.get("line_items", []):
+            remaining = _f(li.get("quantity")) - _f(li.get("quantity_received"))
+            if remaining <= 0:
+                continue
+            product = products.get(str(li.get("item_id"))) or {}
+            brand = (product.get("brand") or "").strip()
+            if not brand:
+                continue
+            agg = per_brand.setdefault(brand.lower(), {"units": 0.0, "mrp_value": 0.0})
+            agg["units"] += remaining
+            agg["mrp_value"] += remaining * _f(product.get("rate"))
+
+        for brand_key, agg in per_brand.items():
+            by_brand.setdefault(brand_key, []).append({
+                "purchaseorder_number": number,
+                "vendor_name": po.get("vendor_name", "") or "",
+                "order_name": bo.get("name", "") or "",
+                "eta_date": eta.date().isoformat() if eta else "",
+                "eta_basis": basis,
+                "units": round(agg["units"], 0),
+                "mrp_value": round(agg["mrp_value"], 2),
+            })
+
+    # Soonest first; anything undated sorts last rather than pretending to be
+    # imminent.
+    for rows in by_brand.values():
+        rows.sort(key=lambda r: (not r["eta_date"], r["eta_date"]))
+    return by_brand
+
+
 def _fallback_unit_costs_sync(db, fx: Dict[str, float]) -> Dict[str, float]:
     """Latest purchase-order rate per SKU, in INR.
 
@@ -1511,6 +1611,7 @@ def _aggregate_brands(
     min_selling_days: int = DEFAULT_MIN_SELLING_DAYS,
     period_days: int = 90,
     sales_3m: Optional[Dict] = None,
+    transit_arrivals: Optional[Dict] = None,
 ) -> List[Dict]:
     """Roll master-report SKUs into brand rows priced per `_unit_cost_for`.
 
@@ -1678,6 +1779,17 @@ def _aggregate_brands(
         wh_collection_value = wh_mrp_value / 2
         transit_collection_value = transit_mrp_value / 2
 
+        # When the in-transit stock is expected, soonest first. The first leg
+        # with a date is the one the buyer is waiting on; an ETA already in the
+        # past is flagged rather than quietly shown as "coming".
+        arrivals = (transit_arrivals or {}).get(brand.lower(), [])
+        today = datetime.now().date()
+        for leg in arrivals:
+            eta = _parse_date(leg.get("eta_date"))
+            leg["days_away"] = (eta.date() - today).days if eta else None
+            leg["is_overdue"] = bool(eta and eta.date() < today)
+        next_arrival = next((leg for leg in arrivals if leg.get("eta_date")), None)
+
         # Average monthly sales over the last three complete calendar months,
         # ex-GST — measured off the invoice ledger by `_brand_sales_3m_sync`,
         # deliberately independent of the report's own date range so that
@@ -1751,6 +1863,8 @@ def _aggregate_brands(
             "months_in_warehouse": _months(wh_units),
             "months_in_transit": _months(transit_units),
             "months_total": _months(wh_units + transit_units),
+            "transit_arrivals": arrivals,
+            "next_arrival": next_arrival,
 
             "urgency": urgency,
             "cash_trapped": round(cash_trapped, 2),
@@ -1913,11 +2027,13 @@ async def _brand_order_plan_data(
     fallback_task = asyncio.to_thread(_fallback_unit_costs_sync, db, fx)
     behaviour_task = asyncio.to_thread(_expected_collections_sync, db, datetime.now())
     sales_3m_task = asyncio.to_thread(_brand_sales_3m_sync, db)
+    arrivals_task = asyncio.to_thread(_transit_arrivals_sync, db)
 
     (master, cash, receivables, payables, open_pos, opex,
-     collection, fallback_costs, ar_behaviour, sales_3m) = await asyncio.gather(
+     collection, fallback_costs, ar_behaviour, sales_3m,
+     transit_arrivals) = await asyncio.gather(
         master_task, cash_task, ar_task, ap_task, po_task, opex_task,
-        collection_task, fallback_task, behaviour_task, sales_3m_task
+        collection_task, fallback_task, behaviour_task, sales_3m_task, arrivals_task
     )
 
     working_capital = _build_working_capital(
@@ -1955,7 +2071,7 @@ async def _brand_order_plan_data(
     rows = _aggregate_brands(
         items, brand_logistics, fallback_costs, fx,
         max_cover_days, min_selling_days, period_days,
-        sales_3m.get("by_brand", {}),
+        sales_3m.get("by_brand", {}), transit_arrivals,
     )
     allocation = _allocate(rows, envelope, reserve_total)
 
