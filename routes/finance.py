@@ -23,6 +23,7 @@ import asyncio
 import bisect
 import io
 import logging
+import re as _re
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -40,6 +41,7 @@ INVOICES = "invoices"
 BILLS = "bills"
 PURCHASE_ORDERS = "purchase_orders"
 BRAND_LOGISTICS = "brand_logistics"
+BRAND_ORDERS = "brand_orders"
 NEW_BRAND_RESERVES = "finance_new_brand_reserves"
 
 # Ceiling on how much stock a single order may buy, expressed as days of cover.
@@ -54,6 +56,9 @@ DEFAULT_MAX_COVER_DAYS = 120
 # roughly 53,000 units against the 120-day cap. Two days of a launch is not a
 # run rate.
 DEFAULT_MIN_SELLING_DAYS = 30
+
+# Average calendar month, for turning a daily run rate into months of cover.
+DAYS_PER_MONTH = 30.44
 
 # Zoho keeps voided invoices at their full original balance, and drafts are not
 # yet receivable. Including either overstates AR by crores.
@@ -373,6 +378,92 @@ async def delete_new_brand_reserve(reserve_id: str, db=Depends(get_database)):
     return JSONResponse(status_code=status.HTTP_200_OK, content={"deleted": True})
 
 
+# ─── Per-brand planning settings ────────────────────────────────────────────────
+#
+# How much cover an order may buy is a brand decision, not a global one: a brand
+# on a 96-day lead time out of China cannot be held to the same ceiling as one
+# restocked locally in three weeks. The cap lives on `brand_logistics` next to
+# `lead_time` — the collection the plan already reads — so there is one place
+# per brand and no second source of truth to drift.
+
+
+class BrandCoverSetting(BaseModel):
+    max_cover_days: Optional[float] = Field(
+        None, ge=0, description="Days of cover an order may buy. Null clears the override."
+    )
+
+
+def _brand_settings_sync(db) -> List[Dict]:
+    """Every brand we could plan for, with its saved cap where it has one."""
+    logistics = {
+        (d.get("brand", "") or "").strip().lower(): d
+        for d in db.get_collection(BRAND_LOGISTICS).find({}, {"_id": 0})
+    }
+    brands = {
+        b.strip() for b in db.get_collection("products").distinct("brand") if b and b.strip()
+    }
+    brands.update((d.get("brand", "") or "").strip() for d in logistics.values())
+
+    rows = []
+    for brand in sorted(b for b in brands if b):
+        s = logistics.get(brand.lower(), {})
+        cap = s.get("max_cover_days")
+        rows.append({
+            "brand": brand,
+            "lead_time": _f(s.get("lead_time"), 60.0),
+            "max_cover_days": _f(cap) if cap is not None else None,
+            "has_override": cap is not None,
+        })
+    return rows
+
+
+@router.get("/brand-settings")
+async def list_brand_settings(db=Depends(get_database)):
+    """Per-brand lead time and order cover cap."""
+    rows = await asyncio.to_thread(_brand_settings_sync, db)
+    return JSONResponse(status_code=status.HTTP_200_OK, content={
+        "brands": rows,
+        "default_max_cover_days": DEFAULT_MAX_COVER_DAYS,
+        "with_override": sum(1 for r in rows if r["has_override"]),
+    })
+
+
+@router.put("/brand-settings/{brand}")
+async def set_brand_cover_days(
+    brand: str, body: BrandCoverSetting, db=Depends(get_database)
+):
+    """Save (or clear) a brand's order cover cap.
+
+    Upserts by brand so a brand with no logistics row yet can still carry a cap;
+    `$set`/`$unset` of this one field leaves `lead_time` and the safety-day
+    settings owned by the Brand Logistics page untouched.
+    """
+    name = brand.strip()
+    if not name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Brand is required")
+
+    update = (
+        {"$set": {"brand": name, "max_cover_days": body.max_cover_days}}
+        if body.max_cover_days is not None
+        else {"$set": {"brand": name}, "$unset": {"max_cover_days": ""}}
+    )
+
+    def _save():
+        db.get_collection(BRAND_LOGISTICS).update_one(
+            {"brand": {"$regex": f"^{_re.escape(name)}$", "$options": "i"}},
+            update,
+            upsert=True,
+        )
+        return db.get_collection(BRAND_LOGISTICS).find_one({"brand": name}, {"_id": 0})
+
+    saved = await asyncio.to_thread(_save)
+    return JSONResponse(status_code=status.HTTP_200_OK, content={
+        "brand": name,
+        "max_cover_days": (saved or {}).get("max_cover_days"),
+        "lead_time": _f((saved or {}).get("lead_time"), 60.0),
+    })
+
+
 # ─── Cash position ──────────────────────────────────────────────────────────────
 
 def _cash_position_sync(db) -> Dict:
@@ -459,6 +550,12 @@ def _cash_position_sync(db) -> Dict:
 
 OPEX_BREAKDOWN_LIMIT = 15
 
+# Spend already accounted for elsewhere in the working-capital picture, so
+# counting it as a running cost would charge it twice. Custom duty is part of
+# the landed cost of an inbound order and is shown per PO in the open
+# purchase-order commitment.
+OPEX_EXCLUDED_ACCOUNTS = ("Custom Duty",)
+
 
 def _monthly_opex_sync(db, start: datetime, end: datetime) -> Dict:
     """Average monthly operating outflow, measured over an explicit window.
@@ -468,15 +565,19 @@ def _monthly_opex_sync(db, start: datetime, end: datetime) -> Dict:
     burn figure. Transfers are excluded as internal movement.
 
     Also returns what the money went on. `offset_account_name` is the account
-    the spend was booked against — salaries, loan EMIs, duty, reimbursements —
-    which is the only field on the transaction that says *what* it was. It is
-    granular (127 distinct names over a 90-day window, largely one per payee),
-    so the biggest are listed individually and the tail is rolled into "Other".
+    the spend was booked against — salaries, loan EMIs, reimbursements — which
+    is the only field on the transaction that says *what* it was. It is granular
+    (127 distinct names over a 90-day window, largely one per payee), so the
+    biggest are listed individually and the tail is rolled into "Other".
+
+    `OPEX_EXCLUDED_ACCOUNTS` is left out entirely: that spend is already charged
+    against the open purchase-order commitment.
     """
     days = max(1, (end - start).days)
     match = {
         "transaction_date": {"$gte": start, "$lte": end},
         "transaction_type": {"$in": ["expense", "tds_payment"]},
+        "offset_account_name": {"$nin": list(OPEX_EXCLUDED_ACCOUNTS)},
     }
 
     rows = list(db.get_collection(BANK_TRANSACTIONS).aggregate([
@@ -529,6 +630,7 @@ def _monthly_opex_sync(db, start: datetime, end: datetime) -> Dict:
         "transactions_sampled": count,
         "breakdown": breakdown,
         "category_count": len(rows),
+        "excluded_accounts": list(OPEX_EXCLUDED_ACCOUNTS),
     }
 
 
@@ -846,6 +948,71 @@ def _payables_sync(db) -> Dict:
     }
 
 
+def _date_str(v) -> str:
+    """Brand-order dates are stored as `YYYY-MM-DD` strings or datetimes."""
+    if not v:
+        return ""
+    if isinstance(v, datetime):
+        return v.date().isoformat()
+    return str(v)[:10]
+
+
+# (label, amount field, date field, currency). Amounts on a brand order are not
+# all in the same currency: the supplier legs are in the PO's currency, the
+# landed-cost legs (duty, freight, service providers) are paid locally in INR.
+# See the payment report headers in routes/brand_orders.py.
+_BO_PAYMENT_LEGS = [
+    ("Advance payment", "advance_payment_amount", "advance_payment_date", "PO"),
+    ("Custom duty", "custom_duty", "custom_duty_due_date", "INR"),
+    ("Shipping charges", "shipping_charges", "shipping_charges_due_date", "INR"),
+    ("Balance payment", "balance_payment_amount", "balance_payment_date", "INR"),
+    ("Paid to supplier", "total_payment_made_to_supplier",
+     "total_payment_made_to_supplier_date", "PO"),
+]
+
+
+def _brand_order_payment_schedule(bo: Dict, po_ccy: str, fx_rate: float) -> List[Dict]:
+    """Dated payment legs recorded against a brand order, oldest date first.
+
+    Legs with neither an amount nor a date are dropped — a blank row on the
+    brand order says nothing. Undated legs are kept (the money is committed even
+    if the date has not been agreed) and sort last.
+    """
+    legs: List[Dict] = []
+    for label, amt_key, date_key, ccy_kind in _BO_PAYMENT_LEGS:
+        amount = _f(bo.get(amt_key))
+        date = _date_str(bo.get(date_key))
+        if amount <= 0 and not date:
+            continue
+        ccy = po_ccy if ccy_kind == "PO" else "INR"
+        rate = fx_rate if ccy_kind == "PO" else 1.0
+        legs.append({
+            "label": label,
+            "amount": round(amount, 2),
+            "currency_code": ccy,
+            "amount_inr": round(amount * rate, 2),
+            "date": date,
+        })
+
+    for vp in bo.get("vendor_payments") or []:
+        amount = _f(vp.get("amount"))
+        date = _date_str(vp.get("date"))
+        name = (vp.get("name") or "").strip()
+        if amount <= 0 and not date:
+            continue
+        legs.append({
+            "label": name or "Service provider",
+            "amount": round(amount, 2),
+            "currency_code": "INR",
+            "amount_inr": round(amount, 2),
+            "date": date,
+        })
+
+    # Undated legs last, dated legs chronologically.
+    legs.sort(key=lambda p: (p["date"] == "", p["date"]))
+    return legs
+
+
 def _open_po_commitment_sync(db, fx: Dict[str, float]) -> Dict:
     """Value still to be paid on issued purchase orders.
 
@@ -855,6 +1022,11 @@ def _open_po_commitment_sync(db, fx: Dict[str, float]) -> Dict:
 
     These are foreign-currency orders, so every row carries its own rate and the
     converted total is explicitly labelled rather than silently mixed.
+
+    Each row also carries the payment/milestone schedule the buyers maintain
+    against the order on `/brand_orders` (advance, custom duty, shipping,
+    balance, plus any ad-hoc vendor payments), so the commitment can be read as
+    "what is due, and when" rather than a single lump sum.
     """
     pos = list(
         db.get_collection(PURCHASE_ORDERS).find(
@@ -864,6 +1036,26 @@ def _open_po_commitment_sync(db, fx: Dict[str, float]) -> Dict:
              "line_items": 1, "_id": 0},
         ).sort([("date", 1), ("purchaseorder_number", 1)])
     )
+
+    po_numbers = [p.get("purchaseorder_number") for p in pos if p.get("purchaseorder_number")]
+    brand_orders = {
+        bo["purchaseorder_number"]: bo
+        for bo in db.get_collection(BRAND_ORDERS).find(
+            {"purchaseorder_number": {"$in": po_numbers}},
+            {"_id": 1, "purchaseorder_number": 1, "brand": 1, "name": 1,
+             "po_sub_total": 1, "po_due_date": 1,
+             "advance_payment_amount": 1, "advance_payment_date": 1,
+             "custom_duty": 1, "custom_duty_due_date": 1,
+             "shipping_charges": 1, "shipping_charges_due_date": 1,
+             "balance_payment_amount": 1, "balance_payment_date": 1,
+             "total_payment_made_to_supplier": 1,
+             "total_payment_made_to_supplier_date": 1,
+             "vendor_payments": 1,
+             "ready_date": 1, "etd_date": 1, "eta_port_date": 1,
+             "duty_payment_date": 1, "inward_date": 1},
+        )
+        if bo.get("purchaseorder_number")
+    }
 
     rows = []
     total_inr = 0.0
@@ -881,6 +1073,8 @@ def _open_po_commitment_sync(db, fx: Dict[str, float]) -> Dict:
             continue
         inr = open_val * rate
         total_inr += inr
+        bo = brand_orders.get(po.get("purchaseorder_number") or "") or {}
+        schedule = _brand_order_payment_schedule(bo, ccy, rate)
         rows.append({
             "purchaseorder_number": po.get("purchaseorder_number", ""),
             "vendor_name": po.get("vendor_name", "") or "",
@@ -890,10 +1084,126 @@ def _open_po_commitment_sync(db, fx: Dict[str, float]) -> Dict:
             "open_value_inr": round(inr, 2),
             "date": str(po.get("date", ""))[:10],
             "delivery_date": str(po.get("delivery_date", ""))[:10],
+            # From the brand order the buyers maintain against this PO.
+            "brand": bo.get("brand", "") or "",
+            "order_name": bo.get("name", "") or "",
+            "brand_order_id": str(bo["_id"]) if bo.get("_id") else "",
+            "po_due_date": _date_str(bo.get("po_due_date")),
+            "milestones": [
+                {"label": label, "date": d}
+                for label, d in (
+                    ("Ready", _date_str(bo.get("ready_date"))),
+                    ("ETD", _date_str(bo.get("etd_date"))),
+                    ("Port ETA", _date_str(bo.get("eta_port_date"))),
+                    ("Duty paid", _date_str(bo.get("duty_payment_date"))),
+                    ("Inward", _date_str(bo.get("inward_date"))),
+                )
+                if d
+            ],
+            "payment_schedule": schedule,
+            "scheduled_total_inr": round(sum(p["amount_inr"] for p in schedule), 2),
         })
 
     rows.sort(key=lambda r: -r["open_value_inr"])
     return {"purchase_orders": rows, "total_inr": round(total_inr, 2), "count": len(rows)}
+
+
+CREDIT_NOTES = "credit_notes"
+
+# A sale is not counted until it is a real document.
+SALES_EXCLUDED_STATUSES = ("void", "draft")
+
+
+def _last_3_months_range() -> tuple:
+    """The three most recent *complete* calendar months.
+
+    Same convention as `sheets_updater._last_3_months_range` so the two reports
+    never quote different "last 3 months". Complete months rather than a rolling
+    90 days because a part-month tail makes the average read low for no reason —
+    on 7 Aug that would be 3.2 months of sales divided by 3.
+    """
+    today = datetime.now()
+    end_dt = today.replace(day=1) - timedelta(days=1)
+    start_month, start_year = end_dt.month - 2, end_dt.year
+    if start_month <= 0:
+        start_month += 12
+        start_year -= 1
+    start_dt = end_dt.replace(year=start_year, month=start_month, day=1)
+    return start_dt, end_dt
+
+
+def _brand_sales_3m_sync(db) -> Dict:
+    """Invoiced sales per brand over the last three complete months, ex-GST.
+
+    Measured straight off the invoice ledger rather than reused from the report
+    period, because the report's date range is the user's to change and "last 3
+    months" has to mean last 3 months.
+
+    **The amounts are already ex-GST.** `line_items.item_total` sums exactly to
+    the invoice `sub_total`, with `tax_total` added on top to reach `total` —
+    verified across both `is_inclusive_tax` True and False invoices, where Zoho
+    back-calculates the line to its ex-tax amount. Stripping tax again here
+    would understate sales by the GST rate.
+    """
+    start_dt, end_dt = _last_3_months_range()
+    start_s, end_s = start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
+
+    def _by_item(collection: str, date_match: Dict) -> Dict[str, float]:
+        pipeline = [
+            {"$match": {**date_match, "status": {"$nin": list(SALES_EXCLUDED_STATUSES)}}},
+            {"$unwind": "$line_items"},
+            {"$group": {
+                "_id": "$line_items.item_id",
+                "amount": {"$sum": "$line_items.item_total"},
+            }},
+        ]
+        return {
+            str(r["_id"]): _f(r["amount"])
+            for r in db.get_collection(collection).aggregate(pipeline, allowDiskUse=True)
+            if r.get("_id")
+        }
+
+    # `invoices.date` is a 'YYYY-MM-DD' string; `credit_notes.date` is a real
+    # datetime. Same window, two different comparisons.
+    sales_by_item = _by_item(INVOICES, {"date": {"$gte": start_s, "$lte": end_s}})
+    returns_by_item = _by_item(
+        CREDIT_NOTES,
+        {"date": {"$gte": start_dt, "$lte": end_dt.replace(hour=23, minute=59, second=59)}},
+    )
+
+    item_ids = set(sales_by_item) | set(returns_by_item)
+    brand_by_item = {
+        str(p["item_id"]): (p.get("brand") or "").strip()
+        for p in db.get_collection("products").find(
+            {"item_id": {"$in": list(item_ids)}}, {"item_id": 1, "brand": 1, "_id": 0}
+        )
+        if p.get("item_id")
+    }
+
+    by_brand: Dict[str, Dict[str, float]] = {}
+    unmapped = 0.0
+    for item_id, amount in sales_by_item.items():
+        brand = brand_by_item.get(item_id)
+        if not brand:
+            unmapped += amount
+            continue
+        by_brand.setdefault(brand.lower(), {"gross": 0.0, "returns": 0.0})["gross"] += amount
+    for item_id, amount in returns_by_item.items():
+        brand = brand_by_item.get(item_id)
+        if not brand:
+            continue
+        by_brand.setdefault(brand.lower(), {"gross": 0.0, "returns": 0.0})["returns"] += amount
+
+    return {
+        "by_brand": by_brand,
+        "start_date": start_s,
+        "end_date": end_s,
+        "months": 3,
+        # Sales on items with no product row (services, adjustments, deleted
+        # SKUs). Reported so the brand totals never silently disagree with the
+        # ledger.
+        "unmapped_sales": round(unmapped, 2),
+    }
 
 
 def _fallback_unit_costs_sync(db, fx: Dict[str, float]) -> Dict[str, float]:
@@ -1199,6 +1509,8 @@ def _aggregate_brands(
     fallback_costs: Dict[str, float], fx: Dict[str, float],
     max_cover_days: Optional[int] = None,
     min_selling_days: int = DEFAULT_MIN_SELLING_DAYS,
+    period_days: int = 90,
+    sales_3m: Optional[Dict] = None,
 ) -> List[Dict]:
     """Roll master-report SKUs into brand rows priced per `_unit_cost_for`.
 
@@ -1228,17 +1540,29 @@ def _aggregate_brands(
         )
         # No sales at all is not "new", it is dead — that is the EXCESS path.
         is_new_brand = bool(has_sales and 0 < selling_days < min_selling_days)
+        # The cap is a per-brand decision saved on brand_logistics; the request
+        # parameter is only the default for brands that have not set one.
+        saved_cap = settings.get("max_cover_days")
+        base_cover_cap = int(_f(saved_cap)) if saved_cap is not None else max_cover_days
+        cover_cap_source = "brand" if saved_cap is not None else "default"
         # A launch DRR is a guess, so buy one lead time of cover at most: enough
         # not to stock out before a real reorder, by which point there is real
         # data to size it from.
         brand_cover_cap = (
-            min(max_cover_days or int(lead_time), int(lead_time))
+            min(base_cover_cap or int(lead_time), int(lead_time))
             if is_new_brand
-            else max_cover_days
+            else base_cover_cap
         )
+        if is_new_brand:
+            cover_cap_source = "new_brand"
 
         stock_units = transit_units = 0.0
         stock_value = transit_value = 0.0
+        wh_units = 0.0
+        wh_mrp_value = transit_mrp_value = 0.0
+        skus_missing_mrp = 0
+        net_units_sold = 0.0
+        gross_units_sold = credit_note_units = 0.0
         order_units = capital_required = 0.0
         suggested_units = suggested_capital = 0.0
         revenue = cogs_sold = 0.0
@@ -1269,6 +1593,20 @@ def _aggregate_brands(
             transit_value += transit * unit_cost
             revenue += _f(cm.get("total_amount"))
             cogs_sold += max(0.0, net_units) * unit_cost
+
+            # Retail-value view, Pupscribe warehouse only. `latest_zoho_stock` is
+            # the WH snapshot; `latest_total_stock` above also carries FBA, which
+            # is not in the warehouse and must not be counted here.
+            mrp = _f(it.get("mrp"))
+            wh_qty = _f(it.get("latest_zoho_stock"))
+            wh_units += wh_qty
+            wh_mrp_value += wh_qty * mrp
+            transit_mrp_value += transit * mrp
+            if mrp <= 0 and (wh_qty > 0 or transit > 0):
+                skus_missing_mrp += 1
+            net_units_sold += max(0.0, net_units)
+            gross_units_sold += _f(cm.get("total_units_sold"))
+            credit_note_units += _f(cm.get("total_credit_notes"))
 
             suggested_units += suggested_qty
             suggested_capital += suggested_qty * unit_cost
@@ -1321,6 +1659,37 @@ def _aggregate_brands(
         elif urgency == "EXCESS" and drr <= 0:
             cash_trapped = avg_inventory
 
+        # Sell-through DRR: net units over the *calendar* window, not over the
+        # days the SKU happened to be in stock. The master report's DRR answers
+        # "how fast does it sell when available", which is the right basis for
+        # sizing an order; this answers "how fast does the warehouse actually
+        # drain", which is the right basis for valuing what is sitting in it. A
+        # SKU in stock 10 days of 90 has a flattering days-in-stock DRR and would
+        # make the holding look like weeks of cover when it is months.
+        sell_through_drr = round(net_units_sold / period_days, 3) if period_days > 0 else 0.0
+        monthly_units = sell_through_drr * DAYS_PER_MONTH
+
+        def _months(units: float) -> Optional[float]:
+            # No sell-through means no meaningful answer — not "zero months".
+            if monthly_units <= 0:
+                return None
+            return round(units / monthly_units, 1)
+
+        wh_collection_value = wh_mrp_value / 2
+        transit_collection_value = transit_mrp_value / 2
+
+        # Average monthly sales over the last three complete calendar months,
+        # ex-GST — measured off the invoice ledger by `_brand_sales_3m_sync`,
+        # deliberately independent of the report's own date range so that
+        # "last 3 months" always means last 3 months. Returns come from actual
+        # credit notes, not from a per-unit estimate.
+        s3 = sales_3m.get(brand.lower(), {})
+        sales_3m_gross = _f(s3.get("gross"))
+        sales_3m_returns = _f(s3.get("returns"))
+        sales_3m_net = max(0.0, sales_3m_gross - sales_3m_returns)
+        avg_monthly_sales = sales_3m_gross / 3
+        avg_monthly_sales_net = sales_3m_net / 3
+
         sku_rows.sort(key=lambda r: -r["capital_required"])
 
         rows.append({
@@ -1354,6 +1723,35 @@ def _aggregate_brands(
             "is_new_brand": is_new_brand,
             "selling_days": round(selling_days, 0),
             "cover_cap_days": brand_cover_cap,
+            "cover_cap_source": cover_cap_source,
+
+            # ── Retail-value view (Pupscribe warehouse) ──────────────────────
+            "wh_units": round(wh_units, 0),
+            "wh_mrp_value": round(wh_mrp_value, 2),
+            "wh_collection_value": round(wh_collection_value, 2),
+            "transit_mrp_value": round(transit_mrp_value, 2),
+            "transit_collection_value": round(transit_collection_value, 2),
+            "total_mrp_value": round(wh_mrp_value + transit_mrp_value, 2),
+            "total_collection_value": round(wh_collection_value + transit_collection_value, 2),
+            "skus_missing_mrp": skus_missing_mrp,
+
+            # ── Sales, ex-GST ────────────────────────────────────────────────
+            "avg_monthly_sales_ex_gst": round(avg_monthly_sales, 2),
+            "avg_monthly_sales_net_ex_gst": round(avg_monthly_sales_net, 2),
+            "sales_3m_gross_ex_gst": round(sales_3m_gross, 2),
+            "sales_3m_returns_ex_gst": round(sales_3m_returns, 2),
+            "sales_3m_net_ex_gst": round(sales_3m_net, 2),
+
+            # ── Months of cover on measured sell-through ─────────────────────
+            "sell_through_drr": sell_through_drr,
+            "monthly_units": round(monthly_units, 1),
+            "monthly_mrp_value": round(
+                monthly_units * (wh_mrp_value / wh_units) if wh_units > 0 else 0.0, 2
+            ),
+            "months_in_warehouse": _months(wh_units),
+            "months_in_transit": _months(transit_units),
+            "months_total": _months(wh_units + transit_units),
+
             "urgency": urgency,
             "cash_trapped": round(cash_trapped, 2),
             "skus": sku_rows,
@@ -1514,11 +1912,12 @@ async def _brand_order_plan_data(
     collection_task = asyncio.to_thread(_collection_run_rate_sync, db, _win_start, _win_end)
     fallback_task = asyncio.to_thread(_fallback_unit_costs_sync, db, fx)
     behaviour_task = asyncio.to_thread(_expected_collections_sync, db, datetime.now())
+    sales_3m_task = asyncio.to_thread(_brand_sales_3m_sync, db)
 
     (master, cash, receivables, payables, open_pos, opex,
-     collection, fallback_costs, ar_behaviour) = await asyncio.gather(
+     collection, fallback_costs, ar_behaviour, sales_3m) = await asyncio.gather(
         master_task, cash_task, ar_task, ap_task, po_task, opex_task,
-        collection_task, fallback_task, behaviour_task
+        collection_task, fallback_task, behaviour_task, sales_3m_task
     )
 
     working_capital = _build_working_capital(
@@ -1552,8 +1951,11 @@ async def _brand_order_plan_data(
     reserve_total = sum(r["amount"] for r in reserves)
 
     items = master.get("combined_data", []) or []
+    period_days = max(1, (_win_end - _win_start).days)
     rows = _aggregate_brands(
-        items, brand_logistics, fallback_costs, fx, max_cover_days, min_selling_days
+        items, brand_logistics, fallback_costs, fx,
+        max_cover_days, min_selling_days, period_days,
+        sales_3m.get("by_brand", {}),
     )
     allocation = _allocate(rows, envelope, reserve_total)
 
@@ -1633,6 +2035,32 @@ async def _brand_order_plan_data(
         "horizon_days": horizon_projection["horizon_days"],
         "max_cover_days": max_cover_days,
         "min_selling_days": min_selling_days,
+        "period_days": period_days,
+        # Retail-value roll-up across every brand, for the page header.
+        "inventory_value": {
+            "wh_mrp_value": round(sum(r["wh_mrp_value"] for r in rows), 2),
+            "wh_collection_value": round(sum(r["wh_collection_value"] for r in rows), 2),
+            "transit_mrp_value": round(sum(r["transit_mrp_value"] for r in rows), 2),
+            "transit_collection_value": round(sum(r["transit_collection_value"] for r in rows), 2),
+            "total_mrp_value": round(sum(r["total_mrp_value"] for r in rows), 2),
+            "total_collection_value": round(sum(r["total_collection_value"] for r in rows), 2),
+            "wh_units": round(sum(r["wh_units"] for r in rows), 0),
+            "skus_missing_mrp": sum(r["skus_missing_mrp"] for r in rows),
+            "sales_3m_gross_ex_gst": round(sum(r["sales_3m_gross_ex_gst"] for r in rows), 2),
+            "sales_3m_net_ex_gst": round(sum(r["sales_3m_net_ex_gst"] for r in rows), 2),
+            "avg_monthly_sales_ex_gst": round(
+                sum(r["avg_monthly_sales_ex_gst"] for r in rows), 2
+            ),
+            "avg_monthly_sales_net_ex_gst": round(
+                sum(r["avg_monthly_sales_net_ex_gst"] for r in rows), 2
+            ),
+            "sales_window": {
+                "start_date": sales_3m.get("start_date", ""),
+                "end_date": sales_3m.get("end_date", ""),
+                "months": sales_3m.get("months", 3),
+            },
+            "unmapped_sales": sales_3m.get("unmapped_sales", 0.0),
+        },
         "allocation": allocation,
         "new_brand_reserves": reserves,
         "brands": rows,
@@ -1809,6 +2237,21 @@ def _build_plan_xlsx(data: Dict) -> bytes:
          alloc.get("capped_capital", 0.0)),
         (f"New brands held for review (< {data.get('min_selling_days')} days selling), indicative",
          alloc.get("new_brands_indicative", 0.0)),
+    ) + tuple(
+        (label, (data.get("inventory_value") or {}).get(key, 0.0))
+        for label, key in (
+            ("— Warehouse stock at MRP", "wh_mrp_value"),
+            ("— Warehouse collection value (MRP ÷ 2)", "wh_collection_value"),
+            ("— In-transit stock at MRP", "transit_mrp_value"),
+            ("— In-transit collection value (MRP ÷ 2)", "transit_collection_value"),
+            (
+                "— Avg monthly sales, ex-GST ("
+                + f"{(data.get('inventory_value') or {}).get('sales_window', {}).get('start_date', '')} to "
+                + f"{(data.get('inventory_value') or {}).get('sales_window', {}).get('end_date', '')})",
+                "avg_monthly_sales_ex_gst",
+            ),
+            ("— Avg monthly sales net of returns, ex-GST", "avg_monthly_sales_net_ex_gst"),
+        )
     ):
         ws.cell(row=r, column=1, value=label)
         ws.cell(row=r, column=2, value=val).number_format = _MONEY
@@ -1843,7 +2286,12 @@ def _build_plan_xlsx(data: Dict) -> bytes:
     ws2 = wb.create_sheet("Brand Plan")
     headers = [
         "Priority", "Brand", "Urgency", "Recommendation", "Lead Time",
-        "Days Selling", "DRR", "On Hand", "In Transit", "Days Coverage",
+        "Cover Cap (days)", "Days Selling", "DRR", "On Hand", "In Transit", "Days Coverage",
+        "WH Units", "WH MRP Value", "WH Collection Value",
+        "Transit MRP Value", "Transit Collection Value",
+        "Sell-through DRR", "Months in WH", "Months in Transit",
+        "Avg Monthly Sales, last 3 months (ex-GST)",
+        "Avg Monthly Sales Net of Returns (ex-GST)",
         "Inventory at Cost", "Revenue", "Gross Margin", "Margin %", "GMROI",
         "SKUs to Order", "Suggested Units", "Order Units (capped)", "Units Trimmed",
         "Capital Required", "Funded Amount", "Funded %", "Cash Trapped",
@@ -1852,9 +2300,13 @@ def _build_plan_xlsx(data: Dict) -> bytes:
     for i, b in enumerate(data["brands"], start=2):
         vals = [
             b.get("priority"), b["brand"], b["urgency"], b["recommendation"],
-            b["lead_time"], b.get("selling_days"), b["drr"],
-            b["on_hand_units"], b["in_transit_units"],
-            b["current_days_coverage"], b["inventory_at_cost"], b["revenue"],
+            b["lead_time"], b.get("cover_cap_days"), b.get("selling_days"), b["drr"],
+            b["on_hand_units"], b["in_transit_units"], b["current_days_coverage"],
+            b.get("wh_units"), b.get("wh_mrp_value"), b.get("wh_collection_value"),
+            b.get("transit_mrp_value"), b.get("transit_collection_value"),
+            b.get("sell_through_drr"), b.get("months_in_warehouse"), b.get("months_in_transit"),
+            b.get("avg_monthly_sales_ex_gst"), b.get("avg_monthly_sales_net_ex_gst"),
+            b["inventory_at_cost"], b["revenue"],
             b["gross_margin"], b["margin_pct"], b["gmroi"], b["skus_to_order"],
             b.get("suggested_units", b["order_units"]), b["order_units"],
             b.get("capped_units", 0), b["capital_required"], b["funded_amount"],
@@ -1863,11 +2315,15 @@ def _build_plan_xlsx(data: Dict) -> bytes:
         for col, v in enumerate(vals, start=1):
             c = ws2.cell(row=i, column=col, value=v)
             c.border = _THIN
-            if col in (11, 12, 13, 20, 21, 23):
+            if col in (13, 14, 15, 16, 20, 21, 22, 23, 24, 31, 32, 34):
                 c.number_format = _MONEY
         ws2.cell(row=i, column=3).fill = _URGENCY_FILL.get(b["urgency"], PatternFill())
     ws2.freeze_panes = "C2"
-    _autosize(ws2, [9, 22, 11, 16, 11, 12, 9, 11, 11, 14, 18, 16, 16, 10, 9, 13, 15, 18, 13, 18, 16, 11, 16])
+    _autosize(ws2, [
+        9, 22, 11, 16, 11, 15, 12, 9, 11, 11, 14,
+        11, 16, 18, 17, 20, 15, 13, 15, 20, 24,
+        18, 16, 16, 10, 9, 13, 15, 18, 13, 18, 16, 11, 16,
+    ])
 
     # ── Sheet 3: SKU detail for funded brands ───────────────────────────────
     ws3 = wb.create_sheet("SKU Detail")
