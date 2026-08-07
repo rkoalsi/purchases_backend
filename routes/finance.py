@@ -919,32 +919,78 @@ def _receivables_sync(db) -> Dict:
 
 
 def _payables_sync(db) -> Dict:
+    """Unpaid bills, with **when** each one falls due.
+
+    A single "to pay" total is not actionable — ₹38L due next week and ₹38L due
+    next quarter are different problems. Every bill keeps its due date, vendors
+    carry their next due date and how much of their balance is already overdue,
+    and the whole list is returned so the page can show what sits behind the
+    number.
+    """
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     buckets = _empty_buckets()
-    by_vendor: Dict[str, float] = {}
+    by_vendor: Dict[str, Dict] = {}
+    bills: List[Dict] = []
 
     cursor = db.get_collection(BILLS).find(
         {"status": {"$in": list(AP_STATUSES)}},
-        {"vendor_name": 1, "bill_number": 1, "balance": 1,
-         "due_date": 1, "status": 1, "_id": 0},
+        {"vendor_name": 1, "bill_number": 1, "balance": 1, "total": 1,
+         "due_date": 1, "date": 1, "status": 1, "_id": 0},
     )
     for bill in cursor:
         bal = _f(bill.get("balance"))
         if bal <= 0:
             continue
-        buckets[_bucket_for(_parse_date(bill.get("due_date")), today)] += bal
+        due = _parse_date(bill.get("due_date"))
+        bucket = _bucket_for(due, today)
+        buckets[bucket] += bal
+        # No due date is treated as due now by `_bucket_for`; keep that honest
+        # here too rather than showing it as far-off.
+        days = (due - today).days if due else 0
         name = bill.get("vendor_name", "") or "Unknown"
-        by_vendor[name] = by_vendor.get(name, 0.0) + bal
 
-    top = sorted(
-        ({"vendor_name": k, "balance": round(v, 2)} for k, v in by_vendor.items()),
-        key=lambda r: -r["balance"],
-    )[:20]
+        bills.append({
+            "vendor_name": name,
+            "bill_number": bill.get("bill_number", "") or "",
+            "balance": round(bal, 2),
+            "total": round(_f(bill.get("total")), 2),
+            "bill_date": _date_str(bill.get("date")),
+            "due_date": _date_str(bill.get("due_date")),
+            "days_until_due": days,
+            "is_overdue": days < 0,
+            "bucket": bucket,
+            "status": bill.get("status", "") or "",
+        })
+
+        v = by_vendor.setdefault(name, {
+            "vendor_name": name, "balance": 0.0, "bill_count": 0,
+            "overdue": 0.0, "next_due_date": "", "_next": None,
+        })
+        v["balance"] += bal
+        v["bill_count"] += 1
+        if days < 0:
+            v["overdue"] += bal
+        # Soonest unpaid date is the one that matters for "when must I pay".
+        if due and (v["_next"] is None or due < v["_next"]):
+            v["_next"] = due
+            v["next_due_date"] = _date_str(bill.get("due_date"))
+
+    for v in by_vendor.values():
+        v.pop("_next", None)
+        v["balance"] = round(v["balance"], 2)
+        v["overdue"] = round(v["overdue"], 2)
+
+    top = sorted(by_vendor.values(), key=lambda r: -r["balance"])[:20]
+    bills.sort(key=lambda b: (b["due_date"] == "", b["due_date"]))
 
     return {
         "buckets": {k: round(v, 2) for k, v in buckets.items()},
         "total": round(sum(buckets.values()), 2),
         "top_vendors": top,
+        "bills": bills,
+        "bill_count": len(bills),
+        "overdue_total": round(sum(b["balance"] for b in bills if b["is_overdue"]), 2),
+        "no_due_date_total": round(sum(b["balance"] for b in bills if not b["due_date"]), 2),
     }
 
 
@@ -1500,6 +1546,124 @@ async def get_working_capital(
         "days": (window_end - window_start).days,
     }
     return JSONResponse(status_code=status.HTTP_200_OK, content=payload)
+
+
+def _build_open_pos_xlsx(open_pos: Dict, fx_meta: Dict) -> bytes:
+    """Open POs, their milestones, and every payment leg behind them."""
+    wb = openpyxl.Workbook()
+
+    ws = wb.active
+    ws.title = "Open POs"
+    ws["A1"] = "Open Purchase Orders"
+    ws["A1"].font = Font(bold=True, size=16, color="1F3864")
+    applied = (fx_meta or {}).get("applied") or {}
+    ws["A2"] = (
+        f"{open_pos.get('count', 0)} open order(s) · "
+        f"₹{open_pos.get('total_inr', 0):,.0f} still to be received · "
+        f"converted at USD {applied.get('USD', 'n/a')} / CNY {applied.get('CNY', 'n/a')} · "
+        f"generated {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    ws["A2"].font = Font(italic=True, size=9, color="666666")
+
+    milestone_labels = ["Ready", "ETD", "Port ETA", "Duty paid", "Inward"]
+    headers = [
+        "PO Number", "Brand", "Order Name", "Vendor", "PO Date", "PO Due Date",
+        "Currency", "Open Value", "FX Rate", "Open Value (INR)",
+        "Scheduled Payments (INR)", *milestone_labels,
+    ]
+    _write_header(ws, headers, row=4)
+
+    r = 5
+    for po in open_pos.get("purchase_orders", []):
+        by_label = {m["label"]: m["date"] for m in po.get("milestones", [])}
+        values = [
+            po.get("purchaseorder_number", ""), po.get("brand", ""),
+            po.get("order_name", ""), po.get("vendor_name", ""),
+            po.get("date", ""), po.get("po_due_date", ""),
+            po.get("currency_code", ""), po.get("open_value", 0),
+            po.get("fx_rate", 0), po.get("open_value_inr", 0),
+            po.get("scheduled_total_inr", 0),
+            *[by_label.get(label, "") for label in milestone_labels],
+        ]
+        for col, v in enumerate(values, start=1):
+            c = ws.cell(row=r, column=col, value=v)
+            c.border = _THIN
+            if col in (8, 10, 11):
+                c.number_format = _MONEY
+        r += 1
+
+    total_row = r
+    ws.cell(row=total_row, column=1, value="Total").font = Font(bold=True)
+    for col in (10, 11):
+        c = ws.cell(
+            row=total_row, column=col,
+            value=f"=SUM({get_column_letter(col)}5:{get_column_letter(col)}{r - 1})" if r > 5 else 0,
+        )
+        c.font = Font(bold=True)
+        c.number_format = _MONEY
+
+    _autosize(ws, [16, 16, 26, 30, 12, 13, 10, 14, 10, 18, 22, 12, 12, 12, 12, 12])
+    ws.freeze_panes = "A5"
+
+    # ── Payment schedule: one row per leg, so it can be sorted by date ───────
+    ws2 = wb.create_sheet("Payment Schedule")
+    _write_header(ws2, [
+        "Due Date", "PO Number", "Brand", "Vendor", "Payment",
+        "Amount", "Currency", "Amount (INR)",
+    ])
+    legs = [
+        (leg, po)
+        for po in open_pos.get("purchase_orders", [])
+        for leg in po.get("payment_schedule", [])
+    ]
+    # Undated legs last — the money is committed but the date is not agreed.
+    legs.sort(key=lambda t: (t[0].get("date", "") == "", t[0].get("date", "")))
+    row = 2
+    for leg, po in legs:
+        values = [
+            leg.get("date", "") or "(no date)", po.get("purchaseorder_number", ""),
+            po.get("brand", ""), po.get("vendor_name", ""), leg.get("label", ""),
+            leg.get("amount", 0), leg.get("currency_code", ""), leg.get("amount_inr", 0),
+        ]
+        for col, v in enumerate(values, start=1):
+            c = ws2.cell(row=row, column=col, value=v)
+            c.border = _THIN
+            if col in (6, 8):
+                c.number_format = _MONEY
+        row += 1
+    _autosize(ws2, [13, 16, 16, 30, 26, 16, 10, 16])
+    ws2.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@router.get("/open-purchase-orders/download")
+async def download_open_purchase_orders(
+    usd_inr: Optional[float] = Query(None, gt=0),
+    cny_inr: Optional[float] = Query(None, gt=0),
+    db=Depends(get_database),
+):
+    """Open POs as a workbook: one sheet per PO, one row per payment leg."""
+    fx_resolved = await _resolve_fx(usd_inr, cny_inr)
+    try:
+        open_pos = await asyncio.to_thread(_open_po_commitment_sync, db, fx_resolved["rates"])
+        content = await asyncio.to_thread(_build_open_pos_xlsx, open_pos, fx_resolved["meta"])
+    except Exception as e:
+        logger.error(f"open-purchase-orders download failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to build workbook: {e}",
+        )
+
+    filename = f"open_purchase_orders_{datetime.now().strftime('%Y%m%d')}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/cashflow")
