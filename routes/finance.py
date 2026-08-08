@@ -1151,7 +1151,36 @@ def _open_po_commitment_sync(db, fx: Dict[str, float]) -> Dict:
         })
 
     rows.sort(key=lambda r: -r["open_value_inr"])
-    return {"purchase_orders": rows, "total_inr": round(total_inr, 2), "count": len(rows)}
+
+    # Landed cost still to be paid on these orders. Duty only, deliberately:
+    #
+    # * The supplier legs (advance / balance / paid-to-supplier) are payment for
+    #   the same goods already valued above, and on some orders they are
+    #   recorded twice over — PO-DOGFEST015 carries Advance ₹33.8L *and* Paid to
+    #   supplier ₹33.8L for one payment. Summing the schedule double-counts.
+    # * Shipping is excluded because freight vendors raise real bills that are
+    #   already in payables (Shri Swami Samarth Shipping, ₹2.8L open today), so
+    #   charging it here would count it twice.
+    #
+    # Duty has neither problem: it is paid to customs, appears in no open bill,
+    # and is excluded from opex by OPEX_EXCLUDED_ACCOUNTS.
+    duty_inr = 0.0
+    for row in rows:
+        row["duty_inr"] = round(sum(
+            leg["amount_inr"] for leg in row.get("payment_schedule", [])
+            if "duty" in leg["label"].lower()
+        ), 2)
+        duty_inr += row["duty_inr"]
+
+    return {
+        "purchase_orders": rows,
+        "goods_inr": round(total_inr, 2),
+        "duty_inr": round(duty_inr, 2),
+        # What the cash bridge charges: unreceived goods plus the duty owed on
+        # them. Named `total_inr` because that is the committed outflow.
+        "total_inr": round(total_inr + duty_inr, 2),
+        "count": len(rows),
+    }
 
 
 CREDIT_NOTES = "credit_notes"
@@ -1352,6 +1381,85 @@ def _transit_arrivals_sync(db) -> Dict[str, List[Dict]]:
     return by_brand
 
 
+def _brand_origin_sync(db) -> Dict[str, Dict]:
+    """Where each brand is bought from, and whether that is overseas.
+
+    An imported brand cannot be reordered at short notice, so when cash is
+    short it has to be funded ahead of one that can be topped up locally — by
+    the time a domestic brand runs low there is still time to act, and by the
+    time an imported one does there is not.
+
+    Primary source is the `brands` collection's `vendor_id` → `vendors`
+    (`country_code` / `currency_code`). That mapping is missing for some brands
+    (Truelove and Zippy Paws today), so the fallback is the currency actually
+    used on their most recent purchase orders — a PO raised in USD or CNY is an
+    import whatever the mapping says.
+    """
+    vendors = {
+        v["vendor_id"]: v
+        for v in db.get_collection("vendors").find(
+            {}, {"vendor_id": 1, "vendor_name": 1, "currency_code": 1,
+                 "country_code": 1, "billing_address": 1, "_id": 0},
+        )
+        if v.get("vendor_id")
+    }
+
+    origins: Dict[str, Dict] = {}
+    for b in db.get_collection("brands").find({}, {"name": 1, "vendor_id": 1, "_id": 0}):
+        name = (b.get("name") or "").strip()
+        if not name:
+            continue
+        v = vendors.get(b.get("vendor_id")) or {}
+        country = (
+            v.get("country_code")
+            or (v.get("billing_address") or {}).get("country")
+            or ""
+        ).strip()
+        currency = (v.get("currency_code") or "").strip().upper()
+        if not v:
+            continue
+        is_overseas = bool(currency and currency != "INR") or (
+            bool(country) and country.lower() not in ("india", "in")
+        )
+        origins[name.lower()] = {
+            "vendor_name": v.get("vendor_name", "") or "",
+            "vendor_country": country or ("India" if currency == "INR" else ""),
+            "vendor_currency": currency,
+            "is_overseas": is_overseas,
+            "origin_source": "vendor_mapping",
+        }
+
+    # Fallback for brands with no usable vendor mapping.
+    item_brand = {
+        str(p["item_id"]): (p.get("brand") or "").strip()
+        for p in db.get_collection("products").find(
+            {"item_id": {"$exists": True}}, {"item_id": 1, "brand": 1, "_id": 0}
+        )
+        if p.get("item_id") and (p.get("brand") or "").strip()
+    }
+    seen: Dict[str, Dict] = {}
+    for po in db.get_collection(PURCHASE_ORDERS).find(
+        {}, {"currency_code": 1, "vendor_name": 1, "date": 1, "line_items.item_id": 1, "_id": 0}
+    ).sort([("date", -1)]):
+        ccy = (po.get("currency_code") or "INR").upper()
+        for li in po.get("line_items", []):
+            brand = item_brand.get(str(li.get("item_id")))
+            if not brand:
+                continue
+            key = brand.lower()
+            if key in origins or key in seen:
+                continue
+            seen[key] = {
+                "vendor_name": po.get("vendor_name", "") or "",
+                "vendor_country": "" if ccy == "INR" else "",
+                "vendor_currency": ccy,
+                "is_overseas": ccy != "INR",
+                "origin_source": "purchase_orders",
+            }
+    origins.update(seen)
+    return origins
+
+
 def _fallback_unit_costs_sync(db, fx: Dict[str, float]) -> Dict[str, float]:
     """Latest purchase-order rate per SKU, in INR.
 
@@ -1549,7 +1657,15 @@ async def get_working_capital(
 
 
 def _build_open_pos_xlsx(open_pos: Dict, fx_meta: Dict) -> bytes:
-    """Open POs, their milestones, and every payment leg behind them."""
+    """Open POs, their milestones and their payment legs — one row per PO.
+
+    The payment legs are spread across columns (the same legs the expanded row
+    on the working-capital page shows: advance, custom duty, shipping, balance,
+    paid to supplier) so a PO stays a single row and nothing has to be looked up
+    on a second sheet. Each leg carries its own amount, its INR equivalent and
+    its date, because the supplier legs are in the PO currency (USD/CNY) while
+    duty and shipping are paid locally in INR.
+    """
     wb = openpyxl.Workbook()
 
     ws = wb.active
@@ -1566,35 +1682,79 @@ def _build_open_pos_xlsx(open_pos: Dict, fx_meta: Dict) -> bytes:
     ws["A2"].font = Font(italic=True, size=9, color="666666")
 
     milestone_labels = ["Ready", "ETD", "Port ETA", "Duty paid", "Inward"]
+    leg_labels = [label for label, *_ in _BO_PAYMENT_LEGS]  # fixed legs, UI order
     headers = [
         "PO Number", "Brand", "Order Name", "Vendor", "PO Date", "PO Due Date",
         "Currency", "Open Value", "FX Rate", "Open Value (INR)",
+    ]
+    for label, _amt_key, _date_key, ccy_kind in _BO_PAYMENT_LEGS:
+        native = f"{label} Amount ({'PO Ccy' if ccy_kind == 'PO' else 'INR'})"
+        headers += [native, f"{label} (INR)", f"{label} Date"]
+    headers += [
+        "Other Payments (INR)", "Other Payments Detail",
         "Scheduled Payments (INR)", *milestone_labels,
     ]
     _write_header(ws, headers, row=4)
 
+    leg_start = 11                                   # first leg amount column
+    other_col = leg_start + 3 * len(leg_labels)      # Other Payments (INR)
+    scheduled_col = other_col + 2
+    # Amount columns get the money format: open value, INR, every leg amount +
+    # its INR twin, the ad-hoc total and the scheduled total.
+    money_cols = {8, 10, other_col, scheduled_col}
+    for i in range(len(leg_labels)):
+        money_cols.update({leg_start + 3 * i, leg_start + 3 * i + 1})
+    # Only rupee columns are totalled — native amounts are a mix of USD and CNY
+    # across rows, so a column sum of them would be meaningless.
+    total_cols = {10, other_col, scheduled_col}
+    total_cols.update(leg_start + 3 * i + 1 for i in range(len(leg_labels)))
+
     r = 5
     for po in open_pos.get("purchase_orders", []):
         by_label = {m["label"]: m["date"] for m in po.get("milestones", [])}
+        schedule = po.get("payment_schedule", [])
+        by_leg = {leg.get("label"): leg for leg in schedule}
+
+        leg_values: List = []
+        for label in leg_labels:
+            leg = by_leg.get(label) or {}
+            leg_values += [
+                leg.get("amount", 0) or 0,      # in the leg's own currency (col G / INR)
+                leg.get("amount_inr", 0) or 0,
+                leg.get("date", "") or "",
+            ]
+
+        # Ad-hoc vendor payments (service providers) have no fixed column —
+        # summarised inline so the sheet stays one row per PO.
+        others = [leg for leg in schedule if leg.get("label") not in leg_labels]
+        other_total = round(sum(leg.get("amount_inr", 0) or 0 for leg in others), 2)
+        other_detail = "; ".join(
+            f"{leg.get('label', '')} ₹{leg.get('amount_inr', 0):,.0f}"
+            + (f" ({leg.get('date')})" if leg.get("date") else "")
+            for leg in others
+        )
+
         values = [
             po.get("purchaseorder_number", ""), po.get("brand", ""),
             po.get("order_name", ""), po.get("vendor_name", ""),
             po.get("date", ""), po.get("po_due_date", ""),
             po.get("currency_code", ""), po.get("open_value", 0),
             po.get("fx_rate", 0), po.get("open_value_inr", 0),
+            *leg_values,
+            other_total, other_detail,
             po.get("scheduled_total_inr", 0),
             *[by_label.get(label, "") for label in milestone_labels],
         ]
         for col, v in enumerate(values, start=1):
             c = ws.cell(row=r, column=col, value=v)
             c.border = _THIN
-            if col in (8, 10, 11):
+            if col in money_cols:
                 c.number_format = _MONEY
         r += 1
 
     total_row = r
     ws.cell(row=total_row, column=1, value="Total").font = Font(bold=True)
-    for col in (10, 11):
+    for col in sorted(total_cols):
         c = ws.cell(
             row=total_row, column=col,
             value=f"=SUM({get_column_letter(col)}5:{get_column_letter(col)}{r - 1})" if r > 5 else 0,
@@ -1602,37 +1762,11 @@ def _build_open_pos_xlsx(open_pos: Dict, fx_meta: Dict) -> bytes:
         c.font = Font(bold=True)
         c.number_format = _MONEY
 
-    _autosize(ws, [16, 16, 26, 30, 12, 13, 10, 14, 10, 18, 22, 12, 12, 12, 12, 12])
+    widths = [16, 16, 26, 30, 12, 13, 10, 14, 10, 18]
+    widths += [14, 16, 13] * len(leg_labels)
+    widths += [18, 34, 22] + [12] * len(milestone_labels)
+    _autosize(ws, widths)
     ws.freeze_panes = "A5"
-
-    # ── Payment schedule: one row per leg, so it can be sorted by date ───────
-    ws2 = wb.create_sheet("Payment Schedule")
-    _write_header(ws2, [
-        "Due Date", "PO Number", "Brand", "Vendor", "Payment",
-        "Amount", "Currency", "Amount (INR)",
-    ])
-    legs = [
-        (leg, po)
-        for po in open_pos.get("purchase_orders", [])
-        for leg in po.get("payment_schedule", [])
-    ]
-    # Undated legs last — the money is committed but the date is not agreed.
-    legs.sort(key=lambda t: (t[0].get("date", "") == "", t[0].get("date", "")))
-    row = 2
-    for leg, po in legs:
-        values = [
-            leg.get("date", "") or "(no date)", po.get("purchaseorder_number", ""),
-            po.get("brand", ""), po.get("vendor_name", ""), leg.get("label", ""),
-            leg.get("amount", 0), leg.get("currency_code", ""), leg.get("amount_inr", 0),
-        ]
-        for col, v in enumerate(values, start=1):
-            c = ws2.cell(row=row, column=col, value=v)
-            c.border = _THIN
-            if col in (6, 8):
-                c.number_format = _MONEY
-        row += 1
-    _autosize(ws2, [13, 16, 16, 30, 26, 16, 10, 16])
-    ws2.freeze_panes = "A2"
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1646,7 +1780,7 @@ async def download_open_purchase_orders(
     cny_inr: Optional[float] = Query(None, gt=0),
     db=Depends(get_database),
 ):
-    """Open POs as a workbook: one sheet per PO, one row per payment leg."""
+    """Open POs as a single-sheet workbook: one row per PO, payment legs inline."""
     fx_resolved = await _resolve_fx(usd_inr, cny_inr)
     try:
         open_pos = await asyncio.to_thread(_open_po_commitment_sync, db, fx_resolved["rates"])
@@ -1746,6 +1880,11 @@ def _unit_cost_for(
     return 0.0, "none"
 
 
+# Statuses the master report refuses to raise an order for. Kept here too so
+# the plan can say *why* a SKU shows no quantity rather than leaving a silent 0.
+NON_ORDERABLE_STATUSES = ("inactive", "discontinued until stock lasts")
+
+
 def _cap_order_qty(
     order_qty: float, drr: float, on_hand: float, in_transit: float,
     max_cover_days: Optional[int],
@@ -1776,6 +1915,7 @@ def _aggregate_brands(
     period_days: int = 90,
     sales_3m: Optional[Dict] = None,
     transit_arrivals: Optional[Dict] = None,
+    origins: Optional[Dict] = None,
 ) -> List[Dict]:
     """Roll master-report SKUs into brand rows priced per `_unit_cost_for`.
 
@@ -1791,6 +1931,10 @@ def _aggregate_brands(
     for brand, group in by_brand.items():
         settings = brand_logistics.get(brand.lower(), {})
         lead_time = _f(settings.get("lead_time"), 60.0)
+        origin = (origins or {}).get(brand.lower()) or {
+            "vendor_name": "", "vendor_country": "", "vendor_currency": "",
+            "is_overseas": False, "origin_source": "unknown",
+        }
 
         # How long the brand has actually been selling: the longest-running SKU
         # in it. Max, not average — one new SKU inside an established brand does
@@ -1828,6 +1972,8 @@ def _aggregate_brands(
         skus_missing_mrp = 0
         net_units_sold = 0.0
         gross_units_sold = credit_note_units = 0.0
+        skus_not_orderable = 0
+        status_counts: Dict[str, int] = {}
         order_units = capital_required = 0.0
         suggested_units = suggested_capital = 0.0
         revenue = cogs_sold = 0.0
@@ -1847,8 +1993,18 @@ def _aggregate_brands(
             suggested_qty = _f(it.get("order_qty_plus_extra_qty_rounded"))
             net_units = _f(cm.get("total_sales"))
             sku_drr = _f(cm.get("avg_daily_run_rate"))
+            sku_status = (it.get("purchase_status") or "").strip()
+
+            # The cap is a *holding* limit — "never sit on more than N days of
+            # stock" — so it has to divide by calendar sell-through, not by
+            # master's days-in-stock DRR. Against the inflated DRR a 110-day cap
+            # was letting Zippy Paws buy 287 real days of cover. Where a SKU was
+            # out of stock for much of the window the two diverge sharply, so
+            # the lower of the pair applies.
+            sku_sell_through = max(0.0, net_units) / period_days if period_days > 0 else 0.0
+            cap_drr = min(sku_drr, sku_sell_through) if sku_sell_through > 0 else sku_drr
             order_qty = _cap_order_qty(
-                suggested_qty, sku_drr, on_hand, transit, brand_cover_cap
+                suggested_qty, cap_drr, on_hand, transit, brand_cover_cap
             )
 
             drr += sku_drr
@@ -1872,6 +2028,9 @@ def _aggregate_brands(
             net_units_sold += max(0.0, net_units)
             gross_units_sold += _f(cm.get("total_units_sold"))
             credit_note_units += _f(cm.get("total_credit_notes"))
+            if sku_status in NON_ORDERABLE_STATUSES:
+                skus_not_orderable += 1
+                status_counts[sku_status] = status_counts.get(sku_status, 0) + 1
 
             suggested_units += suggested_qty
             suggested_capital += suggested_qty * unit_cost
@@ -1904,6 +2063,12 @@ def _aggregate_brands(
                 "capped_units": round(max(0.0, suggested_qty - order_qty), 0),
                 "capital_required": round(order_qty * unit_cost, 2),
                 "excess_or_order": it.get("excess_or_order", ""),
+                # Carried so a zero quantity can say why. A discontinued SKU and
+                # a well-stocked one both show 0, for completely different
+                # reasons, and the buyer has to be able to tell them apart.
+                "purchase_status": sku_status,
+                "orderable": sku_status not in NON_ORDERABLE_STATUSES,
+                "sell_through_drr": round(sku_sell_through, 3),
             })
 
         coverage = round((stock_units + transit_units) / drr, 1) if drr > 0 else 0.0
@@ -1948,10 +2113,31 @@ def _aggregate_brands(
         # past is flagged rather than quietly shown as "coming".
         arrivals = (transit_arrivals or {}).get(brand.lower(), [])
         today = datetime.now().date()
+        # An ETA in the past is not "late stock", it is a date nobody updated —
+        # the goods have either landed and the PO was not received in, or the
+        # shipment slipped and the brand order was never corrected. Either way
+        # the number below it cannot be trusted, so it is called out separately
+        # from stock that simply has no date at all.
+        stale_units = stale_value = 0.0
+        no_eta_units = no_eta_value = 0.0
+        stale_legs = no_eta_legs = 0
+        max_days_stale = 0
         for leg in arrivals:
             eta = _parse_date(leg.get("eta_date"))
             leg["days_away"] = (eta.date() - today).days if eta else None
             leg["is_overdue"] = bool(eta and eta.date() < today)
+            leg["is_stale"] = leg["is_overdue"]
+            leg["days_stale"] = -leg["days_away"] if leg["is_overdue"] else 0
+            leg["has_eta"] = bool(eta)
+            if leg["is_stale"]:
+                stale_legs += 1
+                stale_units += leg["units"]
+                stale_value += leg["mrp_value"]
+                max_days_stale = max(max_days_stale, leg["days_stale"])
+            elif not eta:
+                no_eta_legs += 1
+                no_eta_units += leg["units"]
+                no_eta_value += leg["mrp_value"]
         next_arrival = next((leg for leg in arrivals if leg.get("eta_date")), None)
 
         # Average monthly sales over the last three complete calendar months,
@@ -2024,11 +2210,36 @@ def _aggregate_brands(
             "monthly_mrp_value": round(
                 monthly_units * (wh_mrp_value / wh_units) if wh_units > 0 else 0.0, 2
             ),
+            # Cover if nothing else arrives. `current_days_coverage` counts
+            # in-transit stock as though it were on the shelf, which can read as
+            # comfortable while the warehouse is nearly empty.
+            "on_hand_days_coverage": round(stock_units / drr, 1) if drr > 0 else 0.0,
+            # How much of the brand's DRR is stock-out inflation: master divides
+            # by days in stock, so a SKU available 40% of the window looks 2.5×
+            # faster than it sells. Above ~1.5 the order quantity is the least
+            # trustworthy number on the row.
+            "drr_inflation": (
+                round(drr / sell_through_drr, 2) if sell_through_drr > 0 and drr > 0 else None
+            ),
+            "skus_not_orderable": skus_not_orderable,
+            "not_orderable_breakdown": status_counts,
+            **{
+                k: origin.get(k)
+                for k in ("vendor_name", "vendor_country", "vendor_currency",
+                          "is_overseas", "origin_source")
+            },
             "months_in_warehouse": _months(wh_units),
             "months_in_transit": _months(transit_units),
             "months_total": _months(wh_units + transit_units),
             "transit_arrivals": arrivals,
             "next_arrival": next_arrival,
+            "transit_stale_legs": stale_legs,
+            "transit_stale_units": round(stale_units, 0),
+            "transit_stale_mrp_value": round(stale_value, 2),
+            "transit_max_days_stale": max_days_stale,
+            "transit_no_eta_legs": no_eta_legs,
+            "transit_no_eta_units": round(no_eta_units, 0),
+            "transit_no_eta_mrp_value": round(no_eta_value, 2),
 
             "urgency": urgency,
             "cash_trapped": round(cash_trapped, 2),
@@ -2051,7 +2262,17 @@ def _allocate(rows: List[Dict], envelope: float, new_brand_reserve: float = 0.0)
     incumbents every time.
     """
     fundable = [r for r in rows if r["urgency"] in ("CRITICAL", "ORDER") and r["capital_required"] > 0]
-    fundable.sort(key=lambda r: (URGENCY_RANK[r["urgency"]], -r["gmroi"], -r["drr"]))
+    # Within an urgency tier, imported brands are funded first: they cannot be
+    # topped up at short notice, so the window to act on them closes sooner. A
+    # domestic brand at the same urgency can still be reordered after the next
+    # collection lands. GMROI then decides between brands of the same origin,
+    # which is what it was always there for.
+    fundable.sort(key=lambda r: (
+        URGENCY_RANK[r["urgency"]],
+        not r.get("is_overseas", False),
+        -r["gmroi"],
+        -r["drr"],
+    ))
 
     reserve = max(0.0, new_brand_reserve)
     available = max(0.0, envelope - reserve)
@@ -2065,6 +2286,35 @@ def _allocate(rows: List[Dict], envelope: float, new_brand_reserve: float = 0.0)
             row["funded_amount"] = 0.0
             row["funded_pct"] = 0.0
             row["recommendation"] = "DEFER"
+            # DEFER is always a cash decision — the brand is ranked and wanted.
+            # Say so, and say what stock it has to survive on, because "wait"
+            # is only safe if something is actually coming.
+            on_hand_cover = row.get("on_hand_days_coverage") or 0.0
+            transit = row.get("in_transit_units") or 0
+            nxt = row.get("next_arrival") or {}
+            if transit > 0 and nxt.get("eta_date"):
+                days = nxt.get("days_away")
+                when = (
+                    f"{abs(days)} days overdue" if nxt.get("is_overdue")
+                    else f"in {days} days"
+                )
+                incoming = (
+                    f" It has {transit:,.0f} units in transit ({when}), but that is already "
+                    f"counted in its {row['current_days_coverage']} days of cover — only "
+                    f"{on_hand_cover} days are physically on hand."
+                )
+            elif transit > 0:
+                incoming = (
+                    f" It has {transit:,.0f} units in transit with no ETA recorded, already "
+                    f"counted in its cover; only {on_hand_cover} days are on hand."
+                )
+            else:
+                incoming = (
+                    f" Nothing is in transit — its {on_hand_cover} days of cover is all it has."
+                )
+            row["defer_reason"] = (
+                f"Cash ran out at priority {rank}, not a problem with the brand." + incoming
+            )
         elif remaining >= need:
             row["funded_amount"] = round(need, 2)
             row["funded_pct"] = 100.0
@@ -2116,10 +2366,27 @@ def _allocate(rows: List[Dict], envelope: float, new_brand_reserve: float = 0.0)
                 # the master report suggested no quantity (usually because the
                 # SKUs are inactive or discontinued) or we could not cost them.
                 row["recommendation"] = "REVIEW"
-                row["review_reason"] = (
-                    "No costed order quantity — SKUs are likely inactive or "
-                    "discontinued, or have no COGS and no purchase history."
-                )
+                # Name the actual cause: "every SKU is discontinued" and "we
+                # cannot price these" need completely different responses.
+                blocked = row.get("not_orderable_breakdown") or {}
+                if blocked:
+                    detail = ", ".join(
+                        f"{count} {status}" for status, count in sorted(blocked.items())
+                    )
+                    row["review_reason"] = (
+                        f"Needs stock, but nothing can be ordered: {detail} "
+                        f"(of {row['sku_count']} SKUs). Either let it run down as intended, "
+                        f"or reactivate a SKU."
+                    )
+                elif row.get("skus_missing_cost"):
+                    row["review_reason"] = (
+                        f"Needs stock, but {row['skus_missing_cost']} SKU(s) have no managed "
+                        f"price, no COGS and no purchase history, so the order cannot be costed."
+                    )
+                else:
+                    row["review_reason"] = (
+                        "Needs stock but the master report suggested no quantity for any SKU."
+                    )
             else:
                 row["recommendation"] = "HOLD" if row["urgency"] == "HEALTHY" else "DO NOT ORDER"
             for sku in row["skus"]:
@@ -2192,12 +2459,14 @@ async def _brand_order_plan_data(
     behaviour_task = asyncio.to_thread(_expected_collections_sync, db, datetime.now())
     sales_3m_task = asyncio.to_thread(_brand_sales_3m_sync, db)
     arrivals_task = asyncio.to_thread(_transit_arrivals_sync, db)
+    origins_task = asyncio.to_thread(_brand_origin_sync, db)
 
     (master, cash, receivables, payables, open_pos, opex,
      collection, fallback_costs, ar_behaviour, sales_3m,
-     transit_arrivals) = await asyncio.gather(
+     transit_arrivals, origins) = await asyncio.gather(
         master_task, cash_task, ar_task, ap_task, po_task, opex_task,
-        collection_task, fallback_task, behaviour_task, sales_3m_task, arrivals_task
+        collection_task, fallback_task, behaviour_task, sales_3m_task, arrivals_task,
+        origins_task
     )
 
     working_capital = _build_working_capital(
@@ -2235,7 +2504,7 @@ async def _brand_order_plan_data(
     rows = _aggregate_brands(
         items, brand_logistics, fallback_costs, fx,
         max_cover_days, min_selling_days, period_days,
-        sales_3m.get("by_brand", {}), transit_arrivals,
+        sales_3m.get("by_brand", {}), transit_arrivals, origins,
     )
     allocation = _allocate(rows, envelope, reserve_total)
 
@@ -2340,6 +2609,24 @@ async def _brand_order_plan_data(
                 "months": sales_3m.get("months", 3),
             },
             "unmapped_sales": sales_3m.get("unmapped_sales", 0.0),
+        },
+        # Whether the in-transit dates can be trusted. The arrival view is only
+        # as good as the brand orders behind it, so the gaps are surfaced rather
+        # than left for someone to notice.
+        "transit_health": {
+            "stale_legs": sum(r["transit_stale_legs"] for r in rows),
+            "stale_units": round(sum(r["transit_stale_units"] for r in rows), 0),
+            "stale_mrp_value": round(sum(r["transit_stale_mrp_value"] for r in rows), 2),
+            "max_days_stale": max((r["transit_max_days_stale"] for r in rows), default=0),
+            "stale_brands": sorted(
+                r["brand"] for r in rows if r["transit_stale_legs"] > 0
+            ),
+            "no_eta_legs": sum(r["transit_no_eta_legs"] for r in rows),
+            "no_eta_units": round(sum(r["transit_no_eta_units"] for r in rows), 0),
+            "no_eta_mrp_value": round(sum(r["transit_no_eta_mrp_value"] for r in rows), 2),
+            "no_eta_brands": sorted(
+                r["brand"] for r in rows if r["transit_no_eta_legs"] > 0
+            ),
         },
         "allocation": allocation,
         "new_brand_reserves": reserves,
@@ -2565,7 +2852,7 @@ def _build_plan_xlsx(data: Dict) -> bytes:
     # ── Sheet 2: brand plan ─────────────────────────────────────────────────
     ws2 = wb.create_sheet("Brand Plan")
     headers = [
-        "Priority", "Brand", "Urgency", "Recommendation", "Lead Time",
+        "Priority", "Brand", "Origin", "Vendor", "Urgency", "Recommendation", "Lead Time",
         "Cover Cap (days)", "Days Selling", "DRR", "On Hand", "In Transit", "Days Coverage",
         "WH Units", "WH MRP Value", "WH Collection Value",
         "Transit MRP Value", "Transit Collection Value",
@@ -2579,7 +2866,10 @@ def _build_plan_xlsx(data: Dict) -> bytes:
     _write_header(ws2, headers)
     for i, b in enumerate(data["brands"], start=2):
         vals = [
-            b.get("priority"), b["brand"], b["urgency"], b["recommendation"],
+            b.get("priority"), b["brand"],
+            "Imported" if b.get("is_overseas") else "Domestic",
+            b.get("vendor_country") or b.get("vendor_name") or "",
+            b["urgency"], b["recommendation"],
             b["lead_time"], b.get("cover_cap_days"), b.get("selling_days"), b["drr"],
             b["on_hand_units"], b["in_transit_units"], b["current_days_coverage"],
             b.get("wh_units"), b.get("wh_mrp_value"), b.get("wh_collection_value"),
@@ -2595,12 +2885,12 @@ def _build_plan_xlsx(data: Dict) -> bytes:
         for col, v in enumerate(vals, start=1):
             c = ws2.cell(row=i, column=col, value=v)
             c.border = _THIN
-            if col in (13, 14, 15, 16, 20, 21, 22, 23, 24, 31, 32, 34):
+            if col in (15, 16, 17, 18, 22, 23, 24, 25, 26, 33, 34, 36):
                 c.number_format = _MONEY
-        ws2.cell(row=i, column=3).fill = _URGENCY_FILL.get(b["urgency"], PatternFill())
+        ws2.cell(row=i, column=5).fill = _URGENCY_FILL.get(b["urgency"], PatternFill())
     ws2.freeze_panes = "C2"
     _autosize(ws2, [
-        9, 22, 11, 16, 11, 15, 12, 9, 11, 11, 14,
+        9, 22, 11, 24, 11, 16, 11, 15, 12, 9, 11, 11, 14,
         11, 16, 18, 17, 20, 15, 13, 15, 20, 24,
         18, 16, 16, 10, 9, 13, 15, 18, 13, 18, 16, 11, 16,
     ])
@@ -2646,6 +2936,117 @@ def _build_plan_xlsx(data: Dict) -> bytes:
     wb.save(buf)
     buf.seek(0)
     return buf.getvalue()
+
+
+class BrandSheetRequest(BaseModel):
+    """One brand's row, exactly as `/brand-order-plan` returned it."""
+    brand: str
+    skus: List[Dict] = Field(default_factory=list)
+    summary: Dict = Field(default_factory=dict)
+
+
+_SKU_SHEET_COLUMNS: List[tuple] = [
+    ("SKU Code", "sku_code", None, 16),
+    ("Product Name", "product_name", None, 46),
+    ("Purchase Status", "purchase_status", None, 26),
+    ("Unit Cost", "unit_cost", _MONEY, 12),
+    ("Cost Source", "cost_source", None, 16),
+    ("On Hand", "on_hand", None, 11),
+    ("In Transit", "in_transit", None, 11),
+    ("DRR", "drr", None, 9),
+    ("Sell-through DRR", "sell_through_drr", None, 16),
+    ("Days Coverage", "current_days_coverage", None, 14),
+    ("Suggested Qty", "suggested_qty", None, 14),
+    ("Order Qty (capped)", "order_qty", None, 17),
+    ("Units Trimmed", "capped_units", None, 14),
+    ("Funded Qty", "funded_qty", None, 12),
+    ("Capital Required", "capital_required", _MONEY, 17),
+    ("Excess / Order", "excess_or_order", None, 15),
+]
+
+
+def _build_brand_sku_xlsx(brand: str, skus: List[Dict], summary: Dict) -> bytes:
+    """The SKU table for one brand, as shown on the page."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = (brand or "Brand")[:31]
+
+    ws["A1"] = f"{brand} — SKU detail"
+    ws["A1"].font = Font(bold=True, size=16, color="1F3864")
+    bits = [
+        f"{summary.get('recommendation', '')}",
+        f"{summary.get('urgency', '')}",
+        f"cover {summary.get('current_days_coverage', 0)}d vs {summary.get('lead_time', 0)}d lead time",
+        f"cap {summary.get('cover_cap_days') or 'none'}d",
+        f"needs ₹{_f(summary.get('capital_required')):,.0f}",
+        f"funded ₹{_f(summary.get('funded_amount')):,.0f}",
+    ]
+    ws["A2"] = "  ·  ".join(b for b in bits if b.strip(" ·"))
+    ws["A2"].font = Font(italic=True, size=9, color="666666")
+    ws["A3"] = f"{len(skus)} SKU(s) · generated {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    ws["A3"].font = Font(italic=True, size=9, color="666666")
+
+    _write_header(ws, [c[0] for c in _SKU_SHEET_COLUMNS], row=5)
+
+    row = 6
+    for s in skus:
+        for col, (_, key, fmt, _w) in enumerate(_SKU_SHEET_COLUMNS, start=1):
+            c = ws.cell(row=row, column=col, value=s.get(key))
+            c.border = _THIN
+            if fmt:
+                c.number_format = fmt
+        # A SKU that cannot be ordered is why its quantity is zero — make that
+        # visible in the sheet, not just on the page.
+        if s.get("purchase_status") in NON_ORDERABLE_STATUSES:
+            ws.cell(row=row, column=3).fill = PatternFill("solid", fgColor="F4B183")
+        row += 1
+
+    if skus:
+        ws.cell(row=row, column=1, value="Total").font = Font(bold=True)
+        for col, (_, key, fmt, _w) in enumerate(_SKU_SHEET_COLUMNS, start=1):
+            if key not in ("on_hand", "in_transit", "suggested_qty", "order_qty",
+                           "capped_units", "funded_qty", "capital_required"):
+                continue
+            letter = get_column_letter(col)
+            c = ws.cell(row=row, column=col, value=f"=SUM({letter}6:{letter}{row - 1})")
+            c.font = Font(bold=True)
+            if fmt:
+                c.number_format = fmt
+
+    _autosize(ws, [c[3] for c in _SKU_SHEET_COLUMNS])
+    ws.freeze_panes = "C6"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@router.post("/brand-order-plan/brand-sheet")
+async def download_brand_sku_sheet(body: BrandSheetRequest):
+    """One brand's SKU table as xlsx.
+
+    Takes the rows the page already holds rather than re-running the plan — a
+    fresh run costs 60–90s and would produce different numbers from the ones the
+    user is looking at.
+    """
+    try:
+        content = await asyncio.to_thread(
+            _build_brand_sku_xlsx, body.brand, body.skus, body.summary
+        )
+    except Exception as e:
+        logger.error(f"brand sku sheet failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to build sheet: {e}",
+        )
+
+    safe = _re.sub(r"[^A-Za-z0-9_-]+", "_", body.brand or "brand").strip("_") or "brand"
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{safe}_skus.xlsx"'},
+    )
 
 
 @router.get("/brand-order-plan/download")
